@@ -82,7 +82,7 @@ def test_run_attempt_uses_isolated_generated_config(monkeypatch, tmp_path):
     hooks = json.loads(captured["config_home_hooks"])
     assert set(hooks["hooks"]) == {"PreToolUse", "PostToolUse"}
     assert captured["config_home_hook_script"] is True
-    assert captured["argv"] == ["codex", "exec", "--json", "-"]
+    assert captured["argv"] == ["codex", "exec", "--skip-git-repo-check", "--json", "-"]
     assert "go" not in captured["argv"]
     assert captured["stdin_data"] == b"go"
     assert "--ignore-user-config" not in captured["argv"]

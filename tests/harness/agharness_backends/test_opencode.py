@@ -81,7 +81,7 @@ def test_run_attempt_writes_and_registers_the_agpolicy_plugin(monkeypatch, tmp_p
     assert len(captured["config"]["plugin"]) == 1
     assert captured["config"]["plugin"][0].startswith("file://")
     assert captured["config"]["plugin"][0].endswith("agpolicy_plugin.js")
-    assert "agent" not in captured["config"]
+    assert captured["config"]["agent"] == {"title": {"disable": True}}
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
     assert captured["argv"] == ["opencode", "run", "--format", "json"]

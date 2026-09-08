@@ -1009,6 +1009,9 @@ def test_message_during_model_replaces_final_draft_at_next_safe_boundary(streami
     assert _invocation_message_texts(backend.requests[1][1]["messages"]) == [
         "[AGENCY INVOCATION MESSAGE]\nincorporate this before answering"
     ]
+    assert _invocation_message_texts(server.get_main_transcript()) == [
+        "[AGENCY INVOCATION MESSAGE]\nincorporate this before answering"
+    ]
     assert invocation.phase == "closing"
 
 

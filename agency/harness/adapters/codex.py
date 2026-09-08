@@ -166,7 +166,9 @@ class _CodexBackend(agharness_backend):
                 json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
             )
 
-            argv = [resolved, "exec", "--json", "-"]
+            # Agency workspaces need not be Git repositories. The daemon
+            # already supplies the isolated configuration and sandbox boundary.
+            argv = [resolved, "exec", "--skip-git-repo-check", "--json", "-"]
             envp = {
                 "PATH": HARNESS_PATH,
                 "CODEX_HOME": str(config_home),
@@ -427,38 +429,42 @@ class _CodexBackend(agharness_backend):
 
         output_index = 0
         text_item_id = None
-        text_parts: "list[str]" = []
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    if text_item_id is None:
-                        text_item_id = f"msg_{uuid.uuid4().hex}"
-                        yield _sse(
-                            "response.output_item.added",
-                            {
-                                "type": "response.output_item.added",
-                                "output_index": output_index,
-                                "item": {
-                                    "type": "message",
-                                    "id": text_item_id,
-                                    "status": "in_progress",
-                                    "role": "assistant",
-                                    "content": [],
-                                },
-                            },
-                        )
-                    text_parts.append(content)
-                    yield _sse(
-                        "response.output_text.delta",
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": text_item_id,
-                            "output_index": output_index,
-                            "delta": content,
-                        },
-                    )
+                # A redirect can supersede draft deltas. Responses SSE cannot
+                # retract them, so wait for the authoritative host checkpoint.
                 continue
+
+            text_parts = [
+                block.get("text", "")
+                for block in item["message"].get("blocks", [])
+                if block["type"] == "text"
+            ]
+            if any(text_parts):
+                text_item_id = f"msg_{uuid.uuid4().hex}"
+                yield _sse(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "message",
+                            "id": text_item_id,
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                )
+                yield _sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": text_item_id,
+                        "output_index": output_index,
+                        "delta": "".join(text_parts),
+                    },
+                )
 
             if text_item_id is not None:
                 yield _sse(

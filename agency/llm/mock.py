@@ -241,7 +241,7 @@ class _MockBackend:
         )
 
     def dispatch(self, request: dict) -> dict:
-        del request
+        self._before_dispatch(request)
         blocks = copy.deepcopy(self._next_exchange())
         metadata = next((b for b in blocks if b.get("type") == "metadata"), {})
         return {
@@ -251,7 +251,8 @@ class _MockBackend:
         }
 
     def dispatch_stream(self, request: dict, on_client=None) -> "Iterator[dict]":
-        del request, on_client
+        del on_client
+        self._before_dispatch(request)
         blocks = copy.deepcopy(self._next_exchange())
         metadata = next((b for b in blocks if b.get("type") == "metadata"), {})
         content_blocks = [b for b in blocks if b.get("type") != "metadata"]
@@ -278,3 +279,10 @@ class _MockBackend:
             "usage": metadata.get("usage"),
             "stop_reason": metadata.get("stop_reason"),
         }
+
+    def _before_dispatch(self, request: dict) -> None:
+        hook = self.agconfig.llm.replay_dispatch_hook
+        if hook is not None:
+            # Hooks control timing and inspect a snapshot, never rewrite the
+            # request used by the execution stack or the positional replay.
+            hook(copy.deepcopy(request))

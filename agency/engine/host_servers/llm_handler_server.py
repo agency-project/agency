@@ -1600,6 +1600,9 @@ class LlmHandlerServer:
                         "usage": usage,
                         "stop_reason": stop_reason,
                     },
+                    # A redirect may have replaced the draft's request along
+                    # with its response. Preserve that same semantic exchange.
+                    request=request,
                     response=message,
                     usage=usage,
                     finish_reason=stop_reason,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import uuid
 
 from fastapi import Request
@@ -225,12 +226,16 @@ class _OpencodeBackend(agharness_backend):
                 }
             },
             "model": f"{self._PROVIDER_NAME}/{model}",
+            # Headless Agency invocations do not use UI session titles. Keep
+            # that auxiliary generation out of the invocation's model channel
+            # and final-answer checkpoints (OpenCode's built-in title agent).
+            "agent": {"title": {"disable": True}},
             # Per opencode.ai/docs/config's `plugin` array: local plugins are
             # referenced by file:// URL alongside npm-package/version specs.
             "plugin": [f"file://{plugin_path}"],
         }
         if max_steps is not None:
-            config["agent"] = {"build": {"steps": max_steps}}
+            config["agent"]["build"] = {"steps": max_steps}
         (config_home / "opencode.json").write_text(json.dumps(config))
 
     def _write_agpolicy_plugin(self, config_home):
@@ -428,6 +433,7 @@ class _OpencodeBackend(agharness_backend):
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
+            "created": int(time.time()),
             "model": model,
             "choices": [
                 {
@@ -445,11 +451,13 @@ class _OpencodeBackend(agharness_backend):
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
 
         def _chunk(delta: dict, finish_reason: "str | None" = None) -> str:
             payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
             }
@@ -457,14 +465,15 @@ class _OpencodeBackend(agharness_backend):
 
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    yield _chunk({"content": content})
+                # A redirect can replace this draft. SSE cannot retract text;
+                # publish the authoritative message after the host checkpoint.
                 continue
 
             tool_call_index = 0
             for b in item["message"].get("blocks", []):
-                if b["type"] == "tool_use":
+                if b["type"] == "text":
+                    yield _chunk({"content": b.get("text", "")})
+                elif b["type"] == "tool_use":
                     yield _chunk(
                         {
                             "tool_calls": [
@@ -493,6 +502,7 @@ class _OpencodeBackend(agharness_backend):
             usage_payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
                 "choices": [],
                 "usage": {

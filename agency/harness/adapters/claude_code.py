@@ -120,7 +120,14 @@ def _is_session_title_request(raw_request: dict) -> bool:
         for message in raw_request.get("messages", [])
         if isinstance(message, dict)
     )
-    return any(_SESSION_TITLE_PROMPT_MARKER in part for part in parts)
+    return any(
+        _SESSION_TITLE_PROMPT_MARKER in part
+        or (
+            "The session content is provided inside <session> tags." in part
+            and 'Return JSON with a single "title" field.' in part
+        )
+        for part in parts
+    )
 
 
 def _anthropic_tools_to_agency(tools) -> "list[dict] | None":

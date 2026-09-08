@@ -16,6 +16,27 @@ from agency.harness.adapters.opencode import _OpencodeBackend
 
 
 @pytest.mark.parametrize(
+    "backend_cls", [_ClaudeCodeBackend, _CodexBackend, _GrokBackend, _OpencodeBackend]
+)
+def test_external_stream_only_emits_authoritative_text_after_redirect(backend_cls):
+    stream = [
+        {"type": "delta", "content": "superseded draft"},
+        {
+            "type": "done",
+            "message": {
+                "role": "assistant",
+                "blocks": [{"type": "text", "index": 0, "text": "authoritative final"}],
+            },
+            "stop_reason": "stop",
+            "usage": {},
+        },
+    ]
+    frames = "".join(backend_cls(agconfig())._format_agency_stream_to_harness(iter(stream), "m"))
+    assert "superseded draft" not in frames
+    assert "authoritative final" in frames
+
+
+@pytest.mark.parametrize(
     ("backend_cls", "path"),
     [
         (_ClaudeCodeBackend, "/v1/messages"),
@@ -38,7 +59,8 @@ def test_registered_adapter_routes_inject_fastapi_request(backend_cls, path):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_claude_session_title_request_is_answered_without_model_dispatch(stream):
+@pytest.mark.parametrize("title_format", ["legacy", "session_tags"])
+def test_claude_session_title_request_is_answered_without_model_dispatch(stream, title_format):
     app = FastAPI()
     bridge = SimpleNamespace(
         validate_token=lambda _token: True,
@@ -60,11 +82,64 @@ def test_claude_session_title_request_is_answered_without_model_dispatch(stream)
             }
         ],
     }
+    if title_format == "session_tags":
+        # Claude Code 2.1.251 moved the title instructions into the system
+        # prompt and wraps the real invocation input as data, not a model turn.
+        body["system"] = (
+            "The session content is provided inside <session> tags. "
+            'Return JSON with a single "title" field. Capitalize the first letter of the title.'
+        )
+        body["messages"] = [{"role": "user", "content": "<session>Fix a bug</session>"}]
 
     with TestClient(app) as client:
         response = client.post("/v1/messages", headers={"x-api-key": "token"}, json=body)
 
     assert response.status_code == 200
     assert "Agency session" in response.text
+    bridge.dispatch.assert_not_called()
+    bridge.dispatch_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("auxiliary", ["title", "dashboard"])
+def test_grok_auxiliary_request_is_answered_without_model_dispatch(stream, auxiliary):
+    app = FastAPI()
+    bridge = SimpleNamespace(
+        validate_token=lambda _token: True,
+        resolve_model=lambda _token: "test-model",
+        dispatch=MagicMock(side_effect=AssertionError("title request reached the model")),
+        dispatch_stream=MagicMock(side_effect=AssertionError("title request reached the model")),
+    )
+    _GrokBackend(agconfig()).register(app, bridge)
+    body = {
+        "stream": stream,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are tasked with generating the session title.\n"
+                    "Just generate the session_title and nothing else"
+                ),
+            },
+            {"role": "user", "content": "<user_query>Fix a bug</user_query>"},
+        ],
+    }
+    if auxiliary == "dashboard":
+        body["messages"] = [
+            {"role": "assistant", "content": "The actual answer"},
+            {
+                "role": "user",
+                "content": (
+                    "<system-reminder>Write an ultra-short dashboard line that captures "
+                    "the AGENT'S REPLY for the last turn only — a summary.</system-reminder>"
+                ),
+            },
+        ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions", headers={"Authorization": "Bearer token"}, json=body
+        )
+    assert response.status_code == 200
+    assert ("Agency session" if auxiliary == "title" else "Agency turn") in response.text
     bridge.dispatch.assert_not_called()
     bridge.dispatch_stream.assert_not_called()

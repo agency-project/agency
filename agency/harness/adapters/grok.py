@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import uuid
 
 from fastapi import Request
@@ -259,6 +260,51 @@ class _GrokBackend(agharness_backend):
                 )
             body = await request.json()
             model = router.resolve_model(token)
+            # Grok's headless CLI still requests UI titles and dashboard text.
+            # Like Claude's title request, these must not consume invocation
+            # model calls or acknowledge redirects meant for the real turn.
+            is_title = any(
+                message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and message["content"].startswith(
+                    "You are tasked with generating the session title."
+                )
+                and "Just generate the session_title and nothing else" in message["content"]
+                for message in body.get("messages", [])
+            )
+            messages = body.get("messages", [])
+            last = messages[-1] if messages else {}
+            is_dashboard = (
+                last.get("role") == "user"
+                and isinstance(last.get("content"), str)
+                and last["content"].startswith(
+                    "<system-reminder>Write an ultra-short dashboard line that captures "
+                    "the AGENT'S REPLY for the last turn only"
+                )
+                and last["content"].endswith("</system-reminder>")
+            )
+            if is_title or is_dashboard:
+                title_response = {
+                    "type": "done",
+                    "message": {
+                        "role": "assistant",
+                        "blocks": [
+                            {
+                                "type": "text",
+                                "index": 0,
+                                "text": "Agency session" if is_title else "Agency turn",
+                            }
+                        ],
+                    },
+                    "stop_reason": "stop",
+                    "usage": {},
+                }
+                if body.get("stream"):
+                    return StreamingResponse(
+                        self._format_agency_stream_to_harness(iter([title_response]), model),
+                        media_type="text/event-stream",
+                    )
+                return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
 
@@ -385,6 +431,7 @@ class _GrokBackend(agharness_backend):
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
+            "created": int(time.time()),
             "model": model,
             "choices": [
                 {
@@ -402,11 +449,13 @@ class _GrokBackend(agharness_backend):
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
 
         def _chunk(delta: dict, finish_reason: "str | None" = None) -> str:
             payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
             }
@@ -414,14 +463,15 @@ class _GrokBackend(agharness_backend):
 
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    yield _chunk({"content": content})
+                # A redirect can replace this draft. SSE cannot retract text;
+                # publish the authoritative message after the host checkpoint.
                 continue
 
             tool_call_index = 0
             for b in item["message"].get("blocks", []):
-                if b["type"] == "tool_use":
+                if b["type"] == "text":
+                    yield _chunk({"content": b.get("text", "")})
+                elif b["type"] == "tool_use":
                     yield _chunk(
                         {
                             "tool_calls": [
@@ -450,6 +500,7 @@ class _GrokBackend(agharness_backend):
             usage_payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
                 "choices": [],
                 "usage": {

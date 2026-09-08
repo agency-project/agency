@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -67,6 +69,57 @@ def _mock_backend(db_path: Path, **fields):
 
     cfg = agconfig(llmconfig(provider="mock", replay_db_path=str(db_path), **fields))
     return agllm.for_config(cfg)
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["dispatch", "dispatch_stream"])
+def test_replay_dispatch_hook_gates_response_after_config_clone(tmp_path, streaming):
+    from agency.llm.agllm import agllm
+
+    db_path = tmp_path / "source.sqlite3"
+    logger = _make_source_db(db_path)
+    logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+    logger.stop()
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def hook(request):
+        seen.append(request)
+        entered.set()
+        assert release.wait(timeout=5), "test did not release replay dispatch"
+        request.clear()
+
+    cfg = agconfig(
+        llmconfig(
+            provider="mock",
+            replay_db_path=str(db_path),
+            timing_mode="instant",
+            replay_dispatch_hook=hook,
+        )
+    ).clone()
+    assert "replay_dispatch_hook" not in cfg.llm.safe_snapshot()
+    backend = agllm.for_config(cfg)
+    request = {"messages": [{"role": "user", "blocks": []}]}
+
+    def dispatch():
+        if streaming:
+            return list(backend.dispatch_stream(request))
+        return backend.dispatch(request)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        response = executor.submit(dispatch)
+        try:
+            assert entered.wait(timeout=5)
+            assert seen == [request]
+            assert not response.done()
+        finally:
+            release.set()
+        result = response.result(timeout=5)
+    assert request == {"messages": [{"role": "user", "blocks": []}]}
+    if streaming:
+        assert "".join(item.get("text", "") for item in result) == _TEXT_EXCHANGE[0]["text"]
+    else:
+        assert result["message"]["blocks"] == _TEXT_EXCHANGE
 
 
 class TestReplayOrderingAndDispatch:

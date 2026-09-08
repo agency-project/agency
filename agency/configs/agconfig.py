@@ -192,6 +192,9 @@ class llmconfig(confignamespace):
     poisson_seed: "int | None" = None
     timing_fn: "Callable | None" = None  # a plain callable -- not JSON-safe,
     # so safe_snapshot() silently omits it, same as any other non-JSON-safe value.
+    # Test synchronization/inspection before either replay dispatch path emits
+    # a response. Use a function closure so config clones share its gate.
+    replay_dispatch_hook: "Callable[[dict], None] | None" = None
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset(
         {"api_key", "aws_access_key", "aws_secret_key", "aws_session_token"}

@@ -288,8 +288,16 @@ def test_agency_stream_to_harness_text_stream_ends_with_done():
     frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "m"))
     events = _parse_sse(frames)
     assert events[-1] == "[DONE]"
-    content_deltas = [e["choices"][0]["delta"].get("content") for e in events[:2]]
-    assert content_deltas == ["Hel", "lo"]
+    # Strict clients (including Grok) require created on every SSE chunk,
+    # including the usage-only chunk.
+    assert all(isinstance(event["created"], int) for event in events[:-1])
+    assert len({event["created"] for event in events[:-1]}) == 1
+    content_deltas = [
+        e["choices"][0]["delta"]["content"]
+        for e in events
+        if isinstance(e, dict) and e["choices"] and "content" in e["choices"][0]["delta"]
+    ]
+    assert content_deltas == ["Hello"]
     finish_chunk = next(
         e
         for e in events
