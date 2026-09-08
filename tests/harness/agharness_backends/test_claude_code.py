@@ -73,6 +73,7 @@ def _run_attempt(
     prompt="go",
     resume_session_id=None,
     prior_session_blob=None,
+    max_steps=None,
 ):
     runtime = AdapterRuntime(
         agconfig=ag.agconfig,
@@ -88,7 +89,7 @@ def _run_attempt(
         prompt=prompt,
         resume_session_id=resume_session_id,
         prior_session_blob=prior_session_blob,
-        max_steps=None,
+        max_steps=max_steps,
     )
 
 
@@ -217,6 +218,25 @@ def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_cl
         _run_attempt(backend, ag, resume_session_id=None)
 
     assert "--resume" not in captured["argv"]
+
+
+def test_run_attempt_omits_max_turns_when_max_steps_is_none(_patch_which_finds_claude):
+    backend = _ClaudeCodeBackend(agconfig())
+    ag = _make_agent(with_sandbox=False)
+    handle = _make_handle(stdout='{"result": "ok"}')
+    captured = {}
+
+    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
+        captured["argv"] = argv
+        captured["stdin_data"] = stdin_data
+        return handle
+
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
+        mock_px_cls.return_value.launch.side_effect = fake_launch
+        _run_attempt(backend, ag, max_steps=None)
+
+    assert "--max-turns" not in captured["argv"]
+    assert captured["stdin_data"] == b"go"
 
 
 def test_parse_result_json_extracts_result_and_usage():

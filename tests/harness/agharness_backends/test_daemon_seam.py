@@ -101,10 +101,26 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     assert result.final_text == expected
     assert captured["policy"] is runtime.syscall_policy
     assert captured["ag"] is None
-    if backend_cls is _GrokBackend:
+    if backend_cls is _ClaudeCodeBackend:
+        assert captured["argv"][captured["argv"].index("--max-turns") + 1] == "4"
+        assert "do the thing" not in captured["argv"]
+        assert captured["stdin_data"] == b"do the thing"
+    elif backend_cls is _GrokBackend:
+        assert captured["argv"][captured["argv"].index("--max-turns") + 1] == "4"
         assert "do the thing" not in captured["argv"]
         assert captured["prompt"] == "do the thing"
         assert captured["stdin_data"] is None
+    elif backend_cls is _OpencodeBackend:
+        config = json.loads(captured["config"])
+        assert config["agent"]["build"]["steps"] == 4
+        assert config["provider"]["agency-proxy"]["options"] == {
+            "baseURL": f"{runtime.harness_base_url}/v1",
+            "apiKey": runtime.token,
+        }
+        assert config["plugin"][0].startswith("file://")
+        assert "maxSteps" not in captured["config"]
+        assert "do the thing" not in captured["argv"]
+        assert captured["stdin_data"] == b"do the thing"
     else:
         assert "do the thing" not in captured["argv"]
         assert captured["stdin_data"] == b"do the thing"
@@ -199,7 +215,29 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
 
     assert result.ok
     assert result.final_text == "native-ok"
-    assert any("native_harness.cli" in command for command in sandbox.commands)
+    command = next(command for command in sandbox.commands if "native_harness.cli" in command)
+    argv = shlex.split(command)
+    assert argv[argv.index("--max-steps") + 1] == "4"
+
+
+def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch):
+    sandbox = _NativeSandbox()
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+    )
+
+    result = _NativeBackend(agconfig()).run_daemon_attempt(
+        _runtime(sandbox=sandbox),
+        prompt="do the thing",
+        resume_session_id=None,
+        prior_session_blob=None,
+        max_steps=None,
+    )
+
+    assert result.ok
+    command = next(command for command in sandbox.commands if "native_harness.cli" in command)
+    argv = shlex.split(command)
+    assert argv[argv.index("--max-steps") + 1] == "20"
 
 
 @pytest.mark.parametrize("backend_cls", [_NativeBackend, _ClaudeCodeBackend])

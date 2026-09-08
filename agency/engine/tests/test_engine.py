@@ -1133,6 +1133,7 @@ def test_run_attempt_binds_a_fresh_token_for_only_each_rpc_duration():
     assert len(set(bound)) == 2
     assert cleared == bound
     assert [request.attempt_token for request in seen] == bound
+    assert [request.max_steps for request in seen] == [7, 7]
 
 
 def test_run_attempt_clears_its_token_when_the_rpc_raises():

@@ -135,7 +135,7 @@ class _NativeBackend(agharness_backend):
                 "--model",
                 shlex.quote(runtime.model or ""),
                 "--max-steps",
-                str(max_steps or 20),
+                str(20 if max_steps is None else max_steps),
                 "--output-format",
                 "json",
                 "--bridge-base-url",

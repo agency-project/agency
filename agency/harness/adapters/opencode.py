@@ -166,6 +166,7 @@ class _OpencodeBackend(agharness_backend):
                 runtime.token,
                 runtime.model or "default",
                 plugin_path,
+                max_steps,
             )
 
             argv = [resolved, "run", "--format", "json"]
@@ -206,7 +207,13 @@ class _OpencodeBackend(agharness_backend):
         return AttemptResult(ok=True, final_text=final_text)
 
     def _write_opencode_config(
-        self, config_home, base_url: str, token: str, model: str, plugin_path
+        self,
+        config_home,
+        base_url: str,
+        token: str,
+        model: str,
+        plugin_path,
+        max_steps: "int | None",
     ) -> None:
         config = {
             "provider": {
@@ -222,6 +229,8 @@ class _OpencodeBackend(agharness_backend):
             # referenced by file:// URL alongside npm-package/version specs.
             "plugin": [f"file://{plugin_path}"],
         }
+        if max_steps is not None:
+            config["agent"] = {"build": {"steps": max_steps}}
         (config_home / "opencode.json").write_text(json.dumps(config))
 
     def _write_agpolicy_plugin(self, config_home):

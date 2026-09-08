@@ -194,6 +194,7 @@ class GlobalAgentOrchestrator:
         authoritative context chain and scheduler registration therefore have
         one linearization point and cannot be observed in different orders.
         """
+        self._validate_max_steps(max_steps)
         if not isinstance(skill_input, agdata):
             as_pending = getattr(skill_input, "_as_pending_agdata", None)
             if not callable(as_pending):
@@ -236,6 +237,13 @@ class GlobalAgentOrchestrator:
         if cycle_ack is not None:
             cycle_ack.result()
         return invocation
+
+    @staticmethod
+    def _validate_max_steps(max_steps: "int | None") -> None:
+        if max_steps is not None and (
+            not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps <= 0
+        ):
+            raise ValueError("max_steps must be a positive integer or None")
 
     def submit_context_message(self, ag: "agent", message: str) -> MessageSubmission:
         """Atomically publish one orchestrator-owned host-only context request."""

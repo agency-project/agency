@@ -103,12 +103,90 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     assert prompt not in captured["argv"]
     assert "-p" not in captured["argv"]
     assert "--single" not in captured["argv"]
+    assert "--max-turns" not in captured["argv"]
     assert captured["prompt_exists_at_launch"] is True
     assert captured["prompt_text"] == prompt
     assert captured["prompt_path"].parent == config_home
     assert not config_home.exists()
     assert result.ok is True
     assert result.final_text == "ok"
+
+
+def test_max_turn_exhaustion_preserves_structured_result(monkeypatch, tmp_path):
+    backend = _GrokBackend(agconfig())
+    config_home = tmp_path / "grok-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
+    payload = json.dumps(
+        {
+            "text": "partial but useful",
+            "stopReason": "cancelled",
+            "sessionId": "session-1",
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+    )
+
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
+        ptrace_cls.return_value.launch.return_value = _make_handle(
+            stdout=payload,
+            stderr="Error: max turns reached",
+            rc=1,
+        )
+        result = backend.run_daemon_attempt(
+            AdapterRuntime(
+                agconfig=agconfig(),
+                model="test-model",
+                engine_name="test-agent",
+                harness_base_url="http://harness.local",
+                token="tok-1",
+                syscall_policy=MagicMock(),
+            ),
+            prompt="go",
+            resume_session_id=None,
+            prior_session_blob=None,
+            max_steps=7,
+        )
+
+    assert result.ok is True
+    assert result.final_text == "partial but useful"
+    assert result.input_tokens == 3
+    assert result.output_tokens == 2
+    assert result.session_id == "session-1"
+
+
+def test_nonzero_exit_with_unrelated_error_remains_failure(monkeypatch, tmp_path):
+    backend = _GrokBackend(agconfig())
+    config_home = tmp_path / "grok-config"
+    config_home.mkdir()
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home", lambda *args: config_home
+    )
+
+    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
+        ptrace_cls.return_value.launch.return_value = _make_handle(
+            stdout='{"text":"stale","stopReason":"cancelled"}',
+            stderr="authentication failed",
+            rc=1,
+        )
+        result = backend.run_daemon_attempt(
+            AdapterRuntime(
+                agconfig=agconfig(),
+                model="test-model",
+                engine_name="test-agent",
+                harness_base_url="http://harness.local",
+                token="tok-1",
+                syscall_policy=MagicMock(),
+            ),
+            prompt="go",
+            resume_session_id=None,
+            prior_session_blob=None,
+            max_steps=7,
+        )
+
+    assert result.ok is False
+    assert "authentication failed" in result.error_message
 
 
 def test_run_attempt_cleans_config_home_when_launch_fails(monkeypatch, tmp_path):

@@ -44,6 +44,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
     request = HarnessAttemptRequest(
         prompt=PromptPayload("system", "user"),
         harness="fake",
+        max_steps=7,
         resume_session_id="session-1",
         prior_session_blob_b64=base64.b64encode(b"prior session state").decode("ascii"),
         attempt_token="attempt-one",
@@ -61,6 +62,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
 
     assert seen["resume_session_id"] == "session-1"
     assert seen["prior_session_blob"] == b"prior session state"
+    assert seen["max_steps"] == 7
     assert isinstance(seen["runtime"], AdapterRuntime)
     assert seen["runtime"].engine_name == "agent-1"
     assert seen["runtime"].model == "model"

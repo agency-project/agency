@@ -342,6 +342,8 @@ class _ClaudeCodeBackend(agharness_backend):
                 mcp_config,
                 "--strict-mcp-config",
             ]
+            if max_steps is not None:
+                argv += ["--max-turns", str(max_steps)]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
 

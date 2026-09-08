@@ -363,6 +363,26 @@ def test_native_failed_model_leaves_redirect_pending_for_new_attempt(tmp_path):
     assert not handle._pending_messages
 
 
+def test_native_max_steps_counts_model_turns_not_tool_calls(monkeypatch, tmp_path):
+    tool_events = []
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: tool_events.append(args) or "{}")
+    llm = _Llm([_tool_response("one", "two"), _tool_response("three"), _final_response()])
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        max_steps=2,
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "error"
+    assert result.message == "exceeded max_steps=2 without a final answer"
+    assert result.turn_count == 2
+    assert len(llm.requests) == 2
+    assert len(tool_events) == 3
+
+
 def test_redirect_text_is_rendered_after_compaction(monkeypatch, tmp_path):
     handle = AgentControl().begin_invocation("compaction")
     handle.redirect("exact redirect text")

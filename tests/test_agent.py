@@ -304,6 +304,15 @@ def test_run_dispatches_to_agent_engine(harness_name, monkeypatch):
     assert isinstance(ag.engine, FakeAgentEngine)
 
 
+@pytest.mark.parametrize("max_steps", [0, -1, 1.5, "2", True, False])
+def test_run_rejects_invalid_max_steps(max_steps):
+    skill = agskill(name="s", system_prompt="")
+    ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
+
+    with pytest.raises(ValueError, match="max_steps must be a positive integer or None"):
+        ag.run(skill, agdata(task="go"), max_steps=max_steps)
+
+
 # ---------------------------------------------------------------------------
 # History is updated and serialized on the same agent
 # ---------------------------------------------------------------------------

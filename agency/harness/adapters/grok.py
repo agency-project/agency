@@ -129,6 +129,8 @@ class _GrokBackend(agharness_backend):
                 "json",
                 "--yolo",
             ]
+            if max_steps is not None:
+                argv += ["--max-turns", str(max_steps)]
             envp = {
                 "PATH": HARNESS_PATH,
                 # GROK_HOME redirects the *entire* config directory (config.toml,
@@ -160,7 +162,16 @@ class _GrokBackend(agharness_backend):
         finally:
             agharness.cleanup_config_home(config_home)
 
-        if rc != 0:
+        parsed_result = self._parse_structured_result(stdout)
+        max_turn_exhausted = (
+            max_steps is not None
+            and "max turns reached" in stderr.lower()
+            and parsed_result is not None
+            and parsed_result.get("type") != "error"
+            and isinstance(parsed_result.get("text"), str)
+            and parsed_result.get("stopReason") in {"cancelled", "max_turn_requests"}
+        )
+        if rc != 0 and not max_turn_exhausted:
             return AttemptResult(
                 ok=False, error_message=f"grok exited with code {rc}: {stderr or stdout}"
             )
@@ -213,16 +224,23 @@ class _GrokBackend(agharness_backend):
         )
 
     @staticmethod
+    def _parse_structured_result(stdout: str) -> "dict | None":
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    @staticmethod
     def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":
         """Parse `grok --prompt-file ... --output-format json`'s JSON result
         object -- `{"text": "...", "usage": {...}, "sessionId": "...", ...}`
         per xAI's published headless-mode docs (not verified against a
         live run -- see this module's docstring)."""
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError:
-            return stdout.strip(), {}, None
-        if not isinstance(payload, dict):
+        payload = _GrokBackend._parse_structured_result(stdout)
+        if payload is None:
             return stdout.strip(), {}, None
         text = payload.get("text", "")
         usage = payload.get("usage", {}) or {}
