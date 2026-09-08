@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from unittest.mock import MagicMock, patch
 
 from agency.configs.agconfig import agconfig
@@ -31,7 +32,7 @@ def test_codex_available_reflects_real_which():
     assert codex_available() == (shutil.which("codex") is not None)
 
 
-def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeypatch, tmp_path):
+def test_run_attempt_uses_isolated_generated_config(monkeypatch, tmp_path):
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -41,6 +42,10 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     captured = {}
     config_home = tmp_path / "codex-config"
     config_home.mkdir()
+    host_config_home = tmp_path / "host-codex-config"
+    host_config_home.mkdir()
+    (host_config_home / "config.toml").write_text('model = "host-model"\n')
+    monkeypatch.setenv("CODEX_HOME", str(host_config_home))
     monkeypatch.setattr(
         "agency.harness.agharness.materialize_config_home", lambda *args: config_home
     )
@@ -52,6 +57,8 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
         captured["argv"] = argv
         captured["envp"] = envp
         captured["cwd"] = cwd
+        captured["config_path"] = launched_config_home / "config.toml"
+        captured["config"] = tomllib.loads(captured["config_path"].read_text())
         captured["config_home_hooks"] = (launched_config_home / "hooks.json").read_text()
         captured["config_home_hook_script"] = (launched_config_home / "agpolicy_hook.py").exists()
         return handle
@@ -74,12 +81,23 @@ def test_run_attempt_writes_and_registers_admission_and_completion_hooks(monkeyp
     hooks = json.loads(captured["config_home_hooks"])
     assert set(hooks["hooks"]) == {"PreToolUse", "PostToolUse"}
     assert captured["config_home_hook_script"] is True
+    assert captured["argv"] == ["codex", "exec", "--json", "go"]
+    assert "--ignore-user-config" not in captured["argv"]
+    assert captured["config_path"] == config_home / "config.toml"
+    assert captured["config"]["model"] == "test-model"
+    assert captured["config"]["model_provider"] == "agency-proxy"
+    provider = captured["config"]["model_providers"]["agency-proxy"]
+    assert provider["base_url"] == "http://harness.local/v1"
+    assert provider["env_key"] == "AGENCY_PROXY_API_KEY"
+    assert provider["wire_api"] == "responses"
+    assert captured["envp"]["AGENCY_PROXY_API_KEY"] == "tok-1"
     assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
     assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
     assert captured["cwd"] == "/workspace"
     assert captured["envp"]["CODEX_HOME"] == str(config_home)
     assert captured["envp"]["AGPOLICY_STATE_DIR"] == str(config_home)
     assert not config_home.exists()
+    assert (host_config_home / "config.toml").read_text() == 'model = "host-model"\n'
 
 
 def test_parse_output_events_ignores_non_agent_message_items():

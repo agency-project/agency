@@ -166,10 +166,7 @@ class _CodexBackend(agharness_backend):
                 json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
             )
 
-            # --ignore-user-config keeps this run from inheriting the
-            # caller's own ~/.codex/config.toml, matching the same
-            # isolated-config-home intent as the other two backends.
-            argv = [resolved, "exec", "--json", "--ignore-user-config", prompt]
+            argv = [resolved, "exec", "--json", prompt]
             envp = {
                 "PATH": HARNESS_PATH,
                 "CODEX_HOME": str(config_home),
