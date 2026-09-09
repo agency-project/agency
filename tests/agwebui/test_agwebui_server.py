@@ -1153,3 +1153,47 @@ def test_agent_detail_endpoint_unknown_agent_returns_404(server):
     resp = client.get("/api/agents/__no_such_agent__")
     assert resp.status_code == 404
     assert resp.json()["error"] == "unknown agent"
+
+
+# ---------------------------------------------------------------------------
+# Profiler artifact download
+# ---------------------------------------------------------------------------
+
+
+def test_profiler_files_empty_before_the_run_finishes(server):
+    """Nothing exists yet -- agprof only writes output at session stop
+    (see _profiler_dir()'s docstring), so a run still in progress must not
+    error, just report nothing available."""
+    client, _run_dir, _srv = server
+    assert client.get("/api/profiler/files").json() == {"files": []}
+
+
+def test_profiler_files_lists_and_downloads_existing_artifacts(server, monkeypatch):
+    client, run_dir, srv = server
+    profiler_dir = run_dir / "profiler"
+    profiler_dir.mkdir()
+    content = b'{"schema_version": 4}'
+    (profiler_dir / "summary.json").write_bytes(content)
+    monkeypatch.setattr(srv, "_profiler_dir", lambda: profiler_dir)
+
+    assert client.get("/api/profiler/files").json() == {
+        "files": [{"name": "summary.json", "size": len(content)}]
+    }
+
+    resp = client.get("/api/profiler/download/summary.json")
+    assert resp.status_code == 200
+    assert resp.content == content
+    assert "attachment" in resp.headers["content-disposition"]
+    assert "summary.json" in resp.headers["content-disposition"]
+
+
+def test_profiler_download_rejects_filenames_outside_the_fixed_whitelist(server):
+    client, _run_dir, _srv = server
+    resp = client.get("/api/profiler/download/not-a-real-artifact.txt")
+    assert resp.status_code == 404
+
+
+def test_profiler_download_reports_404_for_a_whitelisted_but_missing_file(server):
+    client, _run_dir, _srv = server
+    resp = client.get("/api/profiler/download/summary.md")
+    assert resp.status_code == 404

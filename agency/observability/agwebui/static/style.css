@@ -209,6 +209,20 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   white-space: nowrap;
 }
 
+.profiler-links {
+  font-size: 10px;
+  font-weight: normal;
+  letter-spacing: 0;
+  white-space: nowrap;
+  display: flex;
+  gap: 8px;
+}
+.profiler-links a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+.profiler-links a:hover { text-decoration: underline; }
+
 .right-title { color: var(--text); border-bottom-color: var(--border); }
 
 /* ---------------------------------------------------------- Shared log */

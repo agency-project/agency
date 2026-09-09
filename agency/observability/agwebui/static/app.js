@@ -163,6 +163,44 @@ setInterval(async () => {
   } catch {}
 }, 10_000);
 
+// ---------------------------------------------------------------------------
+// Profiler artifacts
+// ---------------------------------------------------------------------------
+
+const $profilerLinks = document.getElementById('profiler-links');
+
+function fmtBytes(n) {
+  if (n >= 1_048_576) return (n / 1_048_576).toFixed(1) + 'MB';
+  if (n >= 1024)      return (n / 1024).toFixed(1) + 'KB';
+  return n + 'B';
+}
+
+// Profiler output (agprof.trace.json/summary.json/summary.md) only appears
+// once this run's profiling session stops -- normally at the very end of
+// the run (see server.py's _profiler_dir() docstring) -- so poll for it
+// rather than expecting it on page load, and stop once it shows up since
+// it's written once, not continuously.
+async function pollProfilerFiles() {
+  try {
+    const r = await fetch('/api/profiler/files');
+    const j = await r.json();
+    const files = j.files || [];
+    if (!files.length) return false;
+    $profilerLinks.innerHTML = files
+      .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)} (${fmtBytes(f.size)})</a>`)
+      .join('');
+    $profilerLinks.classList.remove('hidden');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const _profilerPollTimer = setInterval(async () => {
+  if (await pollProfilerFiles()) clearInterval(_profilerPollTimer);
+}, 10_000);
+pollProfilerFiles();
+
 // Reset all agent/log state before replaying a historical window.
 function clearAgentState() {
   state.agents.clear();

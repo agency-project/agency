@@ -100,6 +100,30 @@ def _db_path() -> Path:
     return _run_dir / "global_data.sqlite3"
 
 
+# agprof.trace.json/summary.json/summary.md/profile_data.sqlite3 land in a
+# `profiler/` directory that is a *sibling* of `_run_dir` (both are
+# `agency_runs/<run_id>/{logs,profiler}` -- see agprof._env_out_dir() and
+# agutil._DEFAULT_LOG_DIR, which share the same `agency_run_dir_name()`).
+# Only exists once the profiling session has stopped (session()/workload()
+# write output at exit, not continuously), so a run still in progress has
+# nothing here yet -- that's normal, not an error.
+_PROFILER_FILENAMES = ("summary.md", "summary.json", "agprof.trace.json", "profile_data.sqlite3")
+
+
+def _profiler_dir() -> Path:
+    return _run_dir.parent / "profiler"
+
+
+def _list_profiler_files() -> dict:
+    directory = _profiler_dir()
+    files = []
+    for name in _PROFILER_FILENAMES:
+        path = directory / name
+        if path.is_file():
+            files.append({"name": name, "size": path.stat().st_size})
+    return {"files": files}
+
+
 def _xterm256_hex(n: int) -> str:
     """Ported from the old terminal-based agui's agterm.py (removed in
     2705fa8) / agwebui_emitter.ansi_to_hex -- xterm-256 color index -> hex."""
@@ -808,6 +832,33 @@ async def api_agent_detail(agname: str):
     detail = await asyncio.to_thread(_fetch_agent_detail, _db_path(), agname)
     status = 404 if detail.get("error") == "unknown agent" else 200
     return JSONResponse(detail, status_code=status)
+
+
+# ---------------------------------------------------------------------------
+# Profiler artifacts
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/profiler/files")
+async def api_profiler_files():
+    """Which profiler output files exist yet, if any -- empty while the run
+    is still in progress (see _profiler_dir()'s docstring)."""
+    return JSONResponse(await asyncio.to_thread(_list_profiler_files))
+
+
+@app.get("/api/profiler/download/{filename}")
+async def api_profiler_download(filename: str):
+    # Whitelist, not just a directory-scoped read: filename comes straight
+    # from the URL path, so this must never resolve outside _profiler_dir()
+    # (no "..", no absolute path, no symlink surprise) -- an exact match
+    # against the fixed set of names agprof actually writes closes all of
+    # that off at once, no path-sanitizing logic needed.
+    if filename not in _PROFILER_FILENAMES:
+        return JSONResponse({"error": "unknown profiler file"}, status_code=404)
+    path = _profiler_dir() / filename
+    if not path.is_file():
+        return JSONResponse({"error": "not available yet"}, status_code=404)
+    return FileResponse(path, filename=filename, media_type="application/octet-stream")
 
 
 # ---------------------------------------------------------------------------
