@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ctypes
 import platform
+import socket
 import struct
 
 
@@ -96,6 +97,8 @@ SYSCALL_NUMBERS: dict[str, int] = {
     "open": 2,
     "openat": 257,
     "connect": 42,
+    "bind": 49,
+    "sendto": 44,
     "unlink": 87,
     "unlinkat": 263,
     "rename": 82,
@@ -228,6 +231,37 @@ def read_cstring(pid: int, addr: int, max_len: int = 4096) -> str:
         return ""
     raw = read_bytes(pid, addr, max_len)
     return raw.split(b"\x00", 1)[0].decode(errors="replace")
+
+
+# sizeof(struct sockaddr_in6) -- the largest of the two shapes this decodes,
+# so a single capped read covers either one.
+_SOCKADDR_MAX_LEN = 28
+
+
+def read_sockaddr(pid: int, addr: int, addrlen: int) -> "tuple[str | None, int | None]":
+    """Decode a `struct sockaddr*` argument into (ip, port) -- IPv4/IPv6
+    only. Deliberately reads only the address struct, never any data
+    buffer a caller (e.g. sendto()) might pass alongside it: this is for
+    connection metadata (who a syscall is talking to), not payload
+    content. Returns (None, None) for a null pointer, an unreadable
+    address, or any other address family (AF_UNIX, AF_NETLINK, ...)."""
+    if not addr or addrlen <= 0:
+        return None, None
+    try:
+        raw = read_bytes(pid, addr, min(addrlen, _SOCKADDR_MAX_LEN))
+    except OSError:
+        return None, None
+    if len(raw) < 8:
+        return None, None
+    # sa_family is native byte order; the port that follows it is always
+    # network (big-endian) byte order regardless of host endianness.
+    (family,) = struct.unpack_from("<H", raw, 0)
+    port = struct.unpack_from(">H", raw, 2)[0]
+    if family == socket.AF_INET:
+        return socket.inet_ntop(socket.AF_INET, raw[4:8]), port
+    if family == socket.AF_INET6 and len(raw) >= 24:
+        return socket.inet_ntop(socket.AF_INET6, raw[8:24]), port
+    return None, None
 
 
 def resolve_argv(pid: int, argv_ptr: int, max_entries: int = 4096) -> list[str]:

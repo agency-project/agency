@@ -194,6 +194,21 @@ def _make_data_logger(db_path: Path):
     return logger
 
 
+def _strip_ts(messages: list) -> list:
+    """Every message _compute_agent_messages() returns now carries a `ts`
+    (see its docstring) -- real wall-clock time, so not something a test can
+    assert an exact literal for. Validate it's a plausible timestamp, then
+    strip it so the rest of a message can still be compared by literal
+    equality against the old expected shape."""
+    stripped = []
+    for message in messages:
+        message = dict(message)
+        ts = message.pop("ts", None)
+        assert isinstance(ts, (int, float)) and ts > 0, message
+        stripped.append(message)
+    return stripped
+
+
 # ---------------------------------------------------------------------------
 # Fixture: isolated server app with its own run_dir
 # ---------------------------------------------------------------------------
@@ -772,7 +787,7 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     # get reconstructed and appended as in-progress content (see
     # _reconstruct_in_progress_messages) -- the metadata block is dropped,
     # the text block becomes a trailing assistant message.
-    assert detail["messages"] == [
+    assert _strip_ts(detail["messages"]) == [
         {"role": "assistant", "content": "finished"},
         {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "hi"}]},
     ]
@@ -829,7 +844,7 @@ def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_mes
     global_logger.stop()
 
     detail = client.get("/api/agents/NoSnapshot").json()
-    assert detail["messages"] == [{"role": "user", "content": "hi"}]
+    assert _strip_ts(detail["messages"]) == [{"role": "user", "content": "hi"}]
 
 
 # ---------------------------------------------------------------------------
@@ -838,17 +853,48 @@ def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_mes
 # ---------------------------------------------------------------------------
 
 
+def test_reconstruct_in_progress_messages_includes_leading_user_message():
+    """engine.py logs a user_message event as soon as it builds the initial
+    prompt -- reconstruction must surface it as its own leading 'user'-role
+    message, before whatever the assistant has said so far."""
+    from agency.observability.agwebui.server import _reconstruct_in_progress_messages
+
+    rows = [
+        (
+            "user_message",
+            None,
+            json.dumps({"blocks": [{"type": "text", "text": "do the thing"}]}),
+            100.0,
+        ),
+        ("llm_block", "call_1", json.dumps({"type": "text", "text": "working on it"}), 101.0),
+    ]
+    messages = _reconstruct_in_progress_messages(rows)
+    assert messages == [
+        {
+            "role": "user",
+            "blocks": [{"type": "text", "text": "do the thing"}],
+            "ts": 100.0,
+        },
+        {
+            "role": "assistant",
+            "blocks": [{"type": "text", "text": "working on it"}],
+            "ts": 101.0,
+        },
+    ]
+
+
 def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
-        ("llm_block", "call_1", json.dumps({"type": "thinking", "text": "hmm"})),
+        ("llm_block", "call_1", json.dumps({"type": "thinking", "text": "hmm"}), 100.0),
         (
             "llm_block",
             "call_1",
             json.dumps({"type": "tool_use", "name": "write", "arguments": "{}"}),
+            101.0,
         ),
-        ("llm_block", "call_1", json.dumps({"type": "metadata", "usage": {}})),
+        ("llm_block", "call_1", json.dumps({"type": "metadata", "usage": {}}), 102.0),
     ]
     messages = _reconstruct_in_progress_messages(rows)
     assert messages == [
@@ -858,6 +904,7 @@ def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
                 {"type": "thinking", "text": "hmm"},
                 {"type": "tool_use", "name": "write", "arguments": "{}"},
             ],
+            "ts": 100.0,
         }
     ]
 
@@ -866,19 +913,28 @@ def test_reconstruct_in_progress_messages_tool_result_starts_new_assistant_turn(
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
-        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "write"})),
+        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "write"}), 100.0),
         (
             "tool_result",
             None,
             json.dumps({"tool": "write", "arguments": {}, "result": {"ok": True}}),
+            101.0,
         ),
-        ("llm_block", "call_2", json.dumps({"type": "text", "text": "done"})),
+        ("llm_block", "call_2", json.dumps({"type": "text", "text": "done"}), 102.0),
     ]
     messages = _reconstruct_in_progress_messages(rows)
     assert messages == [
-        {"role": "assistant", "blocks": [{"type": "tool_use", "name": "write"}]},
-        {"role": "tool", "blocks": [{"type": "tool_result", "text": json.dumps({"ok": True})}]},
-        {"role": "assistant", "blocks": [{"type": "text", "text": "done"}]},
+        {
+            "role": "assistant",
+            "blocks": [{"type": "tool_use", "name": "write"}],
+            "ts": 100.0,
+        },
+        {
+            "role": "tool",
+            "blocks": [{"type": "tool_result", "text": json.dumps({"ok": True})}],
+            "ts": 101.0,
+        },
+        {"role": "assistant", "blocks": [{"type": "text", "text": "done"}], "ts": 102.0},
     ]
 
 
@@ -890,15 +946,19 @@ def test_reconstruct_in_progress_messages_same_call_label_after_tool_result_star
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
-        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "a"})),
-        ("tool_result", None, json.dumps({"tool": "a", "arguments": {}, "result": 1})),
-        ("llm_block", "call_1", json.dumps({"type": "text", "text": "again"})),
+        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "a"}), 100.0),
+        ("tool_result", None, json.dumps({"tool": "a", "arguments": {}, "result": 1}), 101.0),
+        ("llm_block", "call_1", json.dumps({"type": "text", "text": "again"}), 102.0),
     ]
     messages = _reconstruct_in_progress_messages(rows)
     assert len(messages) == 3
     assert messages[0]["role"] == "assistant"
     assert messages[1]["role"] == "tool"
-    assert messages[2] == {"role": "assistant", "blocks": [{"type": "text", "text": "again"}]}
+    assert messages[2] == {
+        "role": "assistant",
+        "blocks": [{"type": "text", "text": "again"}],
+        "ts": 102.0,
+    }
 
 
 def test_agent_detail_reconstructs_in_progress_content_with_no_live_messages_yet(server):
@@ -926,7 +986,7 @@ def test_agent_detail_reconstructs_in_progress_content_with_no_live_messages_yet
     global_logger.stop()
 
     detail = client.get("/api/agents/InProgress").json()
-    assert detail["messages"] == [
+    assert _strip_ts(detail["messages"]) == [
         {
             "role": "assistant",
             "blocks": [
@@ -950,15 +1010,21 @@ def test_reconstruct_streaming_messages_merges_text_deltas_by_index():
         (
             "call_1",
             json.dumps({"type": "block_delta", "index": 0, "block_type": "text", "text": "Hel"}),
+            100.0,
         ),
         (
             "call_1",
             json.dumps({"type": "block_delta", "index": 0, "block_type": "text", "text": "lo"}),
+            101.0,
         ),
     ]
     messages = _reconstruct_streaming_messages(rows)
     assert messages == [
-        {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "Hello"}]}
+        {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "Hello"}],
+            "ts": 100.0,
+        }
     ]
 
 
@@ -978,12 +1044,14 @@ def test_reconstruct_streaming_messages_merges_tool_use_pieces():
                     "arguments": '{"path"',
                 }
             ),
+            100.0,
         ),
         (
             "call_1",
             json.dumps(
                 {"type": "block_delta", "index": 0, "block_type": "tool_use", "arguments": ': "x"}'}
             ),
+            101.0,
         ),
     ]
     messages = _reconstruct_streaming_messages(rows)
@@ -1000,6 +1068,7 @@ def test_reconstruct_streaming_messages_merges_tool_use_pieces():
                     "arguments": '{"path": "x"}',
                 }
             ],
+            "ts": 100.0,
         }
     ]
 
@@ -1011,18 +1080,24 @@ def test_reconstruct_streaming_messages_drops_metadata_and_usage_items():
         (
             "call_1",
             json.dumps({"type": "block_delta", "index": 0, "block_type": "text", "text": "hi"}),
+            100.0,
         ),
         (
             "call_1",
             json.dumps(
                 {"type": "block_delta", "index": 2**31 - 1, "block_type": "metadata", "data": {}}
             ),
+            101.0,
         ),
-        ("call_1", json.dumps({"type": "usage", "usage": {"prompt_tokens": 1}})),
+        ("call_1", json.dumps({"type": "usage", "usage": {"prompt_tokens": 1}}), 102.0),
     ]
     messages = _reconstruct_streaming_messages(rows)
     assert messages == [
-        {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}
+        {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "hi"}],
+            "ts": 100.0,
+        }
     ]
 
 
@@ -1063,7 +1138,7 @@ def test_agent_detail_includes_currently_streaming_exchange(server):
     global_logger.stop()
 
     detail = client.get("/api/agents/Streaming").json()
-    assert detail["messages"] == [
+    assert _strip_ts(detail["messages"]) == [
         {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "Writing..."}]}
     ]
 

@@ -25,6 +25,12 @@ class agsyscallevent:
     timestamp: float
     tool_name: "str | None" = None
     tool_args: "dict | None" = None
+    program: "str | None" = None
+    # Decoded destination/local address for connect(2)/bind(2)/sendto(2)
+    # (ptrace path only) -- IPv4/IPv6 only. Never populated alongside a
+    # data buffer's contents: this is connection metadata, not payload.
+    address: "str | None" = None
+    port: "int | None" = None
 
 
 __all__ = ["agsyscallevent"]

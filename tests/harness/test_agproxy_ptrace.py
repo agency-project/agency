@@ -145,6 +145,8 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
                     envp=None,
                     path=f"/tmp/{secret}/claude",
                     timestamp=0,
+                    address=None,
+                    port=None,
                 )
             )
             for callback in self.exec_callbacks:
@@ -440,7 +442,7 @@ def test_exec_callback_is_success_only_kernel_named_and_replay_safe(monkeypatch)
     monkeypatch.setattr(
         _tracer_loop,
         "_resolve_syscall_args",
-        lambda *_args: ([attacker_argv0], None, requested_path[0]),
+        lambda *_args: ([attacker_argv0], None, requested_path[0], None, None),
     )
     monkeypatch.setattr(_tracer_loop.pt, "ptrace", lambda *_args: None)
 
@@ -835,6 +837,50 @@ def test_launch_resolves_openat_path():
     assert any(e.path and "hostname" in e.path for e in openat_events), [
         (e.syscall, e.path) for e in openat_events
     ]
+
+
+@ptrace
+def test_launch_decodes_connect_bind_and_sendto_address_and_port():
+    from agency.configs.agconfig import agconfig, ptraceconfig
+
+    events = []
+
+    class RecordingPolicy:
+        def check(self, ag, event):
+            events.append(event)
+            return True
+
+    cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "connect", "bind", "sendto")))
+    px = agProxyPtrace(cfg)
+    script = (
+        "import socket\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "s.bind(('127.0.0.1', 0))\n"
+        "s.settimeout(1)\n"
+        "s.connect(('127.0.0.1', 65535))\n"
+        "s.send(b'hello')\n"
+        "s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "s2.settimeout(1)\n"
+        "s2.sendto(b'world', ('127.0.0.1', 65533))\n"
+    )
+    handle = px.launch([sys.executable, "-c", script], {}, cwd="/tmp", policy=RecordingPolicy())
+    stdout, stderr, rc = handle.wait(timeout=10)
+    assert rc == 0, (stdout, stderr)
+
+    connect_events = [e for e in events if e.syscall == "connect"]
+    bind_events = [e for e in events if e.syscall == "bind"]
+    sendto_events = [e for e in events if e.syscall == "sendto"]
+
+    assert any(e.address == "127.0.0.1" and e.port == 65535 for e in connect_events), connect_events
+    # bind(('127.0.0.1', 0)) requests an ephemeral port -- 0 is exactly what
+    # was passed to the syscall (the kernel's actual assignment is a
+    # separate, un-decoded getsockname() concern).
+    assert any(e.address == "127.0.0.1" and e.port == 0 for e in bind_events), bind_events
+    assert any(e.address == "127.0.0.1" and e.port == 65533 for e in sendto_events), sendto_events
+    # agsyscallevent has no field for a data buffer at all -- decoding a
+    # send-family syscall's destination address can never smuggle payload
+    # content along with it.
+    assert not any(hasattr(e, "buf") or hasattr(e, "data") for e in sendto_events)
 
 
 @ptrace

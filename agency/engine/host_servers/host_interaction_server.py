@@ -94,8 +94,12 @@ class HostInteractionServer:
         label = self._ADMISSION_LABEL[kind]
         if kind == "tool":
             args_text = repr(attributes["arguments"])
+        elif attributes.get("address") is not None:
+            args_text = f"{attributes['address']}:{attributes.get('port')}"
         else:
             args_text = repr(attributes["argv"] or attributes["path"])
+        if attributes.get("program"):
+            args_text = f"{args_text}  program={attributes['program']}"
         args_suffix = f"  args={args_text}"
         if allowed:
             term_message = f"[{self._agname}] {label} ▶  {name}{args_suffix}"
@@ -109,6 +113,7 @@ class HostInteractionServer:
             {"state": f"running_{kind}" if allowed else f"{kind}_denied", kind: name},
             update_latest_snapshot=True,
             term_message=term_message,
+            print_to_terminal=False,
             flush=True,
         )
         if allowed:
@@ -197,7 +202,10 @@ class HostInteractionServer:
                 f"[{self._agname}] {self._ADMISSION_LABEL[kind]} {mark}  {name}  ={result_text}"
             )
         self.record_event(
-            f"{kind}_result", {**attributes, **extra, "call_id": call_id}, term_message=term_message
+            f"{kind}_result",
+            {**attributes, **extra, "call_id": call_id},
+            term_message=term_message,
+            print_to_terminal=False,
         )
         self.record_span(
             f"{kind}:{name}",
@@ -223,10 +231,7 @@ class HostInteractionServer:
     def _wall_clock_to_perf_ns(wall_ts: float) -> "tuple[int, int]":
         """Approximate this host's own perf_counter_ns for a wall-clock
         timestamp reported by anyone (this process included), using this
-        host's own simultaneous clock readings. No calibration handshake is
-        needed with the reporter -- wall clocks are already comparable across
-        processes/containers on one host, unlike perf_counter_ns, whose epoch
-        is arbitrary per process."""
+        host's own simultaneous clock readings."""
         now_perf_ns = time.perf_counter_ns()
         now_wall_ns = time.time_ns()
         target_wall_ns = int(wall_ts * 1e9)
@@ -234,21 +239,13 @@ class HostInteractionServer:
 
     def current_open_context(self):
         """Context of the most recently opened, still-open reported span, if
-        any -- otherwise the request-level fallback. Lets other host-side
-        spans (e.g. LLM dispatch) nest under whatever a harness currently has
-        open via record_span(span_id=..., end_ts=None), without either side
-        needing to know anything about the other."""
+        any -- otherwise the request-level fallback."""
         if self._open_spans:
             return next(reversed(self._open_spans.values())).context()
         return self._profile_context
 
     def profile_settings(self) -> dict:
-        """Whether profiling is on, and automatic-function-sampling settings.
-
-        A harness able to profile its own call stack (any pure-Python one)
-        asks this once, up front, to decide whether that's worth doing at
-        all -- there is nothing harness-specific about the answer itself.
-        """
+        """Whether profiling is on, and automatic-function-sampling settings."""
         settings = agprof._auto_settings
         harness = self._profile_attributes.get("harness")
         if harness in agprof._engine_coverage:
@@ -267,12 +264,7 @@ class HostInteractionServer:
         }
 
     def record_samples(self, samples: "list[dict]") -> dict:
-        """Ingest a batch of already-measured function-call samples.
-
-        Only ever produced by a harness profiling its own Python call stack,
-        but the ingestion itself holds no harness-specific state -- it is
-        just "accept a bounded batch of samples," same as record_span.
-        """
+        """Ingest a batch of already-measured function-call samples."""
         if not isinstance(samples, list) or len(samples) > 128:
             return {"ok": False, "error": "sample batch exceeds 128 events"}
         harness = self._profile_attributes.get("harness") or "remote"
@@ -282,10 +274,7 @@ class HostInteractionServer:
         return {"ok": rejected == 0, "rejected": rejected}
 
     def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
-        """Admission + telemetry entry point for a tool call: decide
-        allow/deny via `check_tool()`, then record a `tool_call` event and
-        (if allowed) open a pending span completed later by
-        `complete_tool_call()`."""
+        """Admission + telemetry entry point for a tool call"""
         allowed, reason = self.check_tool(tool_name, tool_input)
         call_id = self._record_admission(
             "tool", tool_name, {"tool": tool_name, "arguments": tool_input}, allowed, reason
@@ -312,8 +301,7 @@ class HostInteractionServer:
         )
 
     def admit_syscall(self, syscall: "agsyscallevent") -> dict:
-        """Admission + telemetry entry point for a syscall, symmetric with
-        `admit_tool_call()`."""
+        """Admission + telemetry entry point for a syscall"""
         allowed, reason = self.check_syscall(syscall)
         call_id = self._record_admission(
             "syscall",
@@ -323,6 +311,9 @@ class HostInteractionServer:
                 "pid": syscall.pid,
                 "path": syscall.path,
                 "argv": syscall.argv,
+                "program": syscall.program,
+                "address": syscall.address,
+                "port": syscall.port,
             },
             allowed,
             reason,
@@ -341,6 +332,7 @@ class HostInteractionServer:
         call_label: "str | None" = None,
         update_latest_snapshot: bool = False,
         term_message: "str | None" = None,
+        print_to_terminal: bool = True,
         flush: bool = False,
     ) -> None:
         self._data_logger.record_event(
@@ -349,6 +341,7 @@ class HostInteractionServer:
             call_label=call_label,
             update_latest_snapshot=update_latest_snapshot,
             term_message=term_message,
+            print_to_terminal=print_to_terminal,
             flush=flush,
         )
 
@@ -366,19 +359,7 @@ class HostInteractionServer:
         span_id: "str | None" = None,
     ) -> None:
         """Log one flat historical span row -- and, when *span_id* is given,
-        also fold it into the live profiler trace with correct nesting.
-
-        Without *span_id* this is unchanged: a caller that already built its
-        own live span (the admission/completion boundaries above) wants
-        nothing more than the flat row. With *span_id*: passing *end_ts*
-        as ``None`` opens a live span for a later call to close by repeating
-        the same *span_id* with a real *end_ts* (so a still-in-progress
-        parent can be a real parent_context for a child reported later);
-        passing both *start_ts* and *end_ts* together reports the whole span
-        in one call. *parent*, when it names another currently-open span_id,
-        attaches to it regardless of which caller reported that parent --
-        nothing here is specific to any one harness.
-        """
+        also fold it into the live profiler trace with correct nesting."""
         if span_id is not None:
             opened = self._open_spans.pop(span_id, None)
             if opened is None and start_ts is not None and len(self._open_spans) < 1024:

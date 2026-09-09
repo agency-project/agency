@@ -9,6 +9,15 @@ const state = {
   agents:      new Map(),  // agname -> { color, state, skill, tool }
   teams:       new Map(),  // team_name -> Set<agname>
   histories:   new Map(),  // agname -> msg[]
+  // agname -> {cursor, html}[] -- tool/llm/syscall event lines, interleaved
+  // into the transcript at render time (see renderHistory()). `cursor` is
+  // how many transcript messages that agent had at the moment this line
+  // arrived, i.e. "render this right after message #cursor-1" -- there is
+  // no true event timestamp on transcript messages to sort against, but
+  // this lines a call up right where it actually happened: after the
+  // assistant's tool_use message, before the tool's result message lands.
+  systemLogs:  new Map(),
+  systemLogsEnabled: false,
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
@@ -159,6 +168,7 @@ function clearAgentState() {
   state.agents.clear();
   state.teams.clear();
   state.histories.clear();
+  state.systemLogs.clear();
   state.agentOrder = [];
   state.focusedIdx = 0;
   state.autoSelected = false;
@@ -211,6 +221,7 @@ $tlLiveBtn.addEventListener('click', () => {
 
 const $sharedLog        = document.getElementById('shared-log');
 const $agentHistory     = document.getElementById('agent-history');
+const $systemLogCheckbox = document.getElementById('system-log-checkbox');
 const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
 const $navLabel         = document.getElementById('nav-label');
@@ -322,20 +333,117 @@ function appendLog(line) {
 // its own `ts` (see server.py's _build_envelope), so a short HH:MM:SS
 // prefix -- dim, like the old terminal-based agui's -- rides along whenever
 // one's available.
-function appendAgentLog(termMessage, color, ts) {
+function colorizeTermMessage(termMessage, color, ts) {
   const tsPrefix = ts ? `<span class="log-ts">${fmtTs(ts)}</span> ` : '';
   const m = /^(\[[^\]]+\])(.*)$/s.exec(termMessage);
   if (!m || !color) {
-    _appendLogLine(tsPrefix + ansiToHtml(termMessage));
-    return;
+    return tsPrefix + ansiToHtml(termMessage);
   }
   const tag = `<span style="color:${color};font-weight:bold">${esc(m[1])}</span>`;
-  _appendLogLine(tsPrefix + tag + ansiToHtml(m[2]));
+  return tsPrefix + tag + ansiToHtml(m[2]);
 }
+
+function appendAgentLog(termMessage, color, ts) {
+  _appendLogLine(colorizeTermMessage(termMessage, color, ts));
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent system log (tool/LLM/syscall events) -- kept out of the shared
+// log; interleaved into that agent's own transcript instead (renderHistory()
+// below), gated by the "System Logs" checkbox. Lines are always buffered
+// per-agent regardless of the checkbox, so toggling it on replays everything
+// seen so far for the currently selected agent.
+// ---------------------------------------------------------------------------
+
+const SYSTEM_LOG_TYPES = new Set([
+  'tool_result', 'syscall_result', 'llm_stream_error', 'llm_stream_cancelled',
+]);
+const SYSTEM_LOG_AGENT_STATES = new Set([
+  'running_tool', 'tool_denied', 'running_syscall', 'syscall_denied',
+]);
+const SYSTEM_LOG_CAP = 2000;
+
+function isSystemLogEvent(ev) {
+  if (SYSTEM_LOG_TYPES.has(ev.type)) return true;
+  return ev.type === 'agent_state' && SYSTEM_LOG_AGENT_STATES.has(ev.state);
+}
+
+// term_message text for these events is always "[agname] LABEL[pad] MARK  rest"
+// (see host_interaction_server.py's _record_admission/_record_completion and
+// llm_handler_server.py's _finalize_error/_finalize_cancelled) -- parsed back
+// into a name/body split so these lines can render in the exact same
+// header-row-then-newline-then-body shape as an assistant's own tool_use
+// block (.msg-tool-call), instead of as one flat line.
+const SYSLOG_ICON = { TOOL: '⚙', SYSCALL: '⌘', LLM: '✦' };
+const SYSLOG_LINE_RE = /^\[[^\]]+\]\s+(TOOL|SYSCALL|LLM)\s*([▶✓✗?])\s+([\s\S]*)$/;
+
+function formatSyslogLine(termMessage, ts) {
+  const tsHtml = ts ? `<span class="log-ts">${fmtTs(ts)}</span>` : '';
+  const m = SYSLOG_LINE_RE.exec(termMessage);
+  if (!m) {
+    // Defensive fallback -- every event routed here is expected to match.
+    return `${tsHtml} <span class="role-tool-call">${esc(termMessage)}</span>`;
+  }
+  const [, label, mark, rest] = m;
+  const icon = SYSLOG_ICON[label] || '⚙';
+  let name = '';
+  let body = rest;
+  if (label !== 'LLM') {
+    // Tool/syscall names never contain spaces -- the first run of 2+ spaces
+    // is always the field separator the backend used when building the line.
+    const sepIdx = rest.search(/ {2,}/);
+    if (sepIdx === -1) {
+      name = rest;
+      body = '';
+    } else {
+      name = rest.slice(0, sepIdx);
+      body = rest.slice(sepIdx).trim();
+    }
+  }
+  const nameHtml = name ? `  ${esc(name)}` : '';
+  const header =
+    `${tsHtml} <span class="role-tool-call">${icon} ${esc(label)}${nameHtml} ${esc(mark)}</span>`;
+  return body ? `${header}\n<span class="dim">${esc(body)}</span>` : header;
+}
+
+function recordSystemLog(agname, termMessage, ts) {
+  const html = formatSyslogLine(termMessage, ts);
+  const cursor = (state.histories.get(agname) || []).length;
+  if (!state.systemLogs.has(agname)) state.systemLogs.set(agname, []);
+  const lines = state.systemLogs.get(agname);
+  lines.push({ cursor, html });
+  if (lines.length > SYSTEM_LOG_CAP) lines.shift();
+  if (agname === currentAgent()) renderHistory();
+}
+
+try {
+  const stored = localStorage.getItem('agency_system_logs_enabled');
+  state.systemLogsEnabled = stored === null ? false : stored === '1';
+} catch {}
+$systemLogCheckbox.checked = state.systemLogsEnabled;
+
+$systemLogCheckbox.addEventListener('change', () => {
+  state.systemLogsEnabled = $systemLogCheckbox.checked;
+  try { localStorage.setItem('agency_system_logs_enabled', state.systemLogsEnabled ? '1' : '0'); } catch {}
+  renderHistory();
+});
 
 // ---------------------------------------------------------------------------
 // Agent list (right panel)
 // ---------------------------------------------------------------------------
+
+// The backend's own idle state (agent.py's record_state("agent_idle"),
+// set at construction and again by orchestrator._update_agent_display_locked
+// whenever an agent has no ready/blocked work left) is a different string
+// than 'inactive' -- the client's own synthetic "nothing fetched yet"
+// placeholder (agent_registered's initial state, and every empty-state
+// fallback below). Both mean the same thing to a viewer, so normalize the
+// backend's string to the client's at the two points backend state enters
+// `state.agents` (loadAgentDetail's poll, and the 'agent_state' WS push) --
+// every other check in this file only ever needs to know about 'inactive'.
+function normalizeAgentState(st) {
+  return st === 'agent_idle' ? 'inactive' : st;
+}
 
 function isLive(st)      { return st !== 'inactive' && st !== 'finished' && st !== 'skill' && st !== 'paused'; }
 function isIdle(st)      { return st === 'inactive' || st === 'paused'; }
@@ -488,10 +596,27 @@ function renderHistory() {
 
   updateInteractionTitle();
 
-  const msgs  = state.histories.get(agname) || [];
+  const msgs    = state.histories.get(agname) || [];
+  const syslogs = state.systemLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
+  let syslogIdx = 0;
   const frags = [];
 
-  for (const msg of msgs) {
+  // Flush every buffered system-log line that arrived at or before the
+  // point where *cursor* transcript messages existed -- see systemLogs'
+  // definition in `state` for why this is a better position signal than
+  // each message's own `ts` (several messages from one already-completed
+  // skill call share that call's single finish timestamp, so sorting
+  // syslog lines against those would misorder them).
+  function flushSyslogsUpTo(cursor) {
+    while (syslogIdx < syslogs.length && syslogs[syslogIdx].cursor <= cursor) {
+      frags.push(`<div class="msg-syslog">${syslogs[syslogIdx].html}</div>`);
+      syslogIdx++;
+    }
+  }
+
+  flushSyslogsUpTo(0);
+  for (let msgIdx = 0; msgIdx < msgs.length; msgIdx++) {
+    const msg    = msgs[msgIdx];
     const role   = msg.role   || '';
     const blocks = msg.blocks || [];
     // Every block carries an agency-native `type` (text/thinking/tool_use/
@@ -499,16 +624,27 @@ function renderHistory() {
     // llm_handler_server.get_main_transcript() for the shape.
     const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
 
+    // One message can render as several divs (assistant thinking/tool_use/
+    // text blocks each get their own) -- put the same timestamp on every
+    // one of them rather than just the first, so it's never missing from
+    // whichever div the reader actually looks at (e.g. the closing text
+    // div after an earlier tool_use call in the same message).
+    const tsHtml = msg.ts ? `<span class="log-ts">${fmtTs(msg.ts)}</span> ` : '';
+
     if (role === 'system') {
-      if (text) frags.push(`<div class="msg-system">─── sys: ${esc(text)}</div>`);
+      if (text) frags.push(`<div class="msg-system">${tsHtml}─── sys: ${esc(text)}</div>`);
 
     } else if (role === 'user') {
-      if (text) frags.push(`<div class="msg-user"><span class="role-user">▶ user</span>  ${esc(text)}</div>`);
+      if (text) {
+        frags.push(
+          `<div class="msg-user">${tsHtml}<span class="role-user">▶ user</span>  ${esc(text)}</div>`
+        );
+      }
 
     } else if (role === 'assistant') {
       for (const b of blocks) {
         if (b.type === 'thinking' && b.text) {
-          frags.push(`<div class="msg-thinking">💭 thinking\n${esc(b.text)}</div>`);
+          frags.push(`<div class="msg-thinking">${tsHtml}💭 thinking\n${esc(b.text)}</div>`);
         } else if (b.type === 'tool_use') {
           let argsText = '';
           try {
@@ -520,23 +656,32 @@ function renderHistory() {
             argsText = esc(b.arguments || '');
           }
           frags.push(
-            `<div class="msg-tool-call"><span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
+            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
             `<span class="dim">${argsText}</span></div>`
           );
         }
       }
       if (text) {
-        frags.push(`<div class="msg-assistant"><span class="role-assistant">◆ asst</span>\n${esc(text)}</div>`);
+        frags.push(
+          `<div class="msg-assistant">${tsHtml}<span class="role-assistant">◆ assistant</span>\n${esc(text)}</div>`
+        );
       }
 
     } else if (role === 'tool') {
       for (const b of blocks) {
         if (b.type === 'tool_result') {
-          frags.push(`<div class="msg-tool-result"><span class="dim">← ${esc(b.text || '')}</span></div>`);
+          frags.push(
+            `<div class="msg-tool-result">${tsHtml}<span class="dim">← ${esc(b.text || '')}</span></div>`
+          );
         }
       }
     }
+
+    flushSyslogsUpTo(msgIdx + 1);
   }
+  // Anything buffered past the last known message (e.g. arrived in the gap
+  // between this render and the next transcript poll) still belongs here.
+  flushSyslogsUpTo(Infinity);
 
   // Running indicator
   const ag = state.agents.get(agname);
@@ -637,7 +782,7 @@ function handleEvent(ev) {
       state.agents.set(ev.agname, {
         ...existing,
         color: ev.color || existing.color || '#d4d4d4',
-        state: ev.state,
+        state: normalizeAgentState(ev.state),
         skill: ev.skill,
         tool:  ev.tool,
       });
@@ -685,9 +830,17 @@ function handleEvent(ev) {
 
   // Any event can carry the same human-readable line agDataLogger prints to
   // stderr (e.g. "[agent] SKILL OK ..."). Nothing emits a dedicated `log`
-  // event to the global stream anymore, so this is how the shared log
-  // panel sees anything beyond the few cases above that append explicitly.
-  if (ev.term_message) appendAgentLog(ev.term_message, ev.color, ev.ts);
+  // event to the global stream anymore, so this is how the shared log panel
+  // sees anything beyond the few cases above that append explicitly --
+  // except per-agent tool/LLM/syscall events, which go to that agent's own
+  // system log instead (see isSystemLogEvent()).
+  if (ev.term_message) {
+    if (ev.agname && isSystemLogEvent(ev)) {
+      recordSystemLog(ev.agname, ev.term_message, ev.ts);
+    } else {
+      appendAgentLog(ev.term_message, ev.color, ev.ts);
+    }
+  }
 }
 
 // Keep team agents contiguous and before standalone agents
@@ -746,7 +899,7 @@ async function loadAgentDetail(agname) {
     const existing = state.agents.get(agname) || { color: '#d4d4d4' };
     state.agents.set(agname, {
       ...existing,
-      state: agentState.state || existing.state || 'inactive',
+      state: normalizeAgentState(agentState.state) || existing.state || 'inactive',
       skill: agentState.skill ?? existing.skill ?? null,
       tool: agentState.tool ?? existing.tool ?? null,
       config: configPayload.config || configPayload,

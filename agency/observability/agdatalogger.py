@@ -182,13 +182,14 @@ class agDataLogger:
         call_label: "str | None" = None,
         update_latest_snapshot: bool = False,
         term_message: "str | None" = None,
+        print_to_terminal: bool = True,
         flush: bool = False,
     ) -> None:
         timestamp = time.time()
         payload_json = json.dumps(payload)
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
-        if term_message is not None:
+        if term_message is not None and print_to_terminal:
             print(_term_line(timestamp, term_message), file=sys.stderr)
         with self._lock:
             self._event_rows.append(
@@ -257,6 +258,7 @@ class agDataLogger:
         name: "str | None" = None,
         object: "str | None" = None,
         term_message: "str | None" = None,
+        print_to_terminal: bool = True,
     ) -> None:
         """Atomically clear every `stream_deltas` row for *call_label* (both
         already-flushed and still-pending) and append each of *payloads* as
@@ -264,7 +266,7 @@ class agDataLogger:
         timestamp = time.time()
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
-        if term_message is not None:
+        if term_message is not None and print_to_terminal:
             print(_term_line(timestamp, term_message), file=sys.stderr)
         with self._lock:
             self._stream_delta_rows = [

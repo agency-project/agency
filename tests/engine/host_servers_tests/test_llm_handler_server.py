@@ -153,7 +153,9 @@ class _FakeDataLogger:
         self.stream_delta_history.append(entry)
         self.operations.append(("delta", call_label, payload))
 
-    def finalize_stream(self, call_label, type, payloads, term_message=None):
+    def finalize_stream(
+        self, call_label, type, payloads, term_message=None, print_to_terminal=True
+    ):
         self.stream_deltas = [d for d in self.stream_deltas if d[2] != call_label]
         self.finalized.append((call_label, type, payloads))
         self.operations.append(("finalize", call_label, type))
