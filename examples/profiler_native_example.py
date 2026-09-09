@@ -86,9 +86,9 @@ no output and no measurable overhead. Two ways to turn it on:
 under the default ``workload`` scope and never stops one it did not start --
 so both invocations above are correct and neither double-starts.
 
-Requirements: **Linux only** (cgroups v2 + /proc), and the profiler extra::
-
-    uv pip install -e ".[profiler]"     # opentelemetry-sdk, exporter, nvidia-ml-py
+Requirements: **Linux only** (cgroups v2 + /proc). opentelemetry-sdk/-exporter
+and nvidia-ml-py are core dependencies, so a plain ``uv pip install -e .``
+already has everything this needs.
 
 Artifacts land in ``AGENCY_PROFILE_DIR`` (default ``./agprof_trace``):
 

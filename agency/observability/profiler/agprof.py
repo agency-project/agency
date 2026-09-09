@@ -1879,9 +1879,12 @@ def start(
         try:
             otel_session = _OTelSession()
         except ImportError as e:
+            # opentelemetry-sdk is a core dependency (see pyproject.toml) --
+            # reaching this means the install is incomplete/stale, not that
+            # an optional extra was skipped.
             raise RuntimeError(
-                "agprof: profiling requires the optional dependencies; install with "
-                '`pip install -e ".[profiler]"`'
+                "agprof: profiling requires opentelemetry-sdk, a core agency "
+                "dependency -- reinstall with `pip install -e .`"
             ) from e
         from ..agdatalogger import agDataLogger
         from ...configs.agconfig import agconfig as _agconfig_cls, dataloggerconfig
