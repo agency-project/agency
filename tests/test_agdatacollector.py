@@ -379,23 +379,39 @@ def test_record_span_full_args(tmp_path):
     dc.stop()
 
 
-def test_record_span_drops_incomplete_span_instead_of_corrupting_the_batch(tmp_path, capsys):
+def test_record_span_redirects_incomplete_span_to_events_instead_of_corrupting_the_batch(
+    tmp_path, capsys
+):
     """start_ts/end_ts are NOT NULL columns -- a caller reporting an
     incomplete span (e.g. a harness closing a span id the host never
     actually opened) must not crash the whole flush and take every other
     pending row down with it (see the real failure this guards against:
-    sqlite3.IntegrityError from a batched executemany)."""
+    sqlite3.IntegrityError from a batched executemany). It's still recorded,
+    just as a `span_dropped` events row (no NOT NULL constraint to violate
+    there) rather than silently lost -- so the run's own db shows this
+    happened, not just a stderr line."""
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_span("orphaned", None, 5.0, {})
+    dc.record_span("orphaned", None, 5.0, {"tool": "write"}, call_label="call-1")
     dc.record_span("also-orphaned", 5.0, None, {})
     dc.record_event("kept", {"ok": True})
     dc.flush()
 
     assert _select_all(db_path, "spans") == []
     events = _select_all(db_path, "events")
-    assert len(events) == 1
-    assert events[0]["type"] == "kept"
+    assert [e["type"] for e in events] == ["span_dropped", "span_dropped", "kept"]
+
+    first = json.loads(events[0]["payload"])
+    assert first["span_name"] == "orphaned"
+    assert first["start_ts"] is None
+    assert first["end_ts"] == 5.0
+    assert first["attributes"] == {"tool": "write"}
+    assert first["reason"] == "missing start_ts"
+    assert events[0]["call_label"] == "call-1"
+
+    second = json.loads(events[1]["payload"])
+    assert second["reason"] == "missing end_ts"
+
     assert "dropping span" in capsys.readouterr().err
     dc.stop()
 

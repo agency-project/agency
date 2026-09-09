@@ -308,21 +308,49 @@ class agDataLogger:
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
         if start_ts is None or end_ts is None:
             # Both columns are NOT NULL -- a caller reporting an incomplete
             # span (e.g. a harness closing a span id the host never actually
             # opened, which can happen once an in-flight span is abandoned
             # by an interrupt/redirect) must not corrupt the *whole* batched
-            # flush and take every other pending row down with it. Drop only
-            # this one malformed record instead.
+            # flush and take every other pending row down with it. Recorded
+            # as an ordinary `events` row instead (that table has no NOT
+            # NULL constraint this data could violate) so the run's own db
+            # still shows something happened here, rather than only a
+            # stderr line that's easy to miss after the fact.
             print(
                 f"[agdatalogger] WARNING: dropping span {span_name!r} with missing "
                 f"start_ts/end_ts (start_ts={start_ts!r}, end_ts={end_ts!r})",
                 file=sys.stderr,
             )
+            self.record_event(
+                type="span_dropped",
+                payload={
+                    "span_name": span_name,
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "attributes": attributes,
+                    "cpu_ms": cpu_ms,
+                    "runqueue_ms": runqueue_ms,
+                    "blocked_ms": blocked_ms,
+                    "parent": parent,
+                    "call_label": call_label,
+                    "reason": (
+                        "missing start_ts and end_ts"
+                        if start_ts is None and end_ts is None
+                        else "missing start_ts"
+                        if start_ts is None
+                        else "missing end_ts"
+                    ),
+                },
+                name=name,
+                object=object,
+                call_label=call_label,
+                flush=True,
+            )
             return
-        name = self._default_name if name is None else name
-        object = self._default_object if object is None else object
         if term_message is not None:
             print(_term_line(end_ts, term_message), file=sys.stderr)
         with self._lock:
