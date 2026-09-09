@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import dataclass
 from concurrent.futures import Future
@@ -245,3 +246,56 @@ def test_nested_serialization_materializes_pending_protocol_tuples_and_models():
 def test_wait_all_rejects_non_waitable_values():
     with pytest.raises(TypeError, match="not waitable"):
         agdata.wait_all([object()])
+
+
+def test_wait_with_timeout_raises_when_not_yet_resolved():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    with pytest.raises(TimeoutError):
+        pending.wait(timeout=0.05)
+    assert pending.is_pending()
+
+
+def test_wait_with_timeout_returns_self_once_resolved():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    future.set_result(agdata(answer="done"))
+    assert pending.wait(timeout=1) is pending
+    assert pending.answer == "done"
+
+
+async def _await(value):
+    return await value
+
+
+def test_bare_agdata_is_awaitable_and_field_proxies_after_resolution():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    future.set_result(agdata(result="literal", other=42))
+
+    resolved = asyncio.run(_await(pending))
+    assert resolved is pending
+    assert pending.other == 42
+    assert pending.result == "literal"
+    assert pending.to_dict() == {"result": "literal", "other": 42}
+
+
+def test_cancelling_one_async_waiter_does_not_cancel_the_shared_future():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+
+    async def scenario():
+        waiter = asyncio.ensure_future(pending)
+        await asyncio.sleep(0)
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("expected the shielded waiter task to be cancelled")
+        future.set_result(agdata(answer="still running"))
+        return await pending
+
+    assert asyncio.run(scenario()).answer == "still running"
+    assert future.cancelled() is False

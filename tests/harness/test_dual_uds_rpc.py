@@ -10,7 +10,7 @@ from agency.observability.agdatalogger import agDataLogger
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.engine.host_servers.host_server_manager import HostServerManager
-from agency.engine.clients import SandboxInteractionClient
+from agency.engine.clients import HarnessInteractionClient
 from agency.harness.clients import HostServicesClient
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
@@ -96,7 +96,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
             harness_api_port=0,
         )
         assert sandbox_server.start() == str(sandbox_socket)
-        sandbox_client = SandboxInteractionClient(str(sandbox_socket), timeout_s=3.0)
+        sandbox_client = HarnessInteractionClient(str(sandbox_socket), timeout_s=3.0)
 
         request = HarnessAttemptRequest(
             harness="claude_code",

@@ -4,23 +4,28 @@ from __future__ import annotations
 
 import threading
 
-import pytest
 
-from agency import Invocation, agdata, agerror, agent, agskill
+from agency import agdata, agerror, agent, agskill
 from agency.configs.agconfig import agconfig, agentconfig, llmconfig
 from agency.agcontext import agcontext
 from agency.engine import AgentEngine
+from agency.orchestrator import get_orchestrator
+
+
+def _request_for(handle: agdata):
+    orchestrator = get_orchestrator()
+    future = object.__getattribute__(handle, "_future")
+    with orchestrator._event_cond:
+        request_id = orchestrator._future_producers[future]
+        return orchestrator._requests[request_id]
 
 
 class _TransactionSandbox:
     """Small sandbox double that exposes deterministic transaction boundaries."""
 
-    def __init__(self, *, block_commit: bool = False) -> None:
+    def __init__(self) -> None:
         self._lock = threading.RLock()
         self._checkpoint_image = None
-        self._block_commit = block_commit
-        self.commit_entered = threading.Event()
-        self.release_commit = threading.Event()
         self.events: list[str] = []
 
     def change_config(self, _agconfig) -> None:
@@ -28,9 +33,6 @@ class _TransactionSandbox:
 
     def commit(self) -> None:
         self.events.append("commit")
-        self.commit_entered.set()
-        if self._block_commit:
-            assert self.release_commit.wait(timeout=2)
 
     def rm_container(self) -> None:
         self.events.append("discard")
@@ -84,21 +86,8 @@ def _mutate_working_context(context: agcontext) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("control", "expected_error", "expected_state"),
-    [
-        ("cancel", "agent invocation cancelled", "CANCELLED"),
-        ("destroy", "agent destroyed", "DESTROYED"),
-    ],
-)
-def test_control_after_harness_success_wins_before_completion_claim_and_discards(
-    monkeypatch,
-    tmp_path,
-    control,
-    expected_error,
-    expected_state,
-):
-    """A safe-boundary control winner cannot leak harness success into commit."""
+def test_cancel_after_harness_success_wins_before_commit_and_discards(monkeypatch, tmp_path):
+    """A safe-boundary cancel cannot leak harness success into commit."""
     sandbox = _TransactionSandbox()
     ag = _agent(tmp_path, sandbox)
     ag.context = _committed_context()
@@ -113,21 +102,18 @@ def test_control_after_harness_success_wins_before_completion_claim_and_discards
 
     monkeypatch.setattr(AgentEngine, "_execute_harness", successful_harness)
     invocation = ag.run(agskill("controlled-transaction", ""), agdata())
+    request = _request_for(invocation)
     assert harness_succeeded.wait(timeout=2)
 
-    close = None
     try:
-        if control == "cancel":
-            invocation.cancel()
-        else:
-            close = ag.destroy()
+        ag.cancel(invocation)
     finally:
         release_harness_return.set()
 
-    assert invocation.wait(timeout=2).to_dict() == {"error": expected_error}
-    assert invocation.state == expected_state
+    assert invocation.wait(timeout=2).to_dict() == {"error": "agent invocation cancelled"}
+    assert request.cancelled is True
     assert sandbox.events == ["discard"]
-    output_context = invocation._context_future.result(timeout=2)
+    output_context = request.context_future.result(timeout=2)
     assert output_context.recent_transcript == [{"role": "user", "content": "committed transcript"}]
     assert output_context.harness_sessions == {"native": {"session_id": "committed-session"}}
     assert output_context.harness_message_cursors == {"native": 5}
@@ -135,52 +121,6 @@ def test_control_after_harness_success_wins_before_completion_claim_and_discards
     assert all(
         entry.get("source") != "context_notice" for entry in output_context.retained_messages
     )
-    if close is not None:
-        assert close.wait(timeout=2).done() is True
-
-
-def test_destroy_after_engine_claim_during_commit_preserves_success_on_second_claim(
-    monkeypatch, tmp_path
-):
-    """The orchestrator's second claim is idempotent after engine commit wins."""
-    sandbox = _TransactionSandbox(block_commit=True)
-    ag = _agent(tmp_path, sandbox)
-    ag.context = _committed_context()
-    claims: list[bool] = []
-    original_claim = Invocation._claim_completion
-
-    def record_claim(invocation: Invocation) -> bool:
-        claimed = original_claim(invocation)
-        claims.append(claimed)
-        return claimed
-
-    def successful_harness(self, context, *_args, **_kwargs):
-        _mutate_working_context(context)
-        return agdata(ok=True)
-
-    monkeypatch.setattr(Invocation, "_claim_completion", record_claim)
-    monkeypatch.setattr(AgentEngine, "_execute_harness", successful_harness)
-    invocation = ag.run(agskill("commit-winner", ""), agdata())
-
-    assert sandbox.commit_entered.wait(timeout=2)
-    assert claims == [True]
-    close = ag.destroy()
-    assert close.done() is False
-    assert invocation.is_destroyed() is False
-    sandbox.release_commit.set()
-
-    assert invocation.wait(timeout=2).to_dict() == {"ok": True}
-    assert invocation.state == "SUCCEEDED"
-    assert claims == [True, True]
-    assert sandbox.events == ["commit", "check_background_work", "stop"]
-    output_context = invocation._context_future.result(timeout=2)
-    assert output_context.recent_transcript[-1] == {
-        "role": "assistant",
-        "content": "uncommitted harness transcript",
-    }
-    assert output_context.harness_sessions == {"native": {"session_id": "uncommitted-session"}}
-    assert output_context.retained_messages[-1]["source"] == "test-harness"
-    assert close.wait(timeout=2).done() is True
 
 
 def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkeypatch, tmp_path):
@@ -194,11 +134,11 @@ def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkey
 
     monkeypatch.setattr(AgentEngine, "_execute_harness", failed_harness)
     invocation = ag.run(agskill("ordinary-failure", ""), agdata())
+    request = _request_for(invocation)
 
     assert invocation.wait(timeout=2).to_dict() == {"error": "ordinary harness failure"}
-    assert invocation.state == "FAILED"
     assert sandbox.events == ["discard"]
-    output_context = invocation._context_future.result(timeout=2)
+    output_context = request.context_future.result(timeout=2)
     assert output_context.recent_transcript == [{"role": "user", "content": "committed transcript"}]
     assert output_context.harness_sessions == {"native": {"session_id": "committed-session"}}
     assert output_context.harness_message_cursors == {"native": 5}

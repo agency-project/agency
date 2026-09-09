@@ -15,8 +15,7 @@ from typing import TYPE_CHECKING
 from ..observability.agdatalogger import agDataLogger, resolve_global_db_path
 from ..configs.agconfig import agconfig as agconfig_cls, dataloggerconfig
 from ..agcontext import agcontext
-from ..agdata import agdata, agerror
-from .._submission import Invocation, MessageSubmission, Submission
+from ..agdata import agdata, agerror, agcanceled
 from ..engine import AgentEngine
 from ..observability.agdatalogger import _ts
 from ..utils.agutil import _DEFAULT_LOG_DIR, format_exception
@@ -51,7 +50,6 @@ class _ExecutionRequest:
     request_id: str
     sequence: int
     kind: str
-    submission: Submission
     agent: "agent"
     skill: "agskill | None"
     skill_input: "agdata | None"
@@ -64,6 +62,8 @@ class _ExecutionRequest:
     submitted_perf_ns: int
     submitted_wall_ns: int
     state: str = "submitted"
+    cancelled: bool = False
+    message: "str | None" = None
     dependencies: set[Future] = field(default_factory=set)
     producer_ids: set[str] = field(default_factory=set)
     engine: "AgentEngine | None" = None
@@ -186,8 +186,8 @@ class GlobalAgentOrchestrator:
         skill: "agskill",
         skill_input: object,
         max_steps: "int | None" = None,
-    ) -> Invocation:
-        """Atomically publish and register one exact public Invocation.
+    ) -> agdata:
+        """Atomically publish one skill execution and return its bare result agdata.
 
         The orchestrator condition is acquired before the per-agent submission
         lock everywhere these two locks are needed.  Publication into the
@@ -201,42 +201,37 @@ class GlobalAgentOrchestrator:
                 raise TypeError("skill_input must be an agdata or pending result handle")
             skill_input = as_pending()
 
+        result_future: "Future[agdata]" = Future()
+        context_future: "Future[agcontext]" = Future()
         cycle_ack: Future[None] | None = None
         with self._event_cond:
             if not self._accepting:
                 raise RuntimeError("global agent orchestrator is shut down")
             with ag._submission_lock:
-                ag._control.assert_alive("submit a skill")
-                invocation = Invocation(
-                    ag,
-                    ag._control.allocate_invocation_id(),
-                    skill.name,
-                )
                 predecessor = ag.context
-                ordering_id = ag._next_submission_id
-                ag._next_submission_id += 1
-                invocation._bind(ordering_id, predecessor)
-                ag.context = invocation.output_context
-                ag._submissions.add(invocation)
+                new_context = agcontext(_future=context_future)
+                ag.context = new_context
                 try:
-                    self._register_submission_locked(
-                        invocation,
+                    request = self._register_submission_locked(
+                        ag,
                         kind="skill",
                         skill=skill,
                         skill_input=skill_input,
                         max_steps=max_steps,
+                        result_future=result_future,
+                        context_future=context_future,
+                        context_dependency=predecessor,
                     )
                 except BaseException:
-                    ag._submissions.discard(invocation)
-                    if ag.context is invocation.output_context:
+                    if ag.context is new_context:
                         ag.context = predecessor
                     raise
             if threading.current_thread() is not self._scheduler_thread:
                 cycle_ack = Future()
-            self._post_locked("schedule", (invocation._request_id, cycle_ack))
+            self._post_locked("schedule", (request.request_id, cycle_ack))
         if cycle_ack is not None:
             cycle_ack.result()
-        return invocation
+        return agdata(_future=result_future)
 
     @staticmethod
     def _validate_max_steps(max_steps: "int | None") -> None:
@@ -245,67 +240,61 @@ class GlobalAgentOrchestrator:
         ):
             raise ValueError("max_steps must be a positive integer or None")
 
-    def submit_context_message(self, ag: "agent", message: str) -> MessageSubmission:
-        """Atomically publish one orchestrator-owned host-only context request."""
+    def submit_context_message(self, ag: "agent", message: str) -> None:
+        """Atomically publish one orchestrator-owned host-only context request.
+
+        A plain enqueue -- nothing is returned. Ordering into the context
+        chain is already guaranteed synchronously here, before this method
+        returns, so there is nothing for a caller to hold a handle to.
+        """
+        result_future: "Future[agdata]" = Future()
+        context_future: "Future[agcontext]" = Future()
         cycle_ack: Future[None] | None = None
         with self._event_cond:
             if not self._accepting:
                 raise RuntimeError("global agent orchestrator is shut down")
             with ag._submission_lock:
-                ag._control.assert_alive("send a message")
-                submission = MessageSubmission(ag, message)
                 predecessor = ag.context
-                ordering_id = ag._next_submission_id
-                ag._next_submission_id += 1
-                submission._bind(ordering_id, predecessor)
-                ag.context = submission.output_context
-                ag._submissions.add(submission)
+                new_context = agcontext(_future=context_future)
+                ag.context = new_context
                 try:
-                    self._register_submission_locked(
-                        submission,
+                    request = self._register_submission_locked(
+                        ag,
                         kind="context_message",
                         skill=None,
                         skill_input=None,
                         max_steps=None,
+                        result_future=result_future,
+                        context_future=context_future,
+                        context_dependency=predecessor,
+                        message=message,
                     )
                 except BaseException:
-                    ag._submissions.discard(submission)
-                    if ag.context is submission.output_context:
+                    if ag.context is new_context:
                         ag.context = predecessor
                     raise
             if threading.current_thread() is not self._scheduler_thread:
                 cycle_ack = Future()
-            self._post_locked("schedule", (submission._request_id, cycle_ack))
+            self._post_locked("schedule", (request.request_id, cycle_ack))
         if cycle_ack is not None:
             cycle_ack.result()
-        return submission
 
-    def notify_invocation_control(self, invocation: Invocation) -> None:
-        with self._event_cond:
-            if invocation._request_id in self._requests:
-                self._post_locked("control_changed", invocation._request_id)
+    def cancel_request(self, future: "Future") -> None:
+        """Mark whichever request produced *future* as cancelled.
 
-    def suspend_agent(self, ag: "agent") -> None:
+        No scheduler scan and no wake-event: an already-running request is
+        only ever observed by the engine's own checkpoints, and a still-
+        blocked request will naturally reach one once its own predecessor
+        resolves via the normal flow -- nothing here needs to be faster than
+        that.
+        """
         with self._event_cond:
-            ag._control.suspend()
-            self._post_locked("control_changed", ("agent", ag))
-
-    def resume_agent(self, ag: "agent") -> None:
-        with self._event_cond:
-            ag._control.resume_agent()
-            self._post_locked("control_changed", ("agent", ag))
-
-    def destroy_agent(self, ag: "agent") -> bool:
-        """Close one agent's admission and mark all of its requests for teardown."""
-        with self._event_cond:
-            with ag._submission_lock:
-                first = ag._control.destroy()
-                if not first:
-                    return False
-                for submission in tuple(ag._submissions):
-                    submission._request_destroy()
-            self._post_locked("control_changed", ("agent", ag))
-        return True
+            request_id = self._future_producers.get(future)
+            if request_id is None:
+                return
+            request = self._requests.get(request_id)
+            if request is not None:
+                request.cancelled = True
 
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
@@ -480,17 +469,17 @@ class GlobalAgentOrchestrator:
 
     def _register_submission_locked(
         self,
-        submission: Submission,
+        ag: "agent",
         *,
         kind: str,
         skill: "agskill | None",
         skill_input: "agdata | None",
         max_steps: "int | None",
+        result_future: "Future[agdata]",
+        context_future: "Future[agcontext]",
+        context_dependency: agcontext,
+        message: "str | None" = None,
     ) -> _ExecutionRequest:
-        ag = submission._agent
-        context_dependency = submission.predecessor_context
-        if context_dependency is None:
-            raise RuntimeError("submission was not bound to a predecessor context")
         parent_context = agprof.current_span_context()
         submitted_perf_ns = time.perf_counter_ns()
         submitted_wall_ns = time.time_ns()
@@ -500,19 +489,19 @@ class GlobalAgentOrchestrator:
             request_id=request_id,
             sequence=sequence,
             kind=kind,
-            submission=submission,
             agent=ag,
             skill=skill,
             skill_input=skill_input,
             max_steps=max_steps,
-            result_future=submission._result_future,
-            context_future=submission._context_future,
+            result_future=result_future,
+            context_future=context_future,
             parent_context=parent_context,
             ts_start=_ts(),
             submitted_perf_ns=submitted_perf_ns,
             submitted_wall_ns=submitted_wall_ns,
             context_dependency=context_dependency,
             state="submitted",
+            message=message,
         )
         skill_name = skill.name if skill is not None else kind
         request.run_span = agprof.start_external_span(
@@ -533,39 +522,25 @@ class GlobalAgentOrchestrator:
         )
         if request.run_span is not None:
             request.parent_context = request.run_span.context()
-        submission._bind_request(request_id)
         self._requests[request_id] = request
-        self._future_producers[request.result_future] = request_id
-        self._future_producers[request.context_future] = request_id
+        self._future_producers[result_future] = request_id
+        self._future_producers[context_future] = request_id
         self._outstanding_by_agent.setdefault(ag, set()).add(request_id)
         self._submitted_total += 1
         self._record_request_event("request_submitted", request, {})
         return request
 
     def _launch_request_locked(self, request: _ExecutionRequest) -> None:
-        invocation = request.submission
-        if not isinstance(invocation, Invocation):
-            raise RuntimeError("only skill invocations can launch an engine")
         if request.skill is None:
             raise RuntimeError("skill request has no skill")
-        if invocation.is_destroyed():
-            self._destroy_request_locked(request)
-            return
-        if invocation.is_cancelled():
-            self._cancel_request_locked(request)
-            return
         try:
-            request.agent._control.activate_invocation(invocation)
-        except BaseException as exc:
-            self._fail_request_locked(request, format_exception(exc))
-            return
-        try:
-            # From the moment control activation succeeds, every exception must
-            # produce an engine_done event.  Otherwise the request could look
-            # active forever even though no worker was started.
+            # Always launch: a cancelled invocation costs only an AgentEngine
+            # construction here -- its own pre-checkpoint returns a controlled
+            # error before any harness is ever spawned. Every exception from
+            # this point must produce an engine_done event, or the request
+            # could look active forever with no worker started.
             request.state = "running"
             self._end_phase_span_locked(request)
-            invocation._mark_running()
             self._active_by_agent[request.agent] = request.request_id
             request.agent.record_state("running_skill", skill=request.skill.name)
             self._record_request_event("request_started", request, {})
@@ -665,17 +640,9 @@ class GlobalAgentOrchestrator:
         history_before = list(committed_context.recent_transcript)
         logger = ag.data_logger
         execution_started = False
-        invocation = request.submission
-        if not isinstance(invocation, Invocation):
-            raise RuntimeError("skill execution is not bound to an Invocation")
 
-        admission = invocation._checkpoint(
-            "before-infrastructure",
-            allow_messages=False,
-            phase="infrastructure",
-        )
-        if admission.destroyed or admission.cancelled:
-            return self._controlled_completion(request, committed_context, admission.destroyed)
+        if request.cancelled:
+            return self._controlled_completion(request, committed_context)
 
         try:
             with agprof.span("resolve"):
@@ -702,7 +669,8 @@ class GlobalAgentOrchestrator:
                 resource_pool=self.agresource_pool,
                 sandbox=sandbox,
                 max_steps=request.max_steps,
-                invocation=invocation,
+                is_cancelled=lambda: request.cancelled,
+                request_id=request.request_id,
             )
             # A skill-level failure is a rolled-back transaction even when the
             # engine reports it as an agerror rather than raising.  Never
@@ -714,25 +682,14 @@ class GlobalAgentOrchestrator:
             outer_result = agerror(format_exception(exc))
             updated_context = committed_context
 
-        checkpoint = invocation._checkpoint(
-            "after-engine",
-            allow_messages=False,
-            phase="boundary",
-        )
-        if checkpoint.destroyed or checkpoint.cancelled:
-            return self._controlled_completion(request, committed_context, checkpoint.destroyed)
-        if not invocation._claim_completion():
-            return self._controlled_completion(
-                request,
-                committed_context,
-                invocation.is_destroyed(),
-            )
+        if request.cancelled:
+            return self._controlled_completion(request, committed_context)
 
         if execution_started and isinstance(outer_result, agerror):
             # Preserve exactly the canonical rollback notice on a clean copy;
             # every other mutation made by the failed working transaction is
-            # intentionally discarded.  Controlled cancellation/destruction
-            # returned above and therefore never receives this notice.
+            # intentionally discarded.  Controlled cancellation returned above
+            # and therefore never receives this notice.
             updated_context = committed_context.copy()
             ag._record_context_notice(updated_context)
 
@@ -755,23 +712,21 @@ class GlobalAgentOrchestrator:
         self,
         request: _ExecutionRequest,
         committed_context: agcontext,
-        destroyed: bool,
     ) -> _RunCompletion:
-        outcome = "destroyed" if destroyed else "cancelled"
-        message = "agent destroyed" if destroyed else "agent invocation cancelled"
+        message = "agent invocation cancelled"
         try:
             request.agent.data_logger.record_event(
-                type=f"skill_{outcome}",
+                type="skill_cancelled",
                 payload={"skill": request.skill.name if request.skill is not None else None},
-                term_message=f"[{request.agent.agname}] SKILL ■  {outcome}",
+                term_message=f"[{request.agent.agname}] SKILL ■  cancelled",
                 flush=True,
             )
         except Exception as exc:
             print(f"[agorchestrator] WARNING: controlled completion logging failed: {exc}")
         return _RunCompletion(
-            output=agerror(message),
+            output=agcanceled(message),
             context=committed_context,
-            outcome=outcome,
+            outcome="cancelled",
             error_message=message,
         )
 
@@ -837,13 +792,6 @@ class GlobalAgentOrchestrator:
         if request is None:
             return
         self._settle_future(request.context_future, completion.context, "output-context")
-        invocation = request.submission
-        if isinstance(invocation, Invocation):
-            if request.agent._control.active_invocation() is invocation:
-                request.agent._control.finish_invocation(invocation)
-            else:
-                invocation._close_without_activation()
-            invocation._mark_terminal(completion.output)
         request.state = "completed" if completion.outcome == "succeeded" else completion.outcome
         self._completed_total += 1
         if completion.failed:
@@ -858,7 +806,6 @@ class GlobalAgentOrchestrator:
             "succeeded": "request_completed",
             "failed": "request_failed",
             "cancelled": "request_cancelled",
-            "destroyed": "request_destroyed",
         }[completion.outcome]
         self._record_request_event(
             event_type,
@@ -869,30 +816,23 @@ class GlobalAgentOrchestrator:
         self._active_by_agent.pop(request.agent, None)
         self._update_agent_display_locked(request.agent)
         self._settle_future(request.result_future, completion.output, "invocation result")
-        request.agent._submission_finished(request.submission)
 
     def _complete_message_locked(self, request: _ExecutionRequest) -> None:
         """Commit one ready host-only message on the scheduler event loop.
 
-        The event condition is the outer publication/destruction lock.  Taking
-        the agent submission lock beneath it makes the message commit claim
-        atomic with destroy(), while keeping the operation entirely free of
-        engine, sandbox, harness, and capacity ownership.
+        The event condition is the outer publication lock.  Taking the agent
+        submission lock beneath it keeps the sequence-number bump atomic with
+        any other context mutation, while the operation stays entirely free
+        of engine, sandbox, harness, and capacity ownership.
         """
-        submission = request.submission
-        if request.kind != "context_message" or not isinstance(submission, MessageSubmission):
-            raise RuntimeError("context-only completion requires a MessageSubmission")
+        if request.kind != "context_message":
+            raise RuntimeError("context-only completion requires a context_message request")
         if request.state not in {"submitted", "blocked"}:
             return
 
         try:
             output_context = request.context_dependency.copy()
             with request.agent._submission_lock:
-                if submission._destroy_requested or request.agent._control.is_destroyed():
-                    self._destroy_request_locked(request)
-                    return
-                submission._commit_claimed = True
-                submission._state = "COMPLETING"
                 last_retained_sequence = max(
                     (
                         int(entry.get("sequence", 0))
@@ -901,14 +841,14 @@ class GlobalAgentOrchestrator:
                     ),
                     default=0,
                 )
-                request.agent._control.ensure_sequence_at_least(last_retained_sequence)
-                sequence = request.agent._control.next_sequence()
+                request.agent._ensure_sequence_at_least(last_retained_sequence)
+                sequence = request.agent._next_sequence()
             output_context.append_retained_message(
                 {
                     "sequence": sequence,
                     "type": "message",
                     "role": "user",
-                    "content": submission.message,
+                    "content": request.message,
                     "source": "queue_message",
                 }
             )
@@ -920,15 +860,12 @@ class GlobalAgentOrchestrator:
         request.state = "completed"
         self._end_phase_span_locked(request)
         self._settle_future(request.context_future, output_context, "message output-context")
-        with request.agent._submission_lock:
-            submission._state = "SUCCEEDED"
         self._completed_total += 1
         self._end_run_span_locked(request, False, outcome="succeeded")
         self._record_request_event("request_completed", request, {})
         self._finish_request_locked(request)
         self._update_agent_display_locked(request.agent)
         self._settle_future(request.result_future, result, "message result")
-        request.agent._submission_finished(submission)
 
     def _finish_request_locked(self, request: _ExecutionRequest) -> None:
         outstanding = self._outstanding_by_agent.get(request.agent)
@@ -984,26 +921,6 @@ class GlobalAgentOrchestrator:
             counts_as_failure=True,
         )
 
-    def _cancel_request_locked(self, request: _ExecutionRequest) -> None:
-        self._begin_terminal_request_locked(
-            request,
-            output=agerror("agent invocation cancelled"),
-            message="agent invocation cancelled",
-            terminal_state="cancelled",
-            event_type="request_cancelled",
-            counts_as_failure=False,
-        )
-
-    def _destroy_request_locked(self, request: _ExecutionRequest) -> None:
-        self._begin_terminal_request_locked(
-            request,
-            output=agerror("agent destroyed"),
-            message="agent destroyed",
-            terminal_state="destroyed",
-            event_type="request_destroyed",
-            counts_as_failure=False,
-        )
-
     def _begin_terminal_request_locked(
         self,
         request: _ExecutionRequest,
@@ -1018,7 +935,6 @@ class GlobalAgentOrchestrator:
             "completed",
             "failed",
             "cancelled",
-            "destroyed",
             "settling_terminal",
             "running",
         }:
@@ -1045,31 +961,12 @@ class GlobalAgentOrchestrator:
 
     def _finish_terminal_request_locked(self, request: _ExecutionRequest) -> None:
         output = request.terminal_output or agerror(request.terminal_error or "request failed")
-        submission = request.submission
-        if isinstance(submission, Invocation):
-            if request.agent._control.active_invocation() is submission:
-                request.agent._control.finish_invocation(submission)
-            else:
-                submission._close_without_activation()
-            submission._mark_terminal(output)
-        elif isinstance(submission, MessageSubmission):
-            with request.agent._submission_lock:
-                submission._state = (
-                    "DESTROYED" if request.terminal_state == "destroyed" else "FAILED"
-                )
         request.state = request.terminal_state
         self._finish_request_locked(request)
         self._update_agent_display_locked(request.agent)
         self._settle_future(request.result_future, output, "terminal submission result")
-        request.agent._submission_finished(request.submission)
 
     def _update_agent_display_locked(self, ag: "agent") -> None:
-        if ag._control.is_destroyed():
-            ag.record_state("destroying")
-            return
-        if ag._control.is_suspended():
-            ag.record_state("suspended")
-            return
         outstanding = [
             self._requests[rid]
             for rid in self._outstanding_by_agent.get(ag, ())

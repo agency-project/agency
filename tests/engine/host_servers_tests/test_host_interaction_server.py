@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from agency._agent_control import AgentControl
 from agency.agpolicy import agpolicy
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.harness._syscall_event import agsyscallevent
@@ -67,10 +63,10 @@ def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, data_logger=None, invocation=None, agname="agent-1"):
+def _make_server(policy=None, data_logger=None, is_cancelled=None, agname="agent-1"):
     skill = _make_skill(policy)
     data_logger = data_logger if data_logger is not None else _FakeDataLogger()
-    return HostInteractionServer(skill, data_logger, agname, invocation=invocation)
+    return HostInteractionServer(skill, data_logger, agname, is_cancelled=is_cancelled)
 
 
 def _make_syscall(
@@ -282,143 +278,6 @@ def test_build_app_has_no_daemon_command_polling_route():
     client = TestClient(server.build_app())
     response = client.post("/check_inbox")
     assert response.status_code == 404
-
-
-def test_checkpoint_is_bound_to_the_server_invocation_and_serializes_messages():
-    class Invocation:
-        def __init__(self):
-            self.calls = []
-
-        def _checkpoint(self, boundary_id, *, allow_messages, phase):
-            self.calls.append((boundary_id, allow_messages, phase))
-            return SimpleNamespace(
-                cancelled=False,
-                destroyed=False,
-                invocation_messages=[SimpleNamespace(sequence=7, content="continue carefully")],
-            )
-
-    invocation = Invocation()
-    server = _make_server(invocation=invocation)
-
-    result = server.checkpoint("native:tool:0", allow_messages=True, phase="boundary")
-
-    assert invocation.calls == [("native:tool:0", True, "boundary")]
-    assert result == {
-        "cancelled": False,
-        "destroyed": False,
-        "invocation_messages": [{"sequence": 7, "content": "continue carefully"}],
-    }
-
-
-def test_checkpoint_route_validates_wire_shape_and_uses_noop_without_invocation():
-    client = TestClient(_make_server().build_app())
-
-    invalid = client.post(
-        "/checkpoint",
-        json={"boundary_id": "", "allow_messages": "yes", "phase": ""},
-    )
-    valid = client.post(
-        "/checkpoint",
-        json={"boundary_id": "model:1", "allow_messages": False, "phase": "model"},
-    )
-
-    assert invalid.status_code == 400
-    assert valid.status_code == 200
-    assert valid.json() == {
-        "cancelled": False,
-        "destroyed": False,
-        "invocation_messages": [],
-    }
-
-
-def test_paused_checkpoint_disconnect_wakes_and_joins_its_worker():
-    control = AgentControl()
-    invocation = control.begin_invocation("native")
-    invocation.redirect("keep for reconnect")
-    invocation.pause()
-    worker_exited = threading.Event()
-    original_checkpoint = invocation._checkpoint_interruptibly
-
-    def checkpoint_with_exit_signal(*args, **kwargs):
-        try:
-            return original_checkpoint(*args, **kwargs)
-        finally:
-            worker_exited.set()
-
-    invocation._checkpoint_interruptibly = checkpoint_with_exit_signal
-    app = _make_server(invocation=invocation).build_app()
-
-    async def scenario() -> list[dict]:
-        receive_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-        body = json.dumps(
-            {
-                "boundary_id": "native:tool:1",
-                "allow_messages": True,
-                "phase": "boundary",
-            }
-        ).encode()
-        await receive_queue.put({"type": "http.request", "body": body, "more_body": False})
-        sent = []
-
-        async def receive():
-            return await receive_queue.get()
-
-        async def send(message):
-            sent.append(message)
-
-        request_task = asyncio.create_task(
-            app(
-                {
-                    "type": "http",
-                    "asgi": {"version": "3.0", "spec_version": "2.3"},
-                    "http_version": "1.1",
-                    "method": "POST",
-                    "scheme": "http",
-                    "path": "/checkpoint",
-                    "raw_path": b"/checkpoint",
-                    "query_string": b"",
-                    "root_path": "",
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                    "server": ("test", 80),
-                    "client": ("test", 123),
-                    "state": {},
-                },
-                receive,
-                send,
-            )
-        )
-
-        def wait_until_paused() -> bool:
-            with control._condition:
-                return control._condition.wait_for(
-                    lambda: invocation._phase == "paused",
-                    timeout=2.0,
-                )
-
-        assert await asyncio.to_thread(wait_until_paused)
-        await receive_queue.put({"type": "http.disconnect"})
-        await asyncio.wait_for(request_task, timeout=2.0)
-        return sent
-
-    sent = asyncio.run(scenario())
-
-    assert worker_exited.is_set()
-    assert any(
-        message["type"] == "http.response.start" and message["status"] == 499 for message in sent
-    )
-    assert invocation.is_pause_requested() is True
-    assert control.is_paused_actual() is False
-
-    invocation.resume()
-    retry = invocation._checkpoint(
-        "native:tool:1",
-        allow_messages=True,
-        phase="boundary",
-    )
-    assert [entry.content for entry in retry.invocation_messages] == ["keep for reconnect"]
 
 
 def test_build_app_check_syscall_route_allows():
@@ -734,22 +593,3 @@ def test_build_app_complete_syscall_route_records_result_and_span():
     assert response.json() == {"ok": True}
     assert [e[0] for e in logger.events] == ["syscall_call", "agent_state", "syscall_result"]
     assert len(logger.spans) == 1
-
-
-def test_external_tool_admission_fences_redirects_before_policy_hook():
-    handle = AgentControl().begin_invocation("external")
-    called = []
-    server = _make_server(
-        policy=agpolicy(tool_hooks={"tool": lambda args: called.append(args) or True}),
-        invocation=handle,
-    )
-    assert server.check_tool("tool", {"first": True})[0]
-    handle.redirect("stop these actions")
-    allowed, reason = server.check_tool("tool", {"stale": True})
-    assert not allowed
-    assert "Return to the model" in reason
-    assert called == [{"first": True}]
-    snapshot = handle._checkpoint("model", allow_messages=True, phase="model")
-    assert not server.check_tool("tool", {})[0]
-    handle._acknowledge_redirects(snapshot.invocation_messages)
-    assert server.check_tool("tool", {"revised": True})[0]

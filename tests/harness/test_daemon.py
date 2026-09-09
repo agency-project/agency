@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.engine.clients import SandboxInteractionClient
+from agency.engine.clients import HarnessInteractionClient
 from agency.harness import daemon
 from agency.harness.adapters.agharness_backend import (
     AdapterRuntime,
@@ -225,7 +225,7 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
 
     try:
         manager.start()
-        with SandboxInteractionClient(str(socket_path), timeout_s=2.0) as client:
+        with HarnessInteractionClient(str(socket_path), timeout_s=2.0) as client:
             assert client.is_ready()
             result = client.run_harness_attempt(request)
     finally:

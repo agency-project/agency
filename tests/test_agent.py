@@ -8,7 +8,6 @@ from agency.agcontext import agcontext
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.agent import agent
-from agency._submission import Invocation
 from agency.agname import agname as _agname
 from agency.configs.agconfig import (
     agconfig as agconfig_cls,
@@ -38,7 +37,8 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
         resource_pool,
         sandbox,
         max_steps=None,
-        invocation=None,
+        is_cancelled=lambda: False,
+        request_id=None,
     ):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
@@ -50,6 +50,8 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 resource_pool=resource_pool,
                 sandbox=sandbox,
                 max_steps=max_steps,
+                is_cancelled=is_cancelled,
+                request_id=request_id,
             )
         output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps
@@ -156,8 +158,9 @@ def make_agent() -> agent:
 # ---------------------------------------------------------------------------
 
 
-def test_run_returns_pending_invocation():
-    """run() is non-blocking and exposes pending output through Invocation.result."""
+def test_run_returns_pending_bare_agdata():
+    """run() is non-blocking and returns a bare, pending agdata directly --
+    no wrapper object."""
     skill = agskill(name="s", system_prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
@@ -167,8 +170,7 @@ def test_run_returns_pending_invocation():
 
     ag = make_agent()
     result = ag.run(skill, agdata())
-    assert isinstance(result, Invocation)
-    assert isinstance(result.result, agdata)
+    assert type(result) is agdata
     assert result.done is True  # field access blocks until task finishes
 
 
@@ -420,7 +422,7 @@ def test_run_returns_direct_answer_from_engine():
     )
     ag = make_agent()
     invocation = ag.run(skill, agdata(question="Capital of France?"))
-    assert invocation.result.result == '{"answer": "Paris"}'
+    assert invocation.result == '{"answer": "Paris"}'
 
 
 # test_end_to_end_with_tool was retired here along with execute_react()

@@ -151,7 +151,7 @@ class agteam:
         far (via ``agent.change_config``). Agents created afterward pick up
         the new ``self.agconfig`` automatically, the same way they do at
         construction."""
-        self.agconfig = agconfig.clone()
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         for a in self._agents:
             a.change_config(self.agconfig)
 

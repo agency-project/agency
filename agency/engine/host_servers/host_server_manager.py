@@ -5,7 +5,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import uvicorn
 from fastapi import FastAPI
@@ -66,7 +66,8 @@ class HostServerManager:
         skill: "agskill",
         resource_pool: "agResourcePool",
         *,
-        invocation=None,
+        is_cancelled: "Callable[[], bool] | None" = None,
+        request_id: "str | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
@@ -78,15 +79,15 @@ class HostServerManager:
             self._data_logger,
             agent.llm_usage_tracker,
             parent_context=agprof.current_span_context(),
-            invocation=invocation,
-            enable_message_overlay=getattr(agent, "harness", None) != "native",
+            is_cancelled=is_cancelled,
+            request_id=request_id,
+            skill_name=skill.name,
         )
         self._interaction_server = HostInteractionServer(
             skill,
             self._data_logger,
             agent.agname,
-            invocation=invocation,
-            admit_tools=getattr(agent, "harness", None) != "native",
+            is_cancelled=is_cancelled,
             parent_context=agprof.current_span_context(),
             profile_attributes={
                 **agprof.current_span_attributes(),
@@ -102,7 +103,7 @@ class HostServerManager:
             resource_pool,
             self._data_logger,
             # Native tools have already passed the loop's admission fence.
-            invocation=invocation if getattr(agent, "harness", None) != "native" else None,
+            is_cancelled=is_cancelled if getattr(agent, "harness", None) != "native" else None,
         )
         self.change_config(agent.agconfig)
 

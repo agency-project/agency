@@ -89,7 +89,7 @@ class agharness_backend:
         self.change_config(agconfig)
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
-        self.agconfig = agconfig.clone()
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         self._validate_config()
 
     def _validate_config(self) -> None:

@@ -37,8 +37,8 @@ _BARE_THREAD_ALLOWLIST = {
         "HostServerManager.start",
     ): (1, "host UDS server"),
     (
-        "agency/harness/servers/sandbox_interaction_server.py",
-        "SandboxInteractionServer.start",
+        "agency/harness/servers/harness_interaction_server.py",
+        "HarnessInteractionServer.start",
     ): (1, "sandbox interaction server"),
     # ptrace supervision and subprocess pipe plumbing.
     (

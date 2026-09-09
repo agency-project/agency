@@ -23,23 +23,17 @@ class ExecutionScheduler:
         self.schedule: Callable[[], None] = self.default_schedule
 
     def execute(self) -> None:
-        """Run one complete dependency-resolution and scheduling cycle."""
+        """Run one complete dependency-resolution and scheduling cycle.
+
+        No per-request cancelled scan here: cancellation is observed entirely
+        by the engine's own pre/post checkpoints once a request launches (see
+        ``AgentEngine.execute``'s ``is_cancelled`` parameter and
+        ``orchestrator._perform_execution``) -- a request that's still
+        blocked will naturally reach that point once its own predecessor
+        resolves via the normal flow, with no separate settlement path
+        needed.
+        """
         owner = self._orchestrator
-        for request in list(owner._requests.values()):
-            submission = request.submission
-            if request.kind == "context_message":
-                if submission._destroy_requested or request.agent._control.is_destroyed():
-                    owner._destroy_request_locked(request)
-                    continue
-            else:
-                if submission.is_destroyed():
-                    if request.state != "running":
-                        owner._destroy_request_locked(request)
-                    continue
-                if submission.is_cancelled():
-                    if request.state != "running":
-                        owner._cancel_request_locked(request)
-                    continue
         resolved: list[_ExecutionRequest] = []
         wait_pool = sorted(
             (
@@ -133,7 +127,16 @@ class ExecutionScheduler:
             owner._record_request_event("request_ready", pending_exec, {})
 
     def default_schedule(self) -> None:
-        """Launch every eligible ready request allowed by current capacity."""
+        """Launch every eligible ready request allowed by current capacity.
+
+        A same-agent second invocation can never be "ready" concurrently with
+        an unfinished first one -- ``submit()`` chains each new context onto
+        its predecessor under the orchestrator's single lock, and
+        ``resolve_dependency()`` blocks promotion until that predecessor
+        resolves. So the only skip needed here beyond capacity is an explicit
+        ``agent.pause()`` -- unlike mutual exclusion, there is nothing else
+        that would ever hold a paused agent's ready request back.
+        """
         owner = self._orchestrator
         while owner._has_capacity_locked():
             skipped: list[tuple[int, str]] = []
@@ -143,13 +146,7 @@ class ExecutionScheduler:
                 pending_exec = owner._requests.get(entry[1])
                 if pending_exec is None or pending_exec.state != "ready":
                     continue
-                if pending_exec.agent in owner._active_by_agent:
-                    skipped.append(entry)
-                    continue
-                if pending_exec.agent._control.is_suspended():
-                    skipped.append(entry)
-                    continue
-                if getattr(pending_exec.submission, "is_pause_requested", lambda: False)():
+                if pending_exec.agent._paused:
                     skipped.append(entry)
                     continue
                 selected = pending_exec

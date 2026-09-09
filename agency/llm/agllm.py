@@ -86,7 +86,7 @@ class agllm:
     def change_config(self, agconfig: "agconfig_cls") -> None:
         """Replace this instance's agconfig with a clone of the given one,
         then validate it's internally consistent for its own provider."""
-        self.agconfig = agconfig.clone()
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         self._validate_config()
 
     def _validate_config(self) -> None:

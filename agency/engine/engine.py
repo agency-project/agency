@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import threading
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import cloudpickle
 
@@ -21,43 +21,7 @@ if TYPE_CHECKING:
     from ..orchestrator.agresources import agResourcePool
     from ..agskill import agskill
     from ..agtool import agtool
-    from .._submission import Invocation
-    from .clients import SandboxInteractionClient
-
-
-class _NoopDecision:
-    action_admitted = True
-    cancelled = False
-    destroyed = False
-    invocation_messages: tuple = ()
-
-
-class _NoopInvocation:
-    """Lifecycle compatibility for direct ``AgentEngine.execute`` callers."""
-
-    @staticmethod
-    def _checkpoint(_boundary_id: str, *, allow_messages: bool, phase: str) -> _NoopDecision:
-        del allow_messages, phase
-        return _NoopDecision()
-
-    @staticmethod
-    def _claim_completion() -> bool:
-        return True
-
-    @staticmethod
-    def _note_model_result(*, has_tool_calls: bool) -> None:
-        del has_tool_calls
-
-    @staticmethod
-    def is_cancelled() -> bool:
-        return False
-
-    @staticmethod
-    def is_destroyed() -> bool:
-        return False
-
-
-_NOOP_INVOCATION = _NoopInvocation()
+    from .clients import HarnessInteractionClient
 
 
 class AgentEngine:
@@ -71,13 +35,13 @@ class AgentEngine:
         # mid-execution. Read self.agconfig, not self._agent.agconfig.
         self.agconfig: "agconfig_cls" = agent.agconfig.clone()
         self._host_server_manager: "HostServerManager | None" = None
-        self._sandbox_interaction_client: "SandboxInteractionClient | None" = None
+        self._sandbox_interaction_client: "HarnessInteractionClient | None" = None
         self._services_lock = threading.RLock()
         self._services_closed = True
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
-        self.agconfig = agconfig.clone()
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         if self._host_server_manager is not None:
             self._host_server_manager.change_config(self.agconfig)
 
@@ -129,26 +93,21 @@ class AgentEngine:
         resource_pool: "agResourcePool",
         sandbox: agSandbox,
         max_steps: "int | None" = None,
-        invocation: "Invocation | None" = None,
+        is_cancelled: "Callable[[], bool]" = lambda: False,
+        request_id: "str | None" = None,
     ) -> "agdata":
         """Execute one request and own its complete sandbox transaction."""
 
         from ..agdata import agerror
 
-        active_invocation = invocation if invocation is not None else _NOOP_INVOCATION
         sandbox_lock = sandbox._lock
         sandbox_lock.acquire()
         try:
             failed = True
             self._pending_session_update = None
             try:
-                admission = active_invocation._checkpoint(
-                    "engine:before-harness",
-                    allow_messages=False,
-                    phase="infrastructure",
-                )
-                if admission.destroyed or admission.cancelled:
-                    return self._controlled_error(active_invocation, admission.destroyed)
+                if is_cancelled():
+                    return self._controlled_error()
 
                 output = self._execute_harness(
                     context,
@@ -157,22 +116,13 @@ class AgentEngine:
                     resource_pool,
                     sandbox,
                     max_steps=max_steps,
-                    invocation=active_invocation,
+                    is_cancelled=is_cancelled,
+                    request_id=request_id,
                 )
-                completion = active_invocation._checkpoint(
-                    "engine:before-commit",
-                    allow_messages=False,
-                    phase="boundary",
-                )
-                if completion.destroyed or completion.cancelled:
-                    return self._controlled_error(active_invocation, completion.destroyed)
+                if is_cancelled():
+                    return self._controlled_error()
                 if isinstance(output, agerror):
                     return output
-                if not active_invocation._claim_completion():
-                    return self._controlled_error(
-                        active_invocation,
-                        active_invocation.is_destroyed(),
-                    )
                 with agprof.span("teardown:commit"):
                     try:
                         sandbox.commit()
@@ -183,8 +133,7 @@ class AgentEngine:
                             from ..sandbox.pid_diagnostics import decision_snapshot
 
                             diagnostic = decision_snapshot(sandbox._backend, pending)
-                            diagnostic["request_id"] = getattr(invocation, "_request_id", None)
-                            diagnostic["ordering_id"] = getattr(invocation, "ordering_id", None)
+                            diagnostic["request_id"] = request_id
                             self._agent.data_logger.record_event(
                                 type="hibernation_decision", payload=diagnostic, flush=True
                             )
@@ -204,7 +153,6 @@ class AgentEngine:
                                 type="hibernation_outcome",
                                 payload={
                                     "request_id": diagnostic["request_id"],
-                                    "ordering_id": diagnostic["ordering_id"],
                                     "outcome": hibernation,
                                     "decision_epoch": diagnostic["decision_epoch"],
                                 },
@@ -228,12 +176,10 @@ class AgentEngine:
                 self.close()
 
     @staticmethod
-    def _controlled_error(invocation, destroyed: bool) -> "agdata":
-        from ..agdata import agerror
+    def _controlled_error() -> "agdata":
+        from ..agdata import agcanceled
 
-        if destroyed or invocation.is_destroyed():
-            return agerror("agent destroyed")
-        return agerror("agent invocation cancelled")
+        return agcanceled()
 
     def _execute_harness(
         self,
@@ -244,7 +190,8 @@ class AgentEngine:
         sandbox: agSandbox,
         max_steps: "int | None" = None,
         *,
-        invocation=None,
+        is_cancelled: "Callable[[], bool]" = lambda: False,
+        request_id: "str | None" = None,
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
@@ -261,7 +208,8 @@ class AgentEngine:
             sandbox,
             skill,
             resource_pool,
-            invocation=invocation,
+            is_cancelled=is_cancelled,
+            request_id=request_id,
         )
         with self._services_lock:
             self._host_server_manager = manager

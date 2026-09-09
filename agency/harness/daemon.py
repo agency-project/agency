@@ -29,7 +29,7 @@ from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
-from .servers import SandboxInteractionServer
+from .servers import HarnessInteractionServer
 
 _HARNESS_API_PORT = 8766
 
@@ -291,7 +291,7 @@ class HarnessManager:
         )
         self._attempt_lock = threading.Lock()
         self._current_attempt_token: "str | None" = None
-        self._interaction_server = SandboxInteractionServer(
+        self._interaction_server = HarnessInteractionServer(
             sandbox_uds_path,
             self._dispatch_attempt,
         )

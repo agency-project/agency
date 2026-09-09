@@ -1,5 +1,5 @@
 """Servers owned by the sandbox-side harness process."""
 
-from .sandbox_interaction_server import SandboxInteractionServer
+from .harness_interaction_server import HarnessInteractionServer
 
-__all__ = ["SandboxInteractionServer"]
+__all__ = ["HarnessInteractionServer"]

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 from dataclasses import fields, is_dataclass, replace
 from typing import TYPE_CHECKING
@@ -64,7 +65,7 @@ class agdata:
         f = object.__getattribute__(self, "_future")
         return f is not None and not f.done()
 
-    def wait(self) -> "agdata":
+    def wait(self, timeout: "float | None" = None) -> "agdata":
         """Block until this agdata is resolved and return self.
 
         Use as a barrier on a single result::
@@ -73,7 +74,26 @@ class agdata:
             # ... do other work ...
             result.wait()   # block here until the team finishes
             print(result.report_path)   # guaranteed resolved
+
+        *timeout*, if given, raises ``concurrent.futures.TimeoutError`` rather
+        than blocking forever.
         """
+        if timeout is not None:
+            f = object.__getattribute__(self, "_future")
+            if f is not None:
+                f.result(timeout=timeout)
+        self._resolve()
+        return self
+
+    def __await__(self):
+        return self._await_self().__await__()
+
+    async def _await_self(self) -> "agdata":
+        # Shielded so cancelling one waiter's task never cancels the shared
+        # underlying future for any other concurrent awaiter.
+        f = object.__getattribute__(self, "_future")
+        if f is not None:
+            await asyncio.shield(asyncio.wrap_future(f))
         self._resolve()
         return self
 
@@ -266,3 +286,14 @@ class agerror(agdata):
 
     def __repr__(self) -> str:
         return f"agerror({self._data.get('error')!r})"
+
+
+class agcanceled(agerror):
+    """Returned when an invocation was cancelled via ``agent.cancel(handle)``.
+
+    A typed subclass of ``agerror`` so callers can ``isinstance(result, agcanceled)``
+    instead of string-matching ``.error``.
+    """
+
+    def __init__(self, message: str = "agent invocation cancelled"):
+        super().__init__(message)

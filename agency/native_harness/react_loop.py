@@ -3,18 +3,19 @@
 Ties together everything else in this package: dispatch (`llm_client.py`),
 compaction (`compaction.py`), built-in tools (`tools.py`), MCP tools
 (`mcp_client.py`), and the optional agency bridge (`bridge_client.py`) for
-per-tool policy checks and lifecycle checkpoints. Same shape as the old
+per-tool policy checks. Same shape as the old
 `_native_in_container_entrypoint.py`'s `_run_react_loop_inner`, adapted to
 this package's own dependencies instead of a UDS connection to
 `agllm_terminus`/`agmcp_server`/`agharness_messenger`.
 
-Order per turn follows explicit safe boundaries: checkpoint and render
-invocation messages, compact, generate, checkpoint the model result, then checkpoint
-after every published tool result."""
+This loop carries no invocation-lifecycle state of its own: cancellation
+propagates the same way it does for every other harness -- a denied tool
+call (`bridge.check_tool_policy`) or a denied/errored model dispatch
+(`llm.dispatch`), both mediated by the same host-side admission checks any
+external harness goes through. There is no separate "checkpoint" concept."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -22,11 +23,6 @@ from typing import TYPE_CHECKING
 
 from . import tools
 from .profiling import profile_run, span as profile_span
-from .bridge_client import (
-    CONTROL_PHASE_BOUNDARY,
-    CONTROL_PHASE_CLOSING,
-    CONTROL_PHASE_MODEL,
-)
 from .compaction import maybe_compact
 
 if TYPE_CHECKING:
@@ -35,8 +31,6 @@ if TYPE_CHECKING:
     from .mcp_client import McpToolset
 
 _DEFAULT_MAX_STEPS = 20
-_AGENT_DESTROYED_MESSAGE = "agent destroyed"
-_INVOCATION_CANCELLED_MESSAGE = "agent invocation cancelled"
 
 
 @dataclass
@@ -66,7 +60,6 @@ def run_react_loop(
     total_input_tokens = 0
     total_output_tokens = 0
     previous_summary: "str | None" = None
-    rendered_message_sequences: "set[int]" = set()
 
     dispatch_table = dict(tools.TOOL_DISPATCH)
     tool_schemas = list(tools.BUILTIN_TOOL_SCHEMAS.values())
@@ -83,53 +76,9 @@ def run_react_loop(
 
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
-            invocation_messages = []
-            generation_boundary = _native_boundary_id("generation", step, messages)
-            if bridge is not None:
-                decision = bridge.checkpoint(
-                    generation_boundary,
-                    allow_messages=True,
-                    phase=CONTROL_PHASE_MODEL,
-                )
-                stopped = _stopped_message(decision)
-                if stopped is not None:
-                    return ReactLoopResult(status="error", message=stopped, turn_count=step)
-                for entry in decision.get("invocation_messages") or []:
-                    try:
-                        sequence = int(entry["sequence"])
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if sequence in rendered_message_sequences:
-                        continue
-                    rendered_message_sequences.add(sequence)
-                    invocation_messages.append(str(entry.get("content", "")))
-
             messages, previous_summary = maybe_compact(
                 messages, context_limit, llm, model, previous_summary
             )
-
-            if bridge is not None:
-                # Compaction bypasses ordinary invocation messages, but controls may
-                # arrive while it is running. Observe them before task generation.
-                decision = bridge.checkpoint(
-                    _native_boundary_id("post-compaction", step, messages),
-                    allow_messages=False,
-                    phase=CONTROL_PHASE_MODEL,
-                )
-                stopped = _stopped_message(decision)
-                if stopped is not None:
-                    return ReactLoopResult(status="error", message=stopped, turn_count=step)
-
-            # Preserve the exact redirect text across compaction. Only the task
-            # generation below may acknowledge this snapshot.
-            if invocation_messages:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "[AGENCY INVOCATION MESSAGE]\n"
-                        + "\n\n".join(invocation_messages),
-                    }
-                )
 
             resp = llm.dispatch(model, messages, tool_schemas or None)
             if "error" in resp:
@@ -137,33 +86,12 @@ def run_react_loop(
                     status="error", message=str(resp["error"]), turn_count=step + 1
                 )
 
-            if bridge is not None:
-                decision = bridge.checkpoint(
-                    generation_boundary,
-                    allow_messages=False,
-                    phase="model-result",
-                )
-                stopped = _stopped_message(decision)
-                if stopped is not None:
-                    return ReactLoopResult(status="error", message=stopped, turn_count=step + 1)
-
             usage = resp.get("usage") or {}
             total_input_tokens += usage.get("prompt_tokens", 0) or 0
             total_output_tokens += usage.get("completion_tokens", 0) or 0
 
             message = resp["message"]
             tool_calls = message.get("tool_calls") or []
-            if not tool_calls and bridge is not None:
-                decision = bridge.checkpoint(
-                    _native_boundary_id("final", step, messages),
-                    allow_messages=True,
-                    phase=CONTROL_PHASE_CLOSING,
-                )
-                stopped = _stopped_message(decision)
-                if stopped is not None:
-                    return ReactLoopResult(status="error", message=stopped, turn_count=step + 1)
-                if decision.get("invocation_messages"):
-                    continue
             messages.append(message)
             if not tool_calls:
                 return ReactLoopResult(
@@ -175,28 +103,7 @@ def run_react_loop(
                     turn_count=step + 1,
                 )
 
-            for tool_index, tc in enumerate(tool_calls):
-                if bridge is not None:
-                    decision = bridge.checkpoint(
-                        f"native:action:{step}:{tool_index}:{tc['id']}",
-                        allow_messages=False,
-                        phase="action",
-                    )
-                    stopped = _stopped_message(decision)
-                    if stopped is not None:
-                        return ReactLoopResult(status="error", message=stopped, turn_count=step + 1)
-                    if not decision.get("action_admitted"):
-                        # Complete the protocol without executing any remaining
-                        # action authorized by the stale model result.
-                        messages.extend(
-                            {
-                                "role": "tool",
-                                "tool_call_id": skipped["id"],
-                                "content": "Not executed: invocation redirected. Reconsider this action.",
-                            }
-                            for skipped in tool_calls[tool_index:]
-                        )
-                        break
+            for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 fn_args = tc["function"]["arguments"]
                 handler = dispatch_table.get(fn_name)
@@ -251,19 +158,6 @@ def run_react_loop(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )
-                if bridge is not None:
-                    decision = bridge.checkpoint(
-                        f"native:tool:{step}:{tool_index}:{tc['id']}",
-                        allow_messages=False,
-                        phase=CONTROL_PHASE_BOUNDARY,
-                    )
-                    stopped = _stopped_message(decision)
-                    if stopped is not None:
-                        return ReactLoopResult(
-                            status="error",
-                            message=stopped,
-                            turn_count=step + 1,
-                        )
     return ReactLoopResult(
         status="error",
         message=f"exceeded max_steps={max_steps} without a final answer",
@@ -277,20 +171,6 @@ def _parse_tool_input(fn_args: str) -> dict:
     except (json.JSONDecodeError, TypeError):
         parsed = {}
     return parsed if isinstance(parsed, dict) else {}
-
-
-def _native_boundary_id(kind: str, step: int, messages: list) -> str:
-    payload = json.dumps(messages, sort_keys=True, separators=(",", ":"), default=str)
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return f"native:{kind}:{step}:{digest}"
-
-
-def _stopped_message(decision: dict) -> "str | None":
-    if decision.get("destroyed"):
-        return _AGENT_DESTROYED_MESSAGE
-    if decision.get("cancelled"):
-        return str(decision.get("error") or _INVOCATION_CANCELLED_MESSAGE)
-    return None
 
 
 __all__ = ["run_react_loop", "ReactLoopResult"]

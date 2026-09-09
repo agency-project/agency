@@ -480,27 +480,3 @@ def test_lifespan_context_is_usable_as_an_async_context_manager():
             pass
 
     asyncio.run(_enter_and_exit())
-
-
-def test_host_mcp_redirect_blocks_tool_side_effects_until_model_acknowledges():
-    from agency._agent_control import AgentControl
-
-    calls = []
-    tool = agtool(
-        name="probe",
-        description="probe",
-        params={"type": "object", "properties": {}},
-        fn=lambda d: calls.append("called") or agdata(ok=True),
-    )
-    server, _, _ = _make_server(add_host_mcp_tools=[tool])
-    handle = AgentControl().begin_invocation("external")
-    server._invocation = handle
-    handle.redirect("reconsider")
-    _call(server, "probe", {})
-    assert calls == []
-    snapshot = handle._checkpoint("model", allow_messages=True, phase="model")
-    _call(server, "probe", {})
-    assert calls == []
-    handle._acknowledge_redirects(snapshot.invocation_messages)
-    _call(server, "probe", {})
-    assert calls == ["called"]

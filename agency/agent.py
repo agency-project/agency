@@ -6,7 +6,6 @@ import tarfile
 import threading
 import uuid as _uuid_mod
 import weakref
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -50,8 +49,6 @@ from .configs.agconfig import agconfig as agconfig_cls
 
 from .agname import agname as _agname  # [REFACTOR] Why underscore?
 from .observability.profiler import agprof
-from ._agent_control import AgentControl
-from ._submission import CloseHandle, Invocation, MessageSubmission, Submission
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
@@ -67,7 +64,6 @@ def _resolve_agent_default(agconfig: "agconfig_cls | None", field: str, classvar
     return value if value is not None else classvar_default
 
 
-# [REFACTOR] Check how it works
 class agent:
     """Orchestrator that maintains shared history and delegates to named agskills.
 
@@ -75,9 +71,9 @@ class agent:
     logging infrastructure) and delegates execution to agskill objects.
 
     agent.run(skill, input)
-        Always non-blocking.  Returns an Invocation immediately.  Calls on the
-        same agent are serialized through the context chain.  Calls on
-        different agents (forks) run concurrently.
+        Always non-blocking.  Returns a bare, pending ``agdata`` immediately.
+        Calls on the same agent are serialized through the context chain.
+        Calls on different agents (forks) run concurrently.
 
     agent.fork(existing_agent)
         Blocks until the source agent's in-flight task completes, then
@@ -113,7 +109,6 @@ class agent:
         with agprof.span("agent:create"):
             self._initialize(agname, sandbox, agconfig, harness)
 
-    # [REFACTOR] Why separate?
     def _initialize(
         self,
         agname: "str | None",
@@ -220,7 +215,7 @@ class agent:
             default_db_path=resolve_global_db_path(log_dir),
         )
         self._submission_lock = threading.RLock()
-        initial_sequence = max(
+        self._sequence = max(
             (
                 int(entry.get("sequence", 0))
                 for entry in self.context.retained_messages
@@ -228,14 +223,7 @@ class agent:
             ),
             default=0,
         )
-        self._control = AgentControl(initial_sequence=initial_sequence)
-        self._submissions: set[Submission] = set()
-        self._next_submission_id = 1
-        self._active_operations = 0
-        self._cleanup_lock = threading.Lock()
-        self._cleanup_scheduled = False
-        self._cleanup_done = False
-        self._close_handle = CloseHandle()
+        self._paused = False
         self._current_state = "agent_idle"
         _live_agents.add(self)
 
@@ -260,88 +248,27 @@ class agent:
         except Exception as exc:
             print(f"[agent] WARNING: global catalog registration failed for {self.agname}: {exc}")
 
-    def _submission_finished(self, submission: Submission) -> None:
-        with self._orchestrator._event_cond:
-            with self._submission_lock:
-                self._submissions.discard(submission)
-        self._maybe_cleanup_destroyed()
+    def _next_sequence(self) -> int:
+        with self._submission_lock:
+            self._sequence += 1
+            return self._sequence
 
-    @contextmanager
-    def _operation_lease(self, operation: str, *, allow_destroyed: bool = False):
-        """Keep runtime resources alive for one already-admitted host operation."""
-        with self._orchestrator._event_cond:
-            with self._submission_lock:
-                if not allow_destroyed:
-                    self._control.assert_alive(operation)
-                self._active_operations += 1
-        try:
-            yield
-        finally:
-            with self._orchestrator._event_cond:
-                with self._submission_lock:
-                    self._active_operations -= 1
-            self._maybe_cleanup_destroyed()
-
-    def _maybe_cleanup_destroyed(self) -> None:
-        schedule = False
-        with self._orchestrator._event_cond:
-            with self._submission_lock:
-                if (
-                    self._control.is_destroyed()
-                    and self._control.active_invocation() is None
-                    and self._active_operations == 0
-                    and not self._submissions
-                    and not self._cleanup_scheduled
-                ):
-                    self._cleanup_scheduled = True
-                    schedule = True
-        if schedule:
-            try:
-                thread = agprof.spawn_traced(self._finalize_destroy, daemon=True)
-                thread.name = f"agency-destroy-{self.agname}"
-                thread.start()
-            except BaseException:
-                self._finalize_destroy()
-
-    def _finalize_destroy(self) -> None:
-        with self._cleanup_lock:
-            if self._cleanup_done:
-                return
-            self._cleanup_done = True
-        try:
-            self.data_logger.record_event(
-                type="agent_destroyed",
-                payload={"agname": self.agname},
-                term_message=f"[{self.agname}] DESTROYED",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[agent] WARNING: destroy log failed for {self.agname}: {exc}")
-        if self._owns_sandbox and self.sandbox is not None:
-            try:
-                self.sandbox.destroy()
-            except Exception as exc:
-                print(f"[agent] WARNING: sandbox cleanup failed for {self.agname}: {exc}")
-        try:
-            self.data_logger.stop()
-        except Exception as exc:
-            print(f"[agent] WARNING: logger cleanup failed for {self.agname}: {exc}")
-        self._control.mark_destroyed()
-        self._close_handle._settle()
+    def _ensure_sequence_at_least(self, value: int) -> None:
+        with self._submission_lock:
+            self._sequence = max(self._sequence, int(value))
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
-        with self._operation_lease("change config"):
-            self.agconfig = agconfig.clone()
-            self.data_logger.change_config(self.agconfig)
-            if self.sandbox is not None:
-                self.sandbox.change_config(self.agconfig)
-            if self.engine is not None:
-                self.engine.change_config(self.agconfig)
-            self.data_logger.record_event(
-                type="agent_config",
-                payload=self.agconfig.safe_snapshot(),
-                update_latest_snapshot=True,
-            )
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
+        self.data_logger.change_config(self.agconfig)
+        if self.sandbox is not None:
+            self.sandbox.change_config(self.agconfig)
+        if self.engine is not None:
+            self.engine.change_config(self.agconfig)
+        self.data_logger.record_event(
+            type="agent_config",
+            payload=self.agconfig.safe_snapshot(),
+            update_latest_snapshot=True,
+        )
 
     def get_config_copy(self) -> "agconfig_cls":
         """Return a clone of this agent's agconfig."""
@@ -377,23 +304,21 @@ class agent:
     @property
     def history(self) -> agdata:
         """Return the committed transcript after this agent becomes idle."""
-        with self._operation_lease("read history", allow_destroyed=True):
-            return agdata(messages=self.context.get_resolved_transcript())
+        return agdata(messages=self.context.get_resolved_transcript())
 
     @history.setter
     def history(self, value: agdata) -> None:
-        with self._operation_lease("replace history"):
-            messages = value.to_dict().get("messages", [])
-            while True:
-                with self._orchestrator._event_cond:
-                    with self._submission_lock:
-                        current = self.context
-                current.resolve_prev_dependencies()
-                with self._orchestrator._event_cond:
-                    with self._submission_lock:
-                        if self.context is current:
-                            current.set_transcript(messages)
-                            return
+        messages = value.to_dict().get("messages", [])
+        while True:
+            with self._orchestrator._event_cond:
+                with self._submission_lock:
+                    current = self.context
+            current.resolve_prev_dependencies()
+            with self._orchestrator._event_cond:
+                with self._submission_lock:
+                    if self.context is current:
+                        current.set_transcript(messages)
+                        return
 
     def record_state(
         self, state: str, skill: "str | None" = None, tool: "str | None" = None
@@ -410,9 +335,6 @@ class agent:
     # Pause / resume
     # ------------------------------------------------------------------
 
-    def _notify_invocation_control(self, invocation: Invocation) -> None:
-        self._orchestrator.notify_invocation_control(invocation)
-
     def _record_context_notice(self, context: agcontext) -> int:
         """Append the typed rollback notice retained after an ordinary failure."""
         last_retained_sequence = max(
@@ -423,8 +345,8 @@ class agent:
             ),
             default=0,
         )
-        self._control.ensure_sequence_at_least(last_retained_sequence)
-        sequence = self._control.next_sequence(allow_destroyed=True)
+        self._ensure_sequence_at_least(last_retained_sequence)
+        sequence = self._next_sequence()
         context.append_retained_message(
             {
                 "sequence": sequence,
@@ -438,61 +360,53 @@ class agent:
         )
         return sequence
 
-    def suspend(self) -> None:
-        """Close the independent agent-wide scheduler/execution gate."""
-        self._orchestrator.suspend_agent(self)
+    def pause(self) -> None:
+        """Hold this agent's next not-yet-launched run() until resume().
+
+        Whatever is already running is unaffected -- this only gates
+        admission of the next launch (the scheduler's ready-request skip),
+        matching what ``suspend()`` used to do. ``queue_message()`` is never
+        gated by this.
+        """
+        with self._orchestrator._event_cond:
+            self._paused = True
+            self._orchestrator._post_locked("control_changed", ("agent", self))
         self.data_logger.record_event(
-            type="agent_suspend_requested",
+            type="agent_paused",
             payload={"agname": self.agname},
-            term_message=f"[{self.agname}] SUSPEND ▶  requested",
+            term_message=f"[{self.agname}] PAUSE ▶  requested",
         )
 
     def resume(self) -> None:
-        """Reopen only the agent-wide suspension gate."""
-        self._orchestrator.resume_agent(self)
+        with self._orchestrator._event_cond:
+            self._paused = False
+            self._orchestrator._post_locked("control_changed", ("agent", self))
         self.data_logger.record_event(
             type="agent_resumed",
             payload={"agname": self.agname},
-            term_message=f"[{self.agname}] SUSPEND ✓  resumed",
+            term_message=f"[{self.agname}] PAUSE ✓  resumed",
         )
 
-    def destroy(self) -> CloseHandle:
-        """Reject new work and asynchronously drain and clean up this agent."""
-        first = self._orchestrator.destroy_agent(self)
-        if first:
-            _live_agents.discard(self)
-            try:
-                self.data_logger.record_event(
-                    type="agent_destroying",
-                    payload={"agname": self.agname},
-                    term_message=f"[{self.agname}] DESTROY ▶  cleanup scheduled",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(f"[agent] WARNING: destroy request logging failed for {self.agname}: {exc}")
-            self._maybe_cleanup_destroyed()
-        return self._close_handle
-
-    def is_suspended(self) -> bool:
-        return self._control.is_suspended()
-
     def is_paused(self) -> bool:
-        return self._control.is_paused_actual()
+        return self._paused
 
-    @property
-    def lifecycle_state(self) -> str:
-        return self._control.lifecycle_state().upper()
+    def redirect(self, message: str) -> None:
+        raise NotImplementedError(
+            "agent.redirect() needs its own design pass -- no harness has a "
+            "live mid-attempt injection channel today"
+        )
 
-    def is_settled(self) -> bool:
-        if self._control.is_fully_destroyed():
-            return True
-        if self._control.is_destroyed():
-            return False
-        if self._control.is_suspended():
-            active = self._control.active_invocation()
-            return active is None or self._control.is_paused_actual()
-        with self._orchestrator._event_cond:
-            return not self._submissions or self._control.is_paused_actual()
+    def cancel(self, handle: agdata) -> None:
+        """Cancel whichever run() produced *handle*.
+
+        Purely a lookup key: nothing is marked on *handle* itself. A
+        not-yet-launched run naturally reaches the engine's own pre-checkpoint
+        once its predecessor resolves; an already-running one is caught by
+        the post-checkpoint once the harness returns (cooperative-only --
+        does not interrupt an in-flight harness).
+        """
+        future = object.__getattribute__(handle, "_future")
+        self._orchestrator.cancel_request(future)
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
@@ -512,16 +426,20 @@ class agent:
         self.sandbox = agSandbox(self.agname, agconfig=sandbox_config)
         return self.sandbox
 
-    def queue_message(self, message: str) -> MessageSubmission:
-        """Append one ordered retained message without starting infrastructure."""
+    def queue_message(self, message: str) -> None:
+        """Append one ordered retained message without starting infrastructure.
+
+        A plain enqueue -- ordering into the context chain is guaranteed
+        synchronously before this returns, so there is nothing to hand back.
+        """
         if not isinstance(message, str):
             raise TypeError("message must be a string")
         if not message.strip():
             raise ValueError("message must be a non-empty string")
-        return self._orchestrator.submit_context_message(self, message)
+        self._orchestrator.submit_context_message(self, message)
 
-    def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> Invocation:
-        """Submit ready work and immediately return its exact Invocation."""
+    def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
+        """Submit ready work and immediately return its bare result agdata."""
         if max_steps is None:
             return skill.run(self, skill_input)
         return skill.run(self, skill_input, max_steps=max_steps)
@@ -565,12 +483,6 @@ class agent:
     @classmethod
     def fork(cls, src: "agent", agname: str | None = None) -> "agent":
         """Return an independent agent forked from *src*."""
-        with src._operation_lease("fork"):
-            return cls._fork_leased(src, agname)
-
-    @classmethod
-    def _fork_leased(cls, src: "agent", agname: str | None = None) -> "agent":
-        """Construct a fork while the source agent's resources are leased."""
         ag: agent = cls.__new__(cls)
         ag.agname = _agname.allocate_agname(agname, prefix="agent")
         ag._parent_agent_id = str(src.agname)
@@ -674,11 +586,6 @@ class agent:
     def save(self, path: "Path | str | None" = None) -> None:
         """Checkpoint this agent to a single .ckpt file. Defaults to
         `agency_runs/saves/{agname}.ckpt` when *path* is omitted."""
-        with self._operation_lease("save"):
-            self._save_leased(path)
-
-    def _save_leased(self, path: "Path | str | None") -> None:
-        """Write one checkpoint while explicit destruction waits for this lease."""
         path = (
             Path(path) if path is not None else agency_runs_dir() / "saves" / f"{self.agname}.ckpt"
         )

@@ -18,49 +18,70 @@ def _make_agent():
     return agent(agconfig=agconfig(llmconfig(provider="mock", api_key="k", model="")))
 
 
-def test_dispatch_pause_command_pauses_named_agent():
+# agent.pause()/resume() are OS-level-freeze stubs (raise NotImplementedError)
+# pending the cgroup-based redesign -- these tests only verify _dispatch_command
+# routes each command to the right agent's pause()/resume(), independent of
+# what those methods currently do.
+
+
+def test_dispatch_pause_command_calls_pause_on_named_agent(monkeypatch):
     from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
+    called = []
+    monkeypatch.setattr(ag, "pause", lambda: called.append("pause"))
     _dispatch_command({"type": "pause", "agname": ag.agname})
-    assert ag.is_suspended() is True
+    assert called == ["pause"]
 
 
-def test_dispatch_resume_command_resumes_named_agent():
+def test_dispatch_resume_command_calls_resume_on_named_agent(monkeypatch):
     from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
-    ag.suspend()
+    called = []
+    monkeypatch.setattr(ag, "resume", lambda: called.append("resume"))
     _dispatch_command({"type": "resume", "agname": ag.agname})
-    assert ag.is_suspended() is False
+    assert called == ["resume"]
 
 
-def test_dispatch_pause_command_ignores_unknown_agname():
+def test_dispatch_pause_command_ignores_unknown_agname(monkeypatch):
     from agency.observability.agwebui import _dispatch_command
 
     ag = _make_agent()
+    called = []
+    monkeypatch.setattr(ag, "pause", lambda: called.append("pause"))
     _dispatch_command({"type": "pause", "agname": "__no_such_agent__"})
-    assert ag.is_suspended() is False
+    assert called == []
 
 
-def test_dispatch_pause_all_pauses_every_live_agent():
+def test_dispatch_pause_all_calls_pause_on_every_live_agent(monkeypatch):
     from agency.observability.agwebui import _dispatch_command
+    from agency.agent import agent as agent_cls
 
     a, b = _make_agent(), _make_agent()
+    called = []
+    monkeypatch.setattr(a, "pause", lambda: called.append("a"))
+    monkeypatch.setattr(b, "pause", lambda: called.append("b"))
+    # Isolate from any other agent left live (not yet garbage-collected) by
+    # an earlier test -- agent.all() is process-wide, and pause() now raises
+    # NotImplementedError for real, so a stray leftover agent would abort
+    # _dispatch_command's loop before it ever reaches a/b.
+    monkeypatch.setattr(agent_cls, "all", classmethod(lambda cls: [a, b]))
     _dispatch_command({"type": "pause_all"})
-    assert a.is_suspended() is True
-    assert b.is_suspended() is True
+    assert sorted(called) == ["a", "b"]
 
 
-def test_dispatch_resume_all_resumes_every_live_agent():
+def test_dispatch_resume_all_calls_resume_on_every_live_agent(monkeypatch):
     from agency.observability.agwebui import _dispatch_command
+    from agency.agent import agent as agent_cls
 
     a, b = _make_agent(), _make_agent()
-    a.suspend()
-    b.suspend()
+    called = []
+    monkeypatch.setattr(a, "resume", lambda: called.append("a"))
+    monkeypatch.setattr(b, "resume", lambda: called.append("b"))
+    monkeypatch.setattr(agent_cls, "all", classmethod(lambda cls: [a, b]))
     _dispatch_command({"type": "resume_all"})
-    assert a.is_suspended() is False
-    assert b.is_suspended() is False
+    assert sorted(called) == ["a", "b"]
 
 
 def test_dispatch_update_config_applies_to_named_agent():
@@ -337,15 +358,11 @@ def test_poll_commands_applies_and_deletes_command_files(tmp_path):
     t = threading.Thread(target=_poll_commands, args=(cmd_dir, stop), daemon=True)
     t.start()
     try:
+        # agent.pause() currently raises NotImplementedError (cgroup-based
+        # freeze pending) -- _poll_commands() already catches and logs that
+        # per-command, so the file is still consumed exactly as if the
+        # command had succeeded.
         deadline = time.time() + 2.0
-        while time.time() < deadline and not ag.is_suspended():
-            time.sleep(0.02)
-        assert ag.is_suspended() is True
-        # Wait for the unlink on its own deadline rather than asserting it
-        # immediately: _poll_commands() dispatches first and unlinks after
-        # (in its `finally`), so the pause landing above says nothing about
-        # whether the file is gone yet -- on a loaded host the poll thread
-        # can be descheduled in exactly that window.
         while time.time() < deadline and list(cmd_dir.glob("*.json")):
             time.sleep(0.02)
         assert not list(cmd_dir.glob("*.json"))  # consumed

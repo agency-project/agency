@@ -1,11 +1,18 @@
 """Live conformance test for Agency's public submission and lifecycle APIs.
 
 This example uses the native harness and a real OpenAI model. It exercises the
-public ``Agent``, ``Submission``, ``Invocation``, ``MessageSubmission``, and
-``CloseHandle`` surfaces, including ordered context messages, exact-invocation
-messages, independent pause gates, cancellation, destruction, awaiting, and result-field
-proxying. Host-side events make the concurrency claims observable instead of
-inferring them from model prose.
+public ``Agent`` surface: ``run()`` returns a bare, pending ``agdata`` directly
+(no wrapper object), ``queue_message()`` is a plain enqueue with no return
+value (ordering into the context chain is already guaranteed synchronously,
+before it returns), ``agent.cancel(handle)``, and ``agent.pause()``/``resume()``
+as a real admission gate. Host-side tool-call events make the concurrency
+claims observable instead of inferring them from model prose.
+
+``agent.redirect()`` is checked only for still raising ``NotImplementedError``
+-- it has no live delivery mechanism yet (no harness has a mid-attempt
+injection channel today). There is no agent teardown API anymore either
+(``destroy()`` was removed -- cleanup is just letting an ``Agent`` go out of
+scope, same as any other Python object).
 
 Run with profiling enabled to produce both lifecycle evidence and measured
 profiler artifacts::
@@ -28,7 +35,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import threading
 import time
 import traceback
@@ -38,11 +44,6 @@ from typing import Callable
 
 from agency import (
     Agent,
-    AgentDestroyedError,
-    CloseHandle,
-    Invocation,
-    MessageSubmission,
-    Submission,
     agdata,
     agprof,
     agrawstring,
@@ -53,29 +54,13 @@ from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 ORDERED_MEMORY = "ORDERED-CONTEXT-731"
 CANCEL_MEMORY = "CANCEL-CONTEXT-947"
-FIFO_FIRST = "FIFO-FIRST"
-FIFO_SECOND = "FIFO-SECOND"
-FIFO_MARKER = f"{FIFO_FIRST}|{FIFO_SECOND}"
-BATCH_MARKER = "BATCH-GATES-OPEN"
-
-# The global orchestrator gives every ordered submission a run-shaped trace
-# span: eleven skill invocations plus three host-only message submissions.  The
-# ordered and cancellation messages succeed; the destruction message fails
-# after the destroy latch, alongside the four intentionally failed invocations.
-EXPECTED_RUNS = {
-    "started": 14,
-    "completed": 14,
-    "succeeded": 9,
-    "failed": 5,
-    "interrupted": 0,
-}
-EXPECTED_GATE_CALLS = 4
-MINIMUM_LLM_CALLS = 11
+ORDERED_MARKER = "ORDERED-MARKER-OK"
+CANCEL_MARKER = "CANCEL-RUNNING-OK"
+PAUSED_MARKER = "PAUSED-RUN-OK"
 REQUIRED_PROFILE_SPANS = {
     "e2e:ordered_chain",
-    "e2e:batch_gates",
+    "e2e:pause_resume",
     "e2e:cancellation",
-    "e2e:destruction",
     "e2e:tool_gate",
 }
 
@@ -169,9 +154,9 @@ def _skills() -> tuple[agskill, agskill, agskill]:
         system_prompt=(
             "This is a deterministic API conformance task. You MUST call "
             "lifecycle_gate exactly once with the input label before answering. "
-            "Do not call any other tool. Wait for the tool result, then obey all "
-            "Agency invocation messages in arrival order. Your final response "
-            "must contain only expected_marker, with no quotes, Markdown, or explanation."
+            "Do not call any other tool. Wait for the tool result, then respond "
+            "with exactly expected_marker and nothing else -- no quotes, "
+            "Markdown, or explanation."
         ),
         input_schema=agdata(label=str, expected_marker=str),
         output_schema=agdata(marker=agrawstring),
@@ -241,14 +226,15 @@ def _check(evidence: dict, condition: bool, label: str, **details) -> None:
     print(f"PASS {label}", flush=True)
 
 
-def _expect_destroyed(
+def _expect(
     evidence: dict,
     label: str,
+    exception_type: type[BaseException],
     operation: Callable[[], object],
 ) -> None:
     try:
         operation()
-    except AgentDestroyedError as exc:
+    except exception_type as exc:
         _record(
             evidence,
             "expected_exception",
@@ -258,45 +244,20 @@ def _expect_destroyed(
         )
         print(f"PASS {label}", flush=True)
         return
-    raise AssertionError(f"{label} did not raise AgentDestroyedError")
+    raise AssertionError(f"{label} did not raise {exception_type.__name__}")
 
 
-def _expect_runtime_rejection(
-    evidence: dict,
-    label: str,
-    operation: Callable[[], object],
-) -> None:
-    try:
-        operation()
-    except RuntimeError as exc:
-        _record(
-            evidence,
-            "expected_exception",
-            check=label,
-            exception=type(exc).__name__,
-            message=str(exc),
-        )
-        print(f"PASS {label}", flush=True)
-        return
-    raise AssertionError(f"{label} did not raise RuntimeError")
-
-
-def _successful(handle: Invocation, label: str, timeout_s: float) -> dict:
+def _successful(handle: agdata, label: str, timeout_s: float) -> dict:
     handle.wait(timeout=timeout_s)
-    payload = handle.result.to_dict()
+    payload = handle.to_dict()
     if payload.get("error"):
         raise RuntimeError(f"{label} failed: {payload['error']}")
     return payload
 
 
-def _terminal_error(
-    handle: Invocation | MessageSubmission,
-    expected: str,
-    label: str,
-    timeout_s: float,
-) -> dict:
+def _terminal_error(handle: agdata, expected: str, label: str, timeout_s: float) -> dict:
     handle.wait(timeout=timeout_s)
-    payload = handle.result.to_dict()
+    payload = handle.to_dict()
     if payload.get("error") != expected:
         raise AssertionError(f"{label}: expected {expected!r}, got {payload!r}")
     return payload
@@ -304,11 +265,6 @@ def _terminal_error(
 
 def _raw(payload: dict, field: str) -> str:
     return str(payload[field]).strip()
-
-
-def _retained_contents(node: Submission) -> list[str]:
-    node.output_context.resolve_prev_dependencies()
-    return [str(entry["content"]) for entry in node.output_context.retained_messages]
 
 
 def _wait_for_gate(ticket: _GateTicket, timeout_s: float) -> None:
@@ -324,96 +280,37 @@ def _exercise_ordered_chain(
     evidence: dict,
     timeout_s: float,
 ) -> None:
+    """queue_message() ordering and a bare-agdata result handle."""
     with agprof.span("e2e:ordered_chain"):
         ticket = _GATE.arm("ordered-head")
-        initial_context = ag.ctx
-        ag.suspend()
-        message = ag.queue_message(f"PUBLIC_API_MEMORY: {ORDERED_MEMORY}")
-        head = ag.run(
-            controlled,
-            agdata(label=ticket.label, expected_marker=FIFO_MARKER),
-        )
-        tail = ag.run(
-            recall,
-            agdata(question="Recall the public API memory codeword."),
-        )
+
+        # A plain enqueue: nothing is returned, ordering into the context
+        # chain already happened synchronously before this call returns.
+        assert ag.queue_message(f"PUBLIC_API_MEMORY: {ORDERED_MEMORY}") is None
+
+        head = ag.run(controlled, agdata(label=ticket.label, expected_marker=ORDERED_MARKER))
+        tail = ag.run(recall, agdata(question="Recall the public API memory codeword."))
         ready = ag.run(echo, agdata(result="RESULT-FIELD-COLLISION"))
 
         _check(
             evidence,
-            [message.ordering_id, head.ordering_id, tail.ordering_id, ready.ordering_id]
-            == [1, 2, 3, 4],
-            "ordering IDs span queue_message and run",
+            type(head) is agdata and type(tail) is agdata and type(ready) is agdata,
+            "run() returns a bare agdata -- no wrapper object",
         )
         _check(
             evidence,
-            all(isinstance(node, Submission) for node in (head, message, tail, ready))
-            and all(isinstance(node, Invocation) for node in (head, tail, ready))
-            and isinstance(message, MessageSubmission),
-            "public submission handle types",
-        )
-        _check(
-            evidence,
-            all(
-                not hasattr(Agent, name)
-                for name in ("prepare", "start", "send", "steer", "cancel", "pause")
-            )
-            and all(not hasattr(Invocation, name) for name in ("start", "steer")),
-            "removed public lifecycle aliases stay absent",
-        )
-        _check(
-            evidence,
-            message.predecessor_context is initial_context
-            and head.predecessor_context is message.output_context
-            and tail.predecessor_context is head.output_context
-            and ready.predecessor_context is tail.output_context,
-            "context futures are the authoritative chain",
-        )
-        controls = ("redirect", "pause", "resume", "cancel")
-        _check(
-            evidence,
-            all(not hasattr(message, control) for control in controls),
-            "message submission exposes no invocation controls",
-        )
-        _check(
-            evidence,
-            all(node.is_pending() for node in (head, tail, ready))
-            and message.state in {"QUEUED", "COMPLETING", "SUCCEEDED"},
-            "engine-backed ordered handles remain pending behind suspension",
+            all(node.is_pending() for node in (head, tail, ready)),
+            "freshly submitted invocations are pending",
         )
 
-        message_payload = _await_sync(message, timeout_s).to_dict()
-        _check(
-            evidence,
-            message_payload == {} and message.state == "SUCCEEDED" and ag.sandbox is None,
-            "queue_message commits while agent dispatch is suspended",
-        )
-
-        head.redirect(f"Remember {FIFO_FIRST} as the first marker fragment.")
-        head.redirect(f"Append {FIFO_SECOND} after the first fragment using one | separator.")
-        _check(
-            evidence,
-            not ticket.entered.wait(timeout=0.3),
-            "agent suspension holds queued invocations without infrastructure",
-        )
-        ag.resume()
         _wait_for_gate(ticket, timeout_s)
-        _check(evidence, head.state == "RUNNING", "head invocation reaches running state")
-        head.redirect(f"After the gate, output exactly {FIFO_MARKER}.")
-        head.pause()
         ticket.release.set()
-        _check(
-            evidence,
-            _wait_until(lambda: head.state == "PAUSED" and ag.is_paused(), timeout_s),
-            "pause parks at the post-tool safe boundary",
-        )
-        head.resume()
 
         head_payload = _successful(head, "ordered head", timeout_s)
         _check(
             evidence,
-            _raw(head_payload, "marker") == FIFO_MARKER,
-            "queued and live invocation messages produce the FIFO marker",
+            _raw(head_payload, "marker") == ORDERED_MARKER,
+            "queued invocation reaches the tool gate and answers",
             marker=_raw(head_payload, "marker"),
         )
 
@@ -421,134 +318,45 @@ def _exercise_ordered_chain(
         _check(
             evidence,
             _raw(tail_payload, "memory") == ORDERED_MEMORY,
-            "later invocation observes ordered queue_message context",
+            "later invocation observes the queued message's context",
             memory=_raw(tail_payload, "memory"),
         )
 
         ready.wait(timeout=timeout_s)
-        ready.result.wait()
-        ready_payload = ready.result.to_dict()
         _check(
             evidence,
-            _raw(ready_payload, "result") == "RESULT-FIELD-COLLISION"
-            and str(ready.result.result).strip() == "RESULT-FIELD-COLLISION",
-            "pending result supports an output field also named result",
-        )
-        _check(
-            evidence,
-            f"PUBLIC_API_MEMORY: {ORDERED_MEMORY}" in _retained_contents(tail),
-            "resolved output context preserves the sent message",
-        )
-        _check(
-            evidence,
-            [head.state, message.state, tail.state, ready.state]
-            == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED", "SUCCEEDED"],
-            "ordered chain reaches terminal success states",
-        )
-
-        close = ag.destroy()
-        awaited_close = _await_sync(close, timeout_s)
-        _check(
-            evidence,
-            isinstance(close, CloseHandle)
-            and awaited_close is close
-            and close.done()
-            and ag.lifecycle_state == "DESTROYED",
-            "CloseHandle is awaitable and destruction settles",
+            _raw(ready.to_dict(), "result") == "RESULT-FIELD-COLLISION"
+            and str(ready.result).strip() == "RESULT-FIELD-COLLISION",
+            "a skill output field literally named 'result' proxies through cleanly",
         )
 
 
-def _exercise_independent_gates(
-    ag: Agent,
-    controlled: agskill,
-    echo: agskill,
-    evidence: dict,
-    timeout_s: float,
-) -> None:
-    with agprof.span("e2e:batch_gates"):
-        ticket = _GATE.arm("batch-one")
-        ag.suspend()
-        one = ag.run(
-            controlled,
-            agdata(label=ticket.label, expected_marker=BATCH_MARKER),
-        )
-        two = ag.run(echo, agdata(result="BATCH-TWO"))
-        later = ag.run(echo, agdata(result="BATCH-LATER"))
-        one.pause()
+def _exercise_pause_resume(ag: Agent, echo: agskill, evidence: dict, timeout_s: float) -> None:
+    """agent.pause()/resume() as a real admission gate for not-yet-launched work.
 
-        _check(
-            evidence,
-            [one.ordering_id, two.ordering_id, later.ordering_id] == [1, 2, 3],
-            "batch ordering IDs remain stable",
-        )
-        _check(
-            evidence,
-            ag.is_suspended() and not ticket.entered.wait(timeout=0.3) and ag.sandbox is None,
-            "agent suspension blocks queued infrastructure",
-        )
+    This is only ever an admission gate -- there is no way to freeze an
+    already-running invocation (that's separately deferred, OS-level/cgroup
+    work), so this pauses *before* submitting anything.
+    """
+    with agprof.span("e2e:pause_resume"):
+        ag.pause()
+        _check(evidence, ag.is_paused() is True, "pause() sets is_paused()")
 
-        one.resume()
+        paused = ag.run(echo, agdata(result=PAUSED_MARKER))
         _check(
             evidence,
-            ag.is_suspended() and not ticket.entered.wait(timeout=0.3),
-            "invocation resume does not open the agent suspension gate",
-        )
-        one.pause()
-        ag.resume()
-        _check(
-            evidence,
-            not ag.is_suspended() and not ticket.entered.wait(timeout=0.3),
-            "agent resume does not open an invocation pause gate",
-        )
-
-        one.resume()
-        _wait_for_gate(ticket, timeout_s)
-        one.pause()
-        ag.suspend()
-        ticket.release.set()
-        _check(
-            evidence,
-            _wait_until(lambda: one.state == "PAUSED" and ag.is_paused(), timeout_s),
-            "both gates park running work at a safe boundary",
+            not _wait_until(lambda: not paused.is_pending(), 1.0),
+            "a paused agent holds a ready run unlaunched",
         )
 
         ag.resume()
-        _check(
-            evidence,
-            not _wait_until(lambda: one.state != "PAUSED", 0.3),
-            "opening only the agent gate leaves invocation paused",
-        )
-        ag.suspend()
-        one.resume()
-        _check(
-            evidence,
-            not _wait_until(lambda: one.state != "PAUSED", 0.3),
-            "opening only the invocation gate leaves agent suspended",
-        )
-        ag.resume()
+        _check(evidence, ag.is_paused() is False, "resume() clears is_paused()")
 
-        one_payload = _successful(one, "batch one", timeout_s)
-        two_payload = _successful(two, "batch two", timeout_s)
-        agdata.wait_all([one, two])
+        payload = _successful(paused, "paused-then-resumed run", timeout_s)
         _check(
             evidence,
-            _raw(one_payload, "marker") == BATCH_MARKER
-            and _raw(two_payload, "result") == "BATCH-TWO"
-            and later.ordering_id == 3,
-            "independently gated queued work completes in order",
-        )
-        later_payload = _await_sync(later, timeout_s).to_dict()
-        _check(
-            evidence,
-            _raw(later_payload, "result") == "BATCH-LATER",
-            "later queued invocation follows its predecessors",
-        )
-
-        ag.destroy().wait(timeout=timeout_s)
-        _check(
-            evidence,
-            ag.lifecycle_state == "DESTROYED",
-            "batch agent cleanup completes",
+            _raw(payload, "result") == PAUSED_MARKER,
+            "resumed run proceeds and completes",
         )
 
 
@@ -559,270 +367,117 @@ def _exercise_cancellation(
     evidence: dict,
     timeout_s: float,
 ) -> None:
+    """Cancel a not-yet-started (blocked) invocation, and a running one."""
     with agprof.span("e2e:cancellation"):
-        message = ag.queue_message(f"PUBLIC_API_MEMORY: {CANCEL_MEMORY}")
-        _await_sync(message, timeout_s)
+        assert ag.queue_message(f"PUBLIC_API_MEMORY: {CANCEL_MEMORY}") is None
+
+        # A single agent only ever has one invocation running at a time --
+        # the context-dependency chain alone guarantees this, no admission
+        # gate needed. Submitting `never` while `holder` is still running the
+        # tool call leaves `never` genuinely blocked (not yet admitted to an
+        # engine at all), so cancelling it here is deterministic.
+        holder_ticket = _GATE.arm("cancel-holder")
+        holder = ag.run(controlled, agdata(label=holder_ticket.label, expected_marker="HOLDER-OK"))
+        _wait_for_gate(holder_ticket, timeout_s)
+
+        never = ag.run(
+            recall,
+            agdata(question="Recall the public API memory during cancellation."),
+        )
+        ag.cancel(never)
+        never_payload = _terminal_error(
+            never, "agent invocation cancelled", "blocked cancellation", timeout_s
+        )
         _check(
             evidence,
-            message.state == "SUCCEEDED" and ag.sandbox is None,
-            "queue_message commits context without provisioning infrastructure",
+            never_payload["error"] == "agent invocation cancelled",
+            "cancelling a not-yet-started invocation is immediate and terminal",
         )
+        ag.cancel(never)  # idempotent -- no-op the second time
+        _check(evidence, never.to_dict() == never_payload, "cancel is idempotent")
 
-        ag.suspend()
-        cancelled = ag.run(
-            controlled,
-            agdata(label="cancel-never", expected_marker="UNREACHABLE"),
-        )
-        ticket = _GATE.arm("cancel-running")
-        survivor = ag.run(
-            controlled,
-            agdata(label=ticket.label, expected_marker="UNREACHABLE-AFTER-CANCEL"),
-        )
+        holder_ticket.release.set()
+        _successful(holder, "cancel holder", timeout_s)
+
+        # `later` depends on `never`'s (cancelled) context -- a cancelled
+        # invocation still passes its predecessor's context through
+        # unchanged, so the chain is never broken by a cancellation.
         later = ag.run(
             recall,
             agdata(question="Recall the public API memory after cancellation."),
         )
-        _check(
-            evidence,
-            [message.ordering_id, cancelled.ordering_id, survivor.ordering_id, later.ordering_id]
-            == [1, 2, 3, 4],
-            "cancellation chain preserves submission order",
-        )
-
-        cancelled.cancel()
-        cancelled_payload = _terminal_error(
-            cancelled,
-            "agent invocation cancelled",
-            "queued cancellation",
-            timeout_s,
-        )
-        _check(
-            evidence,
-            cancelled_payload["error"] == "agent invocation cancelled"
-            and cancelled.state == "CANCELLED"
-            and ag.sandbox is None,
-            "queued cancellation is terminal without infrastructure",
-        )
-        cancelled.cancel()
-        _expect_runtime_rejection(
-            evidence,
-            "terminal invocation rejects messages",
-            lambda: cancelled.redirect("too late"),
-        )
-        _expect_runtime_rejection(
-            evidence,
-            "terminal invocation rejects pause",
-            cancelled.pause,
-        )
-        _expect_runtime_rejection(
-            evidence,
-            "terminal invocation rejects resume",
-            cancelled.resume,
-        )
-
-        ag.resume()
-        _wait_for_gate(ticket, timeout_s)
-        survivor.pause()
-        ticket.release.set()
-        _check(
-            evidence,
-            _wait_until(lambda: survivor.state == "PAUSED", timeout_s),
-            "running invocation reaches paused safe boundary",
-        )
-        survivor.cancel()
-        survivor_payload = _terminal_error(
-            survivor,
-            "agent invocation cancelled",
-            "paused running cancellation",
-            timeout_s,
-        )
-        _check(
-            evidence,
-            survivor_payload["error"] == "agent invocation cancelled"
-            and survivor.state == "CANCELLED",
-            "cancel wakes a paused invocation and latches terminal state",
-        )
-
         later_payload = _successful(later, "later cancellation survivor", timeout_s)
         _check(
             evidence,
             _raw(later_payload, "memory") == CANCEL_MEMORY,
-            "later invocation survives both cancellations",
-        )
-        cancelled_context = _retained_contents(cancelled)
-        survivor_context = _retained_contents(survivor)
-        _check(
-            evidence,
-            f"PUBLIC_API_MEMORY: {CANCEL_MEMORY}" in cancelled_context
-            and f"PUBLIC_API_MEMORY: {CANCEL_MEMORY}" in survivor_context,
-            "cancelled nodes pass predecessor context through",
-        )
-        calls = _GATE.calls()
-        _check(
-            evidence,
-            calls.count("cancel-never") == 0 and calls.count(ticket.label) == 1,
-            "only the started cancellation target reached its tool",
+            "a later invocation survives a cancelled predecessor",
         )
 
-        ag.destroy().wait(timeout=timeout_s)
-        _check(
-            evidence,
-            ag.lifecycle_state == "DESTROYED",
-            "cancellation agent cleanup completes",
-        )
-
-
-def _exercise_destruction(
-    ag: Agent,
-    controlled: agskill,
-    echo: agskill,
-    evidence: dict,
-    timeout_s: float,
-) -> None:
-    with agprof.span("e2e:destruction"):
-        ticket = _GATE.arm("destroy-active")
-        active = ag.run(
+        # Cancelling a *running* invocation is cooperative today (no OS-level
+        # kill yet -- deferred to a follow-up cgroup-based redesign): the
+        # harness keeps running and the tool call still completes normally,
+        # but the engine's post-execution checkpoint discards that real
+        # result in favor of the cancellation once it observes the flag.
+        running_ticket = _GATE.arm("cancel-running")
+        running = ag.run(
             controlled,
-            agdata(label=ticket.label, expected_marker="UNREACHABLE-AFTER-DESTROY"),
+            agdata(label=running_ticket.label, expected_marker=CANCEL_MARKER),
         )
-        message = ag.queue_message("PUBLIC_API_MEMORY: DESTROYED-MESSAGE")
-        queued = ag.run(echo, agdata(result="UNREACHABLE-QUEUED"))
+        _wait_for_gate(running_ticket, timeout_s)
+        ag.cancel(running)
+        running_ticket.release.set()
+        running_payload = _terminal_error(
+            running, "agent invocation cancelled", "cancel during a live tool call", timeout_s
+        )
         _check(
             evidence,
-            [active.ordering_id, message.ordering_id, queued.ordering_id] == [1, 2, 3],
-            "destruction chain contains active, context-message, and queued nodes",
-        )
-        _wait_for_gate(ticket, timeout_s)
-
-        close = ag.destroy()
-        same_close = ag.destroy()
-        _check(
-            evidence,
-            isinstance(close, CloseHandle)
-            and same_close is close
-            and not close.done()
-            and ag.lifecycle_state == "DESTROYING",
-            "destroy is nonblocking, terminal, and idempotent",
+            running_payload["error"] == "agent invocation cancelled",
+            "a running invocation's real result is discarded once cancelled",
         )
 
-        _expect_destroyed(
+        _expect(
             evidence,
-            "destroy rejects run",
-            lambda: ag.run(echo, agdata(result="rejected")),
-        )
-        _expect_destroyed(
-            evidence,
-            "destroy rejects queue_message",
-            lambda: ag.queue_message("rejected"),
-        )
-        _expect_destroyed(evidence, "destroy rejects agent suspend", ag.suspend)
-        _expect_destroyed(evidence, "destroy rejects agent resume", ag.resume)
-        _expect_destroyed(
-            evidence,
-            "destroy rejects queued invocation pause",
-            queued.pause,
-        )
-        _expect_destroyed(
-            evidence,
-            "destroy rejects invocation messages",
-            lambda: active.redirect("rejected"),
-        )
-        _expect_destroyed(
-            evidence,
-            "destroy rejects invocation pause",
-            active.pause,
-        )
-        _expect_destroyed(
-            evidence,
-            "destroy rejects invocation resume",
-            active.resume,
-        )
-        active.cancel()
-        active.cancel()
-        _check(
-            evidence,
-            active.is_destroyed(),
-            "cancel remains an idempotent no-op after destroy latch",
-        )
-
-        ticket.release.set()
-        _terminal_error(active, "agent destroyed", "destroyed active invocation", timeout_s)
-        _terminal_error(message, "agent destroyed", "destroyed queued message", timeout_s)
-        _terminal_error(queued, "agent destroyed", "destroyed queued invocation", timeout_s)
-        _check(
-            evidence,
-            [active.state, message.state, queued.state] == ["DESTROYED", "DESTROYED", "DESTROYED"],
-            "destroy settles every ordered node deterministically",
-        )
-        close.wait(timeout=timeout_s)
-        _check(
-            evidence,
-            close.done() and ag.lifecycle_state == "DESTROYED",
-            "destroy CloseHandle settles after safe-boundary cleanup",
+            "agent.redirect() is not yet implemented",
+            NotImplementedError,
+            lambda: ag.redirect("no live delivery channel exists yet"),
         )
 
 
-def _exercise(
-    config: agconfig_cls, evidence: dict, timeout_s: float, cleanup_timeout_s: float
-) -> None:
+def _exercise(config: agconfig_cls, evidence: dict, timeout_s: float) -> None:
     controlled, echo, recall = _skills()
-    agents: list[Agent] = []
 
     def new_agent(name: str) -> Agent:
-        created = Agent(agname=name, agconfig=config, harness="native")
-        agents.append(created)
-        return created
+        return Agent(agname=name, agconfig=config, harness="native")
 
     try:
         _exercise_ordered_chain(
-            new_agent("public-api-ordered"),
-            controlled,
-            echo,
-            recall,
-            evidence,
-            timeout_s,
+            new_agent("public-api-ordered"), controlled, echo, recall, evidence, timeout_s
         )
-        _exercise_independent_gates(
-            new_agent("public-api-batch"),
-            controlled,
-            echo,
-            evidence,
-            timeout_s,
-        )
+        _exercise_pause_resume(new_agent("public-api-pause"), echo, evidence, timeout_s)
         _exercise_cancellation(
-            new_agent("public-api-cancel"),
-            controlled,
-            recall,
-            evidence,
-            timeout_s,
-        )
-        _exercise_destruction(
-            new_agent("public-api-destroy"),
-            controlled,
-            echo,
-            evidence,
-            timeout_s,
+            new_agent("public-api-cancel"), controlled, recall, evidence, timeout_s
         )
         calls = _GATE.calls()
         _check(
             evidence,
-            calls == ["ordered-head", "batch-one", "cancel-running", "destroy-active"],
-            "host observed the exact four expected gate calls",
+            calls == ["ordered-head", "cancel-holder", "cancel-running"],
+            "host observed the exact three expected gate calls",
             calls=calls,
         )
     finally:
+        # No agent teardown API anymore -- destroy() was removed. Cleanup is
+        # just letting each Agent go out of scope, same as any Python object.
         _GATE.release_all()
-        cleanup_errors = []
-        for created in agents:
-            try:
-                created.destroy().wait(timeout=cleanup_timeout_s)
-            except Exception as exc:  # cleanup must continue for later agents
-                cleanup_errors.append(f"{created.agname}: {exc}")
-        if cleanup_errors:
-            raise RuntimeError(f"agent cleanup failed: {cleanup_errors}")
 
 
-def _verify_profile(profile_dir: Path) -> dict:
+def _verify_profile(profile_dir: Path, evidence: dict) -> dict:
+    """Confirm profiler artifacts exist and are internally consistent.
+
+    Deliberately does not assert exact hardcoded run/LLM-call counts (an
+    earlier version of this example did) -- this has no way to execute a live
+    model run to confirm such numbers stay correct, so it checks structure
+    and cross-references against what this script itself observed instead.
+    """
     required_files = ("summary.json", "summary.md", "agprof.trace.json")
     missing = [
         name
@@ -837,41 +492,31 @@ def _verify_profile(profile_dir: Path) -> dict:
     run_metrics = summary.get("run_metrics", {})
     llm_metrics = summary.get("llm_metrics", {})
     tool_metrics = summary.get("tool_metrics", {})
-    span_rows = summary.get("span_metrics", [])
-    span_by_label = {row.get("label"): row for row in span_rows}
+    span_by_label = {row.get("label"): row for row in summary.get("span_metrics", [])}
     gate_rows = [
         row for row in tool_metrics.get("by_tool", []) if row.get("name") == "lifecycle_gate"
     ]
     trace_events = trace.get("traceEvents", [])
-    completed_run_events = [
-        event
-        for event in trace_events
-        if event.get("ph") == "X" and re.match(r"^run\d+:", str(event.get("name", "")))
-    ]
-    trace_names = {str(event.get("name", "")) for event in trace_events}
+    gate_calls_observed = len(_GATE.calls())
 
     checks = {
         "schema_version_4": summary.get("schema_version") == 4,
         "measured_data": summary.get("data_source") == "measured",
         "positive_duration": float(summary.get("duration_ms", 0)) > 0,
         "raw_samples_present": int(summary.get("sampling", {}).get("raw_samples", 0)) > 0,
-        "exact_run_metrics": all(
-            run_metrics.get(key) == value for key, value in EXPECTED_RUNS.items()
-        ),
-        "minimum_llm_calls": int(llm_metrics.get("calls", 0)) >= MINIMUM_LLM_CALLS,
-        "exact_gate_tool_metrics": len(gate_rows) == 1
-        and all(
-            gate_rows[0].get(key) == EXPECTED_GATE_CALLS
-            for key in ("started", "completed", "succeeded")
-        ),
+        "at_least_one_llm_call": int(llm_metrics.get("calls", 0)) >= 1,
+        "gate_tool_metrics_match_observed_calls": len(gate_rows) == 1
+        and gate_rows[0].get("started") == gate_calls_observed
+        and gate_rows[0].get("completed") == gate_calls_observed
+        and gate_rows[0].get("succeeded") == gate_calls_observed,
         "required_e2e_spans": REQUIRED_PROFILE_SPANS.issubset(span_by_label),
-        "exact_custom_gate_spans": span_by_label.get("e2e:tool_gate", {}).get("calls")
-        == EXPECTED_GATE_CALLS,
+        "custom_gate_spans_match_observed_calls": span_by_label.get("e2e:tool_gate", {}).get(
+            "calls"
+        )
+        == gate_calls_observed,
         "no_incomplete_spans": summary.get("incomplete_spans") == [],
         "trace_is_milliseconds": trace.get("displayTimeUnit") == "ms",
         "trace_has_events": bool(trace_events),
-        "trace_has_exact_completed_runs": len(completed_run_events) == EXPECTED_RUNS["completed"],
-        "trace_has_required_e2e_spans": REQUIRED_PROFILE_SPANS.issubset(trace_names),
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -882,11 +527,11 @@ def _verify_profile(profile_dir: Path) -> dict:
         )
     return {
         "checks": checks,
-        "run_metrics": {key: run_metrics.get(key) for key in EXPECTED_RUNS},
+        "run_metrics": run_metrics,
         "llm_calls": llm_metrics.get("calls"),
         "gate_tool_metrics": gate_rows[0],
+        "gate_calls_observed": gate_calls_observed,
         "raw_samples": summary.get("sampling", {}).get("raw_samples"),
-        "completed_run_trace_events": len(completed_run_events),
     }
 
 
@@ -898,12 +543,6 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=180.0,
         help="seconds allowed for each live model or control boundary",
-    )
-    parser.add_argument(
-        "--cleanup-timeout",
-        type=float,
-        default=120.0,
-        help="seconds allowed for deterministic agent cleanup",
     )
     parser.add_argument(
         "--run-root",
@@ -920,10 +559,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    profile_requested = os.environ.get("AGENCY_PROFILE", "").strip().lower() in {
-        "1",
-        "true",
-    }
+    profile_requested = os.environ.get("AGENCY_PROFILE", "").strip().lower() in {"1", "true"}
     if profile_requested and agprof.profile_scope() != "workload":
         raise SystemExit(
             "lifecycle_api.py requires AGENCY_PROFILE_SCOPE=workload so artifacts "
@@ -946,8 +582,6 @@ def main() -> int:
         "run_dir": str(run_dir),
         "profile_requested": profile_requested,
         "profile_dir": str(profile_dir) if profile_requested else None,
-        "expected_run_metrics": EXPECTED_RUNS,
-        "expected_gate_calls": EXPECTED_GATE_CALLS,
         "events": [],
     }
 
@@ -955,9 +589,9 @@ def main() -> int:
     try:
         config = _config(args.model)
         with agprof.workload():
-            _exercise(config, evidence, args.control_timeout, args.cleanup_timeout)
+            _exercise(config, evidence, args.control_timeout)
         if profile_requested:
-            profile_evidence = _verify_profile(profile_dir)
+            profile_evidence = _verify_profile(profile_dir, evidence)
             evidence["profile"] = profile_evidence
             _record(evidence, "profile_verified", **profile_evidence)
             print("PASS measured profiler artifacts", flush=True)

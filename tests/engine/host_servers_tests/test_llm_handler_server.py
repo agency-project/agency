@@ -15,12 +15,29 @@ from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 
-from agency._agent_control import AgentControl
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
 from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
+
+
+class _CancelFlag:
+    """Minimal stand-in for the ``is_cancelled`` callable ``LlmHandlerServer`` is given."""
+
+    def __init__(self) -> None:
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+
+def _new_invocation(skill_name: str = "external") -> _CancelFlag:
+    return _CancelFlag()
+
 
 # ---------------------------------------------------------------------------
 # Fakes -- duck-typed to match what serialize helpers read via getattr,
@@ -299,17 +316,6 @@ def _tool_message(call_id: str = "next") -> dict:
     }
 
 
-def _invocation_message_texts(messages: "list[dict]") -> "list[str]":
-    return [
-        block["text"]
-        for message in messages
-        if message.get("role") == "user"
-        for block in message.get("blocks", [])
-        if block.get("type") == "text"
-        and block.get("text", "").startswith("[AGENCY INVOCATION MESSAGE]\n")
-    ]
-
-
 class _RecordingBackend:
     model = "recording"
 
@@ -383,58 +389,13 @@ class _BlockingToolBackend(_RecordingBackend):
         yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
 
 
-class _BlockingFinalOnceBackend(_RecordingBackend):
-    def __init__(self) -> None:
-        super().__init__(final=True)
-        self.entered = threading.Event()
-        self.release = threading.Event()
-
-    def _block_first(self) -> None:
-        if len(self.requests) == 1:
-            self.entered.set()
-            assert self.release.wait(timeout=2.0)
-
-    def dispatch(self, request: dict) -> dict:
-        self.requests.append(("nonstream", copy.deepcopy(request)))
-        self._block_first()
-        return self._result()
-
-    def dispatch_stream(self, request: dict, *, on_client=None):
-        del on_client
-        self.requests.append(("stream", copy.deepcopy(request)))
-        self._block_first()
-        yield {"type": "content", "index": 0, "block_type": "text", "text": "draft"}
-        yield {"type": "usage", "usage": None, "stop_reason": "stop"}
-
-
-class _TextThenBlockingToolBackend(_RecordingBackend):
-    def __init__(self) -> None:
-        super().__init__()
-        self.after_text = threading.Event()
-        self.release = threading.Event()
-
-    def dispatch_stream(self, request: dict, *, on_client=None):
-        del on_client
-        self.requests.append(("stream", copy.deepcopy(request)))
-        yield {"type": "content", "index": 0, "block_type": "text", "text": "working"}
-        self.after_text.set()
-        assert self.release.wait(timeout=2.0)
-        yield {
-            "type": "content",
-            "index": 1,
-            "block_type": "tool_use",
-            "id": "next",
-            "name": "lookup",
-            "arguments": "{}",
-        }
-        yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
-
-
 def _controlled_server(backend, invocation) -> LlmHandlerServer:
     server = LlmHandlerServer(
         _cfg(model="gpt-test"),
         _FakeDataLogger(),
-        invocation=invocation,
+        is_cancelled=invocation.is_cancelled if invocation is not None else None,
+        request_id="test-request",
+        skill_name="test-skill",
         usage_tracker=LlmUsageTracker(),
     )
     server._backend = backend
@@ -852,293 +813,29 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
 # ---------------------------------------------------------------------------
 
 
-def test_invocation_messages_are_fifo_protocol_valid_and_stable_across_stream_replay():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
-    history = _completed_tool_history()
-
-    invocation.redirect("first")
-    invocation.redirect("second")
-    server.dispatch({"messages": history})
-
-    first_request = backend.requests[-1][1]
-    assert first_request["messages"][: len(history)] == history
-    assert _invocation_message_texts(first_request["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nfirst",
-        "[AGENCY INVOCATION MESSAGE]\nsecond",
-    ]
-    assert [message["role"] for message in first_request["messages"][-4:]] == [
-        "tool",
-        "tool",
-        "user",
-        "user",
-    ]
-
-    # Even an identical request must incorporate new redirects before its
-    # result can authorize another action.
-    invocation.redirect("third")
-    stream = server.start_stream({"messages": history, "stream": True})
-    assert _drain(stream)[-1]["type"] == "done"
-    stream._thread.join(timeout=2.0)
-    replay_request = backend.requests[-1][1]
-    assert _invocation_message_texts(replay_request["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nfirst",
-        "[AGENCY INVOCATION MESSAGE]\nsecond",
-        "[AGENCY INVOCATION MESSAGE]\nthird",
-    ]
-
-    expanded = history + [
-        _tool_message(),
-        {
-            "role": "tool",
-            "blocks": [
-                {
-                    "type": "tool_result",
-                    "index": 0,
-                    "tool_call_id": "next",
-                    "text": "next-result",
-                }
-            ],
-        },
-    ]
-    server.dispatch({"messages": expanded})
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nfirst",
-        "[AGENCY INVOCATION MESSAGE]\nsecond",
-        "[AGENCY INVOCATION MESSAGE]\nthird",
-    ]
-    assert invocation.phase == "boundary"
-
-
 @pytest.mark.parametrize("streaming", [False, True])
-def test_final_response_establishes_closing_fence(streaming: bool):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _RecordingBackend(final=True)
-    server = _controlled_server(backend, invocation)
-    invocation.redirect("before final")
-    request = {"messages": _completed_tool_history(), "stream": streaming}
-
-    if streaming:
-        stream = server.start_stream(request)
-        assert _drain(stream)[-1]["type"] == "done"
-        stream._thread.join(timeout=2.0)
-    else:
-        assert server.dispatch(request)["message"]["blocks"][0]["text"] == "done"
-
-    assert invocation.phase == "closing"
-    with pytest.raises(RuntimeError, match="phase is closing"):
-        invocation.redirect("too late")
-
-
-def test_failed_attempt_reuses_pre_boundary_message_on_identical_retry():
-    class _FailOnceBackend(_RecordingBackend):
-        def __init__(self) -> None:
-            super().__init__(final=True)
-            self.failed = False
-
-        def dispatch(self, request: dict) -> dict:
-            self.requests.append(("nonstream", copy.deepcopy(request)))
-            if not self.failed:
-                self.failed = True
-                raise RuntimeError("provider disconnected")
-            return self._result()
-
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _FailOnceBackend()
-    server = _controlled_server(backend, invocation)
-    invocation.redirect("assigned before attempt")
-    request = {"messages": _completed_tool_history()}
-
-    with pytest.raises(RuntimeError, match="provider disconnected"):
-        server.dispatch(request)
-
-    assert invocation.phase == "model"
-    invocation.redirect("deliver after retry")
-
-    server.dispatch(request)
-    assert [_invocation_message_texts(item[1]["messages"]) for item in backend.requests] == [
-        ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
-        ["[AGENCY INVOCATION MESSAGE]\nassigned before attempt"],
-        [
-            "[AGENCY INVOCATION MESSAGE]\nassigned before attempt",
-            "[AGENCY INVOCATION MESSAGE]\ndeliver after retry",
-        ],
-    ]
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_message_during_model_replaces_final_draft_at_next_safe_boundary(streaming: bool):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _BlockingFinalOnceBackend()
-    server = _controlled_server(backend, invocation)
-    request = {"messages": _completed_tool_history(), "stream": streaming}
-
-    if streaming:
-        stream = server.start_stream(request)
-    else:
-        outcome = {}
-
-        def dispatch() -> None:
-            outcome["result"] = server.dispatch(request)
-
-        worker = threading.Thread(target=dispatch, daemon=True)
-        worker.start()
-
-    assert backend.entered.wait(timeout=2.0)
-    assert invocation.phase == "model"
-    invocation.redirect("incorporate this before answering")
-    backend.release.set()
-
-    if streaming:
-        terminal = _drain(stream)[-1]
-        stream._thread.join(timeout=2.0)
-        assert terminal["type"] == "done"
-        assert terminal["message"]["blocks"][0]["text"] == "done"
-    else:
-        worker.join(timeout=2.0)
-        assert not worker.is_alive()
-        assert outcome["result"]["message"]["blocks"][0]["text"] == "done"
-
-    assert len(backend.requests) == 2
-    assert _invocation_message_texts(backend.requests[0][1]["messages"]) == []
-    assert _invocation_message_texts(backend.requests[1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nincorporate this before answering"
-    ]
-    assert _invocation_message_texts(server.get_main_transcript()) == [
-        "[AGENCY INVOCATION MESSAGE]\nincorporate this before answering"
-    ]
-    assert invocation.phase == "closing"
-
-
-def test_incomplete_tool_batch_does_not_drain_or_inject_messages():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+def test_pre_model_stop_returns_conflict_without_calling_provider(streaming: bool):
+    invocation = _new_invocation()
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
-    complete = _completed_tool_history()
-    invocation.redirect("wait for every result")
-
-    server.dispatch({"messages": complete[:-1]})
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == []
-
-    server.dispatch({"messages": complete})
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nwait for every result"
-    ]
-
-
-def test_internal_compaction_bypasses_controls_and_strips_marker():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
-    invocation.redirect("for the next user-visible generation")
-    history = _completed_tool_history()
-
-    server.dispatch({"messages": history, "agency_internal_kind": "compaction"})
-    compaction_request = backend.requests[-1][1]
-    assert "agency_internal_kind" not in compaction_request
-    assert _invocation_message_texts(compaction_request["messages"]) == []
-    assert invocation.phase == "starting"
-
-    server.dispatch({"messages": history})
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nfor the next user-visible generation"
-    ]
-
-
-@pytest.mark.parametrize(
-    ("destroyed", "streaming", "expected"),
-    [
-        (False, False, "agent invocation cancelled"),
-        (False, True, "agent invocation cancelled"),
-        (True, False, "agent destroyed"),
-        (True, True, "agent destroyed"),
-    ],
-)
-def test_pre_model_stop_returns_conflict_without_calling_provider(
-    destroyed: bool, streaming: bool, expected: str
-):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
-    if destroyed:
-        control.destroy()
-    else:
-        invocation.cancel()
+    invocation.cancel()
 
     response = TestClient(server.build_app()).post(
         "/dispatch", json={"messages": _completed_tool_history(), "stream": streaming}
     )
 
     assert response.status_code == 409
-    assert response.json() == {"error": {"message": expected, "transient": False}}
+    assert response.json() == {
+        "error": {"message": "agent invocation cancelled", "transient": False}
+    }
     assert backend.requests == []
     assert server._data_logger.events == []
     assert server._data_logger.finalized == []
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_pause_during_model_parks_post_model_boundary_before_tool_delivery(streaming: bool):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _BlockingToolBackend()
-    server = _controlled_server(backend, invocation)
-    request = {"messages": _completed_tool_history(), "stream": streaming}
-    finished = threading.Event()
-    outcome = {}
-
-    if streaming:
-        stream = server.start_stream(request)
-    else:
-
-        def dispatch() -> None:
-            try:
-                outcome["result"] = server.dispatch(request)
-            except BaseException as exc:
-                outcome["error"] = exc
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=dispatch, daemon=True)
-        worker.start()
-
-    assert backend.entered.wait(timeout=2.0)
-    assert invocation.phase == "model"
-    invocation.pause()
-    assert control.is_paused_actual() is False
-    backend.release.set()
-
-    assert _wait_until(control.is_paused_actual)
-    if streaming:
-        assert stream._queue.empty()
-        assert stream._thread.is_alive()
-    else:
-        assert finished.is_set() is False
-
-    invocation.resume()
-    if streaming:
-        assert _drain(stream)[-1]["type"] == "done"
-        stream._thread.join(timeout=2.0)
-        assert not stream._thread.is_alive()
-    else:
-        worker.join(timeout=2.0)
-        assert not worker.is_alive()
-        assert "error" not in outcome
-        assert outcome["result"]["message"]["blocks"][0]["type"] == "tool_use"
-    assert invocation.phase == "boundary"
-
-
-@pytest.mark.parametrize("streaming", [False, True])
 def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+    invocation = _new_invocation()
     backend = _BlockingToolBackend()
     server = _controlled_server(backend, invocation)
     request = {"messages": _completed_tool_history(), "stream": streaming}
@@ -1158,7 +855,6 @@ def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool
         worker.start()
 
     assert backend.entered.wait(timeout=2.0)
-    assert invocation.phase == "model"
     invocation.cancel()
     backend.release.set()
 
@@ -1219,8 +915,7 @@ def test_unclassified_first_stream_read_error_always_wakes_consumer():
 
 
 def test_controlled_paths_preserve_logger_call_labels_and_finalization():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+    invocation = _new_invocation()
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
     handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
@@ -1239,8 +934,7 @@ def test_malformed_nonstream_result_finalizes_the_logger_call_label():
             self.requests.append(("nonstream", copy.deepcopy(request)))
             return {"usage": None, "message": {"role": "assistant", "blocks": []}}
 
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+    invocation = _new_invocation()
     server = _controlled_server(MalformedBackend(), invocation)
 
     with pytest.raises(KeyError, match="stop_reason"):
@@ -1308,8 +1002,7 @@ def test_stream_spawn_failure_finalizes_the_logger_call_label(monkeypatch):
 
 
 def test_stream_spawn_failure_observes_control_cancel(monkeypatch):
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+    invocation = _new_invocation()
     server = _controlled_server(_RecordingBackend(), invocation)
 
     def cancel_then_fail(*_args, **_kwargs):
@@ -1421,7 +1114,7 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
     server._backend = _FailingBackend()
     handle = _RejectErrorHandle(mod.queue.Queue(), threading.Event(), "rejected-error")
 
-    server._run_stream_producer({"messages": []}, None, False, handle)
+    server._run_stream_producer({"messages": []}, handle)
 
     assert server._data_logger.finalized == [
         ("rejected-error", "llm_stream_cancelled", [{"cancelled": True}])
@@ -1429,8 +1122,7 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
 
 
 def test_stream_logger_records_every_provider_item_in_order_before_finalize():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
+    invocation = _new_invocation()
     backend = _RecordingBackend()
     server = _controlled_server(backend, invocation)
     handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
@@ -1625,31 +1317,6 @@ def test_streaming_response_disconnect_unblocks_full_queue_and_joins_producer():
     assert not producer.is_alive()
     assert handle._cancel_event.is_set()
     assert handle.get_transcript()[0]["response"] is None
-
-
-def test_streaming_response_disconnect_interrupts_paused_post_model_checkpoint():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _TextThenBlockingToolBackend()
-    server = _controlled_server(backend, invocation)
-    handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
-    first = handle.first()
-
-    assert first == {"type": "delta", "content": "working"}
-    assert backend.after_text.wait(timeout=2.0)
-    invocation.pause()
-    backend.release.set()
-    assert _wait_until(control.is_paused_actual)
-    assert handle._thread.is_alive()
-
-    response = StreamingResponse(handle.relay(first), media_type="application/x-ndjson")
-    asyncio.run(_disconnect_after_first_response_body(response))
-
-    assert not handle._thread.is_alive()
-    assert control.is_pause_requested()
-    assert server._data_logger.finalized == [
-        (handle.call_label, "llm_stream_cancelled", [{"cancelled": True}])
-    ]
 
 
 def test_stop_cancels_and_joins_all_handles():
@@ -1880,34 +1547,6 @@ def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypat
     assert response.json() == {"error": {"message": "nope", "transient": False}}
 
 
-def test_stream_http_disconnect_while_paused_before_model_leaves_no_logger_call():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
-    invocation.pause()
-
-    async def scenario() -> None:
-        disconnect = asyncio.Event()
-        request = asyncio.create_task(
-            _post_app_until_disconnect(
-                server.build_app(),
-                {"messages": _completed_tool_history(), "stream": True},
-                disconnect,
-            )
-        )
-        assert await asyncio.to_thread(_wait_until, control.is_paused_actual)
-        disconnect.set()
-        await asyncio.wait_for(request, timeout=2.0)
-
-    asyncio.run(scenario())
-
-    assert backend.requests == []
-    assert server._data_logger.events == []
-    assert server._data_logger.finalized == []
-    assert control.is_pause_requested()
-
-
 def test_stream_http_disconnect_before_first_item_joins_producer():
     backend = _BlockingToolBackend()
     server = _controlled_server(backend, invocation=None)
@@ -1942,37 +1581,6 @@ def test_stream_http_disconnect_before_first_item_joins_producer():
     )
 
 
-def test_nonstream_http_disconnect_interrupts_paused_post_model_checkpoint():
-    control = AgentControl()
-    invocation = control.begin_invocation("external")
-    backend = _BlockingToolBackend()
-    server = _controlled_server(backend, invocation)
-
-    async def scenario() -> None:
-        disconnect = asyncio.Event()
-        request = asyncio.create_task(
-            _post_app_until_disconnect(
-                server.build_app(),
-                {"messages": _completed_tool_history()},
-                disconnect,
-            )
-        )
-        assert await asyncio.to_thread(backend.entered.wait, 2.0)
-        invocation.pause()
-        backend.release.set()
-        assert await asyncio.to_thread(_wait_until, control.is_paused_actual)
-        disconnect.set()
-        await asyncio.wait_for(request, timeout=2.0)
-
-    asyncio.run(scenario())
-
-    logger = server._data_logger
-    assert logger.finalized == [
-        (logger.events[0][2], "llm_stream_cancelled", [{"cancelled": True}])
-    ]
-    assert control.is_pause_requested()
-
-
 def test_build_app_resolve_model_route():
     server, _ = _make_server(model="my-model")
     client = TestClient(server.build_app())
@@ -1988,80 +1596,3 @@ def test_build_app_context_limit_route(monkeypatch):
     response = client.get("/context_limit")
     assert response.status_code == 200
     assert response.json() == {"context_limit": 4096}
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_redirect_during_tool_generating_model_replaces_stale_result(streaming):
-    handle = AgentControl().begin_invocation("external")
-
-    class Backend(_RecordingBackend):
-        def _result(self):
-            if len(self.requests) == 1:
-                handle.redirect("reconsider the tool")
-            return super()._result()
-
-        def dispatch_stream(self, request, *, on_client=None):
-            yield from super().dispatch_stream(request, on_client=on_client)
-            handle.redirect("reconsider the tool")
-
-    backend = Backend()
-    server = _controlled_server(backend, handle)
-    request = {"messages": _completed_tool_history(), "stream": streaming}
-    if streaming:
-        stream = server.start_stream(request)
-        assert _drain(stream)[-1]["type"] == "done"
-        stream._thread.join(timeout=2)
-    else:
-        server.dispatch(request)
-    assert len(backend.requests) == 2
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nreconsider the tool"
-    ]
-    assert not handle._pending_messages
-
-
-def test_failed_follow_up_retains_redirect_across_server_replacement():
-    handle = AgentControl().begin_invocation("external")
-
-    class Backend(_RecordingBackend):
-        def dispatch(self, request):
-            self.requests.append(("nonstream", copy.deepcopy(request)))
-            if len(self.requests) == 1:
-                handle.redirect("retain first")
-                return self._result()
-            handle.redirect("retain second")
-            raise RuntimeError("follow-up failed")
-
-    server = _controlled_server(Backend(), handle)
-    request = {"messages": _completed_tool_history()}
-    with pytest.raises(RuntimeError, match="follow-up failed"):
-        server.dispatch(request)
-    assert [entry.content for entry in handle._pending_messages] == [
-        "retain first",
-        "retain second",
-    ]
-    backend = _RecordingBackend(final=True)
-    replacement = _controlled_server(backend, handle)
-    replacement.dispatch(request)
-    assert _invocation_message_texts(backend.requests[-1][1]["messages"]) == [
-        "[AGENCY INVOCATION MESSAGE]\nretain first",
-        "[AGENCY INVOCATION MESSAGE]\nretain second",
-    ]
-    assert not handle._pending_messages
-    assert handle.phase == "closing"
-
-
-def test_native_host_model_result_leaves_acknowledgement_and_final_fence_to_loop():
-    handle = AgentControl().begin_invocation("native")
-    handle.redirect("native snapshot")
-    handle._checkpoint("native-generation", allow_messages=True, phase="model")
-    backend = _RecordingBackend(final=True)
-    server = _controlled_server(backend, handle)
-    server._enable_message_overlay = False
-    server.dispatch({"messages": _completed_tool_history()})
-    assert [entry.content for entry in handle._pending_messages] == ["native snapshot"]
-    assert handle.phase != "closing"
-    handle._checkpoint("native-generation", allow_messages=False, phase="model-result")
-    handle._checkpoint_final_answer("native-final")
-    assert not handle._pending_messages
-    assert handle.phase == "closing"

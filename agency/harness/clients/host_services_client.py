@@ -126,66 +126,6 @@ class HostServicesClient:
         except Exception:
             return None
 
-    def checkpoint(
-        self,
-        token: str,
-        boundary_id: str,
-        *,
-        allow_messages: bool,
-        phase: str,
-    ) -> dict:
-        """Wait at an invocation-bound host safe boundary."""
-        response = self.client.post(
-            "/interaction/checkpoint",
-            json={
-                "boundary_id": boundary_id,
-                "allow_messages": allow_messages,
-                "phase": phase,
-            },
-            headers=self._attempt_headers(token),
-            # A pause intentionally outlives the ordinary LLM transport timeout.
-            timeout=None,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def checkpoint_async(
-        self,
-        token: str,
-        boundary_id: str,
-        *,
-        allow_messages: bool,
-        phase: str,
-    ) -> dict:
-        """Wait at a checkpoint on a cancellable per-request UDS client.
-
-        The native harness reaches this method through an async sandbox route.
-        Cancelling that route closes only this request's UDS connection, which
-        lets the host observe ``http.disconnect`` without disturbing concurrent
-        LLM, MCP, profiler, or policy traffic on the shared synchronous client.
-        """
-        async with self._new_checkpoint_async_client() as client:
-            response = await client.post(
-                "/interaction/checkpoint",
-                json={
-                    "boundary_id": boundary_id,
-                    "allow_messages": allow_messages,
-                    "phase": phase,
-                },
-                headers=self._attempt_headers(token),
-                timeout=None,
-            )
-            response.raise_for_status()
-            return response.json()
-
-    def _new_checkpoint_async_client(self) -> httpx.AsyncClient:
-        transport = httpx.AsyncHTTPTransport(uds=self._uds_path)
-        return httpx.AsyncClient(
-            transport=transport,
-            base_url="http://agmanager-host",
-            timeout=self._timeout_s,
-        )
-
     def log_warning(self, token: str, message: str) -> None:
         # DATACOLLECTOR: append -- the one existing production call already wired through
         # record_event(type="warning"); model other emission points after this shape.

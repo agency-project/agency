@@ -27,7 +27,7 @@ def _unlink_socket(path: Path) -> None:
     path.unlink()
 
 
-class SandboxInteractionServer:
+class HarnessInteractionServer:
     def __init__(
         self,
         uds_path: str,
@@ -97,7 +97,7 @@ class SandboxInteractionServer:
             time.sleep(0.01)
         if not server.started:
             self.stop()
-            raise RuntimeError("SandboxInteractionServer did not start within timeout")
+            raise RuntimeError("HarnessInteractionServer did not start within timeout")
         return self.uds_path
 
     def stop(self) -> None:
@@ -110,4 +110,4 @@ class SandboxInteractionServer:
         _unlink_socket(Path(self.uds_path))
 
 
-__all__ = ["SandboxInteractionServer"]
+__all__ = ["HarnessInteractionServer"]

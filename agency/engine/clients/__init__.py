@@ -1,3 +1,3 @@
-from .sandbox_interaction_client import SandboxInteractionClient
+from .harness_interaction_client import HarnessInteractionClient
 
-__all__ = ["SandboxInteractionClient"]
+__all__ = ["HarnessInteractionClient"]

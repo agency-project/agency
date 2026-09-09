@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency._agent_control import AgentControl
 from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agschema import agschema
@@ -147,6 +146,7 @@ class _FakeAgent:
         self.agname = "test-agent"
         self.change_config_calls = []
         self.data_logger = _FakeDataLogger()
+        self._destroyed = False
 
     def change_config(self, agconfig):
         self.change_config_calls.append(agconfig)
@@ -159,12 +159,15 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
     collected_iter = iter(collected_sequence) if collected_sequence is not None else None
 
     class _FakeHostServerManager:
-        def __init__(self, agent, sandbox, skill, resource_pool, *, invocation=None):
+        def __init__(
+            self, agent, sandbox, skill, resource_pool, *, is_cancelled=None, request_id=None
+        ):
             self.agent = agent
             self.sandbox = sandbox
             self.skill = skill
             self.resource_pool = resource_pool
-            self.invocation = invocation
+            self.is_cancelled = is_cancelled
+            self.request_id = request_id
             self.started = False
             self.stopped = False
             self.change_config_calls = []
@@ -240,11 +243,6 @@ def test_init_stores_agent_and_starts_with_no_host_server_manager():
     assert engine._agent is agent
     assert engine._host_server_manager is None
     assert engine._sandbox_interaction_client is None
-
-
-def test_direct_execute_noop_invocation_supports_llm_completion_hook():
-    assert mod._NOOP_INVOCATION._note_model_result(has_tool_calls=False) is None
-    assert mod._NOOP_INVOCATION._note_model_result(has_tool_calls=True) is None
 
 
 def test_host_server_manager_property_raises_before_run():
@@ -563,23 +561,14 @@ def test_execute_defers_stop_while_background_work_is_pending(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize(
-    ("control_action", "expected_error"),
-    [("cancel", "agent invocation cancelled"), ("destroy", "agent destroyed")],
-)
-def test_execute_control_wins_after_harness_and_before_commit(
-    monkeypatch,
-    control_action,
-    expected_error,
-):
+def test_execute_control_wins_after_harness_and_before_commit(monkeypatch):
     agent = _FakeAgent()
     engine = AgentEngine(agent)
-    control = AgentControl()
-    invocation = control.begin_invocation("controlled")
+    cancelled = {"flag": False}
 
     def execute_harness(*_args, **_kwargs):
         agent.sandbox.events.append("execute")
-        invocation.cancel() if control_action == "cancel" else control.destroy()
+        cancelled["flag"] = True
         return agdata(done=True)
 
     monkeypatch.setattr(engine, "_execute_harness", execute_harness)
@@ -590,20 +579,16 @@ def test_execute_control_wins_after_harness_and_before_commit(
         SimpleNamespace(),
         SimpleNamespace(),
         agent.sandbox,
-        invocation=invocation,
+        is_cancelled=lambda: cancelled["flag"],
     )
 
-    assert result.error == expected_error
-    assert invocation._completion_claimed is False
+    assert result.error == "agent invocation cancelled"
     assert agent.sandbox.events == ["acquire", "execute", "discard", "release"]
 
 
-def test_execute_observes_destroy_before_harness_without_starting_it(monkeypatch):
+def test_execute_observes_cancel_before_harness_without_starting_it(monkeypatch):
     agent = _FakeAgent()
     engine = AgentEngine(agent)
-    control = AgentControl()
-    invocation = control.begin_invocation("controlled")
-    control.destroy()
     execute_harness = MagicMock()
     monkeypatch.setattr(engine, "_execute_harness", execute_harness)
 
@@ -613,46 +598,12 @@ def test_execute_observes_destroy_before_harness_without_starting_it(monkeypatch
         SimpleNamespace(),
         SimpleNamespace(),
         agent.sandbox,
-        invocation=invocation,
+        is_cancelled=lambda: True,
     )
 
-    assert result.error == "agent destroyed"
+    assert result.error == "agent invocation cancelled"
     execute_harness.assert_not_called()
     assert agent.sandbox.events == ["acquire", "discard", "release"]
-
-
-def test_execute_claims_completion_before_commit_and_fences_late_cancel(monkeypatch):
-    agent = _FakeAgent()
-    engine = AgentEngine(agent)
-    control = AgentControl()
-    invocation = control.begin_invocation("controlled")
-    execution = agdata(done=True)
-    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: execution)
-
-    def during_commit():
-        assert invocation._completion_claimed is True
-        invocation.cancel()
-
-    agent.sandbox.commit_callback = during_commit
-
-    result = engine.execute(
-        SimpleNamespace(),
-        SimpleNamespace(),
-        SimpleNamespace(),
-        SimpleNamespace(),
-        agent.sandbox,
-        invocation=invocation,
-    )
-
-    assert result is execution
-    assert invocation.is_cancelled() is False
-    assert agent.sandbox.events == [
-        "acquire",
-        "commit",
-        "check_background_work",
-        "stop",
-        "release",
-    ]
 
 
 def test_close_always_stops_manager_and_is_idempotent_when_client_close_fails():
@@ -737,7 +688,7 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
-    invocation = AgentControl().begin_invocation("controlled")
+    is_cancelled = lambda: False  # noqa: E731
 
     result = engine.execute(
         agcontext(),
@@ -745,7 +696,8 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
         SimpleNamespace(),
         SimpleNamespace(),
         engine._agent.sandbox,
-        invocation=invocation,
+        is_cancelled=is_cancelled,
+        request_id="run0",
     )
 
     manager = holder["manager"]
@@ -753,7 +705,8 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert holder["requests"][0].harness == "claude_code"
     assert manager.sandbox is engine._agent.sandbox
     assert holder["daemon_sandbox"] is engine._agent.sandbox
-    assert manager.invocation is invocation
+    assert manager.is_cancelled is is_cancelled
+    assert manager.request_id == "run0"
     assert manager.started is True
     assert manager.stopped is True
     assert holder["attempt_client_timeout_s"] is None
@@ -995,8 +948,7 @@ def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monk
         harness_sessions={"claude_code": {"session_id": "session-1", "blob_b64": "b2xk"}},
         retained_messages=[{"sequence": 2, "type": "message", "role": "user", "content": "retain"}],
     )
-    control = AgentControl()
-    invocation = control.begin_invocation("controlled")
+    cancelled = {"flag": False}
     engine = AgentEngine(agent)
     monkeypatch.setattr(
         engine,
@@ -1005,7 +957,7 @@ def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monk
     )
 
     def cancel_with_result(*_args):
-        invocation.cancel()
+        cancelled["flag"] = True
         return agdata(done=True)
 
     monkeypatch.setattr(engine, "_build_execution_result", cancel_with_result)
@@ -1017,7 +969,7 @@ def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monk
         SimpleNamespace(),
         SimpleNamespace(),
         agent.sandbox,
-        invocation=invocation,
+        is_cancelled=lambda: cancelled["flag"],
     )
 
     assert result.error == "agent invocation cancelled"

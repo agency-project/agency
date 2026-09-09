@@ -91,11 +91,11 @@ def _dispatch_command(cmd: dict) -> None:
     if ctype in ("pause", "resume"):
         for a in _agent_cls.all():
             if a.agname == agname:
-                (a.suspend if ctype == "pause" else a.resume)()
+                (a.pause if ctype == "pause" else a.resume)()
                 break
     elif ctype in ("pause_all", "resume_all"):
         for a in _agent_cls.all():
-            (a.suspend if ctype == "pause_all" else a.resume)()
+            (a.pause if ctype == "pause_all" else a.resume)()
     elif ctype == "update_config":
         # Merge into the agent's existing agconfig. The webui editor only
         # ships a safe_snapshot() (LLM knobs etc.) -- replacing the whole
@@ -319,7 +319,7 @@ class agwebui:
 
         # Background thread applying pause/resume (and future) commands the
         # webui server process writes to run_dir/ui_commands -- the server
-        # process itself has no agency imports and can't call agent.suspend()
+        # process itself has no agency imports and can't call agent.pause()
         # directly, so this is the execution-process side of that relay.
         command_stop = threading.Event()
         threading.Thread(

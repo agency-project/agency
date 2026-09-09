@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import itertools
 import json
 import queue
@@ -12,8 +11,7 @@ import time
 import uuid
 from concurrent.futures import Future
 from contextlib import suppress
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -35,16 +33,7 @@ TRANSIENT_DISPATCH_EXCS = (
 _STREAM_QUEUE_MAXSIZE = 256
 _STREAM_JOIN_TIMEOUT_S = 5.0
 _INTERNAL_COMPACTION_KIND = "compaction"
-
-# These values are part of InvocationHandle's deliberately small control
-# vocabulary.  Keep this server independent of the harness wire protocol: the
-# LLM safe boundaries are host-side coordination, not sandbox RPC messages.
-_CONTROL_PHASE_PRE_GENERATION = "model"
-_CONTROL_PHASE_POST_GENERATION = "boundary"
-_CONTROL_PHASE_CLOSING = "closing"
 _INVOCATION_CANCELLED_MESSAGE = "agent invocation cancelled"
-_AGENT_DESTROYED_MESSAGE = "agent destroyed"
-_INVOCATION_MESSAGE_PREFIX = "[AGENCY INVOCATION MESSAGE]\n"
 
 
 def _annotate(span, **metadata) -> None:
@@ -86,72 +75,6 @@ def _extract_metadata_usage(metadata_block: dict) -> "tuple[dict, object]":
     return usage or {}, stop_reason
 
 
-def _stable_digest(value) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _request_fingerprint(request: dict) -> str:
-    """Return a stable identity for a semantic generation, including retries."""
-    semantic_request = {
-        key: value
-        for key, value in request.items()
-        if key not in {"stream", "agency_internal_kind"}
-    }
-    return _stable_digest(semantic_request)
-
-
-def _history_anchor(messages: "list[dict]") -> str:
-    return "root" if not messages else _stable_digest(messages)
-
-
-def _history_allows_user_turn(messages: "list[dict]") -> bool:
-    """Return whether appending an invocation message preserves tool pairing."""
-    outstanding: "dict[str, int]" = {}
-    for message in messages:
-        for block in message.get("blocks", []):
-            if block.get("type") == "tool_use":
-                tool_id = str(block.get("id", ""))
-                outstanding[tool_id] = outstanding.get(tool_id, 0) + 1
-            elif block.get("type") == "tool_result":
-                tool_id = str(block.get("tool_call_id", ""))
-                remaining = outstanding.get(tool_id, 0)
-                if remaining == 0:
-                    return False
-                if remaining <= 1:
-                    outstanding.pop(tool_id, None)
-                else:
-                    outstanding[tool_id] = remaining - 1
-    return not outstanding
-
-
-def _history_without_invocation_messages(messages: "list[dict]") -> "list[dict]":
-    """Recover the harness-owned history from a request with host overlays."""
-    return [
-        message
-        for message in messages
-        if not (
-            message.get("role") == "user"
-            and len(message.get("blocks", [])) == 1
-            and message["blocks"][0].get("type") == "text"
-            and message["blocks"][0].get("text", "").startswith(_INVOCATION_MESSAGE_PREFIX)
-        )
-    ]
-
-
-@dataclass(frozen=True)
-class _MessageOverlay:
-    sequence: int
-    content: str
-    anchor: str
-
-
-@dataclass(frozen=True)
-class _ModelCompletion:
-    completed: bool
-    invocation_messages: tuple = ()
-
-
 class _DispatchError(Exception):
     """Raised by the non-streaming path; carries what build_app()'s route
     needs to translate this into an HTTP response."""
@@ -172,8 +95,6 @@ class _StreamHandle:
         q: "queue.Queue[dict]",
         cancel_event: threading.Event,
         call_label: "str | None" = None,
-        *,
-        interrupt_checkpoint=None,
     ) -> None:
         self._queue = q
         self._queue_condition = threading.Condition()
@@ -183,7 +104,6 @@ class _StreamHandle:
         self._stream_ref_lock = threading.Lock()
         self._stream_ref = None
         self._stream_closed = False
-        self._interrupt_checkpoint = interrupt_checkpoint
         # This connection's own exchange -- kept on the handle rather than a
         # shared instance-wide list so one connection's in-progress writes
         # can never race another connection's. See
@@ -286,11 +206,7 @@ class _StreamHandle:
             # can be admitted.
             self._cancel_event.set()
             self._queue_condition.notify_all()
-        try:
-            if self._interrupt_checkpoint is not None:
-                self._interrupt_checkpoint(self._cancel_event)
-        finally:
-            self._close_stream()
+        self._close_stream()
 
     def cancel_and_join(self, timeout: "float | None" = None) -> bool:
         cancel_error: "BaseException | None" = None
@@ -330,8 +246,9 @@ class LlmHandlerServer:
         usage_tracker: "LlmUsageTracker",
         *,
         parent_context=None,
-        invocation=None,
-        enable_message_overlay: bool = True,
+        is_cancelled: "Callable[[], bool] | None" = None,
+        request_id: "str | None" = None,
+        skill_name: "str | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -347,13 +264,9 @@ class LlmHandlerServer:
         # Non-streaming exchanges only
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
-        self._invocation = invocation
-        self._enable_message_overlay = enable_message_overlay
-        self._control_lock = threading.RLock()
-        self._message_overlays: "list[_MessageOverlay]" = []
-        self._message_sequences: "set[int]" = set()
-        self._model_redirects: dict[str, tuple] = {}
-        self._model_protocol_valid: dict[str, bool] = {}
+        self._is_cancelled = is_cancelled if is_cancelled is not None else (lambda: False)
+        self._request_id = request_id
+        self._skill_name = skill_name
         self.change_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
@@ -443,8 +356,8 @@ class LlmHandlerServer:
         metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
             request_messages, message, prompt_tokens, completion_tokens
         )
-        metadata_block["request_id"] = getattr(self._invocation, "_request_id", None)
-        metadata_block["skill"] = getattr(self._invocation, "skill_name", None)
+        metadata_block["request_id"] = self._request_id
+        metadata_block["skill"] = self._skill_name
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
@@ -464,10 +377,7 @@ class LlmHandlerServer:
     ) -> dict:
         from ...observability.profiler import agprof
 
-        request, boundary_id, controlled = self._prepare_request(
-            request,
-            abort_event=abort_event,
-        )
+        request = self._prepare_request(request, abort_event=abort_event)
         call_label = uuid.uuid4().hex[:12]
         self._data_logger.record_event(
             type="agent_state",
@@ -489,16 +399,7 @@ class LlmHandlerServer:
             finalized = True
 
         def complete_failure(error: BaseException) -> None:
-            try:
-                completed = self._complete_failed_model_request(
-                    boundary_id,
-                    controlled=controlled,
-                    abort_event=abort_event,
-                )
-            except BaseException as control_error:
-                finalize_error(control_error)
-                raise
-            if not completed:
+            if abort_event is not None and abort_event.is_set():
                 finalize_cancelled()
                 raise _RequestAborted from error
             finalize_error(error)
@@ -547,51 +448,30 @@ class LlmHandlerServer:
                     complete_failure(error)
                     raise
 
-                model_boundary_attempted = False
-                try:
-                    usage = result["usage"]
-                    message = result["message"]
-                    stop_reason = result["stop_reason"]
-                    blocks = message["blocks"]
-                    model_boundary_attempted = True
-                    completion = self._complete_model_request(
-                        boundary_id,
-                        message,
-                        controlled=controlled,
-                        abort_event=abort_event,
-                    )
-                    if not completion.completed:
-                        raise _RequestAborted
-                    follow_up = self._dispatch_message_follow_ups(
-                        request,
-                        boundary_id,
-                        completion,
-                        controlled=controlled,
-                        abort_event=abort_event,
-                    )
-                    if follow_up is not None:
-                        request, boundary_id, result, completion = follow_up
-                        usage = result["usage"]
-                        message = result["message"]
-                        stop_reason = result["stop_reason"]
-                        blocks = message["blocks"]
-                    _annotate(
-                        attempt_span,
-                        outcome="success",
-                        input_tokens=(usage or {}).get("prompt_tokens"),
-                        output_tokens=(usage or {}).get("completion_tokens"),
-                    )
-                    self._tag_metadata_block(request["messages"], message)
-                    self._record_exchange(request, message, usage, stop_reason)
-                except _RequestAborted:
-                    finalize_cancelled()
-                    raise
-                except BaseException as error:
-                    if model_boundary_attempted:
-                        finalize_error(error)
-                    else:
+                usage = result["usage"]
+                message = result["message"]
+                stop_reason = result["stop_reason"]
+                blocks = message["blocks"]
+                if self._is_cancelled():
+                    try:
+                        self._raise_if_stopped()
+                    except BaseException as error:
+                        with suppress(BaseException):
+                            _annotate(
+                                attempt_span,
+                                outcome="failure",
+                                error_type=type(error).__name__,
+                            )
                         complete_failure(error)
-                    raise
+                        raise
+                _annotate(
+                    attempt_span,
+                    outcome="success",
+                    input_tokens=(usage or {}).get("prompt_tokens"),
+                    output_tokens=(usage or {}).get("completion_tokens"),
+                )
+                self._tag_metadata_block(request["messages"], message)
+                self._record_exchange(request, message, usage, stop_reason)
                 self._finalize_success(call_label, blocks)
                 finalized = True
                 return result
@@ -611,7 +491,6 @@ class LlmHandlerServer:
             queue.Queue(maxsize=_STREAM_QUEUE_MAXSIZE),
             abort_event if abort_event is not None else threading.Event(),
             uuid.uuid4().hex[:12],
-            interrupt_checkpoint=self._interrupt_checkpoint_wait,
         )
 
     def start_stream(
@@ -626,10 +505,7 @@ class LlmHandlerServer:
         handle = _handle if _handle is not None else self._new_stream_handle(abort_event)
         if abort_event is not None and handle._cancel_event is not abort_event:
             raise ValueError("stream handle and abort event must use the same event")
-        request, boundary_id, controlled = self._prepare_request(
-            request,
-            abort_event=handle._cancel_event,
-        )
+        request = self._prepare_request(request, abort_event=handle._cancel_event)
         call_label = handle.call_label
         self._data_logger.record_event(
             type="agent_state",
@@ -642,8 +518,6 @@ class LlmHandlerServer:
             thread = agprof.spawn_traced(
                 self._run_stream_producer,
                 request,
-                boundary_id,
-                controlled,
                 handle,
                 daemon=True,
             )
@@ -657,31 +531,24 @@ class LlmHandlerServer:
                 thread.start()
                 self._handles.append(handle)
             return handle
-        except BaseException as error:
-            terminal_error = error
-            try:
-                completed = self._complete_failed_model_request(
-                    boundary_id,
-                    controlled=controlled,
-                    abort_event=handle._cancel_event,
-                )
-            except BaseException as control_error:
-                terminal_error = control_error
-                completed = True
+        except BaseException:
+            was_cancelled = handle._cancel_event.is_set()
+            if self._is_cancelled():
+                try:
+                    self._raise_if_stopped()
+                except _DispatchError as stopped_error:
+                    error = stopped_error
             with suppress(BaseException):
                 handle.cancel()
             with self._handles_lock:
                 if handle in self._handles:
                     self._handles.remove(handle)
             handle._thread = None
-            if completed:
-                self._finalize_error(call_label, terminal_error)
-            else:
+            if was_cancelled:
                 self._finalize_cancelled(call_label)
                 raise _RequestAborted from error
-            if terminal_error is not error:
-                raise terminal_error from error
-            raise
+            self._finalize_error(call_label, error)
+            raise error
 
     def stop(self) -> None:
         with self._handles_lock:
@@ -846,10 +713,6 @@ class LlmHandlerServer:
 
                 abort_event = threading.Event()
 
-                def abort_nonstream() -> None:
-                    abort_event.set()
-                    self._interrupt_checkpoint_wait(abort_event)
-
                 worker, result = self._spawn_http_worker(
                     self.dispatch,
                     request,
@@ -859,7 +722,7 @@ class LlmHandlerServer:
                     http_request,
                     worker,
                     result,
-                    abort_nonstream,
+                    abort_event.set,
                 )
                 if disconnected:
                     raise ClientDisconnect
@@ -891,362 +754,28 @@ class LlmHandlerServer:
         request: dict,
         *,
         abort_event: "threading.Event | None" = None,
-    ) -> "tuple[dict, str | None, bool]":
+    ) -> dict:
         prepared = copy.deepcopy(request)
         internal_kind = prepared.pop("agency_internal_kind", None)
-        if self._invocation is None or internal_kind == _INTERNAL_COMPACTION_KIND:
-            if abort_event is not None and abort_event.is_set():
-                raise _RequestAborted
-            return prepared, None, False
-
-        fingerprint = _request_fingerprint(prepared)
-        boundary_id = f"llm:{fingerprint}"
-        with self._control_lock:
-            messages = prepared.get("messages") or []
-            protocol_valid = _history_allows_user_turn(messages)
-            decision = self._checkpoint_invocation(
-                f"{boundary_id}:pre",
-                allow_messages=self._enable_message_overlay and protocol_valid,
-                phase=_CONTROL_PHASE_PRE_GENERATION,
-                abort_event=abort_event,
-            )
-            if decision is None:
-                raise _RequestAborted
-            self._raise_if_stopped(decision)
-
-            if self._enable_message_overlay and protocol_valid:
-                anchor = _history_anchor(messages)
-                self._remember_message_overlays(
-                    self._decision_value(decision, "invocation_messages", ()) or (),
-                    anchor=anchor,
-                )
-                prepared["messages"] = self._inject_message_overlays(messages)
-            self._model_protocol_valid[boundary_id] = protocol_valid
-            self._model_redirects[boundary_id] = tuple(
-                self._decision_value(decision, "invocation_messages", ()) or ()
-            )
-
-        return prepared, boundary_id, True
-
-    def _inject_message_overlays(self, messages: "list[dict]") -> "list[dict]":
-        overlays = sorted(self._message_overlays, key=lambda item: item.sequence)
-        result: "list[dict]" = []
-        inserted: "set[int]" = set()
-
-        for overlay in overlays:
-            if overlay.anchor == "root":
-                result.append(self._invocation_message(overlay))
-                inserted.add(overlay.sequence)
-
-        prefix: "list[dict]" = []
-        for message in messages:
-            result.append(copy.deepcopy(message))
-            prefix.append(message)
-            anchor = _history_anchor(prefix)
-            for overlay in overlays:
-                if overlay.sequence not in inserted and overlay.anchor == anchor:
-                    result.append(self._invocation_message(overlay))
-                    inserted.add(overlay.sequence)
-
-        # If a CLI compacted away an old anchor, retain the admitted
-        # instruction at the current generation rather than silently losing it.
-        for overlay in overlays:
-            if overlay.sequence not in inserted:
-                result.append(self._invocation_message(overlay))
-        return result
-
-    @staticmethod
-    def _invocation_message(overlay: _MessageOverlay) -> dict:
-        return {
-            "role": "user",
-            "blocks": [
-                {
-                    "type": "text",
-                    "index": 0,
-                    "text": f"{_INVOCATION_MESSAGE_PREFIX}{overlay.content}",
-                }
-            ],
-        }
-
-    def _remember_message_overlays(self, entries, *, anchor: str) -> None:
-        for entry in entries:
-            sequence = int(self._decision_value(entry, "sequence", 0))
-            if sequence in self._message_sequences:
-                continue
-            self._message_sequences.add(sequence)
-            self._message_overlays.append(
-                _MessageOverlay(
-                    sequence=sequence,
-                    content=str(self._decision_value(entry, "content", "")),
-                    anchor=anchor,
-                )
-            )
-
-    def _prepare_message_follow_up(
-        self,
-        request: dict,
-        entries,
-        *,
-        anchor: str,
-        abort_event: "threading.Event | None" = None,
-    ) -> "tuple[dict, str]":
-        """Build a replacement generation when a message beats the final fence."""
-        prepared = copy.deepcopy(request)
-        pending = tuple(entries)
-        self._remember_message_overlays(pending, anchor=anchor)
-        prepared.setdefault("messages", []).extend(
-            self._invocation_message(
-                _MessageOverlay(
-                    sequence=int(self._decision_value(entry, "sequence", 0)),
-                    content=str(self._decision_value(entry, "content", "")),
-                    anchor=anchor,
-                )
-            )
-            for entry in pending
-        )
-
-        fingerprint = _request_fingerprint(prepared)
-        boundary_id = f"llm:{fingerprint}:follow-up"
-        decision = self._checkpoint_invocation(
-            f"{boundary_id}:pre",
-            allow_messages=True,
-            phase=_CONTROL_PHASE_PRE_GENERATION,
-            abort_event=abort_event,
-        )
-        if decision is None:
-            raise _RequestAborted
-        self._raise_if_stopped(decision)
-        included = {self._decision_value(entry, "sequence", 0) for entry in pending}
-        additional = tuple(
-            entry
-            for entry in (self._decision_value(decision, "invocation_messages", ()) or ())
-            if self._decision_value(entry, "sequence", 0) not in included
-        )
-        if additional:
-            self._remember_message_overlays(additional, anchor=anchor)
-            prepared["messages"].extend(
-                self._invocation_message(
-                    _MessageOverlay(
-                        sequence=int(self._decision_value(entry, "sequence", 0)),
-                        content=str(self._decision_value(entry, "content", "")),
-                        anchor=anchor,
-                    )
-                )
-                for entry in additional
-            )
-            boundary_id = f"llm:{_request_fingerprint(prepared)}:follow-up"
-        self._model_protocol_valid[boundary_id] = True
-        self._model_redirects[boundary_id] = pending + additional
-        return prepared, boundary_id
-
-    def _complete_model_request(
-        self,
-        boundary_id: "str | None",
-        message: dict,
-        *,
-        controlled: bool,
-        abort_event: "threading.Event | None" = None,
-    ) -> _ModelCompletion:
-        # The native loop owns acknowledgement and its final fence because it
-        # renders redirects itself. External adapters use the host overlay.
-        if (
-            not controlled
-            or self._invocation is None
-            or boundary_id is None
-            or not self._enable_message_overlay
-        ):
-            return _ModelCompletion(not (abort_event is not None and abort_event.is_set()))
-        has_tool_calls = any(block.get("type") == "tool_use" for block in message.get("blocks", []))
-        with self._control_lock:
-            if abort_event is not None and abort_event.is_set():
-                return _ModelCompletion(False)
-            acknowledge = getattr(self._invocation, "_acknowledge_redirects", None)
-            if callable(acknowledge):
-                acknowledge(self._model_redirects.get(boundary_id, ()))
-            # Result checkpoints must be fresh even for an identical retry:
-            # a redirect can arrive after an earlier result was returned.
-            result_boundary = f"{boundary_id}:{uuid.uuid4().hex}"
-            if has_tool_calls:
-                self._invocation._note_model_result(has_tool_calls=True)
-                decision = self._checkpoint_invocation(
-                    f"{result_boundary}:post",
-                    allow_messages=self._model_protocol_valid.get(boundary_id, True),
-                    phase=_CONTROL_PHASE_POST_GENERATION,
-                    abort_event=abort_event,
-                )
-            else:
-                final_checkpoint = getattr(self._invocation, "_checkpoint_final_answer", None)
-                if callable(final_checkpoint):
-                    decision = final_checkpoint(
-                        f"{result_boundary}:post-final",
-                        abort_event=abort_event,
-                    )
-                else:
-                    self._invocation._note_model_result(has_tool_calls=False)
-                    decision = self._checkpoint_invocation(
-                        f"{boundary_id}:post",
-                        allow_messages=False,
-                        phase=_CONTROL_PHASE_CLOSING,
-                        abort_event=abort_event,
-                    )
-            if decision is None:
-                return _ModelCompletion(False)
-            self._raise_if_stopped(decision)
-            return _ModelCompletion(
-                True,
-                tuple(self._decision_value(decision, "invocation_messages", ()) or ()),
-            )
-
-    def _dispatch_message_follow_ups(
-        self,
-        request: dict,
-        boundary_id: "str | None",
-        completion: _ModelCompletion,
-        *,
-        controlled: bool,
-        abort_event: "threading.Event | None" = None,
-    ) -> "tuple[dict, str | None, dict, _ModelCompletion] | None":
-        """Replace a final draft when invocation messages arrived in flight."""
-        if not completion.invocation_messages:
-            return None
-
-        from ...observability.profiler import agprof
-
-        anchor = _history_anchor(
-            _history_without_invocation_messages(request.get("messages") or [])
-        )
-        result: dict = {}
-        attempt = 1
-        while completion.invocation_messages:
-            request, boundary_id = self._prepare_message_follow_up(
-                request,
-                completion.invocation_messages,
-                anchor=anchor,
-                abort_event=abort_event,
-            )
-            with agprof.span(f"llm:message-follow-up[{attempt}]") as follow_up_span:
-                _annotate(
-                    follow_up_span,
-                    model=self._backend.model,
-                    provider=type(self._backend).__name__,
-                )
-                try:
-                    result = self._backend.dispatch(request)
-                except BaseException as error:
-                    with suppress(BaseException):
-                        _annotate(
-                            follow_up_span,
-                            outcome="failure",
-                            error_type=type(error).__name__,
-                        )
-                    self._complete_failed_model_request(
-                        boundary_id,
-                        controlled=controlled,
-                        abort_event=abort_event,
-                    )
-                    if isinstance(error, BAD_REQUEST_EXCS):
-                        raise _DispatchError(
-                            str(error), status_code=400, transient=False
-                        ) from error
-                    if isinstance(error, TRANSIENT_DISPATCH_EXCS):
-                        raise _DispatchError(str(error), status_code=503, transient=True) from error
-                    raise
-                usage = result.get("usage") or {}
-                _annotate(
-                    follow_up_span,
-                    outcome="success",
-                    input_tokens=usage.get("prompt_tokens", 0),
-                    output_tokens=usage.get("completion_tokens", 0),
-                )
-            completion = self._complete_model_request(
-                boundary_id,
-                result["message"],
-                controlled=controlled,
-                abort_event=abort_event,
-            )
-            if not completion.completed:
-                raise _RequestAborted
-            attempt += 1
-        return request, boundary_id, result, completion
-
-    def _complete_failed_model_request(
-        self,
-        boundary_id: "str | None",
-        *,
-        controlled: bool,
-        abort_event: "threading.Event | None" = None,
-    ) -> bool:
-        if not controlled or self._invocation is None or boundary_id is None:
-            return not (abort_event is not None and abort_event.is_set())
-        with self._control_lock:
-            decision = self._checkpoint_invocation(
-                f"{boundary_id}:post-error",
-                allow_messages=False,
-                # Keep the failed attempt's assignment stable across an
-                # identical retry. Messages accepted during the retry window
-                # remain pending for its next distinct or final boundary.
-                phase=_CONTROL_PHASE_PRE_GENERATION,
-                abort_event=abort_event,
-            )
-            if decision is None:
-                return False
-            self._raise_if_stopped(decision)
-            return True
-
-    def _checkpoint_invocation(
-        self,
-        boundary_id: str,
-        *,
-        allow_messages: bool,
-        phase: str,
-        abort_event: "threading.Event | None" = None,
-    ):
-        if abort_event is not None:
-            interruptible = getattr(self._invocation, "_checkpoint_interruptibly", None)
-            if callable(interruptible):
-                return interruptible(
-                    boundary_id,
-                    allow_messages=allow_messages,
-                    phase=phase,
-                    abort_event=abort_event,
-                )
-            if abort_event.is_set():
-                return None
-        decision = self._invocation._checkpoint(
-            boundary_id,
-            allow_messages=allow_messages,
-            phase=phase,
-        )
         if abort_event is not None and abort_event.is_set():
-            return None
-        return decision
+            raise _RequestAborted
+        if internal_kind != _INTERNAL_COMPACTION_KIND and self._is_cancelled():
+            self._raise_if_stopped()
+        return prepared
 
-    def _interrupt_checkpoint_wait(self, abort_event: threading.Event) -> None:
-        invocation = self._invocation
-        if invocation is None:
-            return
-        abort = getattr(invocation, "_abort_checkpoint_wait", None)
-        if callable(abort):
-            abort(abort_event)
-            return
-        # Compatibility with early control implementations that exposed a
-        # no-argument wake method under this name.
-        interrupt = getattr(invocation, "_interrupt_checkpoint_wait", None)
-        if callable(interrupt):
-            try:
-                interrupt(abort_event)
-            except TypeError:
-                interrupt()
-
-    @staticmethod
-    def _decision_value(item, name: str, default=None):
-        return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
-
-    def _raise_if_stopped(self, decision) -> None:
-        if self._decision_value(decision, "destroyed", False):
-            raise _DispatchError(_AGENT_DESTROYED_MESSAGE, status_code=409, transient=False)
-        if self._decision_value(decision, "cancelled", False):
+    def _raise_if_stopped(self) -> None:
+        if self._is_cancelled():
             raise _DispatchError(_INVOCATION_CANCELLED_MESSAGE, status_code=409, transient=False)
+
+    def _invocation_stop_error(self) -> "_DispatchError | None":
+        """Whether the invocation was cancelled while a model call was in
+        flight -- checked again after a successful dispatch so a result
+        never gets delivered for an invocation that's already dead."""
+        try:
+            self._raise_if_stopped()
+        except _DispatchError as error:
+            return error
+        return None
 
     def _finalize_error(self, call_label: "str | None", error: BaseException) -> None:
         agname = getattr(self._data_logger, "_default_name", None)
@@ -1282,8 +811,6 @@ class LlmHandlerServer:
     def _run_stream_producer(
         self,
         request: dict,
-        boundary_id: "str | None",
-        controlled: bool,
         handle: "_StreamHandle",
     ) -> None:
         from ...observability.profiler import agprof
@@ -1359,40 +886,27 @@ class LlmHandlerServer:
                     first_item = next(stream_iter)
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
-                    empty_message = {"role": "assistant", "blocks": []}
-                    try:
-                        completion = self._complete_model_request(
-                            boundary_id,
-                            empty_message,
-                            controlled=controlled,
-                            abort_event=handle._cancel_event,
+                    stop_error = self._invocation_stop_error()
+                    if stop_error is not None:
+                        _annotate(
+                            attempt_span, outcome="failure", error_type=type(stop_error).__name__
                         )
-                    except BaseException as e:
+                        if handle._cancel_event.is_set():
+                            finalize_cancelled()
+                            return
                         publish_error(
-                            e,
-                            status_code=500,
-                            transient=False,
+                            stop_error,
+                            status_code=stop_error.status_code,
+                            transient=stop_error.transient,
                         )
                         return
-                    if not completion.completed:
-                        finalize_cancelled()
-                        return
-                    follow_up = self._dispatch_message_follow_ups(
-                        request,
-                        boundary_id,
-                        completion,
-                        controlled=controlled,
-                        abort_event=handle._cancel_event,
-                    )
-                    if follow_up is not None:
-                        request, boundary_id, result, completion = follow_up
-                        empty_message = result["message"]
+                    empty_message = {"role": "assistant", "blocks": []}
                     enqueued = handle.register_stream_exchange(
                         {
                             "type": "done",
                             "message": empty_message,
-                            "usage": None if follow_up is None else result["usage"],
-                            "stop_reason": None if follow_up is None else result["stop_reason"],
+                            "usage": None,
+                            "stop_reason": None,
                         },
                         request=request,
                         response=empty_message,
@@ -1405,32 +919,14 @@ class LlmHandlerServer:
                     return
                 except BAD_REQUEST_EXCS as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    try:
-                        completed = self._complete_failed_model_request(
-                            boundary_id,
-                            controlled=controlled,
-                            abort_event=handle._cancel_event,
-                        )
-                    except BaseException as control_error:
-                        e = control_error
-                        completed = True
-                    if not completed:
+                    if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
                     publish_error(e, status_code=400, transient=False)
                     return
                 except TRANSIENT_DISPATCH_EXCS as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    try:
-                        completed = self._complete_failed_model_request(
-                            boundary_id,
-                            controlled=controlled,
-                            abort_event=handle._cancel_event,
-                        )
-                    except BaseException as control_error:
-                        e = control_error
-                        completed = True
-                    if not completed:
+                    if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
                     publish_error(e, status_code=503, transient=True)
@@ -1440,16 +936,7 @@ class LlmHandlerServer:
                     # item. Otherwise the synchronous route remains blocked in
                     # handle.first() when setup or the first read fails.
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    try:
-                        completed = self._complete_failed_model_request(
-                            boundary_id,
-                            controlled=controlled,
-                            abort_event=handle._cancel_event,
-                        )
-                    except BaseException as control_error:
-                        e = control_error
-                        completed = True
-                    if not completed:
+                    if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
                     publish_error(e, status_code=500, transient=False)
@@ -1528,16 +1015,7 @@ class LlmHandlerServer:
                         handle.register_stream_exchange(item, response=message)
                 except BaseException as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    try:
-                        completed = self._complete_failed_model_request(
-                            boundary_id,
-                            controlled=controlled,
-                            abort_event=handle._cancel_event,
-                        )
-                    except BaseException as control_error:
-                        e = control_error
-                        completed = True
-                    if not completed:
+                    if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
                     publish_error(
@@ -1552,6 +1030,14 @@ class LlmHandlerServer:
                 if handle._cancel_event.is_set():
                     finalize_cancelled()
                     return
+                stop_error = self._invocation_stop_error()
+                if stop_error is not None:
+                    publish_error(
+                        stop_error,
+                        status_code=stop_error.status_code,
+                        transient=stop_error.transient,
+                    )
+                    return
                 _annotate(
                     attempt_span,
                     outcome="success",
@@ -1559,40 +1045,6 @@ class LlmHandlerServer:
                     output_tokens=(usage or {}).get("completion_tokens"),
                 )
                 message = _blocks_to_message(blocks)
-                try:
-                    completion = self._complete_model_request(
-                        boundary_id,
-                        message,
-                        controlled=controlled,
-                        abort_event=handle._cancel_event,
-                    )
-                except BaseException as e:
-                    publish_error(
-                        e,
-                        status_code=500,
-                        transient=False,
-                        response=message,
-                        usage=usage,
-                        finish_reason=stop_reason,
-                        streaming=False,
-                        error=f"{type(e).__name__}: {e}",
-                    )
-                    return
-                if not completion.completed:
-                    finalize_cancelled()
-                    return
-                follow_up = self._dispatch_message_follow_ups(
-                    request,
-                    boundary_id,
-                    completion,
-                    controlled=controlled,
-                    abort_event=handle._cancel_event,
-                )
-                if follow_up is not None:
-                    request, boundary_id, result, completion = follow_up
-                    message = result["message"]
-                    usage = result["usage"]
-                    stop_reason = result["stop_reason"]
                 enqueued = handle.register_stream_exchange(
                     {
                         "type": "done",
@@ -1600,8 +1052,6 @@ class LlmHandlerServer:
                         "usage": usage,
                         "stop_reason": stop_reason,
                     },
-                    # A redirect may have replaced the draft's request along
-                    # with its response. Preserve that same semantic exchange.
                     request=request,
                     response=message,
                     usage=usage,
@@ -1615,28 +1065,15 @@ class LlmHandlerServer:
                 finalize_success(message["blocks"])
         except BaseException as e:
             if not finalized:
-                terminal_error = e
-                # Failures in profiling or transcript setup still cross the
-                # post-error control boundary before waking ``first()`` and
-                # durably terminating the logger call label.
-                try:
-                    completed = self._complete_failed_model_request(
-                        boundary_id,
-                        controlled=controlled,
-                        abort_event=handle._cancel_event,
-                    )
-                except BaseException as control_error:
-                    terminal_error = control_error
-                    completed = True
-                if not completed:
+                if handle._cancel_event.is_set():
                     finalize_cancelled()
                 else:
                     publish_error(
-                        terminal_error,
+                        e,
                         status_code=500,
                         transient=False,
                         streaming=False,
-                        error=f"{type(terminal_error).__name__}: {terminal_error}",
+                        error=f"{type(e).__name__}: {e}",
                     )
         finally:
             handle._close_stream()

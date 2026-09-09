@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency import CloseHandle, agdata, agerror, agent, agskill
+from agency import agdata, agerror, agent, agskill
 from agency.configs.agconfig import agconfig, agentconfig, llmconfig, orchestratorconfig
 from agency.agcontext import agcontext
 from agency.engine import AgentEngine
@@ -26,6 +26,14 @@ def _agent(tmp_path, *, max_engines: int | None = None) -> agent:
     sandbox._lock = threading.RLock()
     sandbox._checkpoint_image = None
     return agent(sandbox=sandbox, agconfig=config)
+
+
+def _request_for(handle: agdata):
+    orchestrator = get_orchestrator()
+    future = object.__getattribute__(handle, "_future")
+    with orchestrator._event_cond:
+        request_id = orchestrator._future_producers[future]
+        return orchestrator._requests[request_id]
 
 
 def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch, tmp_path):
@@ -53,9 +61,10 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
     )
 
     invocation = ag.run(agskill("fails", ""), agdata())
+    request = _request_for(invocation)
 
     assert invocation.wait(timeout=2).to_dict() == {"error": "ordinary skill failure"}
-    output_context = invocation._context_future.result(timeout=2)
+    output_context = request.context_future.result(timeout=2)
     assert output_context.recent_transcript == seed
     assert output_context.harness_sessions == {"stable": {"session_id": "committed"}}
     assert output_context.retained_messages == [
@@ -79,89 +88,6 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
         },
     ]
     assert ag.history.messages == seed
-
-
-class _CoordinatedFuture(Future):
-    """Force both legacy check/set and direct set_result races deterministically."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._done_barrier = threading.Barrier(2)
-        self._set_barrier = threading.Barrier(2)
-        self._done_calls = 0
-        self._set_calls = 0
-        self._calls_lock = threading.Lock()
-
-    def done(self) -> bool:
-        with self._calls_lock:
-            if self._set_calls >= 2:
-                return super().done()
-            self._done_calls += 1
-            call = self._done_calls
-        if call <= 2:
-            self._done_barrier.wait(timeout=2)
-            return False
-        return super().done()
-
-    def set_result(self, result) -> None:
-        with self._calls_lock:
-            self._set_calls += 1
-            call = self._set_calls
-        if call <= 2:
-            self._set_barrier.wait(timeout=2)
-        super().set_result(result)
-
-
-def test_close_handle_concurrent_settlement_is_idempotent():
-    close = CloseHandle()
-    close._future = _CoordinatedFuture()
-    failures: list[BaseException] = []
-
-    def settle() -> None:
-        try:
-            close._settle()
-        except BaseException as exc:
-            failures.append(exc)
-
-    settlers = [threading.Thread(target=settle) for _ in range(2)]
-    for thread in settlers:
-        thread.start()
-    for thread in settlers:
-        thread.join(timeout=2)
-        assert not thread.is_alive()
-
-    assert failures == []
-    assert close.done() is True
-    assert close.wait(timeout=0) is close
-
-
-def test_destroy_waits_for_an_already_admitted_save_lease(monkeypatch, tmp_path):
-    ag = _agent(tmp_path)
-    save_entered = threading.Event()
-    release_save = threading.Event()
-    save_finished = threading.Event()
-
-    def hold_save(self, _path) -> None:
-        save_entered.set()
-        assert release_save.wait(timeout=2)
-
-    monkeypatch.setattr(agent, "_save_leased", hold_save)
-
-    def save() -> None:
-        ag.save(tmp_path / "held.ckpt")
-        save_finished.set()
-
-    save_thread = threading.Thread(target=save)
-    save_thread.start()
-    assert save_entered.wait(timeout=2)
-
-    close = ag.destroy()
-    assert close.done() is False
-    release_save.set()
-    save_thread.join(timeout=2)
-
-    assert save_finished.is_set()
-    assert close.wait(timeout=2).done() is True
 
 
 def test_scheduler_fatal_event_settles_submit_and_closes_admission(monkeypatch, tmp_path):
@@ -252,12 +178,13 @@ def test_shutdown_settles_request_with_unmanaged_predecessor(tmp_path):
     ag = _agent(tmp_path)
     ag.context = agcontext(_future=predecessor_future)
     invocation = ag.run(agskill("blocked", ""), agdata())
+    request = _request_for(invocation)
     orchestrator = get_orchestrator()
     callback_observed_context = threading.Event()
-    invocation._result_future.add_done_callback(
+    object.__getattribute__(invocation, "_future").add_done_callback(
         lambda _future: (
             callback_observed_context.set()
-            if invocation._context_future.done()
+            if request.context_future.done()
             else pytest.fail("shutdown published result before output context")
         )
     )
@@ -309,7 +236,7 @@ def test_shutdown_wait_from_result_callback_does_not_self_deadlock(monkeypatch, 
         finally:
             callback_finished.set()
 
-    invocation._result_future.add_done_callback(shutdown_from_callback)
+    object.__getattribute__(invocation, "_future").add_done_callback(shutdown_from_callback)
 
     assert invocation.wait(timeout=2).ok is True
     assert callback_finished.wait(timeout=2)

@@ -28,7 +28,7 @@ from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
 
-def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code"):
+def _make_manager(tmp_path, policy=None, is_cancelled=None, harness="claude_code"):
     cfg = agconfig(
         llmconfig(model="test-model"),
         hostserverconfig(uds_path=str(tmp_path / "host.sock")),
@@ -43,6 +43,7 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
     )
     sandbox = SimpleNamespace()
     skill = SimpleNamespace(
+        name="test-skill",
         policy=policy if policy is not None else agpolicy(),
         host_mcp_tools=[],
         output_schema=None,
@@ -54,7 +55,7 @@ def _make_manager(tmp_path, policy=None, invocation=None, harness="claude_code")
             sandbox,
             skill,
             resource_pool,
-            invocation=invocation,
+            is_cancelled=is_cancelled,
         ),
         agent,
         skill,
@@ -84,20 +85,12 @@ def test_construction_captures_run_context_for_llm_requests(tmp_path, monkeypatc
     assert manager._llm_handler_server._parent_context is parent_context
 
 
-def test_construction_binds_one_invocation_to_both_control_servers(tmp_path):
-    invocation = object()
-    manager, _, _ = _make_manager(tmp_path, invocation=invocation)
+def test_construction_binds_one_cancel_check_to_both_control_servers(tmp_path):
+    is_cancelled = lambda: False  # noqa: E731
+    manager, _, _ = _make_manager(tmp_path, is_cancelled=is_cancelled)
 
-    assert manager._llm_handler_server._invocation is invocation
-    assert manager._interaction_server._invocation is invocation
-
-
-def test_native_control_checkpoints_do_not_duplicate_the_llm_message_overlay(tmp_path):
-    native, _, _ = _make_manager(tmp_path, harness="native")
-    external, _, _ = _make_manager(tmp_path, harness="claude_code")
-
-    assert native._llm_handler_server._enable_message_overlay is False
-    assert external._llm_handler_server._enable_message_overlay is True
+    assert manager._llm_handler_server._is_cancelled is is_cancelled
+    assert manager._interaction_server._is_cancelled is is_cancelled
 
 
 def test_attempt_token_gate_accepts_only_the_exact_active_token(tmp_path):

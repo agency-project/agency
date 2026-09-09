@@ -6,7 +6,7 @@ from dataclasses import asdict
 from fastapi.testclient import TestClient
 
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
-from agency.harness.servers.sandbox_interaction_server import SandboxInteractionServer
+from agency.harness.servers.harness_interaction_server import HarnessInteractionServer
 
 
 def test_harness_attempt_request_round_trips_through_json():
@@ -51,7 +51,7 @@ def test_attempt_token_crosses_the_sandbox_attempt_route():
     )
     seen = []
     expected = HarnessAttemptResult(ok=True, final_text="done")
-    server = SandboxInteractionServer(
+    server = HarnessInteractionServer(
         "/unused/test.sock",
         lambda received: seen.append(received) or expected,
     )

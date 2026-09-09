@@ -90,9 +90,9 @@ def test_empty_tracking_does_not_start_a_process_scan():
 def test_health_payload_is_compatible_and_reports_process_identity():
     import os
     from fastapi.testclient import TestClient
-    from agency.harness.servers.sandbox_interaction_server import SandboxInteractionServer
+    from agency.harness.servers.harness_interaction_server import HarnessInteractionServer
 
-    server = SandboxInteractionServer("/unused", Mock())
+    server = HarnessInteractionServer("/unused", Mock())
     with TestClient(server.build_app()) as client:
         response = client.get("/health")
     assert response.json() == {"ready": True}

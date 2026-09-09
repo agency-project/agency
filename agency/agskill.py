@@ -10,7 +10,6 @@ from .agtool import agtool
 
 
 if TYPE_CHECKING:
-    from ._submission import Invocation
     from .agent import agent
 
 
@@ -343,7 +342,7 @@ class agskill:
         return content
 
     # ------------------------------------------------------------------
-    # Scheduling wrapper — non-blocking, returns the exact Invocation
+    # Scheduling wrapper — non-blocking, returns the bare result agdata
     # ------------------------------------------------------------------
 
     def run(
@@ -351,8 +350,8 @@ class agskill:
         ag: "agent",
         skill_input: agdata,
         max_steps: "int | None" = None,
-    ) -> "Invocation":
-        """Submit through the global orchestrator and return its Invocation."""
+    ) -> agdata:
+        """Submit through the global orchestrator and return its result agdata."""
         from .orchestrator import get_orchestrator
 
         orchestrator = get_orchestrator(ag.agconfig)

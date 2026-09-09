@@ -26,7 +26,7 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.configs.agconfig import agconfig, dataloggerconfig, hostserverconfig, llmconfig
-from agency.engine.clients import SandboxInteractionClient
+from agency.engine.clients import HarnessInteractionClient
 from agency.engine.engine import AgentEngine
 from agency.engine.host_servers.host_server_manager import HostServerManager
 from agency.harness.daemon import HarnessManager
@@ -90,7 +90,7 @@ def sandbox_manager():
         skill = agskill("host", "test", add_host_mcp_tools=[agtool("host_probe", "", host_tool)])
         host = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())
         process = ctx.Process(target=_serve_manager, args=(directory, ready, release, stop))
-        client = SandboxInteractionClient(f"{directory}/sandbox.sock", timeout_s=25)
+        client = HarnessInteractionClient(f"{directory}/sandbox.sock", timeout_s=25)
         engine = AgentEngine(agent)
         engine._host_server_manager = host
         engine._sandbox_interaction_client = client

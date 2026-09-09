@@ -79,7 +79,7 @@ class agResourcePool:
         agconfig: "agconfig_cls | None" = None,
         data_logger: "agDataLogger | None" = None,
     ) -> None:
-        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
+        self.change_config(agconfig)
         if idle_cpus is not None:
             self.agconfig.resources.idle_cpus = idle_cpus
         if idle_memory is not None:

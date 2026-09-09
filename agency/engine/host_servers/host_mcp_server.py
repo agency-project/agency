@@ -4,7 +4,7 @@ import inspect
 import logging
 import threading
 from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
@@ -77,13 +77,13 @@ class HostMcpServer:
         resource_pool: "agResourcePool",
         data_logger: "agDataLogger",
         *,
-        invocation=None,
+        is_cancelled: "Callable[[], bool] | None" = None,
     ) -> None:
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
         self._data_logger = data_logger
-        self._invocation = invocation
+        self._is_cancelled = is_cancelled if is_cancelled is not None else (lambda: False)
         self._persistent_vars: "dict[str, object]" = {}
         self._mcp_server: "MCPServer | None" = None
 
@@ -92,16 +92,8 @@ class HostMcpServer:
         required = set((tool.params or {}).get("required", list(properties.keys())))
 
         def call_tool(**kwargs: "object") -> dict:
-            if self._invocation is not None:
-                decision = self._invocation._checkpoint(
-                    "host-mcp:action", allow_messages=False, phase="action"
-                )
-                if decision.cancelled or decision.destroyed:
-                    return {"error": "agent invocation stopped"}
-                if not decision.action_admitted:
-                    return {
-                        "error": "Invocation redirected. Return to the model before taking another action."
-                    }
+            if self._is_cancelled():
+                return {"error": "agent invocation stopped"}
             # No admit_tool_call() here -- the caller (PreToolUse hook or
             # react_loop.py's bridge check) already admitted; doing it again
             # would double-admit every MCP tool call.

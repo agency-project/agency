@@ -16,7 +16,7 @@ from ..utils.agutil import (
     ensure_python_packages_in_container,
 )
 from ..harness.executable import HARNESS_PATH, prepare_harness_executable
-from .clients import SandboxInteractionClient
+from .clients import HarnessInteractionClient
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
@@ -34,8 +34,8 @@ class DaemonHandle:
     container_sandbox_uds_path: str
     engine_name: str
 
-    def client(self, timeout_s: "float | None" = 300.0) -> SandboxInteractionClient:
-        return SandboxInteractionClient(self.sandbox_uds_path, timeout_s=timeout_s)
+    def client(self, timeout_s: "float | None" = 300.0) -> HarnessInteractionClient:
+        return HarnessInteractionClient(self.sandbox_uds_path, timeout_s=timeout_s)
 
 
 def _sandbox_socket_path(host_uds_path: str) -> Path:
