@@ -234,7 +234,6 @@ def _cgroup_reexec_command(slice_name: str, cgroup_dir: str) -> list[str]:
 def _user_scope_available() -> bool:
     """Probe whether systemd user-session cgroup delegation works here --
     a real subprocess, not a re-exec, so a failure can fall back cleanly."""
-    import subprocess
 
     try:
         result = subprocess.run(
@@ -806,6 +805,50 @@ def register_engine(engine: str) -> None:
 def telemetry_error(kind: str, count: int = 1) -> None:
     if enabled():
         _health[kind] += count
+
+
+def ingest_auto_samples(
+    pid: int, samples: "list[dict]", *, thread_label: str = "Remote thread"
+) -> int:
+    """Accept a batch of already-measured function-call samples from an
+    external reporter (a harness profiling its own call stack, outside this
+    process). Returns the number rejected. A no-op when profiling is off or
+    automatic-function sampling was not requested for this session."""
+    if not enabled() or _auto_settings is None:
+        return 0
+    now = time.perf_counter_ns()
+    rejected = 0
+    for sample in samples:
+        try:
+            name = sample["name"]
+            if not isinstance(name, str) or not name or len(name) > 512:
+                raise ValueError("invalid name")
+            started = int(sample["perf_ns"])
+            if started < _session_started_ns or started > now + 1_000_000_000:
+                raise ValueError("timestamp outside profile session")
+            duration = int(sample["duration_ns"])
+            if duration < 0 or started + duration > now + 1_000_000_000:
+                raise ValueError("invalid interval")
+            if len(_auto_records) >= _auto_settings["max_events"]:
+                telemetry_error("remote_auto_dropped")
+                continue
+            _auto_records.append(
+                (
+                    pid,
+                    int(sample["tid"]),
+                    name,
+                    str(sample.get("filename", ""))[:1024],
+                    int(sample.get("lineno", 0)),
+                    started,
+                    duration,
+                    str(sample.get("outcome", "unknown"))[:32],
+                    thread_label,
+                )
+            )
+        except (KeyError, ValueError, TypeError, OverflowError):
+            rejected += 1
+            telemetry_error("remote_events_rejected")
+    return rejected
 
 
 def current_span_context():

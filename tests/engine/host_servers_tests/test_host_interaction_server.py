@@ -466,7 +466,10 @@ def test_admit_tool_call_records_call_event_and_returns_call_id():
     assert logger.spans == []
 
 
-def test_admit_tool_call_with_large_arguments_truncates_term_message():
+def test_admit_tool_call_with_large_arguments_keeps_full_term_message():
+    # Truncation for display is a webui-only concern (agwebui/server.py's
+    # _truncate_for_display) -- the term_message written here (terminal
+    # print + the agent's own db) must carry the full text.
     logger = _FakeDataLogger()
     server = _make_server(policy=agpolicy(), data_logger=logger)
     big_content = "y" * 5000
@@ -475,8 +478,7 @@ def test_admit_tool_call_with_large_arguments_truncates_term_message():
 
     term_message = logger.events[1][4]
     assert term_message is not None
-    assert "…" in term_message
-    assert len(term_message) < len(big_content)
+    assert big_content in term_message
 
 
 def test_admit_tool_call_denied_term_message_still_shows_args():

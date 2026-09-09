@@ -122,17 +122,17 @@ def run_react_loop(
                         )
                     else:
                         tool_started_ns = time.perf_counter_ns()
+                        tool_started_wall_ns = time.time_ns()
                         try:
                             result_content = handler(fn_args)
                         except BaseException as exc:
-                            if getattr(bridge, "_profiler", None) is not None:
-                                bridge.complete_tool_policy(
-                                    call_id,
-                                    None,
-                                    error=str(exc),
-                                    duration_ns=time.perf_counter_ns() - tool_started_ns,
-                                    started_perf_ns=tool_started_ns + bridge._profiler.offset,
-                                )
+                            bridge.complete_tool_policy(
+                                call_id,
+                                None,
+                                error=str(exc),
+                                duration_ns=time.perf_counter_ns() - tool_started_ns,
+                                started_wall_ns=tool_started_wall_ns,
+                            )
                             raise
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
                 else:
@@ -142,15 +142,12 @@ def run_react_loop(
                     fn_name, tc["id"], result_content, offload_dir
                 )
                 if bridge is not None:
-                    if (
-                        getattr(bridge, "_profiler", None) is not None
-                        and tool_duration_ns is not None
-                    ):
+                    if tool_duration_ns is not None:
                         bridge.complete_tool_policy(
                             call_id,
                             result_content,
                             duration_ns=tool_duration_ns,
-                            started_perf_ns=tool_started_ns + bridge._profiler.offset,
+                            started_wall_ns=tool_started_wall_ns,
                             error=str(result_error) if result_error is not None else None,
                         )
                     else:

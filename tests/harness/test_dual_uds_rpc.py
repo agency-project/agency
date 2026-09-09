@@ -63,7 +63,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     try:
         host_manager.bind_attempt_token(attempt_token)
         assert host_manager.start() == str(host_socket)
-        host_client = HostServicesClient(str(host_socket), None, timeout_s=2.0)
+        host_client = HostServicesClient(str(host_socket), timeout_s=2.0)
         host_client.register_attempt_token(attempt_token)
 
         def mock_attempt_handler(request):

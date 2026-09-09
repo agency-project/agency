@@ -746,13 +746,11 @@ class GlobalAgentOrchestrator:
             input_dict = local_skill_input.to_dict()
             result_dict = result.to_dict()
             if result_dict.get("error"):
-                truncate = ag.agconfig.skill.error_log_truncate
                 logger.record_event(
                     type="skill_error",
                     payload={"skill": skill.name, "error": str(result_dict["error"])},
                     term_message=(
-                        f"[{ag.agname}] SKILL ✗  {skill.name}  "
-                        f"error={str(result_dict['error'])[:truncate]}"
+                        f"[{ag.agname}] SKILL ✗  {skill.name}  error={result_dict['error']}"
                     ),
                 )
             else:

@@ -228,6 +228,18 @@ def _synthesize_term_message(event_type: str, name: "str | None", payload: dict)
     return None
 
 
+_TERM_MESSAGE_DISPLAY_MAX_CHARS = 300
+
+
+def _truncate_for_display(term_message: str) -> str:
+    """Trim a term_message for the browser only -- the terminal print and
+    the term_message column stored in the agent's own db both keep the full
+    text; only what ships to the shared webui log gets shortened here."""
+    if len(term_message) <= _TERM_MESSAGE_DISPLAY_MAX_CHARS:
+        return term_message
+    return f"{term_message[:_TERM_MESSAGE_DISPLAY_MAX_CHARS]}…"
+
+
 def _build_envelope(
     event_type: str,
     timestamp: float,
@@ -258,7 +270,7 @@ def _build_envelope(
     elif name and (event_type == "agent_registered" or term_message):
         envelope["color"] = _agent_color(name)
     if term_message:
-        envelope["term_message"] = term_message
+        envelope["term_message"] = _truncate_for_display(term_message)
     return json.dumps(envelope)
 
 

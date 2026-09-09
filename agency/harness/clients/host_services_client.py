@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import hmac
 import json
-import socket
-import struct
 import threading
-import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import TYPE_CHECKING, AsyncIterator
@@ -25,43 +22,18 @@ if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
 
 
-def _recv_exactly(sock, n: int) -> bytes:
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError(f"connection closed with {remaining} bytes still expected")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _recv_framed(sock) -> dict:
-    (length,) = struct.unpack(">Q", _recv_exactly(sock, 8))
-    return json.loads(_recv_exactly(sock, length).decode("utf-8"))
-
-
-def _send_framed(sock, payload: dict) -> None:
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    sock.sendall(struct.pack(">Q", len(body)) + body)
-
-
 class HostServicesClient:
     """Thin client wrapping this agent's one bridged connection to its
-    `agmanager_host` instance."""
+    `agmanager_host` instance -- the single UDS path any harness (or a
+    harness's own profiler) uses to reach the host."""
 
-    def __init__(
-        self, uds_path: str, profiler_uds_path: "str | None", timeout_s: float = 300
-    ) -> None:
+    def __init__(self, uds_path: str, timeout_s: float = 300) -> None:
         self._uds_path = uds_path
         self._timeout_s = timeout_s
         transport = httpx.HTTPTransport(uds=uds_path)
         self.client = httpx.Client(
             transport=transport, base_url="http://agmanager-host", timeout=timeout_s
         )
-        self.profiler_uds_path = profiler_uds_path
-        self._profiler_synced_tokens: "set[str]" = set()
         self._attempt_token_lock = threading.Lock()
         self._active_attempt_token: "str | None" = None
 
@@ -83,7 +55,6 @@ class HostServicesClient:
             if active is None or not self._attempt_tokens_match(active, token):
                 return False
             self._active_attempt_token = None
-            self._profiler_synced_tokens.discard(active)
             return True
 
     def validate_token(self, token: str) -> bool:
@@ -156,7 +127,7 @@ class HostServicesClient:
         result: object = None,
         error: "str | None" = None,
         duration_ns: int | None = None,
-        started_perf_ns: int | None = None,
+        started_wall_ns: int | None = None,
     ) -> None:
         response = self.client.post(
             "/interaction/complete_tool",
@@ -165,7 +136,7 @@ class HostServicesClient:
                 "result": result,
                 "error": error,
                 **({"duration_ns": duration_ns} if duration_ns is not None else {}),
-                **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+                **({"started_wall_ns": started_wall_ns} if started_wall_ns is not None else {}),
             },
             headers=self._attempt_headers(token),
         )
@@ -268,9 +239,12 @@ class HostServicesClient:
             timeout=self._timeout_s,
         )
 
-    def profile_request(self, token: str, path: str, payload: dict) -> dict:
+    def record_profiler_span(self, token: str, payload: dict) -> dict:
+        """Report one span -- open (no ``end_ts``), closing, or already
+        complete -- via the same canonical route any host-observed span
+        goes through. See ``HostInteractionServer.record_span``."""
         response = self.client.post(
-            "/interaction/profile/" + path,
+            "/interaction/record_span",
             json=payload,
             headers=self._attempt_headers(token),
             timeout=2.0,
@@ -278,53 +252,31 @@ class HostServicesClient:
         response.raise_for_status()
         return response.json()
 
-    def forward_profiler_event(self, token: str, event: dict) -> dict:
-        if not self.validate_token(token):
-            return {"ok": False, "error": "unknown or missing token"}
-        if self.profiler_uds_path is None:
-            return {"ok": False, "error": "no profiler bridge configured for this launch"}
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        try:
-            sock.connect(self.profiler_uds_path)
-            # Synchronize this container's clock against the host's, once
-            # per token -- same handshake the old agproxy_llm.py's
-            # `_forward_profiler_hook` did, needed so a hook's captured
-            # in-container timestamp can be translated into the host's
-            # clock domain before it's used as a span boundary.
-            if token not in self._profiler_synced_tokens:
-                wall_0 = time.time_ns()
-                perf_0 = time.perf_counter_ns()
-                _send_framed(
-                    sock, {"token": token, "ev": "clock_sync", "wall_ns": wall_0, "perf_ns": perf_0}
-                )
-                sync = _recv_framed(sock)
-                wall_1 = time.time_ns()
-                perf_1 = time.perf_counter_ns()
-                if not sync.get("ok"):
-                    return sync
-                _send_framed(
-                    sock,
-                    {
-                        "token": token,
-                        "ev": "clock_offset",
-                        "wall_offset_ns": int(sync["host_wall_ns"] - (wall_0 + wall_1) / 2),
-                        "perf_offset_ns": int(sync["host_perf_ns"] - (perf_0 + perf_1) / 2),
-                    },
-                )
-                offset = _recv_framed(sock)
-                if not offset.get("ok"):
-                    return offset
-                self._profiler_synced_tokens.add(token)
-            _send_framed(sock, {**event, "token": token})
-            return _recv_framed(sock)
-        finally:
-            sock.close()
+    def record_profiler_samples(self, token: str, samples: list) -> dict:
+        """Report a batch of already-measured function-call samples."""
+        response = self.client.post(
+            "/interaction/record_samples",
+            json={"samples": samples},
+            headers=self._attempt_headers(token),
+            timeout=2.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def profiler_settings(self, token: str) -> dict:
+        """Whether profiling is on, and automatic-function-sampling settings."""
+        response = self.client.post(
+            "/interaction/profile_settings",
+            json={},
+            headers=self._attempt_headers(token),
+            timeout=2.0,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def close(self) -> None:
         with self._attempt_token_lock:
             self._active_attempt_token = None
-            self._profiler_synced_tokens.clear()
         self.client.close()
 
 

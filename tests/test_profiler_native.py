@@ -26,6 +26,19 @@ class Logger:
         pass
 
 
+def _bridge_for(app: TestClient) -> SimpleNamespace:
+    """A minimal bridge exposing exactly the methods NativeProfiler calls,
+    routed straight to a HostInteractionServer's own TestClient -- the same
+    canonical routes any harness's real bridge would hit."""
+    return SimpleNamespace(
+        profiler_settings=lambda: app.post("/profile_settings").json(),
+        record_profiler_span=lambda payload: app.post("/record_span", json=payload).json(),
+        record_profiler_samples=lambda samples: app.post(
+            "/record_samples", json={"samples": samples}
+        ).json(),
+    )
+
+
 def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
@@ -36,27 +49,19 @@ def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path)
                 "test-agent",
                 parent_context=agprof.current_span_context(),
             )
-            app = TestClient(server.build_app())
-
-            def transport(request):
-                route = request.url.path.replace("/agprof/", "/profile/")
-                response = app.post(route, json=json.loads(request.content))
-                return httpx.Response(response.status_code, json=response.json())
-
-            bridge = SimpleNamespace(
-                token="secret",
-                _client=httpx.Client(
-                    transport=httpx.MockTransport(transport), base_url="http://bridge"
-                ),
-            )
+            bridge = _bridge_for(TestClient(server.build_app()))
             with NativeProfiler(bridge) as native:
                 with native.span("turn0"):
                     call_id = server.admit_tool_call("read", {})["call_id"]
                     started = time.perf_counter_ns()
+                    started_wall_ns = time.time_ns()
                     sum(range(100))
                     duration = time.perf_counter_ns() - started
                     server.complete_tool_call(
-                        call_id, result="ok", duration_ns=duration, started_perf_ns=started
+                        call_id,
+                        result="ok",
+                        duration_ns=duration,
+                        started_wall_ns=started_wall_ns,
                     )
                 # No subsequent LLM dispatch is needed to record the final tool.
     records = {r[1]: r for r in agprof.profile_records()}
@@ -64,60 +69,80 @@ def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path)
     assert records["turn0"][8] == records["run0:task:agent"][7]
     assert records["tool:read"][3] == duration
     assert records["tool:read"][6]["provenance"] == "container_asserted"
-    assert "secret" not in (tmp_path / "agprof.trace.json").read_text()
 
 
-def test_profile_ingest_rejects_stale_sessions_and_unknown_parents(monkeypatch, tmp_path):
+def test_record_span_opens_closes_and_nests_without_any_harness_specific_state(
+    monkeypatch, tmp_path
+):
+    """The canonical mechanism new spans go through -- open now (no end_ts),
+    close later by repeating the same span_id, and a child naming an open
+    span_id as its parent nests under it. Nothing here is native-specific;
+    HostInteractionServer holds no state named after any one harness."""
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
+        with agprof.span("run0:task:agent"):
+            server = HostInteractionServer(
+                SimpleNamespace(policy=agpolicy()),
+                Logger(),
+                "test-agent",
+                parent_context=agprof.current_span_context(),
+            )
+            server.record_span("turn0", time.time(), None, {}, span_id="t0")
+            assert "t0" in server._open_spans
+            server.record_span("tool:read", time.time(), time.time(), {}, span_id="c0", parent="t0")
+            assert "c0" not in server._open_spans  # reported complete in one call
+            server.record_span("turn0", None, time.time(), {}, span_id="t0")
+            assert not server._open_spans
+    records = {r[1]: r for r in agprof.profile_records()}
+    assert records["tool:read"][8] == records["turn0"][7]
+    assert records["turn0"][8] == records["run0:task:agent"][7]
+
+
+def test_record_samples_rejects_invalid_entries(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    with agprof.session(tmp_path, sample_hz=0, auto_functions=True):
         server = HostInteractionServer(SimpleNamespace(policy=agpolicy()), Logger(), "test-agent")
-        config = server.profile_config()
-        assert not server.profile_events({"session_id": "stale"})["ok"]
-        result = server.profile_events(
-            {
-                "session_id": config["session_id"],
-                "events": [
-                    {
-                        "kind": "start",
-                        "id": "child",
-                        "parent_id": "missing",
-                        "name": "turn0",
-                        "perf_ns": time.perf_counter_ns(),
-                    },
-                    {"kind": "automatic", "name": "bad", "perf_ns": -1, "duration_ns": 5},
-                ],
-            }
-        )
-        assert result == {"ok": False, "rejected": 2}
-        assert not server._remote_spans
-    assert agprof.summary_metrics()["sampling"]["telemetry_errors"]["remote_events_rejected"] == 2
+        result = server.record_samples([{"name": "bad", "perf_ns": -1, "duration_ns": 5, "tid": 1}])
+        assert result == {"ok": False, "rejected": 1}
+    assert agprof.summary_metrics()["sampling"]["telemetry_errors"]["remote_events_rejected"] == 1
 
 
 def test_standalone_native_collector_captures_dependencies_without_host_imports(tmp_path):
     # A real separate interpreter verifies sys.monitoring ownership, rather
     # than mocking away the central mechanism under test.
     script = """
-import json, sys, time
-from types import SimpleNamespace
+import json, sys
 from native_harness.profiling import NativeProfiler
-class Response:
-    def __init__(self, data): self.data = data
-    def raise_for_status(self): pass
-    def json(self): return self.data
-class Client:
-    def post(self, path, json, **kwargs):
-        if path.endswith("config"):
-            return Response({"enabled": True, "session_id": "test", "host_perf_ns": time.perf_counter_ns(),
-                "automatic": {"min_duration_ms": 0, "max_depth": 32, "max_events": 1000, "include_dependencies": True}})
-        events.extend(json["events"])
-        return Response({"ok": True})
-events = []
-with NativeProfiler(SimpleNamespace(token="test", _client=Client())):
+
+samples = []
+
+class Bridge:
+    token = "test"
+
+    def profiler_settings(self):
+        return {
+            "enabled": True,
+            "automatic": {
+                "min_duration_ms": 0,
+                "max_depth": 32,
+                "max_events": 1000,
+                "include_dependencies": True,
+            },
+        }
+
+    def record_profiler_span(self, payload):
+        return {"ok": True}
+
+    def record_profiler_samples(self, batch):
+        samples.extend(batch)
+        return {"ok": True, "rejected": 0}
+
+with NativeProfiler(Bridge()):
     from pathlib import PurePosixPath
     PurePosixPath("/one/two").as_posix()
 assert "agency" not in sys.modules
 assert "opentelemetry" not in sys.modules
-print(json.dumps(events))
+print(json.dumps(samples))
 """
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "agency")}
     result = subprocess.run(
@@ -128,10 +153,9 @@ print(json.dumps(events))
         capture_output=True,
         check=True,
     )
-    events = json.loads(result.stdout)
-    automatic = [e for e in events if e["kind"] == "automatic"]
-    assert automatic
-    assert any("pathlib" in e["name"] for e in automatic)
+    samples = json.loads(result.stdout)
+    assert samples
+    assert any("pathlib" in s["name"] for s in samples)
 
 
 @pytest.mark.parametrize("engine", ["native", "claude_code", "codex", "opencode", "grok"])
@@ -254,25 +278,29 @@ def test_profiler_gateway_authenticates_and_forwards_attempt_header():
         requests.append(request)
         return httpx.Response(200, json={"ok": True})
 
-    bridge = HostServicesClient("/unused", None)
+    bridge = HostServicesClient("/unused")
     bridge.client.close()
     bridge.client = httpx.Client(base_url="http://host", transport=httpx.MockTransport(receive))
     bridge.register_attempt_token("current")
     app = FastAPI()
     app.include_router(build_router(bridge))
     with TestClient(app) as client:
-        assert client.post("/agprof/events", json={}).status_code == 401
+        assert client.post("/agprof/span", json={"name": "s"}).status_code == 401
         assert not requests
         response = client.post(
-            "/agprof/events", json={"events": []}, headers={"Authorization": "Bearer current"}
+            "/agprof/span",
+            json={"name": "s", "start_ts": 1.0, "end_ts": 2.0, "attributes": {}},
+            headers={"Authorization": "Bearer current"},
         )
         assert response.json() == {"ok": True}
-        assert requests[0].url.path == "/interaction/profile/events"
+        assert requests[0].url.path == "/interaction/record_span"
         assert requests[0].headers[ATTEMPT_TOKEN_HEADER] == "current"
         bridge.clear_attempt_token("current")
         assert (
             client.post(
-                "/agprof/events", json={}, headers={"Authorization": "Bearer current"}
+                "/agprof/span",
+                json={"name": "s"},
+                headers={"Authorization": "Bearer current"},
             ).status_code
             == 401
         )

@@ -20,14 +20,12 @@ def _bridge(handler, token: str = "token"):
     bridge.client = httpx.Client(
         transport=httpx.MockTransport(handler), base_url="http://agency-host"
     )
-    bridge.profiler_uds_path = None
     bridge._uds_path = "/unused/test-host.sock"
     bridge._timeout_s = 300
     bridge._new_mcp_async_client = lambda: httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://agency-host",
     )
-    bridge._profiler_synced_tokens = set()
     bridge._attempt_token_lock = threading.Lock()
     bridge._active_attempt_token = None
     bridge.register_attempt_token(token)
@@ -46,6 +44,9 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             ("POST", "/interaction/record_event"): {"ok": True},
             ("POST", "/interaction/check_tool"): {"allowed": False, "reason": "blocked"},
             ("POST", "/interaction/check_syscall"): {"allowed": True, "reason": None},
+            ("POST", "/interaction/record_span"): {"ok": True},
+            ("POST", "/interaction/record_samples"): {"ok": True, "rejected": 0},
+            ("POST", "/interaction/profile_settings"): {"enabled": True, "automatic": None},
         }
         return httpx.Response(200, json=responses[(request.method, request.url.path)])
 
@@ -69,6 +70,14 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             timestamp=1.0,
         )
         assert bridge.check_syscall_policy("token", syscall) == (True, None, None)
+        assert bridge.record_profiler_span(
+            "token", {"name": "turn0", "span_id": "s1", "attributes": {}}
+        ) == {"ok": True}
+        assert bridge.record_profiler_samples("token", [{"name": "f"}]) == {
+            "ok": True,
+            "rejected": 0,
+        }
+        assert bridge.profiler_settings("token") == {"enabled": True, "automatic": None}
     finally:
         bridge.close()
 
@@ -89,6 +98,9 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             "tool_name": None,
             "tool_args": None,
         },
+        {"name": "turn0", "span_id": "s1", "attributes": {}},
+        {"samples": [{"name": "f"}]},
+        {},
     ]
 
 
@@ -197,16 +209,30 @@ def test_bridge_rejects_stale_token_before_host_request():
 
 
 def test_profiler_and_context_routes_reject_unknown_tokens():
-    bridge = _bridge(lambda _request: httpx.Response(200, json={}))
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, json={"enabled": False, "automatic": None})
+
+    bridge = _bridge(handler)
     app = FastAPI()
     app.include_router(build_interaction_router(bridge))
     try:
         with TestClient(app) as client:
             assert (
                 client.post(
-                    "/agprof/hook",
+                    "/agprof/span",
                     headers={"Authorization": "Bearer stale"},
-                    json={"name": "event"},
+                    json={"name": "span"},
+                ).status_code
+                == 401
+            )
+            assert (
+                client.post(
+                    "/agprof/samples",
+                    headers={"Authorization": "Bearer stale"},
+                    json={"samples": []},
                 ).status_code
                 == 401
             )
@@ -222,7 +248,8 @@ def test_profiler_and_context_routes_reject_unknown_tokens():
                 headers={"Authorization": "Bearer token"},
             )
             assert status.status_code == 200
-            assert status.json() == {"configured": False}
+            assert status.json() == {"enabled": False, "automatic": None}
+            assert seen == [("POST", "/interaction/profile_settings")]
             assert (
                 client.post(
                     "/internal/context_limit",

@@ -93,7 +93,7 @@ class _LocalSandbox:
 
 class _HarnessApiServer:
     def __init__(self, host_uds_path: str, port: int, harness_backend: agharness_backend) -> None:
-        self._bridge = HostServicesClient(host_uds_path, None)
+        self._bridge = HostServicesClient(host_uds_path)
         self._port = port
         self._harness_backend = harness_backend
         self._server: "uvicorn.Server | None" = None

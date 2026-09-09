@@ -55,29 +55,36 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             body.get("result"),
             body.get("error"),
             **({"duration_ns": body["duration_ns"]} if "duration_ns" in body else {}),
-            **({"started_perf_ns": body["started_perf_ns"]} if "started_perf_ns" in body else {}),
+            **({"started_wall_ns": body["started_wall_ns"]} if "started_wall_ns" in body else {}),
         )
         return JSONResponse({"ok": True})
-
-    @router.post("/agprof/hook")
-    async def agprof_hook(request: Request):
-        token = extract_bearer_token(request)
-        if not token or not bridge.validate_token(token):
-            return JSONResponse({"ok": False, "error": "unknown or missing token"}, status_code=401)
-        body = await request.json()
-        result = await asyncio.to_thread(
-            bridge.forward_profiler_event, token, {**body, "ev": "hook"}
-        )
-        if result.get("error") == "unknown or missing token":
-            return JSONResponse(result, status_code=401)
-        return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
     @router.get("/agprof/status")
     async def agprof_status(request: Request):
         token = extract_bearer_token(request)
         if not token or not bridge.validate_token(token):
             return JSONResponse({"error": "unknown or missing token"}, status_code=401)
-        return JSONResponse({"configured": bridge.profiler_uds_path is not None})
+        return JSONResponse(await asyncio.to_thread(bridge.profiler_settings, token))
+
+    @router.post("/agprof/span")
+    async def agprof_span(request: Request):
+        token = extract_bearer_token(request)
+        if not token or not bridge.validate_token(token):
+            return JSONResponse({"ok": False, "error": "unknown or missing token"}, status_code=401)
+        body = await request.json()
+        return JSONResponse(await asyncio.to_thread(bridge.record_profiler_span, token, body))
+
+    @router.post("/agprof/samples")
+    async def agprof_samples(request: Request):
+        token = extract_bearer_token(request)
+        if not token or not bridge.validate_token(token):
+            return JSONResponse({"ok": False, "error": "unknown or missing token"}, status_code=401)
+        if len(await request.body()) > 1_048_576:
+            return JSONResponse({"error": "sample batch too large"}, status_code=413)
+        body = await request.json()
+        return JSONResponse(
+            await asyncio.to_thread(bridge.record_profiler_samples, token, body.get("samples", []))
+        )
 
     # This agent's model's context window, for a caller (native_harness's
     # own compaction, see that package's `compaction.py`) that runs its own
@@ -93,19 +100,6 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             return JSONResponse({"error": "unknown or missing token"}, status_code=401)
         limit = await asyncio.to_thread(bridge.context_limit, token)
         return JSONResponse({"context_limit": limit})
-
-    @router.post("/agprof/{operation}")
-    async def agprof_events(operation: str, request: Request):
-        if operation not in ("config", "events"):
-            return JSONResponse({"error": "unknown profiler operation"}, status_code=404)
-        token = extract_bearer_token(request)
-        if not token or not bridge.validate_token(token):
-            return JSONResponse({"error": "unknown or missing bearer token"}, status_code=401)
-        if len(await request.body()) > 1_048_576:
-            return JSONResponse({"error": "profile batch too large"}, status_code=413)
-        return JSONResponse(
-            await asyncio.to_thread(bridge.profile_request, token, operation, await request.json())
-        )
 
     return router
 

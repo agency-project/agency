@@ -47,7 +47,7 @@ class BridgeClient:
         result: object,
         *,
         duration_ns: int | None = None,
-        started_perf_ns: int | None = None,
+        started_wall_ns: int | None = None,
         error: str | None = None,
     ) -> None:
         """Report a tool call's completion for telemetry. Best-effort: no
@@ -64,7 +64,7 @@ class BridgeClient:
                     "result": result,
                     "error": error,
                     **({"duration_ns": duration_ns} if duration_ns is not None else {}),
-                    **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+                    **({"started_wall_ns": started_wall_ns} if started_wall_ns is not None else {}),
                 },
                 headers={"Authorization": f"Bearer {self.token}"},
             )
@@ -83,6 +83,27 @@ class BridgeClient:
             return resp.json().get("context_limit")
         except Exception:
             return None
+
+    def profiler_settings(self) -> dict:
+        resp = self._client.get("/agprof/status", headers={"Authorization": f"Bearer {self.token}"})
+        resp.raise_for_status()
+        return resp.json()
+
+    def record_profiler_span(self, payload: dict) -> dict:
+        resp = self._client.post(
+            "/agprof/span", json=payload, headers={"Authorization": f"Bearer {self.token}"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def record_profiler_samples(self, samples: list) -> dict:
+        resp = self._client.post(
+            "/agprof/samples",
+            json={"samples": samples},
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def close(self) -> None:
         self._client.close()

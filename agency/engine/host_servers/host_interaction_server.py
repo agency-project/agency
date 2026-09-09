@@ -13,6 +13,12 @@ from fastapi.responses import JSONResponse
 from ...harness._syscall_event import agsyscallevent
 from ...observability.profiler import agprof
 
+# Slack absorbed by translating a reporter's wall-clock timestamp into this
+# host's own perf_counter_ns domain (see _wall_clock_to_perf_ns) -- generous
+# enough for typical wall-clock sync and the jitter between two independent
+# host-local conversions, not a negotiated per-caller value.
+_CLOCK_SLACK_NS = 5_000_000
+
 if TYPE_CHECKING:
     from ...observability.agdatalogger import agDataLogger
     from ...agskill import agskill
@@ -46,10 +52,11 @@ class HostInteractionServer:
         # a denied call never really runs, so it has nothing to complete.
         self._pending_calls: "dict[str, tuple]" = {}
         self._pending_calls_lock = threading.Lock()
-        self._remote_spans: dict[str, object] = {}
-        self._remote_turn: str | None = None
-        self._profile_session_id = None
-        self._clock_uncertainty_ns = 0
+        # Spans a caller opened via record_span(span_id=..., end_ts=None) and
+        # has not yet closed. Generic -- any reporter (this class's own
+        # admission/completion boundaries, or a harness reporting its own
+        # internal spans) can open/close/nest through the same dict.
+        self._open_spans: "dict[str, object]" = {}
         self._profile_pid = -2 - agprof.next_index("remote-profile")
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
@@ -89,8 +96,6 @@ class HostInteractionServer:
             args_text = repr(attributes["arguments"])
         else:
             args_text = repr(attributes["argv"] or attributes["path"])
-        if len(args_text) > 200:
-            args_text = f"{args_text[:200]}…"
         args_suffix = f"  args={args_text}"
         if allowed:
             term_message = f"[{self._agname}] {label} ▶  {name}{args_suffix}"
@@ -119,7 +124,7 @@ class HostInteractionServer:
                         "timing": "hook_boundary",
                         "provenance": "host_observed",
                     },
-                    parent_context=self.profile_parent_context(),
+                    parent_context=self.current_open_context(),
                 )
                 self._pending_calls[call_id] = (kind, name, attributes, started / 1e9, profile_span)
         return call_id
@@ -146,15 +151,20 @@ class HostInteractionServer:
         duration_ns = extra.get("duration_ns")
         overrides = {}
         if duration_ns is not None:
-            measured_start = extra.get("started_perf_ns")
+            started_wall_ns = extra.get("started_wall_ns")
+            measured_start = (
+                self._wall_clock_to_perf_ns(started_wall_ns / 1e9)[0]
+                if isinstance(started_wall_ns, int)
+                else None
+            )
             if (
                 isinstance(duration_ns, int)
                 and not isinstance(duration_ns, bool)
                 and duration_ns >= 0
-                and isinstance(measured_start, int)
+                and measured_start is not None
                 and profile_span is not None
-                and measured_start >= profile_span._t0 - self._clock_uncertainty_ns
-                and measured_start + duration_ns <= end_perf_ns + self._clock_uncertainty_ns
+                and measured_start >= profile_span._t0 - _CLOCK_SLACK_NS
+                and measured_start + duration_ns <= end_perf_ns + _CLOCK_SLACK_NS
             ):
                 timing = "exact"
                 measured_end = measured_start + duration_ns
@@ -175,7 +185,7 @@ class HostInteractionServer:
                     "outcome": outcome,
                     "timing": timing,
                     "provenance": "container_asserted" if timing == "exact" else "host_observed",
-                    "clock_uncertainty_ns": self._clock_uncertainty_ns if timing == "exact" else 0,
+                    "clock_uncertainty_ns": _CLOCK_SLACK_NS if timing == "exact" else 0,
                 },
                 **overrides,
             )
@@ -183,8 +193,6 @@ class HostInteractionServer:
         if kind == "tool":
             mark = {"success": "✓", "failure": "✗", "unknown": "?"}[outcome]
             result_text = repr(extra["error"] if outcome == "failure" else extra.get("result"))
-            if len(result_text) > 200:
-                result_text = f"{result_text[:200]}…"
             term_message = (
                 f"[{self._agname}] {self._ADMISSION_LABEL[kind]} {mark}  {name}  ={result_text}"
             )
@@ -203,32 +211,53 @@ class HostInteractionServer:
         with self._pending_calls_lock:
             pending = list(self._pending_calls.values())
             self._pending_calls.clear()
-        for span in self._remote_spans.values():
+        for span in self._open_spans.values():
             agprof.interrupt_external_span(span)
-        self._remote_spans.clear()
-        self._remote_turn = None
+        self._open_spans.clear()
         for _kind, _name, _attrs, _start, span in pending:
             agprof.interrupt_external_span(span)
         if pending:
             agprof.telemetry_error("unmatched_completions", len(pending))
 
-    def profile_parent_context(self):
-        turn = self._remote_spans.get(self._remote_turn)
-        return turn.context() if turn is not None else self._profile_context
+    @staticmethod
+    def _wall_clock_to_perf_ns(wall_ts: float) -> "tuple[int, int]":
+        """Approximate this host's own perf_counter_ns for a wall-clock
+        timestamp reported by anyone (this process included), using this
+        host's own simultaneous clock readings. No calibration handshake is
+        needed with the reporter -- wall clocks are already comparable across
+        processes/containers on one host, unlike perf_counter_ns, whose epoch
+        is arbitrary per process."""
+        now_perf_ns = time.perf_counter_ns()
+        now_wall_ns = time.time_ns()
+        target_wall_ns = int(wall_ts * 1e9)
+        return now_perf_ns + (target_wall_ns - now_wall_ns), target_wall_ns
 
-    def profile_config(self) -> dict:
-        self._profile_session_id = agprof._profile_session_id
+    def current_open_context(self):
+        """Context of the most recently opened, still-open reported span, if
+        any -- otherwise the request-level fallback. Lets other host-side
+        spans (e.g. LLM dispatch) nest under whatever a harness currently has
+        open via record_span(span_id=..., end_ts=None), without either side
+        needing to know anything about the other."""
+        if self._open_spans:
+            return next(reversed(self._open_spans.values())).context()
+        return self._profile_context
+
+    def profile_settings(self) -> dict:
+        """Whether profiling is on, and automatic-function-sampling settings.
+
+        A harness able to profile its own call stack (any pure-Python one)
+        asks this once, up front, to decide whether that's worth doing at
+        all -- there is nothing harness-specific about the answer itself.
+        """
         settings = agprof._auto_settings
-        engine = self._profile_attributes.get("harness")
-        if engine == "native" and engine in agprof._engine_coverage:
-            agprof._engine_coverage[engine]["automatic_functions"] = (
-                "host_and_native_python" if settings else "disabled"
+        harness = self._profile_attributes.get("harness")
+        if harness in agprof._engine_coverage:
+            agprof._engine_coverage[harness]["automatic_functions"] = (
+                "host_and_remote_python" if settings else "disabled"
             )
-            agprof._engine_coverage[engine]["retries"] = "container_reported"
+            agprof._engine_coverage[harness]["retries"] = "container_reported"
         return {
             "enabled": agprof.enabled(),
-            "session_id": self._profile_session_id,
-            "host_perf_ns": time.perf_counter_ns(),
             "automatic": None
             if settings is None
             else {
@@ -237,110 +266,19 @@ class HostInteractionServer:
             },
         }
 
-    def profile_events(self, request: dict) -> dict:
-        """Accept bounded telemetry only inside the manager's authenticated attempt fence."""
-        if (
-            not agprof.enabled()
-            or request.get("session_id") != self._profile_session_id
-            or self._profile_session_id != agprof._profile_session_id
-        ):
-            return {"ok": False, "error": "inactive profile session"}
-        events = request.get("events", [])
-        if not isinstance(events, list) or len(events) > 128:
-            return {"ok": False, "error": "profile batch exceeds 128 events"}
-        uncertainty = request.get("clock_uncertainty_ns", 0)
-        if not isinstance(uncertainty, int) or uncertainty < 0 or uncertainty > 1_000_000_000:
-            return {"ok": False, "error": "invalid clock uncertainty"}
-        self._clock_uncertainty_ns = uncertainty
-        now = time.perf_counter_ns()
-        rejected = 0
-        for event in events:
-            try:
-                name = event["name"]
-                if not isinstance(name, str) or not name or len(name) > 512:
-                    raise ValueError("invalid name")
-                started = int(event["perf_ns"])
-                if started < agprof._session_started_ns or started > now + 1_000_000_000:
-                    raise ValueError("timestamp outside profile session")
-                wall = time.time_ns() + started - time.perf_counter_ns()
-                kind = event["kind"]
-                if kind == "automatic":
-                    duration = int(event["duration_ns"])
-                    if duration < 0 or started + duration > now + 1_000_000_000:
-                        raise ValueError("invalid interval")
-                    settings = agprof._auto_settings
-                    if settings is None:
-                        continue
-                    if len(agprof._auto_records) >= settings["max_events"]:
-                        agprof.telemetry_error("remote_auto_dropped")
-                        continue
-                    agprof._auto_records.append(
-                        (
-                            self._profile_pid,
-                            int(event["tid"]),
-                            name,
-                            str(event.get("filename", ""))[:1024],
-                            int(event.get("lineno", 0)),
-                            started,
-                            duration,
-                            str(event.get("outcome", "unknown"))[:32],
-                            "Native Python",
-                        )
-                    )
-                elif kind == "start":
-                    identifier = event["id"]
-                    if (
-                        not isinstance(identifier, str)
-                        or not identifier
-                        or len(identifier) > 128
-                        or identifier in self._remote_spans
-                    ):
-                        raise ValueError("invalid or duplicate span id")
-                    if len(self._remote_spans) >= 1024:
-                        raise ValueError("too many open remote spans")
-                    parent_id = event.get("parent_id")
-                    if parent_id is not None and parent_id not in self._remote_spans:
-                        raise ValueError("unknown parent")
-                    parent = self._remote_spans.get(parent_id)
-                    if parent is not None and started < parent._t0:
-                        raise ValueError("child starts before parent")
-                    span = agprof.start_external_span(
-                        name,
-                        start_perf_ns=started,
-                        start_wall_ns=wall,
-                        parent_context=parent.context() if parent else self._profile_context,
-                        metadata={
-                            **self._profile_attributes,
-                            "timing": "exact",
-                            "provenance": "container_asserted",
-                            "clock_uncertainty_ns": max(
-                                0, min(int(request.get("clock_uncertainty_ns", 0)), 1_000_000_000)
-                            ),
-                        },
-                    )
-                    self._remote_spans[identifier] = span
-                    if name.startswith("turn"):
-                        self._remote_turn = identifier
-                elif kind == "end":
-                    identifier = event["id"]
-                    span = self._remote_spans.get(identifier)
-                    if span is None or started < span._t0:
-                        raise ValueError("unmatched end")
-                    self._remote_spans.pop(identifier)
-                    outcome = event.get("outcome", "unknown")
-                    if outcome not in ("success", "failure", "unknown"):
-                        outcome = "unknown"
-                    span.end(end_perf_ns=started, end_wall_ns=wall, metadata={"outcome": outcome})
-                    if self._remote_turn == identifier:
-                        self._remote_turn = None
-                else:
-                    raise ValueError("invalid event kind")
-            except (KeyError, ValueError, TypeError, OverflowError):
-                rejected += 1
-                agprof.telemetry_error("remote_events_rejected")
-        dropped = request.get("dropped", 0)
-        if isinstance(dropped, int) and dropped > 0:
-            agprof.telemetry_error("remote_events_dropped", dropped)
+    def record_samples(self, samples: "list[dict]") -> dict:
+        """Ingest a batch of already-measured function-call samples.
+
+        Only ever produced by a harness profiling its own Python call stack,
+        but the ingestion itself holds no harness-specific state -- it is
+        just "accept a bounded batch of samples," same as record_span.
+        """
+        if not isinstance(samples, list) or len(samples) > 128:
+            return {"ok": False, "error": "sample batch exceeds 128 events"}
+        harness = self._profile_attributes.get("harness") or "remote"
+        rejected = agprof.ingest_auto_samples(
+            self._profile_pid, samples, thread_label=f"{harness} thread"
+        )
         return {"ok": rejected == 0, "rejected": rejected}
 
     def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
@@ -360,7 +298,7 @@ class HostInteractionServer:
         result: object = None,
         error: "str | None" = None,
         duration_ns: int | None = None,
-        started_perf_ns: int | None = None,
+        started_wall_ns: int | None = None,
     ) -> None:
         self._record_completion(
             "tool",
@@ -369,7 +307,7 @@ class HostInteractionServer:
                 "result": result,
                 "error": error,
                 **({"duration_ns": duration_ns} if duration_ns is not None else {}),
-                **({"started_perf_ns": started_perf_ns} if started_perf_ns is not None else {}),
+                **({"started_wall_ns": started_wall_ns} if started_wall_ns is not None else {}),
             },
         )
 
@@ -417,15 +355,53 @@ class HostInteractionServer:
     def record_span(
         self,
         name: str,
-        start_ts: float,
-        end_ts: float,
+        start_ts: "float | None",
+        end_ts: "float | None",
         attributes: dict,
         cpu_ms: "float | None" = None,
         runqueue_ms: "float | None" = None,
         blocked_ms: "float | None" = None,
         parent: "str | None" = None,
         call_label: "str | None" = None,
+        span_id: "str | None" = None,
     ) -> None:
+        """Log one flat historical span row -- and, when *span_id* is given,
+        also fold it into the live profiler trace with correct nesting.
+
+        Without *span_id* this is unchanged: a caller that already built its
+        own live span (the admission/completion boundaries above) wants
+        nothing more than the flat row. With *span_id*: passing *end_ts*
+        as ``None`` opens a live span for a later call to close by repeating
+        the same *span_id* with a real *end_ts* (so a still-in-progress
+        parent can be a real parent_context for a child reported later);
+        passing both *start_ts* and *end_ts* together reports the whole span
+        in one call. *parent*, when it names another currently-open span_id,
+        attaches to it regardless of which caller reported that parent --
+        nothing here is specific to any one harness.
+        """
+        if span_id is not None:
+            opened = self._open_spans.pop(span_id, None)
+            if opened is None and start_ts is not None and len(self._open_spans) < 1024:
+                parent_span = self._open_spans.get(parent)
+                start_perf_ns, start_wall_ns = self._wall_clock_to_perf_ns(start_ts)
+                opened = agprof.start_external_span(
+                    name,
+                    start_perf_ns=start_perf_ns,
+                    start_wall_ns=start_wall_ns,
+                    parent_context=(
+                        parent_span.context() if parent_span is not None else self._profile_context
+                    ),
+                    metadata={**self._profile_attributes, **attributes},
+                )
+            if end_ts is None:
+                if opened is not None:
+                    self._open_spans[span_id] = opened
+                return
+            if opened is not None:
+                end_perf_ns, end_wall_ns = self._wall_clock_to_perf_ns(end_ts)
+                opened.end(
+                    end_perf_ns=end_perf_ns, end_wall_ns=end_wall_ns, metadata=dict(attributes)
+                )
         self._data_logger.record_span(
             name,
             start_ts,
@@ -441,13 +417,13 @@ class HostInteractionServer:
     def build_app(self) -> FastAPI:
         app = FastAPI()
 
-        @app.post("/profile/config")
-        def _profile_config() -> JSONResponse:
-            return JSONResponse(self.profile_config())
+        @app.post("/profile_settings")
+        def _profile_settings() -> JSONResponse:
+            return JSONResponse(self.profile_settings())
 
-        @app.post("/profile/events")
-        def _profile_events(request: dict) -> JSONResponse:
-            return JSONResponse(self.profile_events(request))
+        @app.post("/record_samples")
+        def _record_samples(request: dict) -> JSONResponse:
+            return JSONResponse(self.record_samples(request.get("samples", [])))
 
         @app.post("/check_tool")
         def _check_tool(request: dict) -> JSONResponse:
@@ -460,7 +436,7 @@ class HostInteractionServer:
                 request.get("result"),
                 request.get("error"),
                 request.get("duration_ns"),
-                request.get("started_perf_ns"),
+                request.get("started_wall_ns"),
             )
             return JSONResponse({"ok": True})
 
@@ -491,14 +467,15 @@ class HostInteractionServer:
         def _record_span(request: dict) -> JSONResponse:
             self.record_span(
                 request["name"],
-                request["start_ts"],
-                request["end_ts"],
+                request.get("start_ts"),
+                request.get("end_ts"),
                 request["attributes"],
                 cpu_ms=request.get("cpu_ms"),
                 runqueue_ms=request.get("runqueue_ms"),
                 blocked_ms=request.get("blocked_ms"),
                 parent=request.get("parent"),
                 call_label=request.get("call_label"),
+                span_id=request.get("span_id"),
             )
             return JSONResponse({"ok": True})
 

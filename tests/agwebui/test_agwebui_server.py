@@ -169,6 +169,22 @@ def test_db_provided_term_message_wins_over_synthesis(server):
     assert envelope["term_message"] == "[team_research_0000] CREATED  parent=None"
 
 
+def test_long_term_message_is_truncated_only_for_the_webui_envelope(server):
+    """The terminal print and the agent's own db keep the full text (see
+    orchestrator.py/host_interaction_server.py's writers) -- only what
+    _build_envelope hands to the browser gets shortened."""
+    from agency.observability.agwebui.server import _build_envelope, _TERM_MESSAGE_DISPLAY_MAX_CHARS
+
+    full_message = "[agent_alex_0000] SKILL ✗  s  error=" + ("x" * 5000)
+    envelope = json.loads(
+        _build_envelope("skill_error", 1.0, "agent_alex_0000", "{}", full_message)
+    )
+    assert envelope["term_message"] != full_message
+    assert len(envelope["term_message"]) <= _TERM_MESSAGE_DISPLAY_MAX_CHARS + 1
+    assert envelope["term_message"].endswith("…")
+    assert full_message.startswith(envelope["term_message"][:-1])
+
+
 def _make_data_logger(db_path: Path):
     from agency.observability.agdatalogger import agDataLogger
     from agency.configs.agconfig import agconfig, dataloggerconfig

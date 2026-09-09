@@ -95,7 +95,7 @@ class HostServerManager:
             },
         )
         self._llm_handler_server._profile_context_provider = (
-            self._interaction_server.profile_parent_context
+            self._interaction_server.current_open_context
         )
         self._host_mcp_server = HostMcpServer(
             sandbox,
