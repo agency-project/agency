@@ -81,24 +81,27 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
         worker.join(5)
         assert not worker.is_alive()
         data = (tmp_path / "input.bin").read_bytes()
+        expected_input = b"\x1b[200~[Agency run]\noriginal prompt\x1b[201~\r"
+        if mode != "finished":
+            expected_input += b"\x1b"  # Escape interrupts Claude's active turn.
+        if mode == "restored":
+            expected_input += b"\x1b\x1b"
+        if mode not in {"finished", "completion_race", "exit"}:
+            expected_input += b"\x1b[200~[Agency redirect]\n" + message.encode() + b"\x1b[201~\r"
+        assert data == expected_input
+        assert b"\x03" not in data
         if mode in {"finished", "completion_race"}:
             assert delivered is False
-            assert data.count(b"\x03") == int(mode == "completion_race")
             assert len(results) == 1
             assert not errors
         elif mode in {"exit", "unacknowledged"}:
             assert delivered is False
             assert errors
             assert execution.handle.returncode is not None
-            assert data.count(b"\x03") == 1
         else:
             assert delivered is True
             assert not errors
             assert results[0].final_text == "scripted final"
-            assert data.count(b"\x03") == 1
-            expected = b"\x1b[200~[Agency redirect]\n" + message.encode() + b"\x1b[201~\r"
-            assert data.endswith(expected)
-            assert (b"\x1b\x1b" in data) == (mode == "restored")
         assert execution.redirect("after completion") is False
     finally:
         if execution.handle is not None:

@@ -876,7 +876,7 @@ class _ClaudePtyExecution:
     def _interrupt(self):
         offset = len(self._transcript())
         generation = self.handle.terminal_screen()[3]
-        self.handle.write_terminal(b"\x03")
+        self.handle.write_terminal(b"\x1b")
 
         def interrupted():
             # Native completion can win just after the caller's active check.

@@ -67,7 +67,7 @@ while True:
     with (root / "input.bin").open("ab") as out:
         out.write(chunk)
     buffer += chunk
-    if buffer == b"\x03":
+    if buffer == b"\x1b":
         buffer = b""
         if mode == "exit":
             sys.exit(0)
