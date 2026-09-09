@@ -54,7 +54,11 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
     detail = _fetch_agent_detail(global_path, "researcher")
     assert detail["state"]["state"] == "inactive"
     assert detail["config"] == {"temperature": 0.2}
-    assert detail["messages"] == [{"role": "assistant", "content": "done"}]
+    # _compute_agent_messages() stamps every message with a best-effort `ts`
+    # (real wall-clock time, not something to assert an exact literal for).
+    (message,) = detail["messages"]
+    assert isinstance(message.pop("ts", None), (int, float))
+    assert message == {"role": "assistant", "content": "done"}
     assert _fetch_agent_detail(global_path, "missing")["error"] == "unknown agent"
 
 

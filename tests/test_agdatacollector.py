@@ -379,6 +379,27 @@ def test_record_span_full_args(tmp_path):
     dc.stop()
 
 
+def test_record_span_drops_incomplete_span_instead_of_corrupting_the_batch(tmp_path, capsys):
+    """start_ts/end_ts are NOT NULL columns -- a caller reporting an
+    incomplete span (e.g. a harness closing a span id the host never
+    actually opened) must not crash the whole flush and take every other
+    pending row down with it (see the real failure this guards against:
+    sqlite3.IntegrityError from a batched executemany)."""
+    dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
+    dc.start()
+    dc.record_span("orphaned", None, 5.0, {})
+    dc.record_span("also-orphaned", 5.0, None, {})
+    dc.record_event("kept", {"ok": True})
+    dc.flush()
+
+    assert _select_all(db_path, "spans") == []
+    events = _select_all(db_path, "events")
+    assert len(events) == 1
+    assert events[0]["type"] == "kept"
+    assert "dropping span" in capsys.readouterr().err
+    dc.stop()
+
+
 def test_record_span_does_not_touch_latest_values(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()

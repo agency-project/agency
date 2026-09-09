@@ -308,6 +308,19 @@ class agDataLogger:
         term_message: "str | None" = None,
         flush: bool = False,
     ) -> None:
+        if start_ts is None or end_ts is None:
+            # Both columns are NOT NULL -- a caller reporting an incomplete
+            # span (e.g. a harness closing a span id the host never actually
+            # opened, which can happen once an in-flight span is abandoned
+            # by an interrupt/redirect) must not corrupt the *whole* batched
+            # flush and take every other pending row down with it. Drop only
+            # this one malformed record instead.
+            print(
+                f"[agdatalogger] WARNING: dropping span {span_name!r} with missing "
+                f"start_ts/end_ts (start_ts={start_ts!r}, end_ts={end_ts!r})",
+                file=sys.stderr,
+            )
+            return
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None:

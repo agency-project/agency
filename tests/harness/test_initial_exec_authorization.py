@@ -34,6 +34,8 @@ class _FakeLoop:
             envp=dict(envp),
             path=argv[0],
             timestamp=1.0,
+            address=None,
+            port=None,
         )
         child = SimpleNamespace(
             syscall="execve",
@@ -42,6 +44,8 @@ class _FakeLoop:
             envp={},
             path="/bin/tool",
             timestamp=2.0,
+            address=None,
+            port=None,
         )
         matching_child = SimpleNamespace(**vars(root))
         matching_child.pid = 102
