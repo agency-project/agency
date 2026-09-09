@@ -337,8 +337,9 @@ class LlmHandlerServer:
         `data` and are unreadable by anything (including this class's own
         _extract_metadata_usage()) without repeating that fragment-walk.
 
-        ``ttft_ms`` (streaming calls only; None for the non-streaming path,
-        where "time to first token" isn't a meaningful distinct quantity) is
+        ``ttft_ms`` (how long the caller waited to see any content -- for the
+        non-streaming path that's the same moment the whole response becomes
+        available, since there is no earlier partial content to report) is
         otherwise only ever recorded as an agprof span annotation -- an
         optional, separate store a replay/mock backend can't rely on having
         been populated during the original run. Persisting it here too makes
@@ -418,6 +419,7 @@ class LlmHandlerServer:
                     model=self._backend.model,
                     provider=type(self._backend).__name__,
                 )
+                t0 = time.perf_counter()
                 try:
                     result = self._backend.dispatch(request)
                 except BAD_REQUEST_EXCS as error:
@@ -464,13 +466,23 @@ class LlmHandlerServer:
                             )
                         complete_failure(error)
                         raise
+                # "Time to first token" isn't a separate quantity on this
+                # non-streaming path -- there is only one moment the whole
+                # response becomes available, so that moment is reported as
+                # ttft_ms here too (matching _run_stream_producer's meaning
+                # of the field: how long the caller waited to see any
+                # content). There is deliberately no per-token timing
+                # (TPOT-style) equivalent added here -- nothing in this
+                # codebase measures that for the streaming path either.
+                ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                 _annotate(
                     attempt_span,
                     outcome="success",
                     input_tokens=(usage or {}).get("prompt_tokens"),
                     output_tokens=(usage or {}).get("completion_tokens"),
+                    ttft_ms=ttft_ms,
                 )
-                self._tag_metadata_block(request["messages"], message)
+                self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
                 self._record_exchange(request, message, usage, stop_reason)
                 self._finalize_success(call_label, blocks)
                 finalized = True
@@ -531,7 +543,8 @@ class LlmHandlerServer:
                 thread.start()
                 self._handles.append(handle)
             return handle
-        except BaseException:
+        except BaseException as exc:
+            error = exc
             was_cancelled = handle._cancel_event.is_set()
             if self._is_cancelled():
                 try:
@@ -1007,12 +1020,19 @@ class LlmHandlerServer:
                             block["data"].append(stream_item["data"])
                         block["ts_end"] = now
                         message = _blocks_to_message(blocks)
-                        item = (
-                            {"type": "delta", "content": text_piece}
-                            if stream_item["block_type"] == "text" and text_piece
-                            else None
-                        )
-                        handle.register_stream_exchange(item, response=message)
+                        # Deliberately never pass an item here: this keeps
+                        # register_stream_exchange()'s queue-full backpressure
+                        # wait from ever triggering for a per-delta call (that
+                        # wait is gated on `item is not None`), so this loop
+                        # can never block on how fast -- or whether at all --
+                        # the harness-facing consumer drains the queue. The
+                        # upstream provider is always fully drained regardless
+                        # of the harness's own state (paused, slow, or gone);
+                        # only the one final "done" event below is ever
+                        # actually delivered. `response=message` still keeps
+                        # the transcript's latest-known partial content
+                        # current for a mid-stream disconnect/cancel.
+                        handle.register_stream_exchange(response=message)
                 except BaseException as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
                     if handle._cancel_event.is_set():

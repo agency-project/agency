@@ -33,11 +33,13 @@ class HarnessInteractionServer:
         uds_path: str,
         attempt_handler: Callable[[HarnessAttemptRequest], HarnessAttemptResult],
         *,
+        control_handler: "Callable[[str], None] | None" = None,
         startup_timeout_s: float = 10.0,
         shutdown_timeout_s: float = 10.0,
     ) -> None:
         self.uds_path = uds_path
         self._attempt_handler = attempt_handler
+        self._control_handler = control_handler
         self._startup_timeout_s = startup_timeout_s
         self._shutdown_timeout_s = shutdown_timeout_s
         self._server: "uvicorn.Server | None" = None
@@ -71,6 +73,19 @@ class HarnessInteractionServer:
                 sandbox_mcp_tools_b64=payload.get("sandbox_mcp_tools_b64"),
             )
             return JSONResponse(asdict(self._attempt_handler(request)))
+
+        @app.post("/control/{action}")
+        def _control(action: str) -> JSONResponse:
+            # A sync route -- like /harness_attempt above -- runs in
+            # Starlette's threadpool, so this is served concurrently even
+            # while /harness_attempt's handler is still blocked in its own
+            # worker thread for a different in-flight attempt.
+            if self._control_handler is None:
+                return JSONResponse({"error": "no control handler configured"}, status_code=501)
+            if action not in ("pause", "resume", "cancel"):
+                return JSONResponse({"error": f"unknown action {action!r}"}, status_code=404)
+            self._control_handler(action)
+            return JSONResponse({"ok": True})
 
         return app
 

@@ -362,6 +362,7 @@ class _ClaudeCodeBackend(agharness_backend):
                 policy=runtime.syscall_policy,
                 ag=None,
             )
+            runtime.register_control_handle(handle)
 
             stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
             _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")

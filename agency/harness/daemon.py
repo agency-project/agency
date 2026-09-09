@@ -214,6 +214,7 @@ def _run_adapter_attempt(
     model: str,
     engine_name: str,
     syscall_policy,
+    register_control_handle: "Callable[[object], None]",
 ) -> HarnessAttemptResult:
     attempt_token = request.attempt_token
     if not isinstance(attempt_token, str) or not attempt_token:
@@ -241,6 +242,7 @@ def _run_adapter_attempt(
             syscall_policy=syscall_policy,
             sandbox=_LocalSandbox() if request.harness == "native" else None,
             has_sandbox_mcp_tools=request.sandbox_mcp_tools_b64 is not None,
+            register_control_handle=register_control_handle,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
@@ -291,14 +293,63 @@ class HarnessManager:
         )
         self._attempt_lock = threading.Lock()
         self._current_attempt_token: "str | None" = None
+        # Separate from _attempt_lock, which is held for an attempt's ENTIRE
+        # duration (see _dispatch_attempt()) -- a /control/* request must be
+        # served concurrently with an in-flight attempt, not block behind it.
+        self._control_lock = threading.Lock()
+        self._current_control_handle: object = None
+        # Sticky: persists across attempts for this daemon's whole life, so
+        # a pause requested between attempts (or before the first one ever
+        # ran) still applies the instant the next harness process exists --
+        # see _register_control_handle().
+        self._agent_paused = False
         self._interaction_server = HarnessInteractionServer(
             sandbox_uds_path,
             self._dispatch_attempt,
+            control_handler=self.control,
         )
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
         self._harness_api.change_config(self._agconfig)
+
+    def _register_control_handle(self, handle: object) -> None:
+        """Passed to each adapter as AdapterRuntime.register_control_handle
+        -- called with this attempt's launch handle immediately after it
+        starts. Applies a pause requested before this handle existed."""
+        with self._control_lock:
+            self._current_control_handle = handle
+            should_pause = self._agent_paused
+        if should_pause:
+            try:
+                handle.pause()
+            except Exception as exc:
+                print(f"[harness_daemon] WARNING: pause() on new attempt failed: {exc}")
+
+    def _clear_control_handle(self) -> None:
+        with self._control_lock:
+            self._current_control_handle = None
+
+    def control(self, action: str) -> None:
+        """Backs HarnessInteractionServer's /control/{action} route.
+        No-op (not an error) when nothing is currently registered -- see
+        agent.py's cancel()/pause()/resume() for why that's safe."""
+        with self._control_lock:
+            if action == "pause":
+                self._agent_paused = True
+            elif action == "resume":
+                self._agent_paused = False
+            handle = self._current_control_handle
+        if handle is None:
+            return
+        if action == "pause":
+            handle.pause()
+        elif action == "resume":
+            handle.resume()
+        elif action == "cancel":
+            handle.kill()
+        else:
+            raise ValueError(f"unknown harness control action {action!r}")
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token
@@ -323,6 +374,7 @@ class HarnessManager:
             finally:
                 self._current_attempt_token = None
                 self._harness_api.clear_attempt_token(token)
+                self._clear_control_handle()
 
     def _run_adapter_request(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = self._current_attempt_token
@@ -336,6 +388,7 @@ class HarnessManager:
                 self._harness_api.resolve_model(token),
                 self._engine_name,
                 self._harness_api.syscall_policy(token),
+                self._register_control_handle,
             )
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")

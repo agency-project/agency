@@ -320,6 +320,12 @@ class HostServerManager:
                 self._llm_handler_server.stop()
             except BaseException as exc:
                 llm_error = exc
+                from ...utils.agutil import format_exception
+
+                print(
+                    f"[host_server_manager] WARNING: llm_handler_server.stop() failed: "
+                    f"{format_exception(exc)}"
+                )
 
             server = self._server
             thread = self._server_thread

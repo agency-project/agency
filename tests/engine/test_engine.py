@@ -147,9 +147,13 @@ class _FakeAgent:
         self.change_config_calls = []
         self.data_logger = _FakeDataLogger()
         self._destroyed = False
+        self._paused = False
 
     def change_config(self, agconfig):
         self.change_config_calls.append(agconfig)
+
+    def is_paused(self) -> bool:
+        return self._paused
 
 
 def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=None):

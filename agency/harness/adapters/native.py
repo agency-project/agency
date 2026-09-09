@@ -7,13 +7,15 @@ its result through the common daemon adapter seam.
 from __future__ import annotations
 
 import json
-import shlex
+import os
+import sys
 import uuid
 
 from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
+from ..executable import HARNESS_PATH
 
 _DEFAULT_TIMEOUT_S = 600
 
@@ -76,19 +78,7 @@ class _NativeBackend(agharness_backend):
         max_steps: "int | None",
     ) -> AttemptResult:
         from .. import agharness
-
-        # Do not infer this from the bridge URL: native_harness genuinely needs a container
-        # (PYTHONPATH/package bind-mount, ensure_python_packages_in_container,
-        # sandbox.exec() itself), so it checks the sandbox's own kind
-        # directly, a real, current limitation, not a silently-accepted no-op.
-        if not agharness.is_container_backed(runtime.sandbox):
-            return AttemptResult(
-                ok=False,
-                error_message=(
-                    "native's standalone harness requires a container-backed sandbox -- "
-                    "bare-host/chroot support is future work"
-                ),
-            )
+        from ..ptrace.supervisor import agProxyPtrace
 
         from ...utils.agutil import (
             AGENCY_PACKAGE_CONTAINER_MOUNT,
@@ -122,44 +112,54 @@ class _NativeBackend(agharness_backend):
                 has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
             )
             pkg_pythonpath = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/agency"
-            run_id = uuid.uuid4().hex[:8]
-            stdout_path = f"{scratch_dir}/stdout-{run_id}.json"
-            stderr_path = f"{scratch_dir}/stderr-{run_id}.log"
 
             argv = [
-                "python3",
+                sys.executable,
                 "-m",
                 "native_harness.cli",
                 "-p",
-                shlex.quote(prompt),
+                prompt,
                 "--model",
-                shlex.quote(runtime.model or ""),
+                runtime.model or "",
                 "--max-steps",
                 str(20 if max_steps is None else max_steps),
                 "--output-format",
                 "json",
                 "--bridge-base-url",
-                shlex.quote(runtime.harness_base_url),
+                runtime.harness_base_url,
                 "--bridge-token",
-                shlex.quote(runtime.token),
+                runtime.token,
                 "--mcp-config",
-                shlex.quote(json.dumps(mcp_config)),
+                json.dumps(mcp_config),
                 "--session-dir",
-                shlex.quote(scratch_dir),
+                scratch_dir,
                 "--offload-dir",
-                shlex.quote(offload_dir),
+                offload_dir,
             ]
             if resume_session_id:
-                argv += ["--resume", shlex.quote(resume_session_id)]
+                argv += ["--resume", resume_session_id]
 
-            cmd = (
-                f"cd /workspace && PYTHONPATH={shlex.quote(pkg_pythonpath)} "
-                + " ".join(argv)
-                + f" > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}"
+            envp = {
+                "PATH": HARNESS_PATH,
+                "PYTHONPATH": pkg_pythonpath,
+            }
+            if "HOME" in os.environ:
+                envp["HOME"] = os.environ["HOME"]
+
+            # Same ptrace-supervised launch every other adapter uses (see
+            # agProxyPtrace.launch()'s docstring) -- gives native the exact
+            # same OS-level pause/resume/kill control as claude_code/codex/
+            # opencode/grok, with no harness-specific control mechanism.
+            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
+            handle = px.launch(
+                argv,
+                envp,
+                cwd="/workspace",
+                policy=runtime.syscall_policy,
+                ag=None,
             )
-            _, rc = sandbox.exec(cmd, workdir="/workspace", timeout=_DEFAULT_TIMEOUT_S)
-            stdout = sandbox.read_file(stdout_path)
-            stderr = sandbox.read_file(stderr_path) if rc != 0 else ""
+            runtime.register_control_handle(handle)
+            stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
 
             if rc != 0:
                 return AttemptResult(

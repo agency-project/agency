@@ -133,26 +133,24 @@ class ExecutionScheduler:
         an unfinished first one -- ``submit()`` chains each new context onto
         its predecessor under the orchestrator's single lock, and
         ``resolve_dependency()`` blocks promotion until that predecessor
-        resolves. So the only skip needed here beyond capacity is an explicit
-        ``agent.pause()`` -- unlike mutual exclusion, there is nothing else
-        that would ever hold a paused agent's ready request back.
+        resolves. So the only skip needed here at all is capacity -- the
+        scheduler has no notion of ``agent.pause()``/``cancel()`` whatsoever;
+        those are handled entirely inside ``agent.py``/the harness daemon
+        (see ``agent.pause()``'s docstring). A paused agent's ready request
+        still launches immediately here, same as any other -- it's the
+        harness itself, at the OS-process level, that stays (or starts)
+        held.
         """
         owner = self._orchestrator
         while owner._has_capacity_locked():
-            skipped: list[tuple[int, str]] = []
             selected: "_ExecutionRequest | None" = None
             while self._ready:
                 entry = heapq.heappop(self._ready)
                 pending_exec = owner._requests.get(entry[1])
                 if pending_exec is None or pending_exec.state != "ready":
                     continue
-                if pending_exec.agent._paused:
-                    skipped.append(entry)
-                    continue
                 selected = pending_exec
                 break
-            for entry in skipped:
-                heapq.heappush(self._ready, entry)
             if selected is None:
                 return
             owner._launch_request_locked(selected)

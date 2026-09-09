@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -694,6 +695,61 @@ def test_live_traced_process_is_incomplete_when_profiler_stops(tmp_path):
         if handle is not None:
             handle.kill()
             handle.wait(timeout=10)
+
+
+def _proc_state(pid: int) -> str:
+    status = Path(f"/proc/{pid}/status").read_text()
+    for line in status.splitlines():
+        if line.startswith("State:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"no State: line for pid {pid}")
+
+
+def _wait_until(predicate, *, timeout: float, message: str) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(message)
+        time.sleep(0.05)
+
+
+@ptrace
+def test_pause_stops_traced_process_and_resume_continues_it():
+    """Validates the actual OS-level effect, not just internal bookkeeping:
+    a paused traced process must reach a real 'T (stopped)' /proc state, and
+    resume() must bring it back to running. A naive SIGSTOP-then-PTRACE_CONT
+    would NOT do this -- see TracerLoop.pause()/resume()'s docstrings for
+    why the restart must be withheld rather than re-issued."""
+    handle = agProxyPtrace().launch(
+        ["/bin/sleep", "30"],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+    )
+    try:
+        pid = next(iter(handle.pids()))
+        _wait_until(
+            lambda: _proc_state(pid)[:1] in ("S", "R"),
+            timeout=5,
+            message="process never reached a running state",
+        )
+
+        handle.pause()
+        _wait_until(
+            lambda: _proc_state(pid).lower().startswith("t"),
+            timeout=5,
+            message=f"process never stopped, last state={_proc_state(pid)!r}",
+        )
+
+        handle.resume()
+        _wait_until(
+            lambda: not _proc_state(pid).lower().startswith("t"),
+            timeout=5,
+            message="process never resumed from stopped state",
+        )
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
 
 
 @ptrace

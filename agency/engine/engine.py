@@ -228,6 +228,23 @@ class AgentEngine:
                 agconfig=self.agconfig,
             )
 
+            # Sync current pause state to the daemon before this attempt
+            # starts -- closes the race where pause() was requested before
+            # the sandbox/daemon existed at all, or between attempts (the
+            # daemon's own sticky state, see HarnessManager._agent_paused,
+            # is what actually holds it; agent.pause()/resume() reach the
+            # SAME daemon directly whenever one already exists). No
+            # blocking wait, no Event -- the daemon is what stays paused.
+            if self._agent.is_paused():
+                try:
+                    with handle.client(timeout_s=10) as client:
+                        client.pause_harness()
+                except Exception as exc:
+                    print(
+                        f"[engine] WARNING: pause_harness() sync failed for "
+                        f"{self._agent.agname}: {exc}"
+                    )
+
             # Obtain Host -> Sandbox handle
             with self._services_lock:
                 # Invocation pause is intentionally unbounded. Readiness probes

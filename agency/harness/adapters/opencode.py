@@ -194,6 +194,7 @@ class _OpencodeBackend(agharness_backend):
                 policy=runtime.syscall_policy,
                 ag=None,
             )
+            runtime.register_control_handle(handle)
             stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
         finally:
             agharness.cleanup_config_home(config_home)

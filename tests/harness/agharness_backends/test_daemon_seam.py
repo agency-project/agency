@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
-import shlex
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -169,6 +167,11 @@ def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, 
 
 
 class _NativeSandbox:
+    """Only backs materialize/cleanup_config_home_in_container and session
+    blob I/O now -- native's harness launch itself goes through the same
+    agProxyPtrace.launch() mock every other adapter's test uses (see
+    test_native_adapter_launches_through_typed_runtime), not sandbox.exec()."""
+
     class _Backend:
         IMAGE_KIND = "container"
 
@@ -182,15 +185,7 @@ class _NativeSandbox:
 
     def exec(self, cmd, workdir="/workspace", timeout=600):
         self.commands.append(cmd)
-        if "native_harness.cli" in cmd:
-            match = re.search(r"> ([^ ]+) 2> ([^ ]+)$", cmd)
-            assert match
-            self.files[match.group(1)] = json.dumps({"result": "native-ok", "usage": {}})
-            self.files[match.group(2)] = ""
         return "", 0
-
-    def read_file(self, path):
-        return self.files[path]
 
     def read_file_bytes(self, path):
         return self.files[path].encode()
@@ -199,10 +194,31 @@ class _NativeSandbox:
         self.files[path] = data.decode()
 
 
+def _native_launch(captured: dict, stdout: str):
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+        import sys
+
+        assert argv[0] == sys.executable
+        assert cwd == "/workspace"
+        assert stdin_data is None
+        captured["argv"] = argv
+        captured["envp"] = envp
+        handle = MagicMock()
+        handle.wait.return_value = (stdout, "", 0)
+        return handle
+
+    return launch
+
+
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     sandbox = _NativeSandbox()
+    captured: dict = {}
     monkeypatch.setattr(
         "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
+        _native_launch(captured, json.dumps({"result": "native-ok", "usage": {}})),
     )
 
     result = _NativeBackend(agconfig()).run_daemon_attempt(
@@ -215,15 +231,19 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
 
     assert result.ok
     assert result.final_text == "native-ok"
-    command = next(command for command in sandbox.commands if "native_harness.cli" in command)
-    argv = shlex.split(command)
+    argv = captured["argv"]
     assert argv[argv.index("--max-steps") + 1] == "4"
 
 
 def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch):
     sandbox = _NativeSandbox()
+    captured: dict = {}
     monkeypatch.setattr(
         "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
+        _native_launch(captured, json.dumps({"result": "native-ok", "usage": {}})),
     )
 
     result = _NativeBackend(agconfig()).run_daemon_attempt(
@@ -235,8 +255,7 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
     )
 
     assert result.ok
-    command = next(command for command in sandbox.commands if "native_harness.cli" in command)
-    argv = shlex.split(command)
+    argv = captured["argv"]
     assert argv[argv.index("--max-steps") + 1] == "20"
 
 
@@ -262,11 +281,7 @@ def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, 
         runtime, prompt="test", resume_session_id=None, prior_session_blob=None, max_steps=2
     )
     assert result.ok
-    argv = (
-        shlex.split(next(cmd for cmd in sandbox.commands if "native_harness.cli" in cmd))
-        if sandbox is not None
-        else captured["argv"]
-    )
+    argv = captured["argv"]
     servers = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
     assert set(servers) == ({"agency", "agency-sandbox"} if has_sandbox_tools else {"agency"})
     assert servers["agency"]["url"] == f"{runtime.harness_base_url}/mcp"

@@ -22,6 +22,15 @@ class HarnessInteractionClient:
         response.raise_for_status()
         return HarnessAttemptResult(**response.json())
 
+    def pause_harness(self) -> None:
+        self._client.post("/control/pause").raise_for_status()
+
+    def resume_harness(self) -> None:
+        self._client.post("/control/resume").raise_for_status()
+
+    def cancel_harness(self) -> None:
+        self._client.post("/control/cancel").raise_for_status()
+
     def is_ready(self) -> bool:
         response = self._client.get("/health")
         response.raise_for_status()

@@ -122,10 +122,10 @@ def _write_replay(path):
     reason=(
         "agent.redirect() is stubbed (NotImplementedError) pending its own design "
         "pass -- no harness has a live mid-attempt injection channel today. "
-        "agent.pause()/resume() are real now, but only as an admission gate for "
-        "not-yet-launched work; there is no way to freeze/resume an already-running "
-        "invocation (that's separately deferred, OS-level/cgroup work), so this "
-        "lifecycle check no longer exercises mid-flight pause at all."
+        "agent.pause()/resume()/cancel() are real now, including freezing/killing an "
+        "already-running harness at the OS-process level (ptrace-based, uniform "
+        "across every adapter) -- this lifecycle check just doesn't exercise that "
+        "path yet, only redirect()'s still-missing injection channel."
     ),
     strict=False,
 )

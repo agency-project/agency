@@ -360,17 +360,30 @@ class agent:
         )
         return sequence
 
-    def pause(self) -> None:
-        """Hold this agent's next not-yet-launched run() until resume().
+    def _daemon_handle(self):
+        """This agent's already-persistent daemon handle, if one exists --
+        the same cache ensure_harness_daemon() populates, keyed by
+        engine_name (str(agent.agname), see engine.py's _execute_harness()).
+        None if this agent has never run yet."""
+        if self.sandbox is None:
+            return None
+        return getattr(self.sandbox, "_agency_harness_daemon_handles", {}).get(str(self.agname))
 
-        Whatever is already running is unaffected -- this only gates
-        admission of the next launch (the scheduler's ready-request skip),
-        matching what ``suspend()`` used to do. ``queue_message()`` is never
-        gated by this.
+    def pause(self) -> None:
+        """Pause this agent's harness at the OS-process level: if one is
+        currently running, freeze it now; either way, the daemon remembers
+        this so the next harness it launches starts paused too, until
+        resume() (see HarnessManager._agent_paused). No orchestrator/
+        scheduler involvement -- purely agent.py + the sandbox's daemon.
         """
-        with self._orchestrator._event_cond:
-            self._paused = True
-            self._orchestrator._post_locked("control_changed", ("agent", self))
+        self._paused = True
+        handle = self._daemon_handle()
+        if handle is not None:
+            try:
+                with handle.client(timeout_s=10) as client:
+                    client.pause_harness()
+            except Exception as exc:
+                print(f"[agent] WARNING: pause_harness() failed for {self.agname}: {exc}")
         self.data_logger.record_event(
             type="agent_paused",
             payload={"agname": self.agname},
@@ -378,9 +391,14 @@ class agent:
         )
 
     def resume(self) -> None:
-        with self._orchestrator._event_cond:
-            self._paused = False
-            self._orchestrator._post_locked("control_changed", ("agent", self))
+        self._paused = False
+        handle = self._daemon_handle()
+        if handle is not None:
+            try:
+                with handle.client(timeout_s=10) as client:
+                    client.resume_harness()
+            except Exception as exc:
+                print(f"[agent] WARNING: resume_harness() failed for {self.agname}: {exc}")
         self.data_logger.record_event(
             type="agent_resumed",
             payload={"agname": self.agname},
@@ -402,11 +420,25 @@ class agent:
         Purely a lookup key: nothing is marked on *handle* itself. A
         not-yet-launched run naturally reaches the engine's own pre-checkpoint
         once its predecessor resolves; an already-running one is caught by
-        the post-checkpoint once the harness returns (cooperative-only --
-        does not interrupt an in-flight harness).
+        the post-checkpoint once the harness returns (cooperative-only,
+        by itself -- does not interrupt an in-flight harness). If *handle*'s
+        request is the one actually running right now, this also kills its
+        harness process at the OS level, via the same daemon pause()/
+        resume() reaches. A race where the harness hasn't launched yet even
+        though the request is "running" is harmless: cancel_harness() would
+        just find nothing registered, and the cooperative checkpoints above
+        still guarantee agcanceled() regardless of timing.
         """
         future = object.__getattribute__(handle, "_future")
-        self._orchestrator.cancel_request(future)
+        was_running = self._orchestrator.cancel_request(future)
+        if was_running:
+            daemon_handle = self._daemon_handle()
+            if daemon_handle is not None:
+                try:
+                    with daemon_handle.client(timeout_s=10) as client:
+                        client.cancel_harness()
+                except Exception as exc:
+                    print(f"[agent] WARNING: cancel_harness() failed for {self.agname}: {exc}")
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill

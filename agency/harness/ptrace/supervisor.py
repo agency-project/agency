@@ -404,6 +404,12 @@ class agProxyPtraceHandle:
     def kill(self) -> None:
         self._loop.kill()
 
+    def pause(self) -> None:
+        self._loop.pause()
+
+    def resume(self) -> None:
+        self._loop.resume()
+
 
 class agProxyPtrace:
     """Entry point for launching a process under syscall-level supervision.

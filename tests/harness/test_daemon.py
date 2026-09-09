@@ -58,6 +58,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
         "model",
         "agent-1",
         object(),
+        lambda handle: None,
     )
 
     assert seen["resume_session_id"] == "session-1"
@@ -86,6 +87,9 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     manager._engine_name = "agent-1"
     manager._attempt_lock = threading.Lock()
     manager._current_attempt_token = None
+    manager._control_lock = threading.Lock()
+    manager._current_control_handle = None
+    manager._agent_paused = False
     policy = object()
 
     class HarnessApi:
@@ -112,7 +116,9 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     manager._harness_api = HarnessApi()
     manager._attempt_handler = manager._run_adapter_request
 
-    def run_adapter(got_request, config, base_url, model, engine_name, syscall_policy):
+    def run_adapter(
+        got_request, config, base_url, model, engine_name, syscall_policy, register_control_handle
+    ):
         seen.append((got_request, config, base_url, model, engine_name, syscall_policy))
         return expected
 
@@ -142,6 +148,9 @@ def test_daemon_rejects_missing_attempt_token_without_registering():
     manager = HarnessManager.__new__(HarnessManager)
     manager._attempt_lock = threading.Lock()
     manager._current_attempt_token = None
+    manager._control_lock = threading.Lock()
+    manager._current_control_handle = None
+    manager._agent_paused = False
     manager._harness_api = type(
         "HarnessApi",
         (),
@@ -165,6 +174,9 @@ def test_daemon_revokes_attempt_token_when_handler_raises():
     manager = HarnessManager.__new__(HarnessManager)
     manager._attempt_lock = threading.Lock()
     manager._current_attempt_token = None
+    manager._control_lock = threading.Lock()
+    manager._current_control_handle = None
+    manager._agent_paused = False
     manager._harness_api = type(
         "HarnessApi",
         (),

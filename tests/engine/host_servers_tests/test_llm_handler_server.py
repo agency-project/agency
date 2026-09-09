@@ -472,8 +472,9 @@ def test_dispatch_tags_metadata_block_with_new_prompt_tokens_across_exchanges():
     first_result = server.dispatch(first_request)
     first_metadata = next(b for b in first_result["message"]["blocks"] if b["type"] == "metadata")
     assert first_metadata["new_prompt_tokens"] == 100
-    # Non-streaming calls have no distinct "time to first token".
-    assert first_metadata["ttft_ms"] is None
+    # Non-streaming calls report ttft_ms too -- the same moment the whole
+    # response becomes available, since there's no earlier partial content.
+    assert isinstance(first_metadata["ttft_ms"], float)
 
     second_request = {
         "messages": first_request["messages"]
@@ -593,7 +594,14 @@ def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
 # ---------------------------------------------------------------------------
 
 
-def test_start_stream_relays_text_deltas_then_done():
+def test_start_stream_accumulates_deltas_and_delivers_one_done_item():
+    """Deltas are never individually delivered to the harness -- only the
+    one final "done" event carries the fully-assembled message. This is
+    what lets the producer fully drain the upstream provider regardless of
+    the harness's own state (paused, slow, or gone): the queue-full
+    backpressure wait only ever triggers for a real delivered item, and
+    there is only one of those now."""
+
     def create(**kwargs):
         return iter(
             [
@@ -606,17 +614,15 @@ def test_start_stream_relays_text_deltas_then_done():
     server, client = _make_server(create_fn=create)
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
-    assert [i["type"] for i in items] == ["delta", "delta", "done"]
-    assert items[0]["content"] == "Hel"
-    assert items[1]["content"] == "lo"
-    message = items[2]["message"]
+    assert [i["type"] for i in items] == ["done"]
+    message = items[0]["message"]
     assert message["role"] == "assistant"
     content_blocks = [b for b in message["blocks"] if b["type"] != "metadata"]
     assert len(content_blocks) == 1
     block = content_blocks[0]
     assert block["type"] == "text" and block["text"] == "Hello"
     assert "ts_start" in block and "ts_end" in block
-    assert items[2]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    assert items[0]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     metadata_block = next(b for b in message["blocks"] if b["type"] == "metadata")
     assert metadata_block["data"][-1]["usage"] == {
         "prompt_tokens": 1,
@@ -790,13 +796,15 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     server, client = _make_server(create_fn=create)
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
-    assert items[0]["type"] == "delta"
-    assert items[-1] == {
-        "type": "error",
-        "message": "mid-stream failure",
-        "transient": False,
-        "status_code": 500,
-    }
+    # The "ok" delta is never individually delivered -- only the error item is.
+    assert items == [
+        {
+            "type": "error",
+            "message": "mid-stream failure",
+            "transient": False,
+            "status_code": 500,
+        }
+    ]
     handle._thread.join(timeout=2.0)
     assert client.closed is True
     assert server._data_logger.finalized == [
@@ -1525,10 +1533,11 @@ def test_build_app_dispatch_route_streaming_relays_ndjson_lines():
     response = client.post("/dispatch", json={"messages": [], "stream": True})
     assert response.status_code == 200
     lines = [json.loads(line) for line in response.text.strip().split("\n")]
-    assert lines[0] == {"type": "delta", "content": "Hi"}
-    assert lines[-1]["type"] == "done"
-    assert lines[-1]["message"]["role"] == "assistant"
-    blocks = lines[-1]["message"]["blocks"]
+    # Deltas are never individually relayed -- only the one final "done" line.
+    assert len(lines) == 1
+    assert lines[0]["type"] == "done"
+    assert lines[0]["message"]["role"] == "assistant"
+    blocks = lines[0]["message"]["blocks"]
     assert len(blocks) == 1
     assert blocks[0]["type"] == "text"
     assert blocks[0]["text"] == "Hi"

@@ -152,6 +152,16 @@ class TracerLoop:
         self.stderr_r: "int | None" = None
 
         self._known_pids: "set[int]" = set()
+        # pause()/resume(): _held_pids marks a pid that must not be
+        # auto-continued the next time its SIGSTOP delivery-stop is
+        # dispatched; _parked_pids marks one that has actually reached that
+        # stop and is currently withheld there, awaiting resume()'s deferred
+        # PTRACE_CONT. See _dispatch()'s generic-signal fallthrough.
+        self._held_pids: "set[int]" = set()
+        self._parked_pids: "set[int]" = set()
+        # Pids resume() wants continued -- drained and actually PTRACE_CONT'd
+        # by _run() on the dedicated tracer thread (see resume()'s docstring).
+        self._resume_requests: "list[int]" = []
         self._process_pids: "set[int]" = set()
         self._pending_clone_pids: "set[int]" = set()
         self._pending_exec_paths: "dict[int, str | None]" = {}
@@ -471,6 +481,18 @@ class TracerLoop:
         while True:
             with self._lock:
                 pending = list(self._known_pids)
+                to_resume = list(self._resume_requests)
+                self._resume_requests.clear()
+            # resume()'s PTRACE_CONT must be issued from this dedicated
+            # tracer thread -- ptrace's tracer identity is per-thread, so a
+            # call from resume()'s own (arbitrary) caller thread would fail.
+            # resume() only queues the pids here; this loop is what actually
+            # restarts them, on its very next iteration.
+            for pid in to_resume:
+                try:
+                    pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+                except ProcessLookupError:
+                    pass
             if not pending:
                 break
             made_progress = False
@@ -550,7 +572,43 @@ class TracerLoop:
         # occur here with the options above, but must never be forwarded
         # as a real signal if it somehow does).
         forward = 0 if sig == signal.SIGTRAP else sig
+        if sig == signal.SIGSTOP:
+            # Re-injecting SIGSTOP via PTRACE_CONT does not actually suspend
+            # a tracee -- restarting it always resumes it regardless of
+            # which signal is passed in the restart. The only way to truly
+            # hold it stopped is to withhold the restart call entirely once
+            # pause() has asked for this pid to stop -- see pause()/resume().
+            with self._lock:
+                if pid in self._held_pids:
+                    self._parked_pids.add(pid)
+                    return
         pt.ptrace(pt.PTRACE_CONT, pid, 0, forward)
+
+    def pause(self) -> None:
+        """Stop every currently-known pid in the traced tree. Unlike
+        kill(), this must wait for each pid's own SIGSTOP delivery-stop to
+        reach _dispatch() (on the dedicated tracer thread) before it is
+        actually withheld -- see _dispatch()'s generic-signal fallthrough."""
+        with self._lock:
+            pids = list(self._known_pids)
+            self._held_pids |= set(pids)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+
+    def resume(self) -> None:
+        """Queue the deferred PTRACE_CONT for every pid pause() withheld --
+        actually issued by _run() on the dedicated tracer thread, since
+        ptrace() calls are only valid from the thread that attached (this
+        method itself may be called from any thread, e.g. a control-route
+        handler)."""
+        with self._lock:
+            parked = list(self._parked_pids)
+            self._parked_pids.clear()
+            self._held_pids.clear()
+            self._resume_requests.extend(parked)
 
     def _handle_seccomp_stop(self, pid: int) -> None:
         regs = pt.get_regs(pid)

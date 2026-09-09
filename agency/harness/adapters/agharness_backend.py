@@ -19,10 +19,16 @@ Every concrete backend implements the sandbox-daemon
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, Callable, ClassVar, Protocol
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
+
+
+def _discard_control_handle(_handle: object) -> None:
+    """Default register_control_handle -- a caller that doesn't care about
+    pause/resume/kill control (e.g. a test) needn't pass one."""
+    return None
 
 
 @dataclass
@@ -66,6 +72,11 @@ class AdapterRuntime:
     syscall_policy: object
     sandbox: "AdapterSandbox | None" = None
     has_sandbox_mcp_tools: bool = False
+    # Called with this attempt's launch handle (agProxyPtraceHandle for every
+    # adapter, native included) immediately after it starts, before the
+    # adapter blocks on its own .wait() -- lets the daemon apply pause/
+    # resume/kill uniformly, with no harness-specific control mechanism.
+    register_control_handle: "Callable[[object], None]" = _discard_control_handle
 
 
 class agharness_backend:
