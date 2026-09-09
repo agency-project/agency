@@ -77,6 +77,9 @@ class AdapterRuntime:
     # adapter blocks on its own .wait() -- lets the daemon apply pause/
     # resume/kill uniformly, with no harness-specific control mechanism.
     register_control_handle: "Callable[[object], None]" = _discard_control_handle
+    # Register an attempt-local delivery function. False means the caller must
+    # queue the message; True requires native prompt acceptance, not a buffer write.
+    register_redirect: "Callable[[Callable[[str], bool]], None]" = _discard_control_handle
 
 
 class agharness_backend:

@@ -34,12 +34,14 @@ class HarnessInteractionServer:
         attempt_handler: Callable[[HarnessAttemptRequest], HarnessAttemptResult],
         *,
         control_handler: "Callable[[str], None] | None" = None,
+        redirect_handler: "Callable[[str, str], bool] | None" = None,
         startup_timeout_s: float = 10.0,
         shutdown_timeout_s: float = 10.0,
     ) -> None:
         self.uds_path = uds_path
         self._attempt_handler = attempt_handler
         self._control_handler = control_handler
+        self._redirect_handler = redirect_handler
         self._startup_timeout_s = startup_timeout_s
         self._shutdown_timeout_s = shutdown_timeout_s
         self._server: "uvicorn.Server | None" = None
@@ -66,6 +68,7 @@ class HarnessInteractionServer:
             request = HarnessAttemptRequest(
                 prompt=prompt,
                 harness=payload["harness"],
+                request_id=payload.get("request_id"),
                 max_steps=payload.get("max_steps"),
                 resume_session_id=payload.get("resume_session_id"),
                 prior_session_blob_b64=payload.get("prior_session_blob_b64"),
@@ -75,6 +78,20 @@ class HarnessInteractionServer:
                 syscall_hooked_names=payload.get("syscall_hooked_names"),
             )
             return JSONResponse(asdict(self._attempt_handler(request)))
+
+        @app.post("/redirect")
+        def _redirect(payload: dict) -> JSONResponse:
+            request_id, message = payload.get("request_id"), payload.get("message")
+            if not isinstance(request_id, str) or not request_id:
+                return JSONResponse({"error": "missing request_id"}, status_code=400)
+            if not isinstance(message, str) or not message.strip():
+                return JSONResponse({"error": "missing message"}, status_code=400)
+            delivered = (
+                self._redirect_handler(request_id, message)
+                if self._redirect_handler is not None
+                else False
+            )
+            return JSONResponse({"delivered": delivered})
 
         @app.post("/control/{action}")
         def _control(action: str) -> JSONResponse:

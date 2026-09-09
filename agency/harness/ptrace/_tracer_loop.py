@@ -26,7 +26,11 @@ package's only job "run the ptrace mechanics correctly."
 from __future__ import annotations
 
 import ctypes
+import fcntl
+import struct
+import termios
 import os
+import select
 import signal
 import threading
 import time
@@ -195,6 +199,14 @@ class TracerLoop:
         self._thread: "threading.Thread | None" = None
         self._lock = threading.Lock()
 
+        self.pty_master: int | None = None
+        self._pty_size: tuple[int, int] | None = None
+        self._terminal_write_lock = threading.Lock()
+        self._output_limit = 1024 * 1024
+        self._terminal_tail = b""
+        self._terminal_screen = None
+        self._terminal_stream = None
+        self._terminal_generation = 0
         self._stdout_buf = bytearray()
         self._stderr_buf = bytearray()
         self._stdout_reader: "threading.Thread | None" = None
@@ -245,6 +257,7 @@ class TracerLoop:
         cwd: str,
         *,
         stdin_data: "bytes | None" = None,
+        pty_size: "tuple[int, int] | None" = None,
     ) -> None:
         """Starts the fork + trace loop on ONE dedicated thread and blocks
         until the child exists and its first executable image is confirmed
@@ -256,6 +269,14 @@ class TracerLoop:
         caller's thread with the trace loop running on a different one:
         the resulting PTRACE_SETOPTIONS/waitpid calls would target a pid
         this thread was never the tracer of and fail with ESRCH."""
+        if pty_size is not None and stdin_data is not None:
+            raise ValueError("PTY input must use write_terminal")
+        self._pty_size = pty_size
+        if pty_size is not None:
+            import pyte
+
+            self._terminal_screen = pyte.Screen(*pty_size)
+            self._terminal_stream = pyte.ByteStream(self._terminal_screen)
         started = threading.Event()
         start_error: "list[BaseException]" = []
 
@@ -291,6 +312,8 @@ class TracerLoop:
         initial post-TRACEME stop + PTRACE_SETOPTIONS -- all on this
         thread, so `_run()`'s subsequent waitpid()/ptrace() calls are
         always issued by the same thread that attached."""
+        if self._pty_size is not None:
+            return self._fork_pty(argv, envp, cwd)
         stdout_r, stdout_w = os.pipe()
         stderr_r, stderr_w = os.pipe()
         stdin_r, stdin_w = os.pipe() if stdin_data is not None else (None, None)
@@ -374,6 +397,87 @@ class TracerLoop:
                 raise
             self._stdin_writer = writer
 
+    def _fork_pty(self, argv, envp, cwd) -> None:
+        master, slave = os.openpty()
+        self.pty_master = master
+        self.resize_terminal(*self._pty_size)
+        os.set_blocking(master, False)
+        try:
+            pid = os.fork()
+        except BaseException:
+            os.close(master)
+            os.close(slave)
+            self.pty_master = None
+            raise
+        if pid == 0:
+            try:
+                os.close(master)
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+                for target in (0, 1, 2):
+                    os.dup2(slave, target)
+                if slave > 2:
+                    os.close(slave)
+                self._exec_traced(argv, envp, cwd)
+            finally:
+                os._exit(127)
+        os.close(slave)
+        self.root_pid = pid
+        self._remember_spawn(pid)
+        _, status = os.waitpid(pid, 0)
+        if not os.WIFSTOPPED(status):
+            os.close(master)
+            self.pty_master = None
+            raise RuntimeError("PTY child failed before trace setup")
+        pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+        with self._lock:
+            self._options_applied.add(pid)
+        # Keep the master alive for writes; the reader owns a duplicate.
+        self._stdout_reader = threading.Thread(
+            target=self._drain_pipe,
+            args=(os.dup(master), self._stdout_buf),
+            name=f"agproxy_ptrace-{pid}-terminal",
+            daemon=True,
+        )
+        self._stdout_reader.start()
+        pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+
+    def write_terminal(self, data: bytes) -> None:
+        with self._terminal_write_lock:
+            if self.pty_master is None:
+                raise RuntimeError("terminal is closed")
+            remaining = memoryview(data)
+            deadline = time.monotonic() + 15
+            while remaining:
+                try:
+                    written = os.write(self.pty_master, remaining)
+                    if written <= 0:
+                        raise RuntimeError("terminal input closed")
+                    remaining = remaining[written:]
+                except BlockingIOError:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0 or not select.select([], [self.pty_master], [], timeout)[1]:
+                        raise RuntimeError("terminal input timed out") from None
+
+    def resize_terminal(self, columns: int, rows: int) -> None:
+        if not (1 <= columns <= 4096 and 1 <= rows <= 4096):
+            raise ValueError("invalid terminal dimensions")
+        with self._terminal_write_lock:
+            if self.pty_master is None:
+                raise RuntimeError("terminal is closed")
+            fcntl.ioctl(
+                self.pty_master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0)
+            )
+        with self._lock:
+            if self._terminal_screen is not None:
+                self._terminal_screen.resize(lines=rows, columns=columns)
+
+    def close_terminal(self) -> None:
+        with self._terminal_write_lock:
+            if self.pty_master is not None:
+                os.close(self.pty_master)
+                self.pty_master = None
+
     @staticmethod
     def _write_stdin(fd: int, data: bytes) -> None:
         """Write all of *data* off the tracer thread, then deliver EOF."""
@@ -406,16 +510,45 @@ class TracerLoop:
         while True:
             try:
                 chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                select.select([fd], [], [], 0.1)
+                continue
             except OSError:
                 break
             if not chunk:
                 break
             with self._lock:
                 buf += chunk
+                if self._pty_size is not None:
+                    del buf[: -self._output_limit]
+                    self._terminal_stream.feed(chunk)
+                    self._terminal_generation += 1
+            if self._pty_size is not None:
+                # Answer cursor-position queries even with no attached viewer.
+                combined = self._terminal_tail + chunk
+                count = combined.count(b"\x1b[6n")
+                self._terminal_tail = combined[-3:]
+                for _ in range(count):
+                    try:
+                        self.write_terminal(b"\x1b[1;1R")
+                    except (OSError, RuntimeError):
+                        break
         try:
             os.close(fd)
         except OSError:
             pass
+
+    def terminal_screen(self):
+        with self._lock:
+            screen = self._terminal_screen
+            if screen is None:
+                raise RuntimeError("process does not have a terminal")
+            return (
+                list(screen.display),
+                screen.cursor.x,
+                screen.cursor.y,
+                self._terminal_generation,
+            )
 
     def read_output(self) -> "tuple[str, str]":
         with self._lock:
@@ -462,6 +595,9 @@ class TracerLoop:
                 os.close(stdin_r)
             else:
                 os.set_inheritable(0, True)
+        self._exec_traced(argv, envp, cwd)
+
+    def _exec_traced(self, argv, envp, cwd) -> None:
         if cwd:
             os.chdir(cwd)
         pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)

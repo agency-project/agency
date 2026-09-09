@@ -277,6 +277,7 @@ def _run_adapter_attempt(
     engine_name: str,
     syscall_policy,
     register_control_handle: "Callable[[object], None]",
+    register_redirect: "Callable[[Callable[[str], bool]], None]",
 ) -> HarnessAttemptResult:
     attempt_token = request.attempt_token
     if not isinstance(attempt_token, str) or not attempt_token:
@@ -305,6 +306,7 @@ def _run_adapter_attempt(
             sandbox=_LocalSandbox() if request.harness == "native" else None,
             has_sandbox_mcp_tools=request.sandbox_mcp_tools_b64 is not None,
             register_control_handle=register_control_handle,
+            register_redirect=register_redirect,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
@@ -360,6 +362,8 @@ class HarnessManager:
         # served concurrently with an in-flight attempt, not block behind it.
         self._control_lock = threading.Lock()
         self._current_control_handle: object = None
+        self._current_request_id: "str | None" = None
+        self._redirect_handler: "Callable[[str], bool] | None" = None
         # Sticky: persists across attempts for this daemon's whole life, so
         # a pause requested between attempts (or before the first one ever
         # ran) still applies the instant the next harness process exists --
@@ -369,6 +373,7 @@ class HarnessManager:
             sandbox_uds_path,
             self._dispatch_attempt,
             control_handler=self.control,
+            redirect_handler=self.redirect,
         )
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
@@ -381,16 +386,34 @@ class HarnessManager:
         starts. Applies a pause requested before this handle existed."""
         with self._control_lock:
             self._current_control_handle = handle
-            should_pause = self._agent_paused
-        if should_pause:
-            try:
-                handle.pause()
-            except Exception as exc:
-                print(f"[harness_daemon] WARNING: pause() on new attempt failed: {exc}")
+            if self._agent_paused:
+                try:
+                    handle.pause()
+                except Exception as exc:
+                    print(f"[harness_daemon] WARNING: pause() on new attempt failed: {exc}")
 
     def _clear_control_handle(self) -> None:
         with self._control_lock:
             self._current_control_handle = None
+            self._current_request_id = None
+            self._redirect_handler = None
+
+    def _register_redirect(self, handler: "Callable[[str], bool]") -> None:
+        with self._control_lock:
+            self._redirect_handler = handler
+
+    def redirect(self, request_id: str, message: str) -> bool:
+        # Hold the existing control lock through delivery and terminal cleanup.
+        # _attempt_lock keeps the next attempt from starting before that cleanup.
+        # The adapter also fences its native completion against prompt acceptance.
+        with self._control_lock:
+            if request_id != self._current_request_id or self._redirect_handler is None:
+                return False
+            try:
+                return self._redirect_handler(message)
+            except Exception as exc:
+                print(f"[harness_daemon] WARNING: redirect delivery failed: {exc}")
+                return False
 
     def control(self, action: str) -> None:
         """Backs HarnessInteractionServer's /control/{action} route.
@@ -402,16 +425,18 @@ class HarnessManager:
             elif action == "resume":
                 self._agent_paused = False
             handle = self._current_control_handle
-        if handle is None:
-            return
-        if action == "pause":
-            handle.pause()
-        elif action == "resume":
-            handle.resume()
-        elif action == "cancel":
-            handle.kill()
-        else:
-            raise ValueError(f"unknown harness control action {action!r}")
+            # A pause cannot begin midway through redirect's native input wait:
+            # resume would otherwise block on this lock while input stayed frozen.
+            if handle is None:
+                return
+            if action == "pause":
+                handle.pause()
+            elif action == "resume":
+                handle.resume()
+            elif action == "cancel":
+                handle.kill()
+            else:
+                raise ValueError(f"unknown harness control action {action!r}")
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token
@@ -426,6 +451,9 @@ class HarnessManager:
                     error_message=f"{type(exc).__name__}: {exc}",
                 )
             self._current_attempt_token = token
+            with self._control_lock:
+                self._current_request_id = request.request_id
+                self._redirect_handler = None
             try:
                 if request.sandbox_mcp_tools_b64 is not None:
                     return asyncio.run_coroutine_threadsafe(
@@ -434,9 +462,9 @@ class HarnessManager:
                     ).result()
                 return self._attempt_handler(request)
             finally:
+                self._clear_control_handle()
                 self._current_attempt_token = None
                 self._harness_api.clear_attempt_token(token)
-                self._clear_control_handle()
 
     def _run_adapter_request(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = self._current_attempt_token
@@ -455,6 +483,7 @@ class HarnessManager:
                     hooked_syscalls=frozenset(request.syscall_hooked_names or ()),
                 ),
                 self._register_control_handle,
+                self._register_redirect,
             )
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")

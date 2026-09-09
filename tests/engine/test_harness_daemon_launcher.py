@@ -71,6 +71,7 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert '"binary_path":"/bin/claude"' in command
     assert workdir == "/workspace"
     assert "cloudpickle" in installed
+    assert "pyte" in installed
 
 
 def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch, tmp_path):

@@ -25,6 +25,13 @@ class HarnessInteractionClient:
     def pause_harness(self) -> None:
         self._client.post("/control/pause").raise_for_status()
 
+    def redirect_harness(self, request_id: str, message: str) -> bool:
+        response = self._client.post(
+            "/redirect", json={"request_id": request_id, "message": message}
+        )
+        response.raise_for_status()
+        return response.json()["delivered"] is True
+
     def resume_harness(self) -> None:
         self._client.post("/control/resume").raise_for_status()
 

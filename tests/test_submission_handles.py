@@ -55,7 +55,7 @@ def test_cancel_on_an_already_settled_or_unknown_future_is_a_harmless_no_op(tmp_
     ag.cancel(agdata())  # no future at all -- no-op
 
 
-def test_pause_resume_gate_and_redirect_is_still_a_stub(tmp_path):
+def test_pause_resume_gate(tmp_path):
     ag = _agent(tmp_path)
     assert ag.is_paused() is False
 
@@ -64,10 +64,3 @@ def test_pause_resume_gate_and_redirect_is_still_a_stub(tmp_path):
 
     ag.resume()
     assert ag.is_paused() is False
-
-    try:
-        ag.redirect("hello")
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError("agent.redirect() should still be unimplemented")

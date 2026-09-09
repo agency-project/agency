@@ -198,6 +198,29 @@ class HostServicesClient:
                 if item["type"] == "done":
                     return
 
+    async def dispatch_stream_async(self, token: str, agency_context: dict):
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=self._uds_path),
+            base_url="http://agency-host",
+            timeout=None,
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/llm/dispatch",
+                json={**agency_context, "stream": True},
+                headers=self._attempt_headers(token),
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if item["type"] == "error":
+                        raise RuntimeError(item["message"])
+                    yield item
+                    if item["type"] == "done":
+                        return
+
     @asynccontextmanager
     async def forward_mcp_request(
         self,

@@ -231,7 +231,12 @@ class GlobalAgentOrchestrator:
             self._post_locked("schedule", (request.request_id, cycle_ack))
         if cycle_ack is not None:
             cycle_ack.result()
-        return agdata(_future=result_future)
+        result = agdata(_future=result_future)
+        # Keep execution identity outside user data, and retain it after wait()
+        # clears _future. No scheduler request needs to survive completion.
+        object.__setattr__(result, "_execution_id", request.request_id)
+        object.__setattr__(result, "_execution_agent", ag)
+        return result
 
     @staticmethod
     def _validate_max_steps(max_steps: "int | None") -> None:
@@ -278,6 +283,16 @@ class GlobalAgentOrchestrator:
             self._post_locked("schedule", (request.request_id, cycle_ack))
         if cycle_ack is not None:
             cycle_ack.result()
+
+    def redirect_request(self, ag: "agent", request_id: str, message: str) -> bool:
+        with self._event_cond:
+            request = self._requests.get(request_id)
+            if request is None or request.agent is not ag or request.state != "running":
+                return False
+            engine = request.engine
+        # Never hold the scheduler lock during PTY/network I/O. This engine
+        # belongs only to the requested execution, even if it finishes now.
+        return engine.redirect(message) if engine is not None else False
 
     def cancel_request(self, future: "Future") -> bool:
         """Mark whichever request produced *future* as cancelled. Returns

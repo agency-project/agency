@@ -18,6 +18,7 @@ dependencies = [
     "uvicorn[standard]>=0.20.0",
     "websocket-client",
     "pyseccomp",
+    "pyte>=0.8.2",
     "mcp",
     # Profiling (agprof) is a core dependency, not an opt-in extra: any
     # install must be able to profile without a separate install step.

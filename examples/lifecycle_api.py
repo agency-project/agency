@@ -8,11 +8,8 @@ before it returns), ``agent.cancel(handle)``, and ``agent.pause()``/``resume()``
 as a real admission gate. Host-side tool-call events make the concurrency
 claims observable instead of inferring them from model prose.
 
-``agent.redirect()`` is checked only for still raising ``NotImplementedError``
--- it has no live delivery mechanism yet (no harness has a mid-attempt
-injection channel today). There is no agent teardown API anymore either
-(``destroy()`` was removed -- cleanup is just letting an ``Agent`` go out of
-scope, same as any other Python object).
+``agent.redirect(result, message)`` queues future context for the native harness.
+Claude Code additionally supports delivery to an active execution through its PTY.
 
 Run with profiling enabled to produce both lifecycle evidence and measured
 profiler artifacts::
@@ -435,11 +432,14 @@ def _exercise_cancellation(
             "a running invocation's real result is discarded once cancelled",
         )
 
-        _expect(
+        ag.redirect(running, "Remember this after the cancelled execution")
+        _check(
             evidence,
-            "agent.redirect() is not yet implemented",
-            NotImplementedError,
-            lambda: ag.redirect("no live delivery channel exists yet"),
+            any(
+                entry["content"] == "Remember this after the cancelled execution"
+                for entry in ag.context.copy().retained_messages
+            ),
+            "a late redirect is retained as future context",
         )
 
 

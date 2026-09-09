@@ -408,11 +408,29 @@ class agent:
     def is_paused(self) -> bool:
         return self._paused
 
-    def redirect(self, message: str) -> None:
-        raise NotImplementedError(
-            "agent.redirect() needs its own design pass -- no harness has a "
-            "live mid-attempt injection channel today"
-        )
+    def redirect(self, handle: agdata, message: str) -> None:
+        """Redirect the execution that produced *handle*, or queue future context.
+
+        This never waits for a pending result and never targets another run.
+        Unsupported harnesses also use queue_message().
+        """
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        if not message.strip():
+            raise ValueError("message must be a non-empty string")
+        try:
+            owner = object.__getattribute__(handle, "_execution_agent")
+            request_id = object.__getattribute__(handle, "_execution_id")
+        except AttributeError:
+            raise ValueError("handle must be a skill result from this agent") from None
+        if owner is not self:
+            raise ValueError("handle must be a skill result from this agent")
+        try:
+            if self._orchestrator.redirect_request(self, request_id, message):
+                return
+        except Exception as exc:
+            print(f"[agent] WARNING: redirect delivery failed for {self.agname}: {exc}")
+        self.queue_message(message)
 
     def cancel(self, handle: agdata) -> None:
         """Cancel whichever run() produced *handle*.
