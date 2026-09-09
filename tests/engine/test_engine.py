@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ from agency.agdata import agdata
 from agency.agcontext import agcontext
 from agency.agschema import agschema
 from agency.agdata import agerror
+from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.configs.agconfig import agconfig as agconfig_cls
@@ -674,7 +676,9 @@ def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypa
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
     )
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
+    )
     with pytest.raises(RuntimeError, match="launch failed"):
         engine.execute(
             SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -691,7 +695,9 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     execution = agdata(result="done")
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
+    )
     is_cancelled = lambda: False  # noqa: E731
 
     result = engine.execute(
@@ -715,6 +721,51 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert manager.stopped is True
     assert holder["attempt_client_timeout_s"] is None
     assert result is execution
+
+
+def test_execute_logs_user_message_event_with_initial_prompt_content(monkeypatch):
+    """The webui's in-progress transcript reconstruction (server.py's
+    _reconstruct_in_progress_messages) needs this event to show the user's
+    initial turn before the skill call finishes -- see engine.py's comment
+    at the record_event(type="user_message", ...) call site."""
+    _install_fake_host_server_manager(
+        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+    )
+    engine = AgentEngine(_FakeAgent())
+    prompt = PromptPayload("system", "hello there")
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: prompt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(result="done"))
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
+    )
+
+    engine.execute(agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox)
+
+    user_message_events = [e for e in engine._agent.data_logger.events if e[0] == "user_message"]
+    assert len(user_message_events) == 1
+    _type, payload, _call_label, _snapshot = user_message_events[0]
+    assert payload == {"blocks": [{"type": "text", "text": "hello there"}]}
+
+
+def test_execute_logs_user_message_event_with_multimodal_content_as_json(monkeypatch):
+    _install_fake_host_server_manager(
+        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
+    )
+    engine = AgentEngine(_FakeAgent())
+    multimodal = [{"type": "text", "text": "what is this?"}, {"type": "image_url", "image_url": {}}]
+    prompt = PromptPayload("system", multimodal)
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: prompt)
+    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(result="done"))
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
+    )
+
+    engine.execute(agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox)
+
+    user_message_events = [e for e in engine._agent.data_logger.events if e[0] == "user_message"]
+    assert len(user_message_events) == 1
+    _type, payload, _call_label, _snapshot = user_message_events[0]
+    assert payload == {"blocks": [{"type": "text", "text": json.dumps(multimodal)}]}
 
 
 def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeypatch):
@@ -746,7 +797,9 @@ def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeyp
         harness_message_cursors={"claude_code": 1},
         harness_sessions={"claude_code": {"session_id": "prior", "blob_b64": "cHJpb3I="}},
     )
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=0
+    )
 
     result = engine.execute(
         context,
@@ -778,7 +831,10 @@ def test_execute_stops_immediately_on_a_failed_attempt_without_retrying(monkeypa
     monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: "p0")
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(
-        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=3
+        sandbox_mcp_tools=[],
+        policy=agpolicy(),
+        output_schema=agdata(summary=str),
+        max_output_schema_retries=3,
     )
 
     result = engine.execute(
@@ -811,7 +867,10 @@ def test_execute_retries_on_missing_output_fields_then_succeeds(monkeypatch):
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(
-        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=3
+        sandbox_mcp_tools=[],
+        policy=agpolicy(),
+        output_schema=agdata(summary=str),
+        max_output_schema_retries=3,
     )
 
     result = engine.execute(
@@ -857,7 +916,10 @@ def test_execute_transports_and_captures_session_blobs(monkeypatch):
     monkeypatch.setattr(engine, "_build_retry_prompt", lambda *_args, **_kwargs: prompt)
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(
-        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=1
+        sandbox_mcp_tools=[],
+        policy=agpolicy(),
+        output_schema=agdata(summary=str),
+        max_output_schema_retries=1,
     )
 
     def observe_commit_boundary():
@@ -913,7 +975,9 @@ def test_commit_failure_discards_staged_session_and_still_tears_down_services(mo
         lambda *_args, **_kwargs: PromptPayload("system", "prompt"),
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(done=True))
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=0
+    )
 
     with pytest.raises(RuntimeError, match="commit failed"):
         engine.execute(context, skill, SimpleNamespace(), SimpleNamespace(), agent.sandbox)
@@ -965,7 +1029,9 @@ def test_cancelled_transaction_never_publishes_its_staged_session_or_cursor(monk
         return agdata(done=True)
 
     monkeypatch.setattr(engine, "_build_execution_result", cancel_with_result)
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=0)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=0
+    )
 
     result = engine.execute(
         context,
@@ -1005,7 +1071,10 @@ def test_execute_stops_retrying_once_retries_are_exhausted(monkeypatch):
     )
     monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: execution)
     skill = SimpleNamespace(
-        sandbox_mcp_tools=[], output_schema=agdata(summary=str), max_output_schema_retries=2
+        sandbox_mcp_tools=[],
+        policy=agpolicy(),
+        output_schema=agdata(summary=str),
+        max_output_schema_retries=2,
     )
 
     result = engine.execute(
@@ -1034,7 +1103,9 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
         return expected
 
     monkeypatch.setattr(engine, "_build_execution_result", fake_build_result)
-    skill = SimpleNamespace(sandbox_mcp_tools=[], output_schema=None, max_output_schema_retries=3)
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
+    )
     context = SimpleNamespace(marker="ctx", harness_sessions={})
 
     result = engine.execute(

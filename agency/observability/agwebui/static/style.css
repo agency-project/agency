@@ -85,6 +85,18 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   flex-shrink: 0;
 }
 
+#system-log-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+#system-log-toggle:hover { color: var(--text); }
+#system-log-toggle input { cursor: pointer; accent-color: var(--border-log); }
+
 #nav-bar button {
   background: none;
   border: 1px solid var(--border);
@@ -327,6 +339,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .msg-tool-call  { margin: 3px 0; }
 .msg-assistant  { margin: 3px 0; }
 .msg-tool-result{ color: var(--dim); margin: 2px 0; }
+.msg-syslog     { margin: 3px 0; }
 .msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
 .msg-paused     { color: var(--red); }
 

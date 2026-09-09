@@ -28,9 +28,20 @@ class _FakeDataLogger:
         call_label=None,
         update_latest_snapshot=False,
         term_message=None,
+        print_to_terminal=True,
         flush=False,
     ):
-        self.events.append((type, payload, call_label, update_latest_snapshot, term_message, flush))
+        self.events.append(
+            (
+                type,
+                payload,
+                call_label,
+                update_latest_snapshot,
+                term_message,
+                flush,
+                print_to_terminal,
+            )
+        )
 
     def record_span(
         self,
@@ -359,7 +370,9 @@ def test_record_event_delegates_to_data_logger():
     logger = _FakeDataLogger()
     server = _make_server(data_logger=logger)
     server.record_event("warning", {"message": "bad shape"}, call_label="dispatch")
-    assert logger.events == [("warning", {"message": "bad shape"}, "dispatch", False, None, False)]
+    assert logger.events == [
+        ("warning", {"message": "bad shape"}, "dispatch", False, None, False, True)
+    ]
 
 
 def test_record_event_forwards_term_message_and_flush():
@@ -372,7 +385,9 @@ def test_record_event_forwards_term_message_and_flush():
         term_message="[x] idle",
         flush=True,
     )
-    assert logger.events == [("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)]
+    assert logger.events == [
+        ("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True, True)
+    ]
 
 
 def test_record_span_delegates_to_data_logger():
@@ -391,7 +406,7 @@ def test_build_app_record_event_route_delegates_to_data_logger():
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert logger.events == [("warning", {"message": "bad shape"}, None, False, None, False)]
+    assert logger.events == [("warning", {"message": "bad shape"}, None, False, None, False, True)]
 
 
 def test_build_app_record_event_route_forwards_term_message_and_flush():
@@ -409,7 +424,9 @@ def test_build_app_record_event_route_forwards_term_message_and_flush():
         },
     )
     assert response.status_code == 200
-    assert logger.events == [("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True)]
+    assert logger.events == [
+        ("agent_state", {"state": "agent_idle"}, None, True, "[x] idle", True, True)
+    ]
 
 
 def test_build_app_has_no_final_attempt_result_callback_route():
@@ -453,6 +470,7 @@ def test_admit_tool_call_records_call_event_and_returns_call_id():
             False,
             None,
             False,
+            True,
         ),
         (
             "agent_state",
@@ -461,6 +479,7 @@ def test_admit_tool_call_records_call_event_and_returns_call_id():
             True,
             "[agent-1] TOOL    ▶  bash  args={'cmd': 'ls'}",
             True,
+            False,
         ),
     ]
     assert logger.spans == []

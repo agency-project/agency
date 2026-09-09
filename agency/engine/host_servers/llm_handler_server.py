@@ -328,22 +328,7 @@ class LlmHandlerServer:
         ttft_ms: "float | None" = None,
     ) -> None:
         """Enrich this exchange's metadata block with its own new (non-
-        cumulative) prompt token count and the skill/request it belongs to.
-
-        Also promotes usage/stop_reason to top-level keys unconditionally:
-        the batch path already puts them there, but the streaming path's
-        generic block-delta merge loop only ever forwards raw fragments
-        into `data` -- without this, usage/stop_reason stay buried inside
-        `data` and are unreadable by anything (including this class's own
-        _extract_metadata_usage()) without repeating that fragment-walk.
-
-        ``ttft_ms`` (how long the caller waited to see any content -- for the
-        non-streaming path that's the same moment the whole response becomes
-        available, since there is no earlier partial content to report) is
-        otherwise only ever recorded as an agprof span annotation -- an
-        optional, separate store a replay/mock backend can't rely on having
-        been populated during the original run. Persisting it here too makes
-        it a durable part of the same agDataLogger record as usage/stop_reason."""
+        cumulative) prompt token count and the skill/request it belongs to."""
         blocks = message.get("blocks") or []
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
@@ -466,14 +451,6 @@ class LlmHandlerServer:
                             )
                         complete_failure(error)
                         raise
-                # "Time to first token" isn't a separate quantity on this
-                # non-streaming path -- there is only one moment the whole
-                # response becomes available, so that moment is reported as
-                # ttft_ms here too (matching _run_stream_producer's meaning
-                # of the field: how long the caller waited to see any
-                # content). There is deliberately no per-token timing
-                # (TPOT-style) equivalent added here -- nothing in this
-                # codebase measures that for the streaming path either.
                 ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                 _annotate(
                     attempt_span,
@@ -797,6 +774,7 @@ class LlmHandlerServer:
             type="llm_stream_error",
             payloads=[{"error": f"{type(error).__name__}: {error}"}],
             term_message=f"[{agname}] LLM    ✗  {type(error).__name__}: {error}",
+            print_to_terminal=False,
         )
 
     def _finalize_cancelled(self, call_label: "str | None") -> None:
@@ -806,6 +784,7 @@ class LlmHandlerServer:
             type="llm_stream_cancelled",
             payloads=[{"cancelled": True}],
             term_message=f"[{agname}] LLM    ✗  cancelled",
+            print_to_terminal=False,
         )
 
     def _finalize_success(self, call_label: "str | None", payloads: "list[dict]") -> None:

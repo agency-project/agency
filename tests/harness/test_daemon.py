@@ -110,7 +110,7 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
             self.events.append(("resolve", token))
             return "model"
 
-        def syscall_policy(self, token):
+        def syscall_policy(self, token, **_kwargs):
             self.events.append(("policy", token))
             return policy
 
@@ -257,7 +257,9 @@ def test_harness_manager_returns_attempt_result_on_original_rpc():
     assert result == expected
 
 
-def test_host_syscall_policy_check_forwards_to_host_services():
+def test_host_syscall_policy_check_forwards_hooked_syscalls_to_host_services():
+    from types import SimpleNamespace
+
     from agency.harness.daemon import _HostSyscallPolicy
 
     class _FakeHostServices:
@@ -273,11 +275,14 @@ def test_host_syscall_policy_check_forwards_to_host_services():
             self.complete_calls.append((token, call_id, return_value))
 
     host_services = _FakeHostServices()
-    policy = _HostSyscallPolicy(host_services, "attempt-token")
+    policy = _HostSyscallPolicy(
+        host_services, "attempt-token", hooked_syscalls=frozenset({"openat"})
+    )
+    event = SimpleNamespace(syscall="openat")
 
-    decision = policy.check(None, "fake-syscall-event")
+    decision = policy.check(None, event)
     assert decision == (True, None, "call-1")
-    assert host_services.check_calls == [("attempt-token", "fake-syscall-event")]
+    assert host_services.check_calls == [("attempt-token", event)]
 
     policy.check_completion(None, "call-1", 3)
     assert host_services.complete_calls == [("attempt-token", "call-1", 3)]
@@ -338,3 +343,89 @@ def test_pause_finishes_before_a_concurrent_redirect_can_start():
         paused.result(timeout=2)
         assert redirected.result(timeout=2)
     assert order == ["paused", "redirect"]
+
+
+def test_host_syscall_policy_short_circuits_unhooked_syscalls_by_default():
+    """No hook for this syscall -- the decision must be `not default_to_deny`,
+    computed locally, without ever *waiting* on the host RPC (proven here by
+    blocking that RPC until after the assertion on `decision` already ran).
+    The same admission RPC still fires in the background for logging, and
+    its result must never gate the syscall."""
+    import threading
+    from types import SimpleNamespace
+
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    entered_rpc = threading.Event()
+    release_rpc = threading.Event()
+    completed = threading.Event()
+
+    class _FakeHostServices:
+        def __init__(self):
+            self.check_calls = []
+            self.complete_calls = []
+
+        def check_syscall_policy(self, token, syscall):
+            entered_rpc.set()
+            assert release_rpc.wait(timeout=5), "test never released the blocked RPC"
+            self.check_calls.append((token, syscall))
+            return (True, None, "call-1")
+
+        def complete_syscall_policy(self, token, call_id, return_value):
+            self.complete_calls.append((token, call_id, return_value))
+            completed.set()
+
+    host_services = _FakeHostServices()
+    policy = _HostSyscallPolicy(
+        host_services, "attempt-token", hooked_syscalls=frozenset({"openat"})
+    )
+    event = SimpleNamespace(syscall="execve")
+
+    decision = policy.check(None, event)
+    # check() already returned even though the background RPC is still
+    # blocked (or hasn't even started) -- proves it never waited on it.
+    assert decision == (True, None, None)
+
+    release_rpc.set()
+    assert entered_rpc.wait(timeout=5)
+    assert completed.wait(timeout=5)
+    assert host_services.check_calls == [("attempt-token", event)]
+    assert host_services.complete_calls == [("attempt-token", "call-1", None)]
+
+
+def test_host_syscall_policy_short_circuits_to_deny_when_default_to_deny_set():
+    from types import SimpleNamespace
+
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    class _FakeHostServices:
+        def check_syscall_policy(self, token, syscall):
+            raise AssertionError("must not synchronously reach the host")
+
+        def complete_syscall_policy(self, token, call_id, return_value):
+            pass
+
+    policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token", default_to_deny=True)
+    event = SimpleNamespace(syscall="execve")
+
+    assert policy.check(None, event) == (False, None, None)
+
+
+def test_host_syscall_policy_logging_failure_never_raises():
+    import threading
+    from types import SimpleNamespace
+
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    attempted = threading.Event()
+
+    class _FakeHostServices:
+        def check_syscall_policy(self, token, syscall):
+            attempted.set()
+            raise RuntimeError("host unreachable")
+
+    policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token")
+    event = SimpleNamespace(syscall="execve")
+
+    assert policy.check(None, event) == (True, None, None)
+    assert attempted.wait(timeout=5)

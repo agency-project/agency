@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import concurrent.futures
 import json
 import signal
 import subprocess
@@ -33,16 +34,66 @@ from .servers import HarnessInteractionServer
 
 _HARNESS_API_PORT = 8766
 
+# Backs _HostSyscallPolicy's fire-and-forget admission logging (see its
+# docstring). Module-level and shared for the daemon process's whole life --
+# a pool per attempt would leak idle worker threads, since
+# ThreadPoolExecutor workers never self-terminate.
+_SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="syscall-admission-log"
+)
+
 
 class _HostSyscallPolicy:
-    """Ptrace policy adapter backed by the host interaction service."""
+    """Ptrace policy adapter backed by the host interaction service.
 
-    def __init__(self, host_services: HostServicesClient, attempt_token: str) -> None:
+    Only syscalls this attempt's policy actually hooks need the synchronous
+    host round-trip -- every other syscall has a decision that is fully
+    known before the harness even launches (``not default_to_deny``), so it
+    never sits on the traced process's critical path. The same
+    ``/interaction/check_syscall`` call still fires for those, just in the
+    background and with its result discarded, purely so the admission still
+    gets logged (tool_call/agent_state events, the "SYSCALL" line) exactly
+    like a hooked call's does. Its returned ``call_id`` (the host stashes it
+    as a pending call awaiting completion) is immediately closed out with an
+    "unknown" outcome, since nothing here ever observes the syscall's real
+    return value for an admission that was never actually gated on that
+    host round-trip.
+    """
+
+    def __init__(
+        self,
+        host_services: HostServicesClient,
+        attempt_token: str,
+        *,
+        default_to_deny: bool = False,
+        hooked_syscalls: "frozenset[str] | None" = None,
+    ) -> None:
         self._host_services = host_services
         self._attempt_token = attempt_token
+        self._default_to_deny = default_to_deny
+        self._hooked_syscalls = hooked_syscalls or frozenset()
 
     def check(self, _agent, syscall):
-        return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+        if syscall.syscall in self._hooked_syscalls:
+            return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+        _SYSCALL_LOG_POOL.submit(self._log_admission_best_effort, syscall)
+        return (not self._default_to_deny, None, None)
+
+    def _log_admission_best_effort(self, syscall) -> None:
+        try:
+            _allowed, _reason, call_id = self._host_services.check_syscall_policy(
+                self._attempt_token, syscall
+            )
+        except Exception:
+            return  # best-effort logging only -- never affects the syscall's outcome
+        if not call_id:
+            return
+        try:
+            self._host_services.complete_syscall_policy(
+                self._attempt_token, call_id, return_value=None
+            )
+        except Exception:  # noqa: S110 - best-effort logging cleanup only, never the syscall's outcome
+            pass
 
     def check_completion(self, _agent, call_id: "str | None", return_value: int) -> None:
         # A denied (never admitted) syscall has no call_id -- the ptrace
@@ -193,8 +244,19 @@ class _HarnessApiServer:
     def resolve_model(self, token: str) -> str:
         return self._bridge.resolve_model(token)
 
-    def syscall_policy(self, token: str) -> _HostSyscallPolicy:
-        return _HostSyscallPolicy(self._bridge, token)
+    def syscall_policy(
+        self,
+        token: str,
+        *,
+        default_to_deny: bool = False,
+        hooked_syscalls: "frozenset[str] | None" = None,
+    ) -> _HostSyscallPolicy:
+        return _HostSyscallPolicy(
+            self._bridge,
+            token,
+            default_to_deny=default_to_deny,
+            hooked_syscalls=hooked_syscalls,
+        )
 
 
 def _render_attempt_prompt(request: HarnessAttemptRequest) -> str:
@@ -415,7 +477,11 @@ class HarnessManager:
                 self._harness_api.base_url,
                 self._harness_api.resolve_model(token),
                 self._engine_name,
-                self._harness_api.syscall_policy(token),
+                self._harness_api.syscall_policy(
+                    token,
+                    default_to_deny=request.syscall_default_to_deny,
+                    hooked_syscalls=frozenset(request.syscall_hooked_names or ()),
+                ),
                 self._register_control_handle,
                 self._register_redirect,
             )

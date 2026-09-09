@@ -530,22 +530,32 @@ def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
     since (finalized exchanges not yet folded into a new live_messages, and
     the exchange still actively streaming, if any). Shared by the HTTP pull
     path (_fetch_agent_detail) and the push path (_tail_and_broadcast's
-    messages_snapshot broadcast) so both compute it identically."""
+    messages_snapshot broadcast) so both compute it identically.
+
+    Each returned message carries a best-effort `ts` for the client's
+    timestamp display -- individual messages inside one already-completed
+    skill call share that call's single finish timestamp (agcontext's own
+    transcript has no per-message clock), while an in-progress or still-
+    streaming exchange gets the real timestamp of whichever row started it."""
     row = con.execute(
         "SELECT payload, timestamp FROM latest_values WHERE type='live_messages'"
     ).fetchone()
     if row is not None:
         base_messages = _json_object(row[0]).get("messages", [])
+        base_ts = row[1]
         live_messages_ts = row[1]
     else:
         call_row = con.execute(
-            "SELECT payload FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
+            "SELECT payload, timestamp FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         base_messages = _json_object(call_row[0]).get("history_delta", []) if call_row else []
+        base_ts = call_row[1] if call_row else 0.0
         live_messages_ts = 0.0
+    for message in base_messages:
+        message.setdefault("ts", base_ts)
     in_progress = con.execute(
-        "SELECT type, call_label, payload FROM events "
-        "WHERE type IN ('llm_block','tool_result') AND timestamp > ? ORDER BY id",
+        "SELECT type, call_label, payload, timestamp FROM events "
+        "WHERE type IN ('user_message','llm_block','tool_result') AND timestamp > ? ORDER BY id",
         (live_messages_ts,),
     ).fetchall()
     # finalize_stream() atomically clears every stream_deltas row for a
@@ -553,7 +563,8 @@ def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
     # permanent events rows read above) -- so whatever remains here is, by
     # construction, exactly the exchange(s) still streaming right now.
     streaming_rows = con.execute(
-        "SELECT call_label, payload FROM stream_deltas WHERE type='llm_stream_delta' ORDER BY id"
+        "SELECT call_label, payload, timestamp FROM stream_deltas "
+        "WHERE type='llm_stream_delta' ORDER BY id"
     ).fetchall()
     return (
         base_messages
@@ -612,7 +623,7 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
     }
 
 
-def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str]]") -> "list[dict]":
+def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str, float]]") -> "list[dict]":
     """live_messages only gets (re)written once, when a skill call finishes
     (orchestrator._record_execution_results) -- there's no persisted
     snapshot of an in-flight skill's transcript to read. But each LLM
@@ -628,18 +639,24 @@ def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str]]") -> "li
     are grouped into one assistant message per call_label (each LLM
     exchange gets its own call_label); a tool_result row becomes its own
     'tool'-role message and always starts a fresh assistant message after
-    it, mirroring how a real transcript alternates turns."""
+    it, mirroring how a real transcript alternates turns. A user_message
+    row (engine.py logs one right as it builds this attempt's initial
+    prompt) becomes its own leading 'user'-role message the same way."""
     messages: "list[dict]" = []
     current_call_label: "object" = object()  # sentinel, never equals a real call_label
     current_blocks: "list[dict] | None" = None
-    for event_type, call_label, payload_json in rows:
+    for event_type, call_label, payload_json, ts in rows:
         block = _json_object(payload_json)
-        if event_type == "llm_block":
+        if event_type == "user_message":
+            current_call_label = object()
+            current_blocks = None
+            messages.append({"role": "user", "blocks": block.get("blocks", []), "ts": ts})
+        elif event_type == "llm_block":
             if block.get("type") == "metadata":
                 continue
             if call_label != current_call_label or current_blocks is None:
                 current_blocks = []
-                messages.append({"role": "assistant", "blocks": current_blocks})
+                messages.append({"role": "assistant", "blocks": current_blocks, "ts": ts})
                 current_call_label = call_label
             current_blocks.append(block)
         elif event_type == "tool_result":
@@ -649,6 +666,7 @@ def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str]]") -> "li
                 {
                     "role": "tool",
                     "blocks": [{"type": "tool_result", "text": json.dumps(block.get("result"))}],
+                    "ts": ts,
                 }
             )
     return messages
@@ -681,7 +699,7 @@ def _merge_stream_item(block: dict, stream_item: dict) -> None:
         block["arguments"] = block.get("arguments", "") + args_piece
 
 
-def _reconstruct_streaming_messages(rows: "list[tuple[str, str]]") -> "list[dict]":
+def _reconstruct_streaming_messages(rows: "list[tuple[str, str, float]]") -> "list[dict]":
     """The exchange (if any) that's still streaming right now -- not yet
     finalized into a permanent events row (finalize_stream() only runs once
     the whole exchange completes), so without this the panel would freeze
@@ -692,7 +710,8 @@ def _reconstruct_streaming_messages(rows: "list[tuple[str, str]]") -> "list[dict
     "usage" stream_items are dropped, same as the finalized-event path."""
     by_call_label: "dict[object, dict[int, dict]]" = {}
     order: "list[object]" = []
-    for call_label, payload_json in rows:
+    first_ts: "dict[object, float]" = {}
+    for call_label, payload_json, ts in rows:
         stream_item = _json_object(payload_json)
         if stream_item.get("type") != "block_delta":
             continue
@@ -702,6 +721,7 @@ def _reconstruct_streaming_messages(rows: "list[tuple[str, str]]") -> "list[dict
         blocks = by_call_label.setdefault(call_label, {})
         if call_label not in order:
             order.append(call_label)
+            first_ts[call_label] = ts
         idx = stream_item.get("index")
         block = blocks.setdefault(idx, {"type": block_type, "index": idx, "text": ""})
         _merge_stream_item(block, stream_item)
@@ -709,6 +729,7 @@ def _reconstruct_streaming_messages(rows: "list[tuple[str, str]]") -> "list[dict
         {
             "role": "assistant",
             "blocks": [by_call_label[label][i] for i in sorted(by_call_label[label])],
+            "ts": first_ts[label],
         }
         for label in order
         if by_call_label[label]

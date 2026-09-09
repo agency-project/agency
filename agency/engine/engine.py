@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import threading
 import uuid
 from typing import TYPE_CHECKING, Callable
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from ..agcontext import agcontext
     from ..agdata import agdata
     from ..agent import agent
+    from ..agpolicy import agpolicy
     from ..orchestrator.agresources import agResourcePool
     from ..agskill import agskill
     from ..agtool import agtool
@@ -29,10 +31,6 @@ class AgentEngine:
 
     def __init__(self, agent: "agent") -> None:
         self._agent = agent
-        # Cloned so this engine's own agconfig is independent of the owning
-        # agent's -- an engine belongs to exactly one dispatched request and
-        # must not silently pick up a concurrent agent.change_config() call
-        # mid-execution. Read self.agconfig, not self._agent.agconfig.
         self.agconfig: "agconfig_cls" = agent.agconfig.clone()
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "HarnessInteractionClient | None" = None
@@ -284,6 +282,28 @@ class AgentEngine:
             # Captured before the loop may reassign `prompt` to a retry prompt --
             # the needle must stay the original user turn, not a retry prompt.
             initial_prompt = prompt
+            # The real transcript only gains this turn once the whole skill
+            # call finishes (orchestrator._record_execution_results' live_
+            # messages snapshot) -- log it now too, structured the same way,
+            # so the webui's in-progress reconstruction (server.py's
+            # _reconstruct_in_progress_messages) can show it immediately
+            # instead of leaving the user's own message invisible for
+            # however long this attempt takes.
+            user_content = getattr(initial_prompt, "user_content", initial_prompt)
+            self._agent.data_logger.record_event(
+                type="user_message",
+                payload={
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "text": user_content
+                            if isinstance(user_content, str)
+                            else json.dumps(user_content),
+                        }
+                    ]
+                },
+                flush=True,
+            )
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             prior_session = context.harness_sessions.get(self._agent.harness)
@@ -297,6 +317,7 @@ class AgentEngine:
                     resume_session_id=resume_session_id,
                     prior_session_blob_b64=prior_session_blob_b64,
                     sandbox_mcp_tools=skill.sandbox_mcp_tools,
+                    policy=skill.policy,
                 )
                 if not attempt.ok:
                     break
@@ -413,6 +434,7 @@ class AgentEngine:
         resume_session_id: "str | None" = None,
         prior_session_blob_b64: "str | None" = None,
         sandbox_mcp_tools: "list[agtool] | None" = None,
+        policy: "agpolicy | None" = None,
     ) -> HarnessAttemptResult:
         client = self._sandbox_interaction_client
         manager = self._host_server_manager
@@ -438,6 +460,11 @@ class AgentEngine:
                             f"sandbox MCP setup failed during serialization ({type(exc).__name__})"
                         ),
                     )
+            hooked_syscall_names = (
+                sorted(policy.syscall_hooks)
+                if policy is not None and policy.syscall_hooks
+                else None
+            )
             request = HarnessAttemptRequest(
                 prompt=prompt,
                 harness=self._agent.harness,
@@ -447,6 +474,10 @@ class AgentEngine:
                 prior_session_blob_b64=prior_session_blob_b64,
                 attempt_token=attempt_token,
                 sandbox_mcp_tools_b64=sandbox_mcp_tools_b64,
+                syscall_default_to_deny=bool(policy.default_to_deny)
+                if policy is not None
+                else False,
+                syscall_hooked_names=hooked_syscall_names,
             )
             return client.run_harness_attempt(request)
         finally:

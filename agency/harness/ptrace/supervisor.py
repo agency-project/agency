@@ -190,6 +190,23 @@ def _sensitive_environment_values(envp: "dict[str, str]") -> "frozenset[str]":
     )
 
 
+def _resolve_program_name(pid: int, sensitive_values: "frozenset[str]") -> "str | None":
+    """Best-effort executable currently loaded in *pid*, for syscall
+    admission logging -- same kernel-confirmed source and redaction as
+    _executable_display_name() (a credential-bearing path is never echoed),
+    just read live via /proc instead of cached from a PTRACE_EVENT_EXEC
+    callback: a traced pid can exec multiple times over its life, and this
+    always reflects whichever image is loaded at the moment of the syscall.
+    None on any failure (process already exited, unreadable /proc, ...) --
+    this is purely observational and must never affect the syscall itself.
+    """
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+    return _executable_display_name(exe, sensitive_values=sensitive_values)
+
+
 class _ProcessLifecycleProfiler:
     """Translate ptrace spawn/exec/exit observations into agprof records.
 
@@ -492,6 +509,7 @@ class agProxyPtrace:
             envp,
             timing="exact",
         )
+        sensitive_values = _sensitive_environment_values(envp)
         initial_exec_pending = self._allow_initial_exec
 
         def syscall_hook(stop) -> _TraceDecision:
@@ -517,6 +535,9 @@ class agProxyPtrace:
                 envp=stop.envp,
                 path=stop.path,
                 timestamp=stop.timestamp,
+                program=_resolve_program_name(stop.pid, sensitive_values),
+                address=stop.address,
+                port=stop.port,
             )
             decision = policy.check(ag, event)
             allowed = decision[0] if isinstance(decision, tuple) else decision

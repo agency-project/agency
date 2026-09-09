@@ -39,6 +39,8 @@ def test_harness_attempt_request_round_trips_through_json():
         "prior_session_blob_b64": "cHJpb3I=",
         "attempt_token": "attempt-123",
         "sandbox_mcp_tools_b64": "cGF5bG9hZA==",
+        "syscall_default_to_deny": False,
+        "syscall_hooked_names": None,
     }
     prompt = PromptPayload(**decoded.pop("prompt"))
     assert HarnessAttemptRequest(prompt=prompt, **decoded) == request

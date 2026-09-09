@@ -50,6 +50,8 @@ class SeccompStop:
     envp: "dict[str, str] | None"
     path: "str | None"
     timestamp: float
+    address: "str | None" = None
+    port: "int | None" = None
 
 
 @dataclass
@@ -99,36 +101,47 @@ def _kernel_executable_path(pid: int) -> "str | None":
 
 def _resolve_syscall_args(
     pid: int, regs: "pt.UserRegsStruct", syscall_nr: int
-) -> "tuple[list[str] | None, dict[str, str] | None, str | None]":
-    """Resolve the fields agsyscallevent cares about (argv/envp/path) for
-    whichever syscall was intercepted. Returns all-None for any syscall
-    number not in this table -- the event still gets delivered to the
-    policy with just `syscall`/`pid`/`tid`/`timestamp` populated, it's just
-    that this module doesn't yet know how to decode that syscall's specific
-    argument registers."""
+) -> "tuple[list[str] | None, dict[str, str] | None, str | None, str | None, int | None]":
+    """Resolve the fields agsyscallevent cares about (argv/envp/path/
+    address/port) for whichever syscall was intercepted. Returns all-None
+    for any syscall number not in this table -- the event still gets
+    delivered to the policy with just `syscall`/`pid`/`tid`/`timestamp`
+    populated, it's just that this module doesn't yet know how to decode
+    that syscall's specific argument registers."""
     if syscall_nr == pt.SYSCALL_NUMBERS["execve"]:
         # int execve(const char *pathname, char *const argv[], char *const envp[])
         path_ptr, argv_ptr, envp_ptr = regs.rdi, regs.rsi, regs.rdx
         path = pt.read_cstring(pid, path_ptr)
-        return pt.resolve_argv(pid, argv_ptr), pt.resolve_envp(pid, envp_ptr), path
+        return pt.resolve_argv(pid, argv_ptr), pt.resolve_envp(pid, envp_ptr), path, None, None
     if syscall_nr == pt.SYSCALL_NUMBERS["execveat"]:
         # int execveat(int dirfd, const char *pathname, char *const argv[],
         #              char *const envp[], int flags) -- args shift by one
         # register relative to execve() because of the leading dirfd.
         path_ptr, argv_ptr, envp_ptr = regs.rsi, regs.rdx, regs.r10
         path = pt.read_cstring(pid, path_ptr)
-        return pt.resolve_argv(pid, argv_ptr), pt.resolve_envp(pid, envp_ptr), path
+        return pt.resolve_argv(pid, argv_ptr), pt.resolve_envp(pid, envp_ptr), path, None, None
     if syscall_nr == pt.SYSCALL_NUMBERS["open"]:
         # int open(const char *pathname, int flags, mode_t mode)
-        return None, None, pt.read_cstring(pid, regs.rdi)
+        return None, None, pt.read_cstring(pid, regs.rdi), None, None
     if syscall_nr == pt.SYSCALL_NUMBERS["openat"]:
         # int openat(int dirfd, const char *pathname, int flags, mode_t mode)
         # -- resolved as the raw pathname only; a relative path's real target
         # depends on dirfd, which this module does not resolve (that would
         # require reading the tracee's /proc/<pid>/fd/<dirfd> symlink) --
         # policies matching on relative paths should be aware of this.
-        return None, None, pt.read_cstring(pid, regs.rsi)
-    return None, None, None
+        return None, None, pt.read_cstring(pid, regs.rsi), None, None
+    if syscall_nr in (pt.SYSCALL_NUMBERS["connect"], pt.SYSCALL_NUMBERS["bind"]):
+        # int connect/bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+        address, port = pt.read_sockaddr(pid, regs.rsi, regs.rdx)
+        return None, None, None, address, port
+    if syscall_nr == pt.SYSCALL_NUMBERS["sendto"]:
+        # ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+        #                const struct sockaddr *dest_addr, socklen_t addrlen)
+        # -- buf/len (rsi/rdx) are deliberately never read: only the
+        # destination address is policy-relevant here, never the payload.
+        address, port = pt.read_sockaddr(pid, regs.r8, regs.r9)
+        return None, None, None, address, port
+    return None, None, None, None, None
 
 
 class TracerLoop:
@@ -750,7 +763,7 @@ class TracerLoop:
         regs = pt.get_regs(pid)
         nr = regs.orig_rax
         name = pt.SYSCALL_NAMES_BY_NUMBER.get(nr, f"nr:{nr}")
-        argv, envp, path = _resolve_syscall_args(pid, regs, nr)
+        argv, envp, path, address, port = _resolve_syscall_args(pid, regs, nr)
         stop = SeccompStop(
             pid=pid,
             syscall=name,
@@ -759,6 +772,8 @@ class TracerLoop:
             envp=envp,
             path=path,
             timestamp=time.time(),
+            address=address,
+            port=port,
         )
         decision = self._syscall_hook(stop)
         is_exec = nr in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"])
