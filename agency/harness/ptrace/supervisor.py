@@ -366,6 +366,38 @@ class agProxyPtraceHandle:
         stdout, stderr = self._loop.read_output()
         return stdout, stderr, (returncode if returncode is not None else -1)
 
+    def write_terminal(self, data: bytes) -> None:
+        self._loop.write_terminal(data)
+
+    def resize_terminal(self, columns: int, rows: int) -> None:
+        self._loop.resize_terminal(columns, rows)
+
+    def terminal_screen(self):
+        return self._loop.terminal_screen()
+
+    def terminal_output(self) -> str:
+        return self._loop.read_output()[0]
+
+    @property
+    def root_pid(self) -> int:
+        return self._loop.root_pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self._loop._returncode
+
+    def is_paused(self) -> bool:
+        with self._loop._lock:
+            return bool(self._loop._held_pids & self._loop._known_pids)
+
+    def close(self) -> None:
+        self.kill()
+        try:
+            if self._loop.join(timeout=10) is None:
+                raise RuntimeError("traced process tree did not exit")
+        finally:
+            self._loop.close_terminal()
+
     def pids(self) -> "set[int]":
         return self._loop.live_pids()
 
@@ -438,6 +470,7 @@ class agProxyPtrace:
         *,
         cwd: str = "",
         stdin_data: "bytes | None" = None,
+        pty_size: "tuple[int, int] | None" = None,
         policy: "agpolicy",
         ag: "agent | None" = None,
     ) -> agProxyPtraceHandle:
@@ -510,7 +543,10 @@ class agProxyPtrace:
                 include_exit_code=True,
             )
         try:
-            loop.start(argv, envp, cwd, stdin_data=stdin_data)
+            kwargs = {"stdin_data": stdin_data}
+            if pty_size is not None:
+                kwargs["pty_size"] = pty_size
+            loop.start(argv, envp, cwd, **kwargs)
         except BaseException:
             if process_profiler is not None:
                 process_profiler.finalize()

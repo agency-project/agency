@@ -1,271 +1,75 @@
-"""Tests for the Claude Code agharness_backend.
-
-Tier 1 (mocked `agProxyPtrace.launch`) covers `_ClaudeCodeBackend.
-_run_attempt()` -- the one thing genuinely specific to this engine (binary
-resolution, argv/env construction, hook enabling, output parsing). The
-retry loop, structured-output collection, session capture, and transcript
-building it runs inside are all SHARED logic now (`agharness_backends/
-base.py`'s `execute()` template method) and are tested once, generically,
-in test_base.py's `TestSharedExecuteTemplate` instead of being re-tested
-per engine here.
-
-Tier 2 (marked `real_claude`) runs the actual installed `claude` CLI end-to-
-end against a REAL backend (Amazon Bedrock, via AWS_BEARER_TOKEN_BEDROCK)
--- verified working (v2.1.212/v2.1.220) during development: raw-text,
-structured-output-schema, and cross-container session-continuity paths,
-with the request genuinely translated and routed through agmanager_harness
-rather than Claude Code using its own host credentials. Kept here as a
-regression check, skipped when the binary/auth isn't available so this
-suite doesn't require real API access to run.
-"""
+"""Claude native launch configuration and opt-in provider integration tests."""
 
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+import os
+from unittest.mock import MagicMock
 
 import pytest
 
 from agency.configs.agconfig import agconfig, llmconfig, sandboxconfig
 from agency.agdata import agdata
 from agency.agent import agent
-from agency.harness.adapters.claude_code import (
-    _ClaudeCodeBackend,
-    claude_code_available,
-)
+from agency.harness.adapters.claude_code import _ClaudeCodeBackend, claude_code_available
 from agency.harness.adapters.agharness_backend import AdapterRuntime
 from agency.agskill import agskill
 
 
-def _make_agent(with_sandbox=True):
-    ag = MagicMock()
-    ag.agname = "test-agent"
-    ag.agconfig = agconfig()
-    ag.model = "test-model"
-    ag.sandbox = MagicMock() if with_sandbox else None
-    return ag
-
-
-def _make_handle(stdout="", stderr="", rc=0):
-    handle = MagicMock()
-    handle.wait.return_value = (stdout, stderr, rc)
-    return handle
-
-
-@pytest.fixture
-def _patch_which_finds_claude(monkeypatch):
-    """Explicitly requested (NOT autouse) -- the real_claude-marked tests
-    below must see the genuine shutil.which("claude") result, not a fake
-    path, or execve() fails with FileNotFoundError (hit during development:
-    an earlier autouse version of this fixture broke the real-CLI tests by
-    patching `which` out from under them too)."""
-    import shutil as _shutil
-
-    monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
-
-
-def _run_attempt(
-    backend,
-    ag,
-    *,
-    harness_base_url="http://harness.local",
-    token="tok-1",
-    prompt="go",
-    resume_session_id=None,
-    prior_session_blob=None,
-    max_steps=None,
-):
+def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, monkeypatch):
+    monkeypatch.setattr("agency.harness.agharness.materialize_config_home", lambda *a: tmp_path)
+    config = agconfig()
     runtime = AdapterRuntime(
-        agconfig=ag.agconfig,
-        model=ag.model,
-        engine_name=ag.agname,
-        harness_base_url=harness_base_url,
-        token=token,
-        syscall_policy=MagicMock(),
-        sandbox=ag.sandbox,
+        config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
-    return backend.run_daemon_attempt(
-        runtime,
-        prompt=prompt,
-        resume_session_id=resume_session_id,
-        prior_session_blob=prior_session_blob,
-        max_steps=max_steps,
+    argv, env, config_home = _ClaudeCodeBackend(config).prepare_pty(runtime)
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    assert json.loads((config_home / ".claude.json").read_text())["bypassPermissionsModeAccepted"]
+    assert "-p" not in argv
+    assert "--output-format" not in argv
+    assert env["ANTHROPIC_AUTH_TOKEN"] == env["AGPOLICY_TOKEN"] == "attempt-key"
+    assert env["CLAUDE_CONFIG_DIR"] == str(config_home)
+    assert env["IS_SANDBOX"] == "1"
+    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    assert set(hooks) >= {
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "StopFailure",
+        "SessionEnd",
+    }
+    commands = {entry["hooks"][0]["command"] for entries in hooks.values() for entry in entries}
+    assert commands == {
+        f"python3 {config_home}/agpolicy_hook.py",
+        f"python3 {config_home}/claude_pty_hook.py",
+    }
+    assert not (config_home / "agency_lifecycle.py").exists()
+    assert (config_home / "agency-turn.json").exists()
+
+
+def test_native_launch_restores_conversation_before_resuming(tmp_path, monkeypatch):
+    monkeypatch.setattr("agency.harness.agharness.materialize_config_home", lambda *a: tmp_path)
+    from agency.harness.adapters.claude_code import _session_path
+
+    config = agconfig()
+    runtime = AdapterRuntime(
+        config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
-
-
-def test_run_attempt_parses_json_result_field(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-
-    payload = json.dumps({"result": "Hi there!", "usage": {"input_tokens": 5, "output_tokens": 2}})
-    handle = _make_handle(stdout=payload)
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.return_value = handle
-        attempt = _run_attempt(backend, ag)
-
-    assert attempt.ok
-    assert attempt.final_text == "Hi there!"
-    assert attempt.input_tokens == 5
-    assert attempt.output_tokens == 2
-
-
-def test_run_attempt_does_not_override_home(monkeypatch, _patch_which_finds_claude):
-    """Regression test for a real bug hit during development: overriding
-    HOME cut Claude Code off from its own ~/.claude/.credentials.json,
-    forcing "Not logged in" on every run."""
-    monkeypatch.setenv("HOME", "/real/home")
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-
-    handle = _make_handle(stdout='{"result": "ok"}')
-    captured_envp = {}
-    captured_argv = []
-
-    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
-        captured_argv.extend(argv)
-        captured_envp.update(envp)
-        assert stdin_data == b"go"
-        return handle
-
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.side_effect = fake_launch
-        _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
-
-    assert captured_envp.get("HOME") == "/real/home"
-    # LLM traffic is routed through agmanager_harness, not the host's own creds.
-    assert captured_envp.get("ANTHROPIC_BASE_URL") == "http://harness.local"
-    assert captured_envp.get("ANTHROPIC_AUTH_TOKEN") == "tok-1"
-    assert "ANTHROPIC_API_KEY" not in captured_envp
-    settings = json.loads(captured_argv[captured_argv.index("--settings") + 1])
-    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
-
-
-def test_run_attempt_always_registers_admission_and_completion_hooks(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-    handle = _make_handle(stdout='{"result": "ok"}')
-    captured = {}
-
-    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
-        captured["argv"] = argv
-        captured["envp"] = envp
-        captured["stdin_data"] = stdin_data
-        return handle
-
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as ptrace_cls:
-        ptrace_cls.return_value.launch.side_effect = fake_launch
-        _run_attempt(backend, ag, harness_base_url="http://harness.local", token="tok-1")
-
-    settings = json.loads(captured["argv"][captured["argv"].index("--settings") + 1])
-    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
-    assert captured["envp"]["AGPOLICY_BASE_URL"] == "http://harness.local"
-    assert captured["envp"]["AGPOLICY_TOKEN"] == "tok-1"
-    assert captured["envp"]["AGPOLICY_STATE_DIR"]
-    assert "go" not in captured["argv"]
-    assert captured["stdin_data"] == b"go"
-
-
-def test_run_attempt_nonzero_exit_returns_error(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-
-    handle = _make_handle(stdout="", stderr="auth error", rc=1)
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.return_value = handle
-        attempt = _run_attempt(backend, ag)
-
-    assert not attempt.ok
-    assert "auth error" in attempt.error_message
-
-
-def test_run_attempt_threads_resume_session_id_into_argv(_patch_which_finds_claude):
-    """`resume_session_id` is decided by the SHARED retry loop in base.py
-    (see test_base.py's TestSharedExecuteTemplate) and simply threaded
-    through into `--resume <id>` here -- this only tests that threading,
-    not the retry loop itself."""
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-    handle = _make_handle(stdout=json.dumps({"result": "done", "session_id": "sess-abc"}))
-    captured = {}
-
-    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
-        captured["argv"] = argv
-        assert stdin_data == b"go"
-        return handle
-
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.side_effect = fake_launch
-        attempt = _run_attempt(backend, ag, resume_session_id="sess-abc")
-
-    assert attempt.ok
-    assert "--resume" in captured["argv"]
-    assert captured["argv"][captured["argv"].index("--resume") + 1] == "sess-abc"
-
-
-def test_run_attempt_omits_resume_flag_for_a_fresh_session(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-    handle = _make_handle(stdout='{"result": "ok"}')
-    captured = {}
-
-    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
-        captured["argv"] = argv
-        assert stdin_data == b"go"
-        return handle
-
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.side_effect = fake_launch
-        _run_attempt(backend, ag, resume_session_id=None)
-
-    assert "--resume" not in captured["argv"]
-
-
-def test_run_attempt_omits_max_turns_when_max_steps_is_none(_patch_which_finds_claude):
-    backend = _ClaudeCodeBackend(agconfig())
-    ag = _make_agent(with_sandbox=False)
-    handle = _make_handle(stdout='{"result": "ok"}')
-    captured = {}
-
-    def fake_launch(argv, envp, *, cwd, stdin_data, policy, ag):
-        captured["argv"] = argv
-        captured["stdin_data"] = stdin_data
-        return handle
-
-    with patch("agency.harness.ptrace.supervisor.agProxyPtrace") as mock_px_cls:
-        mock_px_cls.return_value.launch.side_effect = fake_launch
-        _run_attempt(backend, ag, max_steps=None)
-
-    assert "--max-turns" not in captured["argv"]
-    assert captured["stdin_data"] == b"go"
-
-
-def test_parse_result_json_extracts_result_and_usage():
-    payload = json.dumps(
-        {
-            "result": "abc",
-            "usage": {"input_tokens": 1, "output_tokens": 2},
-            "session_id": "session-123",
-        }
+    argv, _, _ = _ClaudeCodeBackend(config).prepare_pty(
+        runtime, resume_session_id="native-session", prior_session_blob=b'{"type":"user"}\n'
     )
-    text, usage, session_id = _ClaudeCodeBackend._parse_result_json(payload)
-    assert text == "abc"
-    assert usage == {"input_tokens": 1, "output_tokens": 2}
-    assert session_id == "session-123"
+    assert argv[-2:] == ["--resume", "native-session"]
+    from pathlib import Path
 
+    assert Path(_session_path(str(tmp_path), "native-session")).read_bytes() == b'{"type":"user"}\n'
 
-def test_parse_result_json_falls_back_on_malformed_json():
-    text, usage, session_id = _ClaudeCodeBackend._parse_result_json("not json")
-    assert text == "not json"
-    assert usage == {}
-    assert session_id is None
-
-
-# ---------------------------------------------------------------------------
-# Tier 2: real `claude` CLI (skipped unless the binary + auth are present)
-# ---------------------------------------------------------------------------
 
 real_claude = pytest.mark.skipif(
-    not claude_code_available(), reason="claude CLI not installed on this host"
+    not claude_code_available() or os.environ.get("AGENCY_TEST_REAL_CLAUDE") != "1",
+    reason="explicit paid-provider integration opt-in required",
 )
 
 

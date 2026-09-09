@@ -38,6 +38,7 @@ class AgentEngine:
         self._sandbox_interaction_client: "HarnessInteractionClient | None" = None
         self._services_lock = threading.RLock()
         self._services_closed = True
+        self._request_id: "str | None" = None
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
@@ -78,6 +79,15 @@ class AgentEngine:
             raise client_error
         if manager_error is not None:
             raise manager_error
+
+    def redirect(self, message: str) -> bool:
+        with self._services_lock:
+            client = self._sandbox_interaction_client
+            if self._services_closed or client is None:
+                return False
+            # Service teardown is serialized with this call. In particular,
+            # a late redirect never contacts a hibernated persistent daemon.
+            return client.redirect_harness(self._request_id, message)
 
     @property
     def host_server_manager(self) -> "HostServerManager":
@@ -195,6 +205,7 @@ class AgentEngine:
     ) -> "agdata":
         """Run host services and the sandbox-side harness while locked."""
 
+        self._request_id = request_id
         self._agent.data_logger.record_event(
             type="agent_state",
             payload={"state": "running_harness"},
@@ -430,6 +441,7 @@ class AgentEngine:
             request = HarnessAttemptRequest(
                 prompt=prompt,
                 harness=self._agent.harness,
+                request_id=self._request_id,
                 max_steps=max_steps,
                 resume_session_id=resume_session_id,
                 prior_session_blob_b64=prior_session_blob_b64,

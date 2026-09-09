@@ -18,6 +18,7 @@ dependencies = [
     "uvicorn[standard]>=0.20.0",
     "websocket-client",
     "pyseccomp",
+    "pyte>=0.8.2",
     "mcp"
 ]
 

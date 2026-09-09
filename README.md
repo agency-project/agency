@@ -73,88 +73,37 @@ print(invocation.summary)   # blocks until the invocation succeeds or fails
 
 ## Submissions and lifecycle
 
-All submissions reserve one position in the agent's authoritative context chain. Later work from the same agent cannot overtake that position.
+A skill call returns a pending `agdata` result. Calls from the same agent execute in context order.
 
 ```python
 first = ag.run(skill, agdata(topic="one"))
-second = ag.run(other_skill, first)  # Invocation is a pending data dependency
-
-# Ordered context for submissions that come after it.
-message = ag.queue_message("Keep citations next to the claims they support")
-message.wait()
+second = ag.run(other_skill, first)
+ag.queue_message("Keep citations next to the claims they support")
 third = ag.run(skill, agdata(topic="three"))
-
-# An additional instruction for this exact already-submitted invocation.
-third.redirect("Use only primary sources")
-third.pause()
-third.resume()
-
-close = ag.destroy()  # rejects new submissions immediately
-close.wait()          # waits for asynchronous cleanup; repeated destroy() returns this handle
+ag.redirect(third, "Use only primary sources")
+third.wait()
 ```
 
-`Invocation.redirect(...)` is the invocation-level API formerly named `Invocation.send_message(...)`. It urgently redirects only that exact invocation: pending redirects fence every new action under the shared control lock and remain pending, in FIFO order, until a successful model turn incorporates them. An already-admitted tool may finish, but remaining actions from the stale model result are skipped. Redirect requests are rejected after the final-answer fence. The other invocation controls—`inv.pause()`, `inv.resume()`, and `inv.cancel()`—also target only that exact invocation.
+`ag.redirect(result, message)` targets the skill execution that produced that result. If its harness is active, Claude is interrupted and receives the prompt through its PTY. If the target has not started, has finished, or cannot accept the redirect, the message becomes `queue_message()` exactly once. A late redirect for an earlier result never interrupts a later run. See [redirect lifecycle](docs/Redirect.md).
 
-`ag.suspend()` is the independent agent-wide gate: it prevents new engine-backed dispatch and parks active work at its next safe boundary if it has not crossed the closing/completion fence. Queued work held by the gate occupies no worker or global slot; an already-running invocation retains its slot while parked. `ag.resume()` clears only that gate and does not clear an invocation-specific pause.
+`queue_message()` appends future context in submission order and returns `None`. It does not change already submitted work; the next submission after the enqueue receives that context.
 
-`ag.queue_message()` returns a `MessageSubmission`. It advances the serialized agent context chain by copying its predecessor context and appending retained host-only context without creating an engine, sandbox, harness, or model request. It does not retroactively modify an invocation submitted before it. See [Invocation API](docs/Invocation_API.md) for the distinction from `Invocation.redirect()`.
-
-## Agent and Invocation API reference
+## Agent and result API reference
 
 `Agent` is the public alias of `agent`.
 
-### Create an agent
-
-```python
-from agency import Agent
-
-ag = Agent(
-    agname=None,
-    sandbox=None,
-    agconfig=cfg,
-    harness=None,
-)
-```
-
-### Agent execution and context
-
 | API | Purpose |
 |---|---|
-| `ag.run(skill, skill_input, max_steps=None)` | Submit work and immediately return its `Invocation`. |
-| `await ag.asyncio_run(skill, skill_input, max_steps=None)` | Submit work, wait, and return the resolved `agdata`. |
-| `ag.queue_message(message)` | Add ordered context for submissions made after the message; returns a `MessageSubmission`. |
+| `ag.run(skill, skill_input, max_steps=None)` | Submit work and return its pending `agdata`. |
+| `await ag.asyncio_run(skill, skill_input, max_steps=None)` | Submit work and await the resolved result. |
+| `ag.redirect(result, message)` | Deliver to that active execution or queue future context. |
+| `ag.queue_message(message)` | Enqueue ordered future context. |
+| `ag.pause()` | Freeze the current harness process; pause future launches until resumed. |
+| `ag.resume()` | Resume the harness and clear the persistent pause request. |
+| `ag.is_paused()` | Report whether pause was requested. |
+| `ag.cancel(result)` | Cancel the execution that produced that result. |
 | `ag.context` | The agent's authoritative context chain. |
-| `ag.ctx` | Read/write compatibility alias for `ag.context`. |
-| `ag.history` | Read the committed transcript as `agdata`, or assign `agdata` to replace it. |
-
-Do not use `queue_message()` as a replacement for the former invocation-level `send_message()`. `queue_message()` adds ordered context for later submissions, while `Invocation.redirect()` targets one invocation that has already been submitted:
-
-```python
-await ag.queue_message("Remember this for later work")
-inv = ag.run(skill, skill_input)
-inv.redirect("Apply this only to this invocation")
-```
-
-### Agent lifecycle
-
-| API | Purpose |
-|---|---|
-| `ag.suspend()` | Close the agent-wide dispatch gate and park active work at a safe boundary. |
-| `ag.resume()` | Reopen the agent-wide gate; does not resume an invocation paused with `inv.pause()`. |
-| `ag.destroy()` | Reject new work and begin asynchronous cleanup; returns a reusable `CloseHandle`. |
-| `ag.is_suspended()` | Report whether agent-wide suspension was requested. |
-| `ag.is_paused()` | Report whether active work is actually parked. |
-| `ag.is_settled()` | Report whether the agent currently has no unsettled work, or is safely parked. |
-| `ag.lifecycle_state` | Current agent lifecycle state, such as `ACTIVE`, `SUSPENDED`, `DESTROYING`, or `DESTROYED`. |
-
-Wait for destruction synchronously or asynchronously:
-
-```python
-close = ag.destroy()
-close.wait(timeout=None)
-# or
-await close
-```
+| `ag.history` | Read the committed transcript as `agdata`. |
 
 ### Agent configuration, cloning, and checkpoints
 
@@ -171,46 +120,9 @@ await close
 
 Useful agent metadata includes `ag.agname`, `ag.harness`, `ag.output_path`, and `ag.container_output_path`. `ag.record_state(state, skill=None, tool=None)` is available for runtime logging and UI reporting.
 
-### Invocation results
+### Results
 
-An invocation is an awaitable pending result. Waiting with `inv.wait()` returns the invocation, while awaiting it returns the resolved `agdata`:
-
-```python
-inv = ag.run(skill, skill_input)
-
-inv.wait(timeout=None)
-output = await inv
-pending_or_resolved = inv.result
-```
-
-| API | Purpose |
-|---|---|
-| `inv.result` | The pending or resolved output `agdata`. |
-| `inv.wait(timeout=None)` | Block until resolution and return `inv`. |
-| `await inv` | Resolve to the output `agdata`. |
-| `inv.is_pending()` | Report whether the result is unresolved. |
-| `inv.to_dict()` | Resolve and serialize the output as a dictionary. |
-| `inv.to_json()` | Resolve and serialize the output as JSON. |
-
-Unknown attributes proxy to the output, so `inv.answer` reads the output field named `answer`. To read an output field literally named `result`, use `inv.result.result`. An invocation can also be passed directly anywhere pending `agdata` is accepted.
-
-### Invocation controls and state
-
-| API | Purpose |
-|---|---|
-| `inv.redirect(message)` | Redirect this invocation before its next action or final answer. |
-| `inv.pause()` | Request a safe-boundary pause for this invocation only. |
-| `inv.resume()` | Resume this invocation only. |
-| `inv.cancel()` | Cancel this invocation; repeated calls are safe. |
-| `inv.is_cancelled()` | Report whether cancellation was requested. |
-| `inv.is_destroyed()` | Report whether agent destruction reached this invocation. |
-| `inv.is_pause_requested()` | Report whether an invocation-specific pause is requested. |
-| `inv.state` | Public lifecycle state for the invocation. |
-| `inv.phase` | Current execution phase. |
-
-Identity and ordering fields are `inv.invocation_id`, `inv.ordering_id`, and `inv.skill_name`. Public invocation states are `QUEUED`, `RUNNING`, `PAUSED`, `CANCELLING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, and `DESTROYED`.
-
-The previous `prepare()`, `start()`, `ag.send()`, `inv.send_message()`, and `inv.steer()` APIs have been removed. Use `run()` for a new invocation, `queue_message()` for ordered context affecting later submissions, and `redirect()` for an urgent instruction to one already-submitted invocation.
+A result is an awaitable `agdata`. Both `result.wait(timeout=None)` and `await result` resolve it. Field access, `to_dict()`, and `to_json()` wait automatically. `result.is_pending()` checks without blocking. Execution identity stays private and survives resolution, so the same result remains a valid redirect target afterward.
 
 **OpenAI**
 

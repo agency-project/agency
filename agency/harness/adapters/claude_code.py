@@ -1,7 +1,7 @@
 """Claude Code harness adapter.
 
 Builds the Claude CLI invocation, routes it through the sandbox daemon's
-policy-aware runtime, and normalizes its JSON result.
+policy-aware runtime, and owns native PTY input and completion.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -224,20 +226,27 @@ class _ClaudeCodeBackend(agharness_backend):
         runtime: AdapterRuntime,
         *,
         prompt: str,
-        resume_session_id: "str | None",
-        prior_session_blob: "bytes | None",
-        max_steps: "int | None",
+        resume_session_id: str | None,
+        prior_session_blob: bytes | None,
+        max_steps: int | None,
     ) -> AttemptResult:
+        execution = _ClaudePtyExecution(
+            self,
+            runtime,
+            resume_session_id=resume_session_id,
+            prior_session_blob=prior_session_blob,
+            max_steps=max_steps,
+        )
+        return execution.run(prompt)
+
+    def prepare_pty(self, runtime, *, resume_session_id=None, prior_session_blob=None):
+        """Prepare isolated native configuration; one process belongs to one attempt."""
         from .. import agharness
-        from ..ptrace.supervisor import agProxyPtrace
 
-        # The host preparation layer supplies an executable in this namespace.
         resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-
         config_home = agharness.materialize_config_home(
             runtime.engine_name, runtime.token, runtime.harness_base_url
         )
-
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(
@@ -245,37 +254,37 @@ class _ClaudeCodeBackend(agharness_backend):
                     prior_session_blob,
                 )
 
-            # Bridge Claude Code's PreToolUse permission check to agpolicy
-            # and its PostToolUse/PostToolUseFailure boundaries to the same
-            # host-side admission+completion endpoints (agpolicy_hook.py):
-            # write the self-contained hook script into this launch's own
-            # config_home inside the sandbox daemon's filesystem, then
-            # register it via `--settings`' `hooks` block -- confirmed
-            # directly against the real CLI that this composes fine with
-            # `--setting-sources ""` below, and that omitting `matcher`
-            # hooks every tool call, not just one. Post hooks always run
-            # now (not gated on profiling) -- they report tool-call
-            # completion telemetry, not just profiler spans.
             hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
             hook_path = f"{config_home}/agpolicy_hook.py"
             Path(hook_path).write_bytes(hook_src)
             hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
+            lifecycle_path = config_home / "claude_pty_hook.py"
+            lifecycle_path.write_bytes(Path(__file__).with_name("_claude_pty_hook.py").read_bytes())
+            lifecycle_hook = {
+                "hooks": [{"type": "command", "command": f"python3 {lifecycle_path}"}]
+            }
+            (config_home / "events").mkdir()
             hooks_settings = json.dumps(
                 {
                     "hooks": {
                         "PreToolUse": [hook_command],
                         "PostToolUse": [hook_command],
                         "PostToolUseFailure": [hook_command],
+                        **{
+                            name: [lifecycle_hook]
+                            for name in (
+                                "SessionStart",
+                                "UserPromptSubmit",
+                                "Stop",
+                                "StopFailure",
+                                "SessionEnd",
+                                "Notification",
+                            )
+                        },
                     }
                 }
             )
 
-            # --mcp-config exposes the host proxy and any attempt-local
-            # sandbox tools as separate servers. --strict-mcp-config
-            # restricts this launch to those servers -- redundant
-            # with the isolated config_home/cwd (no `.mcp.json` lives
-            # there) but cheap, explicit insurance against ever silently
-            # inheriting some other server.
             mcp_config = json.dumps(
                 agharness.mcp_config_for(
                     runtime.harness_base_url,
@@ -286,61 +295,42 @@ class _ClaudeCodeBackend(agharness_backend):
 
             envp = {
                 "PATH": HARNESS_PATH,
-                # Point Claude Code's own LLM traffic at agmanager_harness's
-                # translated Anthropic Messages route instead of any real
-                # Anthropic endpoint -- ANTHROPIC_AUTH_TOKEN sends this
-                # token as a bearer `Authorization` header, which
-                # agmanager_harness reads to authenticate against
-                # agmanager_host. Real host credentials (API key, OAuth
-                # login, Bedrock env) are deliberately NOT forwarded: every
-                # claude-driven agent's LLM calls must go through this
-                # agent's own configured agconfig backend, not whatever
-                # this host happens to have lying around.
+                "TERM": "xterm-256color",
+                # The daemon runs inside Agency's sandbox, including when its
+                # container user is root. Claude requires this marker to allow
+                # bypass mode there; Agency's hooks and ptrace still apply.
+                "IS_SANDBOX": "1",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "DISABLE_AUTOUPDATER": "1",
+                "AGENCY_CLAUDE_STATE": str(config_home),
                 "ANTHROPIC_BASE_URL": runtime.harness_base_url,
                 "ANTHROPIC_AUTH_TOKEN": runtime.token,
-                # Lets agpolicy_hook.py (registered above as the
-                # PreToolUse hook) reach agmanager_harness's own
-                # /agpolicy/check_tool route -- same base_url/token as the
-                # LLM traffic above, since it's the same process and the
-                # same per-run bearer token identifies the same agent.
                 "AGPOLICY_BASE_URL": runtime.harness_base_url,
                 "AGPOLICY_TOKEN": runtime.token,
-                # Lets agpolicy_hook.py persist a PreToolUse admission's
-                # call_id to a small per-tool_use_id file here, since the
-                # matching PostToolUse hook is a separate subprocess with no
-                # memory of it otherwise. Reuses config_home -- already a
-                # writable, per-launch directory this same process wrote
-                # the hook script into.
                 "AGPOLICY_STATE_DIR": str(config_home),
-                # Also explicitly unset so the CLI can't fall back to a
-                # locally-configured Bedrock/API-key credential path.
                 "CLAUDE_CODE_USE_BEDROCK": "0",
-                # Relocates Claude Code's ENTIRE storage root (settings AND
-                # session transcripts) into this launch's own config_home
-                # instead of the real $HOME/.claude -- confirmed via strings
-                # in the installed binary ("CLAUDE_CONFIG_DIR=/tmp for
-                # ephemeral local writes"). This is what makes the native
-                # session continuity above (_session_path/_read_session_blob/
-                # _write_session_blob) work at all: without it, the session
-                # file lands under whatever HOME resolves to, not
-                # config_home, so it's invisible to the restore/capture
-                # logic and never cleaned up by cleanup_config_home either.
                 "CLAUDE_CONFIG_DIR": str(config_home),
             }
-            # HOME, when present, belongs to the sandbox daemon. Real host
-            # credentials are not forwarded across the daemon boundary.
             if "HOME" in os.environ:
                 envp["HOME"] = os.environ["HOME"]
 
-            # Agency selected this exact root CLI executable. Authorize only
-            # its initial exec; descendant executions remain policy-controlled.
-            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
-
+            (config_home / "agency-turn.json").write_text(json.dumps({"turn_id": None}))
+            # This is Agency's generated sandbox workspace. Acknowledge startup
+            # dialogs here; Agency's hooks and tracer govern unattended tool use.
+            (config_home / ".claude.json").write_text(
+                json.dumps(
+                    {
+                        "hasCompletedOnboarding": True,
+                        "theme": "dark",
+                        "bypassPermissionsModeAccepted": True,
+                        "projects": {str(config_home): {"hasTrustDialogAccepted": True}},
+                    }
+                )
+            )
             argv = [
                 resolved,
-                "-p",
-                "--output-format",
-                "json",
+                "--permission-mode",
+                "bypassPermissions",
                 "--setting-sources",
                 "",
                 "--settings",
@@ -348,70 +338,15 @@ class _ClaudeCodeBackend(agharness_backend):
                 "--mcp-config",
                 mcp_config,
                 "--strict-mcp-config",
+                "--model",
+                runtime.model,
             ]
-            if max_steps is not None:
-                argv += ["--max-turns", str(max_steps)]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
-
-            handle = px.launch(
-                argv,
-                envp,
-                cwd=str(config_home),
-                stdin_data=prompt.encode("utf-8"),
-                policy=runtime.syscall_policy,
-                ag=None,
-            )
-            runtime.register_control_handle(handle)
-
-            stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
-            _dbg = os.environ.get("AGENCY_DEBUG_RAW_STDOUT_DUMP")
-            if _dbg:
-                with open(_dbg, "a") as _f:
-                    _f.write(f"rc={rc!r}\nstdout={stdout!r}\nstderr={stderr!r}\n---\n")
-
-            if rc != 0:
-                return AttemptResult(
-                    ok=False, error_message=f"claude exited with code {rc}: {stderr or stdout}"
-                )
-
-            final_text, usage, session_id = self._parse_result_json(stdout)
-            session_blob = None
-            if session_id:
-                try:
-                    session_blob = _read_session_blob(
-                        _session_path(str(config_home), session_id),
-                    )
-                except Exception:  # noqa: S110 - session persistence is best-effort
-                    session_blob = None
-
-            return AttemptResult(
-                ok=True,
-                final_text=final_text,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                session_id=session_id,
-                session_blob=session_blob,
-            )
-        finally:
+            return argv, envp, config_home
+        except BaseException:
             agharness.cleanup_config_home(config_home)
-
-    @staticmethod
-    def _parse_result_json(stdout: str) -> "tuple[str, dict, str | None]":
-        """Parse `claude -p --output-format json`'s single JSON result
-        object -- `{"result": "...", "usage": {...}, "session_id": "...", ...}`
-        (verified directly against the real CLI, v2.1.212/2.1.220, during
-        development)."""
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError:
-            return stdout.strip(), {}, None
-        if not isinstance(payload, dict):
-            return stdout.strip(), {}, None
-        text = payload.get("result", "")
-        usage = payload.get("usage", {}) or {}
-        session_id = payload.get("session_id")
-        return text, usage, session_id
+            raise
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -461,10 +396,24 @@ class _ClaudeCodeBackend(agharness_backend):
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
 
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context), model
-                    )
+                async def gen():
+                    # Closing Claude's request closes the upstream UDS stream,
+                    # including while the host is still generating its batch.
+                    from contextlib import aclosing
+                    import anyio
+
+                    stream = router.dispatch_stream_async(token, agency_context)
+                    try:
+                        async with aclosing(stream):
+                            async for item in stream:
+                                if item["type"] == "done":
+                                    for event in self._format_agency_stream_to_harness(
+                                        [item], model
+                                    ):
+                                        yield event
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            await stream.aclose()
 
                 return StreamingResponse(gen(), media_type="text/event-stream")
             agency_response = router.dispatch(token, agency_context)
@@ -774,6 +723,272 @@ def _mid_array_system_warning(body: dict) -> "str | None":
         "(system must be the top-level `system` field, never a `messages` "
         "entry); folding into the leading system message before forwarding"
     )
+
+
+class _ClaudePtyExecution:
+    """One attempt's PTY, native acknowledgments, and terminal boundary.
+
+    The lock covers both final completion and redirect submission. The process
+    is never reused by another attempt, even when its native transcript resumes.
+    """
+
+    INPUT_TIMEOUT = 20.0
+    START_TIMEOUT = 30.0
+
+    def __init__(self, adapter, runtime, *, resume_session_id, prior_session_blob, max_steps):
+        self.runtime = runtime
+        self.argv, self.env, self.config_home = adapter.prepare_pty(
+            runtime, resume_session_id=resume_session_id, prior_session_blob=prior_session_blob
+        )
+        if max_steps is not None:
+            self.argv += ["--max-turns", str(max_steps)]
+        self.handle = None
+        self._lock = threading.RLock()
+        self._active = False
+        self._session_id = resume_session_id
+        self._started = False
+        self._turn_id = None
+        self._expected_prompt = None
+        self._acknowledged = False
+        self._stop = None
+        self._failure = None
+        self._submission_offset = 0
+        self._attempt_offset = 0
+        self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
+
+    @property
+    def _transcript_path(self):
+        if self._session_id is None:
+            return None
+        return Path(_session_path(str(self.config_home), self._session_id))
+
+    def _transcript(self):
+        path = self._transcript_path
+        if path is None or not path.exists():
+            return b""
+        return path.read_bytes()
+
+    def _poll(self):
+        for path in sorted((self.config_home / "events").glob("*.json")):
+            event = json.loads(path.read_text())
+            path.unlink()
+            payload = event["payload"]
+            kind = payload.get("hook_event_name")
+            if kind == "SessionStart":
+                self._session_id = payload["session_id"]
+                self._started = True
+            if event["turn_id"] != self._turn_id:
+                continue
+            if kind == "UserPromptSubmit" and payload.get("prompt") == self._expected_prompt:
+                self._acknowledged = True
+            elif kind == "Stop":
+                self._stop = payload.get("last_assistant_message")
+            elif kind in {"StopFailure", "SessionEnd"}:
+                self._failure = f"Claude {kind}: {payload.get('error', 'session ended')}"
+
+    def _check_alive(self):
+        if self._failure:
+            raise RuntimeError(self._failure)
+        if self.handle.returncode is not None:
+            raise RuntimeError(f"Claude process exited ({self.handle.returncode})")
+
+    def _wait_until(self, predicate, description, timeout=None):
+        deadline = time.monotonic() + (self.INPUT_TIMEOUT if timeout is None else timeout)
+        last_poll = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if self.handle.is_paused():
+                deadline += now - last_poll
+            last_poll = now
+            self._poll()
+            if predicate():
+                return
+            self._check_alive()
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Claude timed out waiting for {description}")
+            time.sleep(0.025)
+
+    def _editable_input(self):
+        # Claude 2.1.251's input box, with the cursor inside it. History and
+        # terminal silence are not evidence that input can safely be submitted.
+        lines, _x, y, generation = self.handle.terminal_screen()
+        upper = next((i for i in range(y - 1, -1, -1) if lines[i].strip().startswith("───")), None)
+        lower = next(
+            (i for i in range(y + 1, len(lines)) if lines[i].strip().startswith("───")), None
+        )
+        if upper is None or lower is None:
+            return None
+        first = lines[upper + 1].lstrip()
+        if not first.startswith("❯"):
+            return None
+        draft = "\n".join(
+            [first[1:].strip(), *[s.strip() for s in lines[upper + 2 : lower]]]
+        ).strip()
+        return draft, generation
+
+    @staticmethod
+    def _validate_prompt(prompt):
+        if any((ord(c) < 32 and c not in "\n\t") or ord(c) == 127 for c in prompt):
+            raise ValueError("native prompt contains terminal control characters")
+
+    def _submit(self, prompt):
+        self._validate_prompt(prompt)
+        self._turn_id = uuid.uuid4().hex
+        self._expected_prompt = prompt
+        self._acknowledged = False
+        self._stop = None
+        self._submission_offset = len(self._transcript())
+        state = self.config_home / "agency-turn.json"
+        temporary = state.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"turn_id": self._turn_id}))
+        temporary.replace(state)
+        self.handle.write_terminal(b"\x1b[200~" + prompt.encode() + b"\x1b[201~")
+        self.handle.write_terminal(b"\r")
+        self._wait_until(lambda: self._acknowledged, "UserPromptSubmit acknowledgment")
+        self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
+
+    @staticmethod
+    def _rows(blob):
+        for line in blob.splitlines(keepends=True):
+            if line.endswith(b"\n"):
+                yield json.loads(line)
+
+    @staticmethod
+    def _text(row):
+        content = row.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            return content
+        return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+
+    def _completed_snapshot(self):
+        if self._stop is None:
+            return None
+        blob = self._transcript()
+        submitted = False
+        for row in self._rows(blob[self._submission_offset :]):
+            text = self._text(row)
+            if row.get("type") == "user" and text == self._expected_prompt:
+                submitted = True
+            if submitted and row.get("type") == "assistant" and text == self._stop:
+                return blob
+        return None
+
+    def _interrupt(self):
+        offset = len(self._transcript())
+        generation = self.handle.terminal_screen()[3]
+        self.handle.write_terminal(b"\x03")
+
+        def interrupted():
+            # Native completion can win just after the caller's active check.
+            # Preserve that result and queue the redirect instead of treating
+            # the idle CLI's lack of an interruption record as a failed run.
+            if self._stop is not None:
+                return True
+            for row in self._rows(self._transcript()[offset:]):
+                if row.get("type") == "user" and self._text(row) in {
+                    "[Request interrupted by user]",
+                    "[Request interrupted by user for tool use]",
+                }:
+                    return True
+            editable = self._editable_input()
+            if editable and editable[0] and editable[1] > generation:
+                # Before its first response Claude restores the original prompt
+                # as a draft. Clear that known draft, then require an empty box.
+                self.handle.write_terminal(b"\x1b\x1b")
+                self._wait_until(
+                    lambda: (self._editable_input() or (None,))[0] == "", "empty input"
+                )
+                return True
+            return False
+
+        self._wait_until(interrupted, "native interruption")
+        return self._stop is None
+
+    def redirect(self, message: str) -> bool:
+        with self._lock:
+            if not self._active:
+                return False
+            if self.handle.is_paused():
+                return False
+            self._poll()
+            if self._stop is not None:
+                return False
+            try:
+                self._validate_prompt(message)
+            except ValueError:
+                return False
+            try:
+                self._check_alive()
+                if not self._interrupt():
+                    return False
+                self._submit("[Agency redirect]\n" + message)
+                return True
+            except (OSError, RuntimeError) as exc:
+                # A partial or unacknowledged submission cannot remain alive:
+                # terminate this attempt before the caller queues its fallback.
+                self._active = False
+                self._failure = str(exc)
+                self.handle.kill()
+                return False
+
+    def run(self, prompt):
+        from ..ptrace.supervisor import agProxyPtrace
+        from ..agharness import cleanup_config_home
+
+        try:
+            self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
+                self.argv,
+                self.env,
+                cwd=str(self.config_home),
+                pty_size=(120, 36),
+                policy=self.runtime.syscall_policy,
+                ag=None,
+            )
+            self.runtime.register_control_handle(self.handle)
+            self.runtime.register_redirect(self.redirect)
+            # Startup does not hold the delivery lock: early redirects return
+            # False immediately instead of waiting for a harness to become ready.
+            self._wait_until(
+                lambda: self._started and (self._editable_input() or (None,))[0] == "",
+                "startup input",
+                self.START_TIMEOUT,
+            )
+            self._attempt_offset = len(self._transcript())
+            self._submit("[Agency run]\n" + prompt)
+            with self._lock:
+                self._active = True
+            last_poll = time.monotonic()
+            while True:
+                with self._lock:
+                    now = time.monotonic()
+                    if self.handle.is_paused():
+                        self._deadline += now - last_poll
+                    last_poll = now
+                    self._poll()
+                    self._check_alive()
+                    snapshot = self._completed_snapshot()
+                    if snapshot is not None:
+                        self._active = False
+                        usage = {"input_tokens": 0, "output_tokens": 0}
+                        for row in self._rows(snapshot[self._attempt_offset :]):
+                            for key in usage:
+                                usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
+                        return AttemptResult(
+                            ok=True,
+                            final_text=self._stop,
+                            session_id=self._session_id,
+                            session_blob=snapshot,
+                            **usage,
+                        )
+                    if time.monotonic() > self._deadline:
+                        raise RuntimeError("Claude attempt timed out")
+                time.sleep(0.025)
+        finally:
+            with self._lock:
+                self._active = False
+                if self.handle is not None:
+                    self.handle.close()
+            cleanup_config_home(self.config_home)
 
 
 __all__ = ["_ClaudeCodeBackend", "claude_code_available"]

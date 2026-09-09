@@ -12,6 +12,7 @@ from agency.harness.servers.harness_interaction_server import HarnessInteraction
 def test_harness_attempt_request_round_trips_through_json():
     request = HarnessAttemptRequest(
         harness="claude_code",
+        request_id="execution-123",
         max_steps=20,
         resume_session_id="session-122",
         prior_session_blob_b64="cHJpb3I=",
@@ -32,6 +33,7 @@ def test_harness_attempt_request_round_trips_through_json():
             "output_instruction": None,
         },
         "harness": "claude_code",
+        "request_id": "execution-123",
         "max_steps": 20,
         "resume_session_id": "session-122",
         "prior_session_blob_b64": "cHJpb3I=",

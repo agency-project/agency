@@ -19,6 +19,8 @@ class PromptPayload:
 class HarnessAttemptRequest:
     prompt: PromptPayload
     harness: str
+    # The enclosing skill execution, shared by its output-repair attempts.
+    request_id: "str | None" = None
     max_steps: "int | None" = None
     resume_session_id: "str | None" = None
     # Session files are opaque bytes, so the JSON protocol carries them as base64.

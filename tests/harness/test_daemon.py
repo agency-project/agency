@@ -59,6 +59,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
         "agent-1",
         object(),
         lambda handle: None,
+        lambda handler: None,
     )
 
     assert seen["resume_session_id"] == "session-1"
@@ -117,7 +118,14 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     manager._attempt_handler = manager._run_adapter_request
 
     def run_adapter(
-        got_request, config, base_url, model, engine_name, syscall_policy, register_control_handle
+        got_request,
+        config,
+        base_url,
+        model,
+        engine_name,
+        syscall_policy,
+        register_control_handle,
+        register_redirect,
     ):
         seen.append((got_request, config, base_url, model, engine_name, syscall_policy))
         return expected
@@ -290,3 +298,43 @@ def test_host_syscall_policy_check_completion_is_a_noop_without_a_call_id():
 
     policy.check_completion(None, None, 3)
     assert host_services.complete_calls == []
+
+
+def test_pause_finishes_before_a_concurrent_redirect_can_start():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    manager = HarnessManager("/unused/sandbox", "/unused/host", "agent", "claude_code")
+    pause_entered, release_pause = threading.Event(), threading.Event()
+    redirect_requested, redirect_entered = threading.Event(), threading.Event()
+    order = []
+
+    def pause():
+        pause_entered.set()
+        assert release_pause.wait(3)
+        order.append("paused")
+
+    def deliver(message):
+        redirect_entered.set()
+        order.append("redirect")
+        return True
+
+    def redirect():
+        redirect_requested.set()
+        return manager.redirect("run", "message")
+
+    manager._current_control_handle = SimpleNamespace(pause=pause)
+    manager._current_request_id = "run"
+    manager._register_redirect(deliver)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paused = pool.submit(manager.control, "pause")
+        assert pause_entered.wait(2)
+        redirected = pool.submit(redirect)
+        try:
+            assert redirect_requested.wait(2)
+            assert not redirect_entered.wait(0.1)
+        finally:
+            release_pause.set()
+        paused.result(timeout=2)
+        assert redirected.result(timeout=2)
+    assert order == ["paused", "redirect"]

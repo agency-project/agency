@@ -18,7 +18,7 @@ cfg = agconfig(
     llmconfig(
         provider="openai",
         model="gpt-5.6-luna",
-        api_key=os.environ["OPENAI_API_KEY"],
+        api_key=os.environ.get("OPENAI_API_KEY", ""),
         reasoning_effort="none",
         max_completion_tokens=1024,
     )
@@ -47,4 +47,4 @@ skill = agskill(
 if __name__ == "__main__":
     invocation = agent(agconfig=cfg, harness="claude_code").run(skill, agdata(number=21))
     invocation.wait()
-    print(invocation.result.result)
+    print(invocation.result)

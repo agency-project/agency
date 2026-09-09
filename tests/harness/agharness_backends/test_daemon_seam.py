@@ -38,12 +38,6 @@ def test_every_engine_implements_daemon_attempt_seam(name):
     ("backend_cls", "stdout", "expected", "config_name"),
     [
         (
-            _ClaudeCodeBackend,
-            json.dumps({"result": "claude-ok", "usage": {"input_tokens": 2}}),
-            "claude-ok",
-            None,
-        ),
-        (
             _CodexBackend,
             json.dumps(
                 {"type": "item.completed", "item": {"type": "agent_message", "text": "codex-ok"}}
@@ -99,11 +93,7 @@ def test_external_cli_adapters_launch_through_typed_runtime(
     assert result.final_text == expected
     assert captured["policy"] is runtime.syscall_policy
     assert captured["ag"] is None
-    if backend_cls is _ClaudeCodeBackend:
-        assert captured["argv"][captured["argv"].index("--max-turns") + 1] == "4"
-        assert "do the thing" not in captured["argv"]
-        assert captured["stdin_data"] == b"do the thing"
-    elif backend_cls is _GrokBackend:
+    if backend_cls is _GrokBackend:
         assert captured["argv"][captured["argv"].index("--max-turns") + 1] == "4"
         assert "do the thing" not in captured["argv"]
         assert captured["prompt"] == "do the thing"
@@ -141,29 +131,16 @@ def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, 
     )
     session = Path(_session_path(str(config_home), "session-one"))
 
-    def launch(_self, argv, envp, *, cwd, stdin_data, **kwargs):
-        assert argv[0] == str(binary)
-        assert argv[argv.index("--resume") + 1] == "session-one"
-        assert "continue" not in argv
-        assert stdin_data == b"continue"
-        assert session.read_bytes() == b"prior transcript"
-        assert Path(cwd, "agpolicy_hook.py").is_file()
-        session.write_bytes(b"updated transcript")
-        handle = MagicMock()
-        handle.wait.return_value = ('{"result":"done","session_id":"session-one"}', "", 0)
-        return handle
-
-    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
-    result = _ClaudeCodeBackend(config).run_daemon_attempt(
+    argv, _env, home = _ClaudeCodeBackend(config).prepare_pty(
         replace(_runtime(sandbox=sandbox), agconfig=config),
-        prompt="continue",
         resume_session_id="session-one",
         prior_session_blob=b"prior transcript",
-        max_steps=4,
     )
-    assert result.ok
-    assert result.session_blob == b"updated transcript"
-    assert not config_home.exists()
+    assert argv[0] == str(binary)
+    assert argv[-2:] == ["--resume", "session-one"]
+    assert session.read_bytes() == b"prior transcript"
+    assert (home / "agpolicy_hook.py").is_file()
+    assert "-p" not in argv
 
 
 class _NativeSandbox:
@@ -277,11 +254,17 @@ def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, 
         "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
     )
     runtime = replace(_runtime(sandbox=sandbox), has_sandbox_mcp_tools=has_sandbox_tools)
-    result = backend_cls(agconfig()).run_daemon_attempt(
-        runtime, prompt="test", resume_session_id=None, prior_session_blob=None, max_steps=2
-    )
-    assert result.ok
-    argv = captured["argv"]
+    if backend_cls is _ClaudeCodeBackend:
+        from agency.harness.agharness import cleanup_config_home
+
+        argv, _, config_home = backend_cls(agconfig()).prepare_pty(runtime)
+        cleanup_config_home(config_home)
+    else:
+        result = backend_cls(agconfig()).run_daemon_attempt(
+            runtime, prompt="test", resume_session_id=None, prior_session_blob=None, max_steps=2
+        )
+        assert result.ok
+        argv = captured["argv"]
     servers = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
     assert set(servers) == ({"agency", "agency-sandbox"} if has_sandbox_tools else {"agency"})
     assert servers["agency"]["url"] == f"{runtime.harness_base_url}/mcp"
