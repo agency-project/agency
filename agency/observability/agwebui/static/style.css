@@ -338,7 +338,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 /* ------------------------------------------------------- History pane */
 
-.msg-system     { color: var(--dim); font-size: 11px; margin: 1px 0; }
+.msg-system     { margin: 3px 0; }
 .msg-user       { margin: 3px 0; }
 .msg-thinking   { color: var(--dim); font-style: italic; margin: 3px 0; border-left: 2px solid var(--border); padding-left: 6px; }
 .msg-tool-call  { margin: 3px 0; }

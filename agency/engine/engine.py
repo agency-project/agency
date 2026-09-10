@@ -366,7 +366,6 @@ class AgentEngine:
         return PromptPayload(
             system_instruction=skill._build_system_prompt(),
             user_content=user_content,
-            output_instruction=agharness.build_output_format_instruction(skill),
         )
 
     @staticmethod
@@ -477,7 +476,11 @@ class AgentEngine:
         attempt: "HarnessAttemptResult",
         sandbox: agSandbox,
     ) -> "agdata | None":
-        """Handle the plain JSON response contract used by non-MCP harnesses."""
+        """Recover structured output from a model's final text, in case it
+        stated its answer as JSON without being asked to (the model is never
+        instructed to do this -- see agschema._lenient_json_object) --
+        structured output is normally submitted via the return_<field>/
+        submit_output MCP tools instead."""
         from ..agdata import agerror
 
         output_schema = skill.output_schema

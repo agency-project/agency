@@ -114,20 +114,6 @@ def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | li
     return skill._build_user_content(skill_input)
 
 
-def build_output_format_instruction(skill: "agskill") -> "str | None":
-    """A plain-text instruction describing the required JSON response shape,
-    appended to the prompt for skills with a structured output_schema,
-    parsed post-hoc by `agschema.validate_and_recover`. Returns None for a
-    raw-text/no-schema skill, which needs no such instruction."""
-    if skill.output_schema is None or skill.output_schema.raw_key() is not None:
-        return None
-    return (
-        "\n\nWhen you are done, respond with a final message containing ONLY a single "
-        "JSON object (no surrounding prose, no markdown code fence) matching this shape:\n"
-        f"{skill.output_schema.to_json()}"
-    )
-
-
 __all__ = [
     "materialize_config_home",
     "cleanup_config_home",
@@ -136,5 +122,4 @@ __all__ = [
     "cleanup_config_home_in_container",
     "mcp_config_for",
     "build_user_turn_prompt",
-    "build_output_format_instruction",
 ]

@@ -304,14 +304,12 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
     monkeypatch.setattr(
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "the-prompt"
     )
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: "the-format")
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "the-system")
     payload = engine._build_prompt_payload(skill, SimpleNamespace())
     assert payload == PromptPayload(
         system_instruction="the-system",
         user_content="the-prompt",
-        output_instruction="the-format",
     )
 
 
@@ -321,7 +319,6 @@ def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
     monkeypatch.setattr(
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "current request"
     )
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: None)
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "system")
 
@@ -345,7 +342,6 @@ def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content(mo
 
     current = [{"type": "text", "text": "current request"}]
     monkeypatch.setattr(agharness, "build_user_turn_prompt", lambda *_args: current)
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda _skill: None)
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "system")
 

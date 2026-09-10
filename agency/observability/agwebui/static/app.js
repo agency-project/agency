@@ -173,37 +173,54 @@ function fmtBytes(n) {
   return n + 'B';
 }
 
-let _profilerFilesShown = false;
+// agprof writes its output files (trace/summary/sqlite3) at its own pace,
+// under names/timing this client has no reason to know or guess -- rather
+// than tracking which specific files mean "done" (fragile: a rename or a
+// newly added output file would silently stop showing up), just render
+// whatever /api/profiler/files currently reports and keep refreshing it.
+// One persistent line is updated in place (not re-appended) each poll, so
+// a file list that's still growing never produces duplicate log lines.
+let _profilerLogLineEl = null;
+let _profilerPollTimer = null;
 
-// Profiler output (agprof.trace.json/summary.json/summary.md) is written
-// once, at the run's profiling session stop -- which (see agwebui/
-// __init__.py's run()) always finishes before the "done" event that puts
-// "All done" in this log, so it's already on disk by the time that
-// happens. checkProfilerFiles() is called both right then (an immediate,
-// one-shot check needing no wait at all) and on a periodic fallback timer
-// (covers a client that connects to an already-finished run, or somehow
-// misses the "done" event) -- whichever fires first wins and stops both.
-async function checkProfilerFiles() {
-  if (_profilerFilesShown) return true;
-  try {
-    const r = await fetch('/api/profiler/files');
-    const j = await r.json();
-    const files = j.files || [];
-    if (!files.length) return false;
-    _profilerFilesShown = true;
-    clearInterval(_profilerPollTimer);
-    const links = files
-      .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)}</a> (${fmtBytes(f.size)})`)
-      .join('  ');
-    _appendLogLine(`<span style="color:var(--yellow)">Profiler output ready:</span>  ${links}`);
-    return true;
-  } catch {
-    return false;
+function _renderProfilerFiles(files) {
+  if (!files.length) return;
+  const links = files
+    .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)}</a> (${fmtBytes(f.size)})`)
+    .join('  ');
+  const html = `<span style="color:var(--yellow)">Profiler output:</span>  ${links}`;
+  if (_profilerLogLineEl) {
+    _profilerLogLineEl.innerHTML = html;
+  } else {
+    _profilerLogLineEl = _appendLogLine(html);
   }
 }
 
-const _profilerPollTimer = setInterval(checkProfilerFiles, 3_000);
-checkProfilerFiles();
+async function checkProfilerFiles() {
+  if (wsClosed) {
+    clearInterval(_profilerPollTimer);
+    return;
+  }
+  try {
+    const r = await fetch('/api/profiler/files');
+    const j = await r.json();
+    _renderProfilerFiles(j.files || []);
+  } catch {}
+}
+
+// Armed once, the first time the run is known to be over -- from the
+// "done" event, whether pushed live or replayed from this agent db's tail
+// on a client that only connects after the run already finished (see
+// server.py's _fetch_tail_events(): "done" is always that db's very last
+// event, so it's always within the replayed tail window). Nothing polls
+// before that: the profiler's own files (profile_data.sqlite3 especially)
+// exist from early in the run, long before it's actually finished, so
+// checking earlier would only mean showing/updating this line too soon.
+function armProfilerPolling() {
+  if (_profilerPollTimer !== null) return;
+  _profilerPollTimer = setInterval(checkProfilerFiles, 3_000);
+  checkProfilerFiles();
+}
 
 // Reset all agent/log state before replaying a historical window.
 function clearAgentState() {
@@ -361,6 +378,7 @@ function _appendLogLine(html) {
   if (logAutoScroll) $sharedLog.scrollTop = $sharedLog.scrollHeight;
   // Cap at 5000 lines to prevent unbounded growth
   while ($sharedLog.children.length > 5000) $sharedLog.removeChild($sharedLog.firstChild);
+  return div;
 }
 
 function appendLog(line) {
@@ -675,7 +693,10 @@ function renderHistory() {
 
     if (role === 'system') {
       if (text && state.fullLogsEnabled) {
-        frags.push(`<div class="msg-system">${tsHtml}─── sys: ${esc(text)}</div>`);
+        frags.push(
+          `<div class="msg-system">${tsHtml}<span class="role-tool-call">⚑ system</span>\n` +
+          `<span class="dim">${esc(text)}</span></div>`
+        );
       }
 
     } else if (role === 'user') {
@@ -875,9 +896,9 @@ function handleEvent(ev) {
     case 'done':
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
       // The run's profiling session (if any) has already stopped by the
-      // time this event fires -- see checkProfilerFiles()'s docstring --
-      // so check right now instead of waiting on the periodic fallback.
-      checkProfilerFiles();
+      // time this event fires -- see armProfilerPolling()'s docstring --
+      // so start polling right now instead of never checking at all.
+      armProfilerPolling();
       break;
   }
 
