@@ -84,7 +84,7 @@ ag.redirect(third, "Use only primary sources")
 third.wait()
 ```
 
-`ag.redirect(result, message)` targets the skill execution that produced that result. If its harness is active, Claude is interrupted and receives the prompt through its PTY. If the target has not started, has finished, or cannot accept the redirect, the message becomes `queue_message()` exactly once. A late redirect for an earlier result never interrupts a later run. See [redirect lifecycle](docs/Redirect.md).
+`ag.redirect(result, message)` targets the skill execution that produced that result. Active Claude Code, Codex, Grok Build, and OpenCode harnesses accept redirects through their interactive PTYs. If the target has not started, has finished, or cannot accept the redirect, the message becomes `queue_message()` exactly once. Native keeps its existing non-PTY execution and queued redirects. A late redirect for an earlier result never interrupts a later run. See [redirect lifecycle](docs/Redirect.md) and [PTY architecture](docs/PTY.md).
 
 `queue_message()` appends future context in submission order and returns `None`. It does not change already submitted work; the next submission after the enqueue receives that context.
 

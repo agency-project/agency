@@ -34,53 +34,22 @@ def test_every_engine_implements_daemon_attempt_seam(name):
     assert type(adapter).run_daemon_attempt is not agharness_backend.run_daemon_attempt
 
 
-@pytest.mark.parametrize(
-    ("backend_cls", "stdout", "expected", "config_name"),
-    [
-        (
-            _CodexBackend,
-            json.dumps(
-                {"type": "item.completed", "item": {"type": "agent_message", "text": "codex-ok"}}
-            ),
-            "codex-ok",
-            "config.toml",
-        ),
-        (_GrokBackend, json.dumps({"text": "grok-ok"}), "grok-ok", "config.toml"),
-        (_OpencodeBackend, json.dumps({"text": "opencode-ok"}), "opencode-ok", "opencode.json"),
-    ],
-)
-def test_external_cli_adapters_launch_through_typed_runtime(
-    monkeypatch, backend_cls, stdout, expected, config_name
-):
-    handle = MagicMock()
-    handle.wait.return_value = (stdout, "", 0)
+@pytest.mark.parametrize("backend_cls", [_CodexBackend, _GrokBackend, _OpencodeBackend])
+def test_external_adapters_use_the_shared_pty_runner(monkeypatch, backend_cls):
+    from agency.harness.adapters.agharness_backend import AttemptResult
+    from agency.harness.adapters.pty_session import PtyExecution
+
     captured = {}
 
-    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
-        captured.update(
-            argv=argv,
-            envp=envp,
-            cwd=cwd,
-            policy=policy,
-            ag=ag,
-            stdin_data=stdin_data,
-        )
-        if config_name is not None:
-            if "OPENCODE_CONFIG" in envp:
-                config_path = Path(envp["OPENCODE_CONFIG"])
-            else:
-                config_home = Path(envp.get("CODEX_HOME") or envp["GROK_HOME"])
-                config_path = config_home / config_name
-            captured["config"] = config_path.read_text()
-        if backend_cls is _GrokBackend:
-            prompt_path = Path(argv[argv.index("--prompt-file") + 1])
-            captured["prompt"] = prompt_path.read_text(encoding="utf-8")
-        return handle
+    def run(execution, prompt):
+        captured.update(runtime=execution.runtime, prompt=prompt, driver=execution.driver)
+        from agency.harness.agharness import cleanup_config_home
 
-    monkeypatch.setattr("shutil.which", lambda binary: f"/usr/bin/{binary}")
-    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+        cleanup_config_home(execution.driver.root)
+        return AttemptResult(ok=True, final_text="native-final")
+
+    monkeypatch.setattr(PtyExecution, "run", run)
     runtime = _runtime()
-
     result = backend_cls(agconfig()).run_daemon_attempt(
         runtime,
         prompt="do the thing",
@@ -88,30 +57,11 @@ def test_external_cli_adapters_launch_through_typed_runtime(
         prior_session_blob=None,
         max_steps=4,
     )
-
-    assert result.ok
-    assert result.final_text == expected
-    assert captured["policy"] is runtime.syscall_policy
-    assert captured["ag"] is None
-    if backend_cls is _GrokBackend:
-        assert captured["argv"][captured["argv"].index("--max-turns") + 1] == "4"
-        assert "do the thing" not in captured["argv"]
-        assert captured["prompt"] == "do the thing"
-        assert captured["stdin_data"] is None
-    elif backend_cls is _OpencodeBackend:
-        config = json.loads(captured["config"])
-        assert config["agent"]["build"]["steps"] == 4
-        assert config["provider"]["agency-proxy"]["options"] == {
-            "baseURL": f"{runtime.harness_base_url}/v1",
-            "apiKey": runtime.token,
-        }
-        assert config["plugin"][0].startswith("file://")
-        assert "maxSteps" not in captured["config"]
-        assert "do the thing" not in captured["argv"]
-        assert captured["stdin_data"] == b"do the thing"
-    else:
-        assert "do the thing" not in captured["argv"]
-        assert captured["stdin_data"] == b"do the thing"
+    assert result.ok and result.final_text == "native-final"
+    assert captured["runtime"] is runtime
+    assert captured["prompt"] == "do the thing"
+    assert captured["driver"].cwd == "/workspace"
+    assert not {"exec", "run", "--json", "--prompt-file", "--format"} & set(captured["driver"].argv)
 
 
 @pytest.mark.parametrize("sandbox", [None, object()])

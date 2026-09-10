@@ -73,6 +73,10 @@ PTRACE_EVENT_EXEC = 4
 PTRACE_EVENT_EXIT = 6
 PTRACE_EVENT_SECCOMP = 7
 
+# Linux waitpid flags are not exposed by Python's os module.
+WAIT_ALL = 0x40000000
+WAIT_NOTHREAD = 0x20000000
+
 # The full set of PTRACE_O_TRACE* lifecycle options agproxy_ptrace always
 # requests -- every new thread/process a traced tree creates gets
 # auto-attached, and PTRACE_O_TRACESECCOMP is what turns a SECCOMP_RET_TRACE

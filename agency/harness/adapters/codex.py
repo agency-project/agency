@@ -1,8 +1,4 @@
-"""Codex CLI harness adapter.
-
-Builds an isolated Codex configuration, launches the CLI through the sandbox
-daemon, and normalizes its JSONL output.
-"""
+"""codex interactive PTY adapter and model-protocol translation."""
 
 from __future__ import annotations
 
@@ -14,7 +10,8 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
-from ..executable import HARNESS_PATH
+from .pty_drivers import run_pty_attempt
+from .pty_session import stream_response
 
 
 def codex_available() -> bool:
@@ -121,7 +118,6 @@ def _sse(event_type: str, data: dict) -> str:
 
 class _CodexBackend(agharness_backend):
     _DEFAULT_BINARY = "codex"
-    _DEFAULT_TIMEOUT_S = 600
     _PROVIDER_NAME = "agency-proxy"
     _ENV_KEY_NAME = "AGENCY_PROXY_API_KEY"
 
@@ -134,75 +130,14 @@ class _CodexBackend(agharness_backend):
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
     ) -> AttemptResult:
-        from pathlib import Path
-
-        from .. import agharness
-        from ..ptrace.supervisor import agProxyPtrace
-
-        # The host preparation layer supplies an executable in this namespace.
-        resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-
-        config_home = agharness.materialize_config_home(
-            runtime.engine_name, runtime.token, runtime.harness_base_url
+        return run_pty_attempt(
+            self,
+            runtime,
+            prompt=prompt,
+            resume_session_id=resume_session_id,
+            prior_session_blob=prior_session_blob,
+            max_steps=max_steps,
         )
-        try:
-            self._write_codex_config(
-                config_home, runtime.harness_base_url, runtime.model or "default"
-            )
-
-            # Bridge Codex's own PreToolUse/PostToolUse hooks (near-identical
-            # payload shape to Claude Code's -- same shared hook script, see
-            # _harness_permission_hook.py) to agpolicy admission and the
-            # host's tool-call completion endpoint. Unverified against a
-            # live `codex` binary (none available in this environment, see
-            # this module's docstring) -- modeled on Claude Code's own
-            # settings.json `hooks` shape and CODEX_HOME redirecting the
-            # whole config directory the same way it does for config.toml.
-            hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
-            hook_path = config_home / "agpolicy_hook.py"
-            hook_path.write_bytes(hook_src)
-            hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
-            (config_home / "hooks.json").write_text(
-                json.dumps({"hooks": {"PreToolUse": [hook_command], "PostToolUse": [hook_command]}})
-            )
-
-            # Agency workspaces need not be Git repositories. The daemon
-            # already supplies the isolated configuration and sandbox boundary.
-            argv = [resolved, "exec", "--skip-git-repo-check", "--json", "-"]
-            envp = {
-                "PATH": HARNESS_PATH,
-                "CODEX_HOME": str(config_home),
-                # Referenced by config.toml's `env_key` -- Codex reads the
-                # provider's API key from the env var *named* there, not
-                # from an inline value in config.toml.
-                self._ENV_KEY_NAME: runtime.token,
-                # Read by agpolicy_hook.py (registered above).
-                "AGPOLICY_BASE_URL": runtime.harness_base_url,
-                "AGPOLICY_TOKEN": runtime.token,
-                "AGPOLICY_STATE_DIR": str(config_home),
-            }
-
-            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
-            handle = px.launch(
-                argv,
-                envp,
-                cwd="/workspace",
-                stdin_data=prompt.encode("utf-8"),
-                policy=runtime.syscall_policy,
-                ag=None,
-            )
-            runtime.register_control_handle(handle)
-            stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
-        finally:
-            agharness.cleanup_config_home(config_home)
-
-        if rc != 0:
-            return AttemptResult(
-                ok=False, error_message=f"codex exited with code {rc}: {stderr or stdout}"
-            )
-
-        final_text = self._parse_output_events(stdout)
-        return AttemptResult(ok=True, final_text=final_text)
 
     def _write_codex_config(self, config_home, base_url: str, model: str) -> None:
         toml_text = (
@@ -216,32 +151,6 @@ class _CodexBackend(agharness_backend):
             f'wire_api = "responses"\n'
         )
         (config_home / "config.toml").write_text(toml_text)
-
-    @staticmethod
-    def _parse_output_events(stdout: str) -> str:
-        """Best-effort extraction of the final `agent_message` item's text
-        from `codex exec --json`'s NDJSON event stream -- unverified
-        against a live run (no `codex` binary available), see this
-        module's docstring."""
-        last_text = ""
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            item = event.get("item") or {}
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str) and text:
-                    last_text = text
-        if last_text:
-            return last_text
-        return stdout.strip()
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -260,13 +169,12 @@ class _CodexBackend(agharness_backend):
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context), model
-                    )
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
+                return StreamingResponse(
+                    stream_response(
+                        router, token, agency_context, model, self._format_agency_stream_to_harness
+                    ),
+                    media_type="text/event-stream",
+                )
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
