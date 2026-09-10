@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import threading
 import uuid
 from typing import TYPE_CHECKING, Callable
@@ -219,6 +218,7 @@ class AgentEngine:
             resource_pool,
             is_cancelled=is_cancelled,
             request_id=request_id,
+            recent_transcript=context.recent_transcript,
         )
         with self._services_lock:
             self._host_server_manager = manager
@@ -282,28 +282,6 @@ class AgentEngine:
             # Captured before the loop may reassign `prompt` to a retry prompt --
             # the needle must stay the original user turn, not a retry prompt.
             initial_prompt = prompt
-            # The real transcript only gains this turn once the whole skill
-            # call finishes (orchestrator._record_execution_results' live_
-            # messages snapshot) -- log it now too, structured the same way,
-            # so the webui's in-progress reconstruction (server.py's
-            # _reconstruct_in_progress_messages) can show it immediately
-            # instead of leaving the user's own message invisible for
-            # however long this attempt takes.
-            user_content = getattr(initial_prompt, "user_content", initial_prompt)
-            self._agent.data_logger.record_event(
-                type="user_message",
-                payload={
-                    "blocks": [
-                        {
-                            "type": "text",
-                            "text": user_content
-                            if isinstance(user_content, str)
-                            else json.dumps(user_content),
-                        }
-                    ]
-                },
-                flush=True,
-            )
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             prior_session = context.harness_sessions.get(self._agent.harness)

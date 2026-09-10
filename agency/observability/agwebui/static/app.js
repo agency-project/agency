@@ -17,7 +17,7 @@ const state = {
   // this lines a call up right where it actually happened: after the
   // assistant's tool_use message, before the tool's result message lands.
   systemLogs:  new Map(),
-  systemLogsEnabled: false,
+  fullLogsEnabled: false,
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
@@ -167,39 +167,43 @@ setInterval(async () => {
 // Profiler artifacts
 // ---------------------------------------------------------------------------
 
-const $profilerLinks = document.getElementById('profiler-links');
-
 function fmtBytes(n) {
   if (n >= 1_048_576) return (n / 1_048_576).toFixed(1) + 'MB';
   if (n >= 1024)      return (n / 1024).toFixed(1) + 'KB';
   return n + 'B';
 }
 
-// Profiler output (agprof.trace.json/summary.json/summary.md) only appears
-// once this run's profiling session stops -- normally at the very end of
-// the run (see server.py's _profiler_dir() docstring) -- so poll for it
-// rather than expecting it on page load, and stop once it shows up since
-// it's written once, not continuously.
-async function pollProfilerFiles() {
+let _profilerFilesShown = false;
+
+// Profiler output (agprof.trace.json/summary.json/summary.md) is written
+// once, at the run's profiling session stop -- which (see agwebui/
+// __init__.py's run()) always finishes before the "done" event that puts
+// "All done" in this log, so it's already on disk by the time that
+// happens. checkProfilerFiles() is called both right then (an immediate,
+// one-shot check needing no wait at all) and on a periodic fallback timer
+// (covers a client that connects to an already-finished run, or somehow
+// misses the "done" event) -- whichever fires first wins and stops both.
+async function checkProfilerFiles() {
+  if (_profilerFilesShown) return true;
   try {
     const r = await fetch('/api/profiler/files');
     const j = await r.json();
     const files = j.files || [];
     if (!files.length) return false;
-    $profilerLinks.innerHTML = files
-      .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)} (${fmtBytes(f.size)})</a>`)
-      .join('');
-    $profilerLinks.classList.remove('hidden');
+    _profilerFilesShown = true;
+    clearInterval(_profilerPollTimer);
+    const links = files
+      .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)}</a> (${fmtBytes(f.size)})`)
+      .join('  ');
+    _appendLogLine(`<span style="color:var(--yellow)">Profiler output ready:</span>  ${links}`);
     return true;
   } catch {
     return false;
   }
 }
 
-const _profilerPollTimer = setInterval(async () => {
-  if (await pollProfilerFiles()) clearInterval(_profilerPollTimer);
-}, 10_000);
-pollProfilerFiles();
+const _profilerPollTimer = setInterval(checkProfilerFiles, 3_000);
+checkProfilerFiles();
 
 // Reset all agent/log state before replaying a historical window.
 function clearAgentState() {
@@ -259,7 +263,7 @@ $tlLiveBtn.addEventListener('click', () => {
 
 const $sharedLog        = document.getElementById('shared-log');
 const $agentHistory     = document.getElementById('agent-history');
-const $systemLogCheckbox = document.getElementById('system-log-checkbox');
+const $fullLogsCheckbox = document.getElementById('full-logs-checkbox');
 const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
 const $navLabel         = document.getElementById('nav-label');
@@ -455,14 +459,14 @@ function recordSystemLog(agname, termMessage, ts) {
 }
 
 try {
-  const stored = localStorage.getItem('agency_system_logs_enabled');
-  state.systemLogsEnabled = stored === null ? false : stored === '1';
+  const stored = localStorage.getItem('agency_full_logs_enabled');
+  state.fullLogsEnabled = stored === null ? false : stored === '1';
 } catch {}
-$systemLogCheckbox.checked = state.systemLogsEnabled;
+$fullLogsCheckbox.checked = state.fullLogsEnabled;
 
-$systemLogCheckbox.addEventListener('change', () => {
-  state.systemLogsEnabled = $systemLogCheckbox.checked;
-  try { localStorage.setItem('agency_system_logs_enabled', state.systemLogsEnabled ? '1' : '0'); } catch {}
+$fullLogsCheckbox.addEventListener('change', () => {
+  state.fullLogsEnabled = $fullLogsCheckbox.checked;
+  try { localStorage.setItem('agency_full_logs_enabled', state.fullLogsEnabled ? '1' : '0'); } catch {}
   renderHistory();
 });
 
@@ -635,7 +639,7 @@ function renderHistory() {
   updateInteractionTitle();
 
   const msgs    = state.histories.get(agname) || [];
-  const syslogs = state.systemLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
+  const syslogs = state.fullLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
   let syslogIdx = 0;
   const frags = [];
 
@@ -670,7 +674,9 @@ function renderHistory() {
     const tsHtml = msg.ts ? `<span class="log-ts">${fmtTs(msg.ts)}</span> ` : '';
 
     if (role === 'system') {
-      if (text) frags.push(`<div class="msg-system">${tsHtml}─── sys: ${esc(text)}</div>`);
+      if (text && state.fullLogsEnabled) {
+        frags.push(`<div class="msg-system">${tsHtml}─── sys: ${esc(text)}</div>`);
+      }
 
     } else if (role === 'user') {
       if (text) {
@@ -696,6 +702,11 @@ function renderHistory() {
           frags.push(
             `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
             `<span class="dim">${argsText}</span></div>`
+          );
+        } else if (b.type === 'metadata' && state.fullLogsEnabled) {
+          frags.push(
+            `<div class="msg-metadata">${tsHtml}<span class="role-tool-call">◇ metadata</span>\n` +
+            `<span class="dim">${esc(JSON.stringify(b))}</span></div>`
           );
         }
       }
@@ -863,6 +874,10 @@ function handleEvent(ev) {
 
     case 'done':
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
+      // The run's profiling session (if any) has already stopped by the
+      // time this event fires -- see checkProfilerFiles()'s docstring --
+      // so check right now instead of waiting on the periodic fallback.
+      checkProfilerFiles();
       break;
   }
 

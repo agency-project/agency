@@ -146,7 +146,15 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
 
     class FakeHostServerManager:
         def __init__(
-            self, agent, sandbox, skill, resource_pool, *, is_cancelled=None, request_id=None
+            self,
+            agent,
+            sandbox,
+            skill,
+            resource_pool,
+            *,
+            is_cancelled=None,
+            request_id=None,
+            recent_transcript=None,
         ):
             self.agent = agent
             self.sandbox = sandbox
@@ -154,6 +162,7 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
             self.resource_pool = resource_pool
             self.is_cancelled = is_cancelled
             self.request_id = request_id
+            self.recent_transcript = recent_transcript
             self.bound_tokens: list[str] = []
             self.cleared_tokens: list[str] = []
             self.active_token = None

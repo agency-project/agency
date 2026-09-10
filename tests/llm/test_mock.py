@@ -77,7 +77,7 @@ def test_replay_dispatch_hook_gates_response_after_config_clone(tmp_path, stream
 
     db_path = tmp_path / "source.sqlite3"
     logger = _make_source_db(db_path)
-    logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+    logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
     logger.stop()
     entered = threading.Event()
     release = threading.Event()
@@ -126,8 +126,8 @@ class TestReplayOrderingAndDispatch:
     def test_dispatch_reconstructs_exchanges_in_order(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
-        logger.finalize_stream("call2", type="llm_block", payloads=_TOOL_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call2", type="llm_block", payloads=_TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -148,7 +148,7 @@ class TestReplayOrderingAndDispatch:
         recorded exchange."""
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -160,7 +160,7 @@ class TestReplayOrderingAndDispatch:
     def test_exhaustion_raises_clear_error(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -171,9 +171,11 @@ class TestReplayOrderingAndDispatch:
     def test_error_and_cancelled_exchanges_are_skipped(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
-        logger.finalize_stream("call2", type="llm_stream_error", payloads=[{"error": "boom"}])
-        logger.finalize_stream("call3", type="llm_block", payloads=_TOOL_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript(
+            "call2", type="llm_stream_error", payloads=[{"error": "boom"}]
+        )
+        logger.record_final_transcript("call3", type="llm_block", payloads=_TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -187,7 +189,7 @@ class TestDispatchStream:
     def test_streams_reconstructable_text_deltas(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path, timing_mode="instant")
@@ -204,7 +206,7 @@ class TestDispatchStream:
     def test_streams_reconstructable_tool_use_deltas(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TOOL_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path, timing_mode="instant")
@@ -249,7 +251,7 @@ class TestTimingModes:
     def test_end_to_end_constant_timing_mode(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(
@@ -263,7 +265,7 @@ class TestTimingModes:
     def test_end_to_end_timing_modes_produce_measurable_delay_difference(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         instant_backend = _mock_backend(db_path, timing_mode="instant")
@@ -275,7 +277,7 @@ class TestTimingModes:
     def test_custom_timing_fn_overrides_timing_mode(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         logger.stop()
 
         calls = []
@@ -315,7 +317,7 @@ class TestLlmHandlerServerIntegration:
 
         source_db = tmp_path / "source_agent_data.sqlite3"
         source_logger = _make_source_db(source_db)
-        source_logger.finalize_stream("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        source_logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
         source_logger.stop()
 
         server_db = tmp_path / "server_data.sqlite3"

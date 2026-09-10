@@ -59,7 +59,7 @@ class agDataLogger:
     def _next_id_locked(self) -> str:
         """Caller must already hold self._lock. The zero-padded sequence
         prefix keeps ids sortable in local insertion order -- rows that share
-        one `timestamp` (e.g. finalize_stream's loop, which computes it once
+        one `timestamp` (e.g. record_final_transcript's loop, which computes it once
         for every payload) still resolve correctly by `id` -- while the
         uuid4 suffix keeps every id globally unique across independently
         constructed instances (one per agent, plus the shared global one),
@@ -249,7 +249,7 @@ class agDataLogger:
             else:
                 self._maybe_flush_locked()
 
-    def finalize_stream(
+    def record_final_transcript(
         self,
         call_label: str,
         type: str,
