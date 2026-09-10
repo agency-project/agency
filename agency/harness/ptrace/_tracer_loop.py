@@ -642,21 +642,25 @@ class TracerLoop:
                     pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
                 except ProcessLookupError:
                     pass
-            if not pending:
+            # A kill can overtake a clone notification. Its auto-attached child
+            # still needs its exit-stop resumed, even though it never entered
+            # _known_pids. Waiting only on known PIDs strands that child and
+            # leaves the group leader a zombie. Scope -1 to THIS tracer thread
+            # so concurrent harnesses and host subprocesses keep their own waits.
+            try:
+                got_pid, status = os.waitpid(-1, os.WNOHANG | pt.WAIT_ALL | pt.WAIT_NOTHREAD)
+            except ChildProcessError:
+                for pid in pending:
+                    self._forget(pid, -1)
                 break
-            made_progress = False
-            for wpid in pending:
-                try:
-                    got_pid, status = os.waitpid(wpid, os.WNOHANG)
-                except ChildProcessError:
-                    self._forget(wpid, -1)
-                    continue
-                if got_pid == 0:
-                    continue
-                made_progress = True
-                self._dispatch(wpid, status)
-            if not made_progress:
+            if got_pid == 0:
                 time.sleep(self._poll_interval_s)
+                continue
+            with self._lock:
+                unknown = got_pid not in self._known_pids
+            if unknown:
+                self._remember_spawn(got_pid, is_process=None)
+            self._dispatch(got_pid, status)
 
         self._finished.set()
 
@@ -854,6 +858,8 @@ class TracerLoop:
 
     def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         with self._lock:
+            if pid in self._known_pids:
+                return
             self._known_pids.add(pid)
             if is_process is None:
                 self._pending_clone_pids.add(pid)
