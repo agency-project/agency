@@ -59,7 +59,11 @@ def main() -> int:
         _emit("deny", "Cannot check invocation admission: hook input must be an object")
         return 0
 
-    hook_event_name = payload.get("hook_event_name") or "PreToolUse"
+    hook_event_name = payload.get("hook_event_name") or {
+        "pre_tool_use": "PreToolUse",
+        "post_tool_use": "PostToolUse",
+        "post_tool_use_failure": "PostToolUseFailure",
+    }.get(payload.get("hookEventName"), "PreToolUse")
     if hook_event_name != "PreToolUse":
         if hook_event_name in ("PostToolUse", "PostToolUseFailure"):
             _report_completion(payload, hook_event_name)

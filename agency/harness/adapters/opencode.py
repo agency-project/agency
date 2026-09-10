@@ -1,22 +1,4 @@
-"""opencode backend -- the reference concrete `agharness_backend`
-implementation and the smallest real end-to-end harness slice: opencode's
-`@ai-sdk/openai-compatible` provider already speaks plain OpenAI
-chat-completions, matching `agproxy_llm`'s passthrough route with zero
-translation, and `opencode run --format json` is a simple headless
-invocation.
-
-CAVEAT: no `opencode` binary is installable in the environment this was
-developed in (opencode requires Node/Bun, neither available) -- this
-backend's orchestration logic (config-home isolation, agproxy_ptrace
-launch, agproxy_llm token registration, output-schema recovery) is real
-and tested (see tests/harness/agharness_backends/test_opencode.py's mocked-launch
-tests), but the exact shape of `--format json`'s event stream and the
-`opencode.json` provider-block schema are implemented from documented
-behavior, not verified against a live run. `_parse_output_events` is
-deliberately isolated and defensive (best-effort per-line JSON parsing,
-falls back to raw text) so CLI drift or a wrong assumption here is a
-contained, fixable gap rather than a crash.
-"""
+"""opencode interactive PTY adapter and model-protocol translation."""
 
 from __future__ import annotations
 
@@ -29,68 +11,12 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
-from ..executable import HARNESS_PATH
+from .pty_drivers import run_pty_attempt
+from .pty_session import stream_response
 
 
 def opencode_available() -> bool:
     return shutil.which("opencode") is not None
-
-
-# See _OpencodeBackend._write_agpolicy_plugin's docstring for the caveats
-# on this plugin's exact hook shape/denial mechanism.
-_AGPOLICY_PLUGIN_JS = """\
-export const AgpolicyPlugin = async () => {
-  const baseUrl = process.env.AGPOLICY_BASE_URL
-  const token = process.env.AGPOLICY_TOKEN
-  const pending = new Map()
-
-  async function post(path, body) {
-    const response = await fetch(baseUrl.replace(/\\/$/, "") + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + token,
-      },
-      body: JSON.stringify(body),
-    })
-    return response.json()
-  }
-
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (!baseUrl || !token) return
-      let decision
-      try {
-        decision = await post("/agpolicy/check_tool", {
-          tool_name: input.tool,
-          tool_input: output.args,
-        })
-      } catch (err) {
-        throw new Error("Cannot check invocation admission: agpolicy request failed: " + err)
-      }
-      if (decision.call_id) pending.set(input.callID, decision.call_id)
-      if (decision.decision === "deny") {
-        throw new Error(decision.reason || "denied by agpolicy")
-      }
-    },
-    "tool.execute.after": async (input, output) => {
-      if (!baseUrl || !token) return
-      const callId = pending.get(input.callID)
-      pending.delete(input.callID)
-      if (!callId) return
-      try {
-        await post("/agpolicy/complete_tool", {
-          call_id: callId,
-          result: output.output,
-          error: null,
-        })
-      } catch (err) {
-        console.error("[agpolicy plugin] complete_tool request failed:", err)
-      }
-    },
-  }
-}
-"""
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -139,7 +65,6 @@ def _flatten_unknown_data(data):
 class _OpencodeBackend(agharness_backend):
     _DEFAULT_BINARY = "opencode"
     _PROVIDER_NAME = "agency-proxy"
-    _DEFAULT_TIMEOUT_S = 600
 
     def run_daemon_attempt(
         self,
@@ -150,63 +75,14 @@ class _OpencodeBackend(agharness_backend):
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
     ) -> AttemptResult:
-        from .. import agharness
-        from ..ptrace.supervisor import agProxyPtrace
-
-        # The host preparation layer supplies an executable in this namespace.
-        resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-
-        config_home = agharness.materialize_config_home(
-            runtime.engine_name, runtime.token, runtime.harness_base_url
+        return run_pty_attempt(
+            self,
+            runtime,
+            prompt=prompt,
+            resume_session_id=resume_session_id,
+            prior_session_blob=prior_session_blob,
+            max_steps=max_steps,
         )
-        try:
-            plugin_path = self._write_agpolicy_plugin(config_home)
-            self._write_opencode_config(
-                config_home,
-                runtime.harness_base_url,
-                runtime.token,
-                runtime.model or "default",
-                plugin_path,
-                max_steps,
-            )
-
-            argv = [resolved, "run", "--format", "json"]
-            envp = {
-                "PATH": HARNESS_PATH,
-                "HOME": str(config_home),
-                "OPENCODE_CONFIG": str(config_home / "opencode.json"),
-                # Read directly (via process.env) by agpolicy_plugin.js --
-                # unlike the subprocess-per-hook-firing CLIs (Claude Code/
-                # Codex/Grok), an opencode plugin is one long-lived JS
-                # module for the whole run, so it can just keep admitted
-                # call_ids in an in-memory Map between tool.execute.before
-                # and tool.execute.after -- no on-disk state dir needed.
-                "AGPOLICY_BASE_URL": runtime.harness_base_url,
-                "AGPOLICY_TOKEN": runtime.token,
-            }
-
-            px = agProxyPtrace(runtime.agconfig, allow_initial_exec=True)
-            handle = px.launch(
-                argv,
-                envp,
-                cwd="/workspace",
-                stdin_data=prompt.encode("utf-8"),
-                policy=runtime.syscall_policy,
-                ag=None,
-            )
-            runtime.register_control_handle(handle)
-            stdout, stderr, rc = handle.wait(timeout=self._DEFAULT_TIMEOUT_S)
-        finally:
-            agharness.cleanup_config_home(config_home)
-
-        if rc != 0:
-            return AttemptResult(
-                ok=False,
-                error_message=f"opencode exited with code {rc}: {stderr or stdout}",
-            )
-
-        final_text = self._parse_output_events(stdout)
-        return AttemptResult(ok=True, final_text=final_text)
 
     def _write_opencode_config(
         self,
@@ -227,7 +103,7 @@ class _OpencodeBackend(agharness_backend):
                 }
             },
             "model": f"{self._PROVIDER_NAME}/{model}",
-            # Headless Agency invocations do not use UI session titles. Keep
+            # Agency owns session titles. Keep
             # that auxiliary generation out of the invocation's model channel
             # and final-answer checkpoints (OpenCode's built-in title agent).
             "agent": {"title": {"disable": True}},
@@ -240,61 +116,14 @@ class _OpencodeBackend(agharness_backend):
         (config_home / "opencode.json").write_text(json.dumps(config))
 
     def _write_agpolicy_plugin(self, config_home):
-        """Bridge opencode's own `tool.execute.before`/`tool.execute.after`
-        plugin hooks (per opencode.ai/docs/plugins) to agpolicy admission
-        and the host's tool-call completion endpoint. Unverified against a
-        live `opencode` binary (none available in this environment, see
-        this module's docstring) -- in particular, throwing from
-        `tool.execute.before` is this plugin's best-effort mechanism for
-        denying a call; opencode's docs describe the hook as able to
-        "modify or block" execution but don't spell out the exact
-        denial API."""
+        """Install the native lifecycle and policy observer."""
         plugin_dir = config_home / "plugin"
         plugin_dir.mkdir(parents=True, exist_ok=True)
         plugin_path = plugin_dir / "agpolicy_plugin.js"
-        plugin_path.write_text(_AGPOLICY_PLUGIN_JS)
-        return plugin_path
+        from pathlib import Path
 
-    @staticmethod
-    def _parse_output_events(stdout: str) -> str:
-        """Best-effort extraction of the final assistant text from
-        `opencode run --format json`'s output -- see this module's
-        docstring on why this is deliberately defensive rather than a
-        strict schema parse."""
-        text_parts = []
-        last_text = ""
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            part = event.get("part")
-            if (
-                event.get("type") == "text"
-                and isinstance(part, dict)
-                and part.get("type") == "text"
-            ):
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    text_parts.append(text)
-                    continue
-            for key in ("text", "content", "result", "message"):
-                value = event.get(key)
-                if isinstance(value, str) and value:
-                    last_text = value
-        if text_parts:
-            return "".join(text_parts)
-        if last_text:
-            return last_text
-        # Fall back to the raw stdout itself (e.g. a plain-text response
-        # with no JSON structure at all) rather than silently returning
-        # an empty string.
-        return stdout.strip()
+        plugin_path.write_bytes((Path(__file__).parent / "_opencode_pty_plugin.js").read_bytes())
+        return plugin_path
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -310,13 +139,12 @@ class _OpencodeBackend(agharness_backend):
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context), model
-                    )
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
+                return StreamingResponse(
+                    stream_response(
+                        router, token, agency_context, model, self._format_agency_stream_to_harness
+                    ),
+                    media_type="text/event-stream",
+                )
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

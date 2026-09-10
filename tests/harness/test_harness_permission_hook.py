@@ -68,8 +68,9 @@ def test_pretooluse_allow_checks_policy_and_persists_call_id(monkeypatch, capsys
     assert json.loads(state_file.read_text()) == {"call_id": "call-abc"}
 
 
+@pytest.mark.parametrize("camel_case", [False, True])
 def test_grok_pretooluse_and_posttooluse_use_canonical_policy_and_shared_call_id(
-    monkeypatch, capsys, tmp_path
+    monkeypatch, capsys, tmp_path, camel_case
 ):
     requests = []
 
@@ -83,7 +84,11 @@ def test_grok_pretooluse_and_posttooluse_use_canonical_policy_and_shared_call_id
     monkeypatch.setenv("AGPOLICY_TOKEN", "secret-token")
     monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
-    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_grok_payload())))
+    pre_payload = _grok_payload()
+    if camel_case:
+        del pre_payload["hook_event_name"]
+        pre_payload["hookEventName"] = "pre_tool_use"
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(pre_payload)))
 
     assert hook.main() == 0
     assert json.loads(requests[0].data) == {
@@ -97,6 +102,9 @@ def test_grok_pretooluse_and_posttooluse_use_canonical_policy_and_shared_call_id
     )
 
     post_payload = _grok_payload("PostToolUse")
+    if camel_case:
+        del post_payload["hook_event_name"]
+        post_payload["hookEventName"] = "post_tool_use"
     post_payload["tool_response"] = {"stdout": "ok"}
     monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(post_payload)))
 
