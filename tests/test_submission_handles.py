@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agency import Agent, agdata, agent
@@ -64,3 +65,28 @@ def test_pause_resume_gate(tmp_path):
 
     ag.resume()
     assert ag.is_paused() is False
+
+
+def test_pause_resume_skips_stale_daemon_when_latest_engine_services_are_closed(tmp_path):
+    ag = _agent(tmp_path)
+    daemon = MagicMock()
+    ag.sandbox._agency_harness_daemon_handles = {str(ag.agname): daemon}
+    ag.engine = SimpleNamespace(_services_closed=True)
+
+    ag.pause()
+    ag.resume()
+
+    daemon.client.assert_not_called()
+
+
+def test_pause_resume_skips_unreachable_cached_daemon(tmp_path, monkeypatch):
+    ag = _agent(tmp_path)
+    daemon = MagicMock()
+    ag.sandbox._agency_harness_daemon_handles = {str(ag.agname): daemon}
+    ag.engine = SimpleNamespace(_services_closed=False)
+    monkeypatch.setattr("agency.engine.harness_daemon_launcher._is_ready", lambda _handle: False)
+
+    ag.pause()
+    ag.resume()
+
+    daemon.client.assert_not_called()

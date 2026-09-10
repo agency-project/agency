@@ -762,13 +762,22 @@ class GlobalAgentOrchestrator:
         updated_context: agcontext,
         history_before: list[dict],
     ) -> None:
+        def logging_safe(value):
+            if isinstance(value, bytes):
+                return {"type": "bytes", "size_bytes": len(value)}
+            if isinstance(value, dict):
+                return {key: logging_safe(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [logging_safe(item) for item in value]
+            return value
+
         ag = request.agent
         skill = request.skill
         logger = ag.data_logger
         try:
             ts_end = _ts()
-            input_dict = local_skill_input.to_dict()
-            result_dict = result.to_dict()
+            input_dict = logging_safe(local_skill_input.to_dict())
+            result_dict = logging_safe(result.to_dict())
             if result_dict.get("error"):
                 logger.record_event(
                     type="skill_error",

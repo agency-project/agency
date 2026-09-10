@@ -405,6 +405,17 @@ def test_validate_and_recover_recovers_agtype_field():
     sb.read_file.return_value = "the recovered content"
     data, paths = s.validate_and_recover('{"doc": "/workspace/out.txt"}', sb)
     assert not isinstance(data, agerror)
-    sb.read_file.assert_called_once_with("/workspace/out.txt")
+    assert sb.read_file.call_count == 2
+    sb.read_file.assert_called_with("/workspace/out.txt")
     assert data.doc == "the recovered content"
     assert paths == ["/workspace/out.txt"]
+
+
+def test_validate_and_recover_rejects_missing_agtype_output_file():
+    s = agschema(agdata(doc=agfile))
+    sb = MagicMock()
+    sb.read_file.side_effect = FileNotFoundError("missing")
+    data, paths = s.validate_and_recover('{"doc": "/workspace/missing.txt"}', sb)
+    assert isinstance(data, agerror)
+    assert "no file found" in data.error
+    assert paths == []

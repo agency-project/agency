@@ -521,7 +521,13 @@ def test_dispatch_passes_tool_choice_through_when_given():
         return _FakeResult([_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")])
 
     server, _ = _make_server(create_fn=create)
-    server.dispatch({"messages": [], "tool_choice": "auto"})
+    server.dispatch(
+        {
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "tool_choice": "auto",
+        }
+    )
     assert seen["tool_choice"] == "auto"
 
 

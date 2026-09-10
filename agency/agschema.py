@@ -280,10 +280,30 @@ class agschema:
             paths.extend(written)
         return paths
 
+    def validate_outputs(
+        self,
+        data: agdata,
+        sandbox: "agSandbox",
+        exec_timeout: float = 5,
+    ) -> list[str]:
+        """Validate sandbox-backed output values before recovering them."""
+        errors: list[str] = []
+        for key, hint in self._data.items():
+
+            def on_leaf(h, value, _key=key):
+                error = h.validate_output(_key, value, sandbox, exec_timeout)
+                if error is not None:
+                    errors.append(error)
+                return value, []
+
+            agtype.walk(hint, data._data.get(key), on_leaf)
+        return errors
+
     def validate_and_recover(
         self,
         raw_text: str,
         sandbox: "agSandbox",
+        exec_timeout: float = 5,
     ) -> "tuple[agdata | agerror, list[str]]":
         """Validate and recover a harness's single raw final-answer text
         against this schema, in one call.
@@ -311,6 +331,10 @@ class agschema:
 
         data = agdata(**parsed)
         errors = self.check(data)
+        if errors:
+            return agerror(f"output schema error: {errors}"), []
+
+        errors = self.validate_outputs(data, sandbox, exec_timeout)
         if errors:
             return agerror(f"output schema error: {errors}"), []
 

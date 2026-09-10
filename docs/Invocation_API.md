@@ -1,110 +1,98 @@
-# Invocation API
+# Pending result and lifecycle API
 
-Agency exposes one scheduled request as both a lifecycle handle and a pending data dependency. There is no wrapper with an independent state machine: the global orchestrator, engine, harness, and caller all reference the exact public `Invocation`.
+Agency exposes a scheduled skill call as a pending `agdata`. There is no public
+invocation wrapper or second lifecycle state machine.
 
 ```python
-from agency import Agent, CloseHandle, Invocation, MessageSubmission, agent
+from agency import Agent, agdata
 
-inv: Invocation = ag.run(skill, skill_input)
+result: agdata = worker.run(skill, skill_input)
 ```
 
-`Agent` is an alias of `agent`. `agskill.run(ag, input)` uses the same submission path and returns the same `Invocation` type. `run()` submits scheduler-eligible work; it does not eagerly start a harness or create execution infrastructure.
+`Agent` is an alias of `agent`. `agskill.run(worker, input)` uses the same
+submission path and returns the same pending result. Submission is lazy: the
+global orchestrator creates an engine and sandbox only after dependencies and
+the agent's earlier context entries are ready.
 
 ## Results and dependencies
 
-`run()` returns immediately. An invocation offers the following result-compatible surface:
+`run()` returns immediately. Any operation that needs the result waits for it:
 
 ```python
-pending = inv.result          # pending agdata handle
-inv.wait()                    # blocks and returns inv
-output = await inv            # resolves to agdata
-value = inv.answer            # unknown attributes proxy to the output
-literal = inv.result.result   # output field literally named "result"
+result.is_pending()          # non-blocking status check
+result.wait(timeout=300)     # resolve in synchronous code
+output = await result        # resolve in asynchronous code
+value = result.answer        # field access also resolves
+mapping = result.to_dict()   # serialization also resolves
 ```
 
-An invocation implements Agency's pending-data protocol, so it can be passed directly as another skill input or nested in supported lists, tuples, dictionaries, dataclasses, and model objects. Recursive dependency discovery, materialization, cycle detection, serialization, and `agdata.wait_all()` all understand that protocol. Cancelling one asynchronous waiter is shielded from cancelling the shared invocation future.
+A pending result can be passed directly as another skill's input, including
+inside supported lists, tuples, dictionaries, dataclasses, and model objects.
+The scheduler discovers these dependencies recursively and keeps blocked work
+out of execution workers and global engine capacity. `agdata.wait_all()` joins
+several pending results.
 
-Once an accepted submission handle has returned, terminal cancellation, destruction, dependency failure, and later scheduler failure resolve to `agerror` data rather than leaving a pending future. Submission validation, closed admission, or failure of the initial acknowledged scheduler cycle may instead raise synchronously before the caller receives a usable handle. For every returned handle, the submission's output context settles before its public result, so result callbacks can safely read committed history or submit follow-up work.
+Once `run()` has returned a result, terminal cancellation, dependency failure,
+and scheduler failure resolve to error-shaped `agdata` rather than leaving the
+future pending. Submission validation or closed admission can raise before a
+result is returned.
 
 ## One ordered context chain
 
-`run()` and `queue_message()` share one authoritative context chain per agent. Each call atomically validates admission, allocates a monotonic ordering ID, captures the current context head, publishes its own output-context placeholder as the new head, and registers the request with the orchestrator. The predecessor context is an implicit dependency, so later same-agent submissions cannot overtake earlier ones.
-
-`Agent.queue_message()` advances that serialized chain:
-
-```python
-# An ordered context entry for later submissions.
-receipt: MessageSubmission = ag.queue_message("Use the production database")
-await receipt
-
-# Submitted after the entry, so this invocation observes it.
-inv = ag.run(skill, skill_input)
-```
-
-Submission order is authoritative:
+`run()` and `queue_message()` share one authoritative context chain per agent.
+The predecessor context is an implicit dependency, so later submissions on the
+same agent cannot overtake earlier ones.
 
 ```python
-inv = ag.run(skill, skill_input)
-
-# Queued after `inv`; this does not retroactively update `inv`.
-await ag.queue_message("Use the production database")
-later = ag.run(other_skill, other_input)
+worker.queue_message("Use the production database")  # returns None
+result = worker.run(skill, skill_input)               # sees the message
 ```
 
-When its predecessor resolves, the scheduler copies that context, appends the validated retained user message, then settles an empty result. This host-only path creates no engine, sandbox, harness, host service, model request, worker job, or capacity claim. Agent suspension is not a gate for a ready context-only message, although an unresolved predecessor can still block it.
+`queue_message()` is a host-only context operation. It creates no engine,
+sandbox, harness, host service, model call, or execution-worker job. A message
+queued after a result was submitted does not retroactively change that result.
 
-`MessageSubmission` supports pending result, waiting, awaiting, context chaining, and serialization behavior. It deliberately has no `redirect()`, `pause()`, `resume()`, or `cancel()` invocation controls.
+## Exact-result controls
 
-## Exact-invocation messages and controls
-
-`Invocation.redirect()` targets one already-submitted invocation without creating a context-chain node or changing submission order:
+The pending `agdata` privately carries the request identity needed by agent
+controls:
 
 ```python
-inv.redirect("Do not modify database rows")
-inv.pause()
-inv.resume()
-inv.cancel()
+result = worker.run(skill, skill_input)
+worker.redirect(result, "Do not modify database rows")
+worker.cancel(result)
 ```
 
-A redirect can be accepted while the invocation is queued or running. It atomically joins the pending FIFO under the invocation's shared control lock. Before every new action, admission checks that queue under the same lock. Pending redirects prevent the action from starting and force a return to the model. A tool already admitted may finish; the remaining actions from a stale model result are skipped.
+`redirect()` addresses the execution that produced that exact result. An
+active interactive external harness receives it through its PTY; otherwise it
+is queued once as future context. A redirect never resumes a paused agent.
 
-Redirects remain pending until a successful model turn incorporates them. Failed requests, disconnects, and retries do not consume them. Internal compaction calls do not acknowledge redirects. Redirecting does not resume a paused invocation or clear agent suspension.
+`cancel()` is idempotent. Work cancelled while dependency-blocked or queued is
+settled without creating execution infrastructure. Running work observes
+cancellation at safe boundaries, and the transaction fence prevents a late
+successful sandbox commit from winning after cancellation.
 
-The final-answer checkpoint atomically chooses between processing pending redirects and entering `closing`. Redirects are rejected after that fence, cancellation, destruction, or completion. Stdin and harness-specific live-message transport are separate concerns.
-
-Pause and cancellation are also cooperative safe-boundary controls. Cancellation is idempotent in blocked, queued, running, paused, and terminal states; work that has not dispatched settles without creating an engine.
-
-Public invocation states are `QUEUED`, `RUNNING`, `PAUSED`, `SUCCEEDED`, `FAILED`, `CANCELLED`, and `DESTROYED`. A brief internal or observable `CANCELLING` transition may occur while running work advances to its next safe boundary.
-
-The concise distinction is:
-
-- `Agent.queue_message()` advances the agent's serialized context chain for later submissions.
-- `Invocation.redirect()` delivers an additional instruction to one exact already-submitted invocation.
-
-## Agent-wide lifecycle
-
-Agent suspension and invocation pause are independent gates:
-
-- `ag.suspend()` prevents new engine-backed dispatch and asks active work to park at its next safe boundary unless it has crossed the closing/completion fence.
-- `ag.resume()` clears only agent suspension. It does not clear `inv.pause()`.
-- `inv.pause()` and `inv.resume()` affect only that invocation.
-- `inv.cancel()` cancels only that invocation and does not affect later submissions.
-
-Queued work held by suspension consumes no worker or global execution slot. An invocation that was already running remains active and keeps its slot while parked. `is_suspended()`, `is_paused()`, `is_settled()`, and `lifecycle_state` derive from the shared agent control and orchestrator state.
-
-## Destruction
+## Agent-wide pause and resume
 
 ```python
-close: CloseHandle = ag.destroy()
-close.wait()
-# or: await close
-assert ag.destroy() is close
+worker.pause()
+assert worker.is_paused()
+pending = worker.run(skill, skill_input)
+worker.resume()
 ```
 
-Destruction closes admission synchronously, then drains asynchronously. Dependency-blocked, queued, running, paused, and context-message submissions all receive terminal results and contexts. Never-dispatched work creates no engine. Running work stops at a safe boundary, and a completion claim prevents success from committing after destruction has won the race.
-
-The reusable `CloseHandle` settles only after active execution, registered submissions, operation leases, callbacks, collector state, resources, and owned sandbox cleanup have drained. Explicit destruction is the reliable lifecycle operation; `__del__` is best-effort only.
+Pause is an agent-wide persistent request. It freezes an active harness process
+when possible and keeps later engine-backed submissions from launching until
+`resume()`. Queued work consumes no worker or engine-capacity slot. There is no
+public `Invocation.pause()`, `agent.suspend()`, or `agent.destroy()` API.
+Sandbox cleanup is owned by `agSandbox`; callers that explicitly use a sandbox
+can call `sandbox.destroy()`.
 
 ## Context on failure
 
-Cancellation, destruction, dependency failure, scheduler rejection, and other pre-execution failure paths copy through the predecessor context without adding context, waiting asynchronously only when that predecessor remains unresolved. An ordinary executed skill failure also discards the working sandbox and context, but appends the canonical retained rollback notice to a clean copy of the predecessor. Cancellation and destruction do not append that notice.
+Cancellation and dependency failure copy the committed predecessor context
+without adding the failed attempt. An ordinary executed skill failure also
+discards the working sandbox transaction, then appends the canonical retained
+rollback notice to a clean predecessor copy. Result settlement happens only
+after the corresponding context has settled, so callbacks can safely inspect
+history or submit follow-up work.

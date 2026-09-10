@@ -263,7 +263,15 @@ class agllm:
                     for b in blocks
                     if b["type"] == "tool_use"
                 ]
-                wire_msg = {"role": "assistant", "content": text or None}
+                # Chat Completions permits null assistant content only when
+                # the same message carries a tool call. Responses-style
+                # clients can emit metadata-only assistant turns after their
+                # hosted blocks are filtered, so preserve those as an empty
+                # string instead of forwarding an invalid null-only message.
+                wire_msg = {
+                    "role": "assistant",
+                    "content": text if text or not tool_calls else None,
+                }
                 if tool_calls:
                     wire_msg["tool_calls"] = tool_calls
             elif role == "tool":

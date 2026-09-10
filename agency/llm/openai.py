@@ -53,7 +53,14 @@ class _OpenAICompatibleBackend(agllm):
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         kwargs = self.build_kwargs(request["messages"], request.get("tools"))
         tool_choice = request.get("tool_choice")
-        if tool_choice is not None and _is_chatcompletions_tool_choice(tool_choice):
+        # Responses-style clients such as Codex may send tool_choice="auto"
+        # even after their hosted tools were filtered from a Chat Completions
+        # request. OpenAI rejects tool_choice when no tools are present.
+        if (
+            kwargs.get("tools")
+            and tool_choice is not None
+            and _is_chatcompletions_tool_choice(tool_choice)
+        ):
             kwargs["tool_choice"] = tool_choice
         return kwargs
 

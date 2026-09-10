@@ -69,10 +69,28 @@ class TestOpenAICompatibleBackend:
 
 
 class TestFormatContextAgencyToBackend:
+    def test_metadata_only_assistant_message_uses_empty_string_content(self):
+        backend = _OpenAICompatibleBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "blocks": [{"type": "metadata", "data": {"source": "responses"}}],
+                    }
+                ]
+            }
+        )
+        assert kwargs["messages"] == [{"role": "assistant", "content": ""}]
+
     def test_recognized_string_tool_choice_passed_through(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [], "tool_choice": "required"}
+            {
+                "messages": [],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": "required",
+            }
         )
         assert kwargs["tool_choice"] == "required"
 
@@ -80,9 +98,18 @@ class TestFormatContextAgencyToBackend:
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         tool_choice = {"type": "function", "function": {"name": "get_weather"}}
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [], "tool_choice": tool_choice}
+            {
+                "messages": [],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "tool_choice": tool_choice,
+            }
         )
         assert kwargs["tool_choice"] == tool_choice
+
+    def test_tool_choice_without_tools_is_dropped(self):
+        backend = _OpenAICompatibleBackend(_cfg(model="m"))
+        kwargs = backend._format_context_agency_to_backend({"messages": [], "tool_choice": "auto"})
+        assert "tool_choice" not in kwargs
 
     def test_foreign_origin_tool_choice_dropped(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))

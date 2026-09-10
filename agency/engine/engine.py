@@ -38,6 +38,7 @@ class AgentEngine:
         self._services_closed = True
         self._request_id: "str | None" = None
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
+        self._agtype_cleanup_paths: set[str] = set()
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
@@ -204,6 +205,7 @@ class AgentEngine:
         """Run host services and the sandbox-side harness while locked."""
 
         self._request_id = request_id
+        self._agtype_cleanup_paths = set()
         self._agent.data_logger.record_event(
             type="agent_state",
             payload={"state": "running_harness"},
@@ -224,6 +226,16 @@ class AgentEngine:
             self._host_server_manager = manager
             self._services_closed = False
         try:
+            input_schema = getattr(skill, "input_schema", None)
+            if input_schema is not None:
+                prepared_paths, _offloaded = input_schema.prepare_inputs_in_sandbox(
+                    skill_input,
+                    sandbox,
+                    skill.name,
+                    context_limit=self.agconfig.llm.context_limit,
+                    agconfig=self.agconfig,
+                )
+                self._agtype_cleanup_paths.update(prepared_paths)
             host_uds_path = manager.start()
             # start harness manager daemon
             engine_name = str(
@@ -363,7 +375,11 @@ class AgentEngine:
                 )
             return result
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                if self._agtype_cleanup_paths:
+                    sandbox.remove_files(sorted(self._agtype_cleanup_paths))
 
     # ------------------------------------------------------------------
     # internal
@@ -509,7 +525,12 @@ class AgentEngine:
             or not hasattr(output_schema, "validate_and_recover")
         ):
             return None
-        recovered, _paths = output_schema.validate_and_recover(attempt.final_text, sandbox)
+        recovered, paths = output_schema.validate_and_recover(
+            attempt.final_text,
+            sandbox,
+            exec_timeout=self.agconfig.skill.agbinary_validate_exec_timeout,
+        )
+        self._agtype_cleanup_paths.update(paths)
         return None if isinstance(recovered, agerror) else recovered
 
     def _build_execution_result(
@@ -537,7 +558,16 @@ class AgentEngine:
             missing = sorted(set(output_schema._data) - set(collected))
             recovered = self._recover_structured_output(skill, attempt, sandbox)
             if not missing:
-                return agdata(**collected)
+                result = agdata(**collected)
+                errors = output_schema.validate_outputs(
+                    result,
+                    sandbox,
+                    exec_timeout=self.agconfig.skill.agbinary_validate_exec_timeout,
+                )
+                if errors:
+                    return agerror(f"output schema error: {errors}")
+                self._agtype_cleanup_paths.update(output_schema.recover_outputs(result, sandbox))
+                return result
             if recovered is not None:
                 return recovered
             message = (

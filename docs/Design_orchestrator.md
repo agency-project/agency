@@ -1,6 +1,6 @@
 # Global orchestrator design
 
-`GlobalAgentOrchestrator` is the process-wide authority for skill invocations and host-only messages. Public handles do not run their own schedulers and do not mirror lifecycle state: each `Invocation` or `MessageSubmission` is the exact submission referenced by its internal orchestrator request.
+`GlobalAgentOrchestrator` is the process-wide authority for skill requests and host-only messages. A skill request exposes only a pending `agdata`; the orchestrator privately maps that result's future to the authoritative internal request used by `Agent.redirect()` and `Agent.cancel()`.
 
 The implementation is split by ownership:
 
@@ -17,7 +17,7 @@ Every agent has one context head. A call to `run()` or `queue_message()` takes t
 3. Capture the current context head as the predecessor.
 4. Create the submission's unresolved output-context placeholder.
 5. Publish that placeholder as the new head.
-6. Register an orchestrator request that references the exact public submission.
+6. Register an orchestrator request and attach its private identity to the pending result.
 
 Registration and chain publication therefore have the same linearization point. The predecessor context is an implicit dependency, so same-agent submissions cannot overtake one another.
 
@@ -40,23 +40,23 @@ submitted ── unresolved predecessor/input ──> blocked
                             ready ──> running ──> terminal
 ```
 
-Each event runs a complete cycle: resolve every waiting request, detect managed dependency cycles, promote all newly ready requests, then dispatch eligible ready work. Recursive dependency discovery and materialization understand agdata-compatible pending handles, including `Invocation` and `MessageSubmission`, along with dictionaries, lists, tuples, dataclasses, and supported model objects.
+Each event runs a complete cycle: resolve every waiting request, detect managed dependency cycles, promote all newly ready requests, then dispatch eligible ready work. Recursive dependency discovery and materialization understand pending `agdata` along with dictionaries, lists, tuples, dataclasses, and supported model objects.
 
 Dispatch requires all of the following:
 
 - predecessor and explicit input dependencies are resolved;
-- the agent is not suspended;
-- the invocation is not terminal or specifically paused;
+- the agent is not paused;
+- the request is not terminal or cancelled;
 - no other engine-backed request is active for that agent;
 - global engine capacity is available.
 
-`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. Dependency-blocked and queued requests held behind agent suspension consume no engine capacity; context-only messages never claim it. An invocation that was already running when it parked at a suspension boundary remains active and retains its slot.
+`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. Dependency-blocked and queued requests held behind agent pause consume no engine capacity; context-only messages never claim it. A request that was already running when its harness process was paused remains active and retains its slot.
 
 ## Reusable workers, fresh engines
 
-The orchestrator owns one lazily populated execution-worker pool. It does not create one thread per invocation. Sequential requests can reuse a worker thread, but every dispatched request receives a new `AgentEngine` bound to that request's exact `Invocation`.
+The orchestrator owns one lazily populated execution-worker pool. It does not create one thread per request. Sequential requests can reuse a worker thread, but every dispatched request receives a new `AgentEngine` bound to that internal request.
 
-Every worker job runs in a fresh `contextvars.Context`, while the profiler parent captured at submission is passed explicitly to the execution span. Reuse therefore cannot leak invocation-local context or tracing state.
+Every worker job runs in a fresh `contextvars.Context`, while the profiler parent captured at submission is passed explicitly to the execution span. Reuse therefore cannot leak request-local context or tracing state.
 
 Submission to the pool is admission-gated. `ThreadPoolExecutor` queues a work item before it may attempt to start a worker; if thread startup fails, the gate marks that queued item rejected. A later healthy worker drains it as a no-op while the scheduler settles the already-failed request exactly once.
 
@@ -64,15 +64,15 @@ Engine completion is posted back to the scheduler. The worker never publishes pu
 
 ## Host-only messages
 
-`queue_message()` registers a request with kind `context_message`. Once its predecessor resolves, the scheduler copies that context, appends the validated retained message, settles the output context, then settles the empty result. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
+`queue_message()` registers a request with kind `context_message` and returns `None`. Once its predecessor resolves, the scheduler copies that context and appends the validated retained message. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
 
-Agent suspension is not a dispatch gate for a ready context message. Any unresolved predecessor still blocks it through the ordinary context chain, including a running invocation parked by suspension.
+Agent pause is not a dispatch gate for a ready context message. Any unresolved predecessor still blocks it through the ordinary context chain, including a running request whose harness is paused.
 
 ## Controls and terminal settlement
 
-Queued cancellation, dependency failure, scheduler rejection, and destruction are handled on the scheduler thread without creating execution infrastructure. Running cancellation and destruction are observed by the exact `Invocation` at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after a terminal control.
+Queued cancellation, dependency failure, and scheduler rejection are handled on the scheduler thread without creating execution infrastructure. Running cancellation is observed through the internal request at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after cancellation.
 
-Ordinary skill failure discards its working context and appends the canonical retained rollback notice. Cancellation and destruction pass through committed predecessor context without that notice.
+Ordinary skill failure discards its working context and appends the canonical retained rollback notice. Cancellation passes through committed predecessor context without that notice.
 
 For every terminal path the scheduler:
 

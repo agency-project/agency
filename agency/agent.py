@@ -2,6 +2,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tarfile
 import threading
 import uuid as _uuid_mod
@@ -364,10 +365,24 @@ class agent:
         """This agent's already-persistent daemon handle, if one exists --
         the same cache ensure_harness_daemon() populates, keyed by
         engine_name (str(agent.agname), see engine.py's _execute_harness()).
-        None if this agent has never run yet."""
+        None when this agent has no active, reachable harness services."""
+        engine = self.engine
+        if engine is None or getattr(engine, "_services_closed", True):
+            return None
         if self.sandbox is None:
             return None
-        return getattr(self.sandbox, "_agency_harness_daemon_handles", {}).get(str(self.agname))
+        handle = getattr(self.sandbox, "_agency_harness_daemon_handles", {}).get(str(self.agname))
+        if handle is None:
+            return None
+
+        # The sandbox caches daemon handles.  Between sequential runs the old
+        # daemon may already have exited while the next engine is starting, so
+        # a cache hit alone does not mean its socket is live.  Avoid issuing a
+        # noisy control request to that stale socket; the engine synchronizes
+        # ``self._paused`` after the replacement daemon becomes ready.
+        from .engine.harness_daemon_launcher import _is_ready
+
+        return handle if _is_ready(handle) else None
 
     def pause(self) -> None:
         """Pause this agent's harness at the OS-process level: if one is
@@ -511,6 +526,10 @@ class agent:
         """Best-effort: log destruction. The sandbox (if any) cleans itself up
         via agSandbox.__del__ once this agent's reference to it is gone."""
         _live_agents.discard(self)
+        # During interpreter finalization sqlite/import machinery may already
+        # be closed. There is no reliable event sink left at that point.
+        if sys.is_finalizing():
+            return
         try:
             self.data_logger.record_event(
                 type="agent_state",
