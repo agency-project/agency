@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ...harness._syscall_event import agsyscallevent
@@ -399,22 +399,30 @@ class HostInteractionServer:
 
     def build_app(self) -> FastAPI:
         app = FastAPI()
+        # Endpoint caches may outlive this app; only the app owns invocation state.
+        app.state.interaction_server = self
 
         @app.post("/profile_settings")
-        def _profile_settings() -> JSONResponse:
-            return JSONResponse(self.profile_settings())
+        def _profile_settings(http_request: Request) -> JSONResponse:
+            return JSONResponse(http_request.app.state.interaction_server.profile_settings())
 
         @app.post("/record_samples")
-        def _record_samples(request: dict) -> JSONResponse:
-            return JSONResponse(self.record_samples(request.get("samples", [])))
+        def _record_samples(request: dict, http_request: Request) -> JSONResponse:
+            return JSONResponse(
+                http_request.app.state.interaction_server.record_samples(request.get("samples", []))
+            )
 
         @app.post("/check_tool")
-        def _check_tool(request: dict) -> JSONResponse:
-            return JSONResponse(self.admit_tool_call(request["tool_name"], request["tool_input"]))
+        def _check_tool(request: dict, http_request: Request) -> JSONResponse:
+            return JSONResponse(
+                http_request.app.state.interaction_server.admit_tool_call(
+                    request["tool_name"], request["tool_input"]
+                )
+            )
 
         @app.post("/complete_tool")
-        def _complete_tool(request: dict) -> JSONResponse:
-            self.complete_tool_call(
+        def _complete_tool(request: dict, http_request: Request) -> JSONResponse:
+            http_request.app.state.interaction_server.complete_tool_call(
                 request["call_id"],
                 request.get("result"),
                 request.get("error"),
@@ -424,19 +432,21 @@ class HostInteractionServer:
             return JSONResponse({"ok": True})
 
         @app.post("/check_syscall")
-        def _check_syscall(request: dict) -> JSONResponse:
-            return JSONResponse(self.admit_syscall(agsyscallevent(**request)))
+        def _check_syscall(request: dict, http_request: Request) -> JSONResponse:
+            return JSONResponse(
+                http_request.app.state.interaction_server.admit_syscall(agsyscallevent(**request))
+            )
 
         @app.post("/complete_syscall")
-        def _complete_syscall(request: dict) -> JSONResponse:
-            self.complete_syscall(
+        def _complete_syscall(request: dict, http_request: Request) -> JSONResponse:
+            http_request.app.state.interaction_server.complete_syscall(
                 request["call_id"], request.get("return_value"), request.get("error")
             )
             return JSONResponse({"ok": True})
 
         @app.post("/record_event")
-        def _record_event(request: dict) -> JSONResponse:
-            self.record_event(
+        def _record_event(request: dict, http_request: Request) -> JSONResponse:
+            http_request.app.state.interaction_server.record_event(
                 request["type"],
                 request["payload"],
                 call_label=request.get("call_label"),
@@ -447,8 +457,8 @@ class HostInteractionServer:
             return JSONResponse({"ok": True})
 
         @app.post("/record_span")
-        def _record_span(request: dict) -> JSONResponse:
-            self.record_span(
+        def _record_span(request: dict, http_request: Request) -> JSONResponse:
+            http_request.app.state.interaction_server.record_span(
                 request["name"],
                 request.get("start_ts"),
                 request.get("end_ts"),

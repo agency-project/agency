@@ -1549,3 +1549,23 @@ def test_build_app_context_limit_route(monkeypatch):
     response = client.get("/context_limit")
     assert response.status_code == 200
     assert response.json() == {"context_limit": 4096}
+
+
+def test_cached_routes_do_not_retain_server_after_app_is_released():
+    import gc
+    import weakref
+
+    server = _make_server()[0]
+    reference = weakref.ref(server)
+    app = server.build_app()
+    # FastAPI caches endpoint classification independently of the app lifetime.
+    from fastapi.routing import APIRoute
+
+    cached_endpoints = [route.endpoint for route in app.routes if isinstance(route, APIRoute)]
+    del server
+    gc.collect()
+    assert reference() is not None, "the live app must own its server"
+    del app
+    gc.collect()
+    assert reference() is None, "cached endpoints must not retain completed requests"
+    assert cached_endpoints

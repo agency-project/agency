@@ -641,21 +641,24 @@ class LlmHandlerServer:
 
     def build_app(self) -> FastAPI:
         app = FastAPI()
+        # Endpoint caches may outlive this app; only the app owns invocation state.
+        app.state.llm_handler_server = self
 
         @app.post("/dispatch")
         async def _dispatch(http_request: Request):
+            server = http_request.app.state.llm_handler_server
             request = await http_request.json()
             try:
                 if request.get("stream"):
                     abort_event = threading.Event()
-                    handle = self._new_stream_handle(abort_event)
-                    worker, result = self._spawn_http_worker(
-                        self.start_stream,
+                    handle = server._new_stream_handle(abort_event)
+                    worker, result = server._spawn_http_worker(
+                        server.start_stream,
                         request,
                         abort_event=abort_event,
                         _handle=handle,
                     )
-                    disconnected = await self._wait_for_http_worker(
+                    disconnected = await server._wait_for_http_worker(
                         http_request,
                         worker,
                         result,
@@ -665,7 +668,7 @@ class LlmHandlerServer:
                     if disconnected:
                         raise ClientDisconnect
                     result.result()
-                    item = await self._first_stream_item(http_request, handle)
+                    item = await server._first_stream_item(http_request, handle)
                     if item["type"] == "error":
                         if not handle.cancel_and_join():
                             raise RuntimeError("LLM stream producer did not stop")
@@ -682,12 +685,12 @@ class LlmHandlerServer:
 
                 abort_event = threading.Event()
 
-                worker, result = self._spawn_http_worker(
-                    self.dispatch,
+                worker, result = server._spawn_http_worker(
+                    server.dispatch,
                     request,
                     abort_event=abort_event,
                 )
-                disconnected = await self._wait_for_http_worker(
+                disconnected = await server._wait_for_http_worker(
                     http_request,
                     worker,
                     result,
@@ -705,12 +708,14 @@ class LlmHandlerServer:
                 raise ClientDisconnect from error
 
         @app.get("/resolve_model")
-        def _resolve_model() -> JSONResponse:
-            return JSONResponse({"model": self.resolve_model()})
+        def _resolve_model(http_request: Request) -> JSONResponse:
+            server = http_request.app.state.llm_handler_server
+            return JSONResponse({"model": server.resolve_model()})
 
         @app.get("/context_limit")
-        def _context_limit() -> JSONResponse:
-            return JSONResponse({"context_limit": self.context_limit()})
+        def _context_limit(http_request: Request) -> JSONResponse:
+            server = http_request.app.state.llm_handler_server
+            return JSONResponse({"context_limit": server.context_limit()})
 
         return app
 
