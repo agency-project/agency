@@ -905,6 +905,8 @@ def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
+        # This execution double bypasses AgentEngine's transaction commit.
+        ag.sandbox.commit()
         return agdata(ok=True), prev_ctx, []
 
     skill_write._test_execute = fake_write

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from unittest.mock import MagicMock
 
 import pytest
@@ -67,60 +68,87 @@ def test_native_launch_restores_conversation_before_resuming(tmp_path, monkeypat
     assert Path(_session_path(str(tmp_path), "native-session")).read_bytes() == b'{"type":"user"}\n'
 
 
+pytestmark = pytest.mark.timeout(240)
+
+
 real_claude = pytest.mark.skipif(
     not claude_code_available() or os.environ.get("AGENCY_TEST_REAL_CLAUDE") != "1",
     reason="explicit paid-provider integration opt-in required",
 )
 
 
-@real_claude
-def test_real_claude_raw_text_end_to_end():
-    # A genuinely-working backend, not a placeholder -- this backend routes
-    # claude's LLM traffic through agmanager_harness's `/v1/messages` route
-    # to this agent's own agmanager_host, so the real credentialed dispatch
-    # must actually happen, not just accept the connection. Uses the same
-    # Bedrock bearer-token credential (AWS_BEARER_TOKEN_BEDROCK) this dev
-    # environment already has.
-    cfg = agconfig(
-        sandboxconfig(backend="docker"),
-        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
-    )
+@pytest.fixture
+def real_agent():
+    """Use a configured paid model through the real Claude harness and gateway.
 
-    ag = agent(agconfig=cfg, harness="claude_code")
+    Set AGENCY_TEST_LLM_PROVIDER/MODEL to select a different provider; OpenAI
+    uses OPENAI_API_KEY, while Bedrock uses AWS_BEARER_TOKEN_BEDROCK.
+    """
+    provider = os.environ.get("AGENCY_TEST_LLM_PROVIDER", "bedrock")
+    model = os.environ.get("AGENCY_TEST_LLM_MODEL", "us.anthropic.claude-sonnet-5")
+    kwargs = {"provider": provider, "model": model}
+    if provider == "openai":
+        kwargs.update(api_key=os.environ["OPENAI_API_KEY"], reasoning_effort="none")
+    config = agconfig(
+        sandboxconfig(
+            backend="docker",
+            base_image=os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "agency-sandbox:latest"),
+        ),
+        llmconfig(**kwargs),
+    )
+    owner = agent(agconfig=config, harness="claude_code")
+    try:
+        yield owner
+    finally:
+        if owner.sandbox is not None:
+            owner.sandbox.destroy()
+
+
+def _run_live(owner, skill, value):
+    result = owner.run(skill, value)
+    try:
+        return result.wait(timeout=90).to_dict()
+    finally:
+        if result.is_pending():
+            owner.cancel(result)
+            result.wait(timeout=30)
+
+
+def _assert_host_llm_exchange(owner):
+    # Successful, request-tagged usage in the host logger proves the CLI used
+    # Agency's model gateway instead of answering through its own credentials.
+    owner.data_logger.flush()
+    with sqlite3.connect(owner.data_logger.db_path) as connection:
+        blocks = [
+            json.loads(row[0])
+            for row in connection.execute(
+                "SELECT payload FROM events WHERE type = 'llm_block' AND name = ?",
+                (str(owner.agname),),
+            )
+        ]
+    assert any(
+        block.get("type") == "metadata"
+        and block.get("request_id")
+        and (block.get("usage") or {}).get("prompt_tokens", 0) > 0
+        for block in blocks
+    ), "no successful credentialed exchange recorded by the host gateway"
+
+
+@real_claude
+def test_real_claude_raw_text_end_to_end(real_agent):
     skill = agskill(
         name="two_word_greeting_test",
         prompt="Respond with exactly the two words requested, nothing else.",
     )
-    result = ag.run(skill, agdata(instruction="Say hi in exactly two words."))
-    result.wait()
-    raw = result.to_dict()
-
-    # The correct answer alone doesn't prove the real backend was actually
-    # used -- HOME is deliberately left untouched (see this backend's
-    # docstring), so a real OAuth-logged-in `claude` on this host could in
-    # principle answer correctly via its OWN credentials if
-    # ANTHROPIC_BASE_URL/AUTH_TOKEN were somehow ignored. Assert directly
-    # against this agent's own agmanager_host request log -- the one place
-    # a real credentialed dispatch is ever recorded -- instead of inferring
-    # "it must have gone through" from the result looking right.
-    request_log = ag._host_agent_manager.request_log
-    assert len(request_log) >= 1, "claude's request never reached agmanager_host"
-    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in request_log)
+    raw = _run_live(real_agent, skill, agdata(instruction="Say hi in exactly two words."))
     assert "error" not in raw, raw
     assert isinstance(raw.get("result"), str) and raw["result"]
+    _assert_host_llm_exchange(real_agent)
 
 
 @real_claude
-def test_real_claude_tool_call_history_is_not_flattened():
-    """Phase 5: a real run that uses a tool must produce a `context.messages`
-    with the actual tool-call/tool-result turns in it -- not the old
-    2-message [user, final-assistant-text] collapse, which would silently
-    discard exactly this kind of turn."""
-    cfg = agconfig(
-        sandboxconfig(backend="docker"),
-        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
-    )
-    ag = agent(agconfig=cfg, harness="claude_code")
+def test_real_claude_tool_call_history_is_not_flattened(real_agent):
+    """The resolved transcript retains actual tool calls and their results."""
     skill = agskill(
         name="claude_tool_history_test",
         prompt=(
@@ -128,104 +156,59 @@ def test_real_claude_tool_call_history_is_not_flattened():
             "gives you, then report its output back in one short sentence."
         ),
     )
-    result = ag.run(skill, agdata(instruction="Run: echo agency-history-marker"))
-    result.wait()
-    raw = result.to_dict()
-
+    raw = _run_live(real_agent, skill, agdata(instruction="Run: echo agency-history-marker"))
     assert "error" not in raw, raw
     assert "agency-history-marker" in raw.get("result", "")
-    # ag.context is a future-backed placeholder until resolved -- reading
-    # .messages directly would just see the unresolved default `[]`.
-    messages = ag.context.get_resolved_messages()
-    assert any(m.get("role") == "tool" for m in messages), (
-        "no tool-role message in context.messages -- history fell back to the "
-        f"flattened 2-message shape instead of the real transcript: {messages}"
-    )
-    assert len(messages) > 2, "transcript should have more than [user, assistant]"
+    messages = real_agent.context.get_resolved_transcript()
+    assert any(m.get("role") == "tool" for m in messages), messages
+    assert len(messages) > 2, "transcript should include tool execution"
+    _assert_host_llm_exchange(real_agent)
 
 
 @real_claude
-def test_real_claude_structured_output_end_to_end():
-    # A genuinely-working backend, not a placeholder -- see
-    # test_real_claude_raw_text_end_to_end's comment for why the request
-    # log check is against this agent's own agmanager_host.
-    cfg = agconfig(
-        sandboxconfig(backend="docker"),
-        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
-    )
-
-    ag = agent(agconfig=cfg, harness="claude_code")
+def test_real_claude_structured_output_end_to_end(real_agent):
     skill = agskill(
         name="structured_greeting_test",
         prompt="You produce a structured greeting.",
         output_schema=agdata(greeting=str, word_count=int),
     )
-    result = ag.run(
-        skill, agdata(instruction="Greet the user with exactly 3 words, then report the count.")
+    raw = _run_live(
+        real_agent,
+        skill,
+        agdata(instruction="Greet the user with exactly 3 words, then report the count."),
     )
-    result.wait()
-    raw = result.to_dict()
-
-    request_log = ag._host_agent_manager.request_log
-    assert len(request_log) >= 1, "claude's request never reached agmanager_host"
-    assert all(e["model"] == "us.anthropic.claude-sonnet-5" for e in request_log)
     assert "error" not in raw, raw
     assert isinstance(raw.get("greeting"), str)
-    assert isinstance(raw.get("word_count"), int)
+    assert raw["word_count"] == len(raw["greeting"].split()) == 3
+    _assert_host_llm_exchange(real_agent)
 
 
 @real_claude
-def test_real_claude_history_continues_across_a_fresh_sandbox():
-    """Session continuity travels with the AGENT
-    (`ag.context.harness_sessions`), not with any particular container:
-    call 1 tells the agent a fact, then `ag.sandbox` is swapped for a
-    brand-new sandbox (a different container instance) before call 2 asks
-    the agent to recall that fact via `--resume` against the captured
-    session blob."""
-    cfg = agconfig(
-        sandboxconfig(backend="docker"),
-        llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
-    )
+def test_real_claude_history_continues_across_a_fresh_sandbox(real_agent):
+    """The native session survives replacement of its original container."""
+    owner = real_agent
     skill = agskill(name="continuity_test_skill", prompt="You are a test assistant.")
-
-    from agency.sandbox.agsandbox import agSandbox
-    import uuid
-
-    ag = agent(
-        agconfig=cfg, sandbox=agSandbox(str(uuid.uuid4()), agconfig=cfg), harness="claude_code"
+    first = _run_live(
+        owner,
+        skill,
+        agdata(instruction="My project's deployment codename is PURPLE-42-NARWHAL. Just say OK."),
     )
-    try:
-        r1 = ag.run(
-            skill,
-            agdata(
-                instruction="My project's deployment codename is PURPLE-42-NARWHAL. Just say OK."
-            ),
-        )
-        r1.wait()
-        raw1 = r1.to_dict()
-        assert "error" not in raw1, raw1
+    assert "error" not in first, first
+    owner.context.resolve_prev_dependencies()
+    stored = owner.context.harness_sessions.get("claude_code")
+    assert stored and stored.get("session_id"), "no session captured after call 1"
+    previous = owner.sandbox
+    previous.destroy()
+    owner.sandbox = None
 
-        stored = ag.context.harness_sessions.get("claude_code")
-        assert stored and stored.get("session_id"), "no session captured after call 1"
-    finally:
-        ag.sandbox.rm_container()
-
-    # Fresh container for call 2 -- proves continuity doesn't depend on
-    # reusing the first container.
-    ag.sandbox = agSandbox(str(uuid.uuid4()), agconfig=cfg)
-    try:
-        r2 = ag.run(
-            skill,
-            agdata(
-                instruction="What's my project's deployment codename? Reply with just the codename."
-            ),
-        )
-        r2.wait()
-        raw2 = r2.to_dict()
-
-        assert "error" not in raw2, raw2
-        assert "PURPLE-42-NARWHAL" in raw2.get("result", ""), (
-            f"continuity failed -- agent didn't recall the code: {raw2!r}"
-        )
-    finally:
-        ag.sandbox.rm_container()
+    second = _run_live(
+        owner,
+        skill,
+        agdata(
+            instruction="What's my project's deployment codename? Reply with just the codename."
+        ),
+    )
+    assert owner.sandbox is not previous
+    assert "error" not in second, second
+    assert "PURPLE-42-NARWHAL" in second.get("result", ""), second
+    _assert_host_llm_exchange(owner)
