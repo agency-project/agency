@@ -113,12 +113,13 @@ class NativeProfiler:
             return
         span_id = uuid.uuid4().hex
         parent_id = self.stack[-1] if self.stack else None
+        started_ts = time.time()
         self._report_span(
             {
                 "name": name,
                 "span_id": span_id,
                 "parent": parent_id,
-                "start_ts": time.time(),
+                "start_ts": started_ts,
                 "attributes": {},
             }
         )
@@ -137,6 +138,8 @@ class NativeProfiler:
                 {
                     "name": name,
                     "span_id": span_id,
+                    "parent": parent_id,
+                    "start_ts": started_ts,
                     "end_ts": time.time(),
                     "attributes": {"outcome": outcome},
                 }

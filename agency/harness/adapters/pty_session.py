@@ -12,6 +12,7 @@ import json
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import PurePosixPath
 
 from .agharness_backend import AttemptResult
@@ -231,52 +232,61 @@ class PtyExecution:
         from ..agharness import cleanup_config_home
         from ..ptrace.supervisor import agProxyPtrace
 
+        phase = getattr(self.driver, "profile_span", lambda name: nullcontext())
         try:
             self.validate_prompt(prompt)
-            self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
-                self.driver.argv,
-                self.driver.env,
-                cwd=self.driver.cwd,
-                pty_size=(120, 36),
-                policy=self.runtime.syscall_policy,
-                ag=None,
-            )
+            with phase("harness:launch"):
+                self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
+                    self.driver.argv,
+                    self.driver.env,
+                    cwd=self.driver.cwd,
+                    pty_size=(120, 36),
+                    policy=self.runtime.syscall_policy,
+                    ag=None,
+                )
             self.runtime.register_control_handle(self.handle)
             self.runtime.register_redirect(self.redirect)
-            self._wait_until(
-                lambda: self.driver.ready(self.handle), "startup input", self.START_TIMEOUT
-            )
-            self._submit(prompt, "run")
+            with phase("harness:startup_ready"):
+                self._wait_until(
+                    lambda: self.driver.ready(self.handle), "startup input", self.START_TIMEOUT
+                )
+            with phase("harness:submit"):
+                self._submit(prompt, "run")
             with self._lock:
                 self._active = True
             last_poll = time.monotonic()
-            while True:
-                with self._lock:
-                    now = time.monotonic()
-                    if self.handle.is_paused():
-                        self._deadline += now - last_poll
-                    last_poll = now
-                    self._poll()
-                    self._check_alive()
-                    if self._stop is not None and self.driver.completed(self._stop):
-                        self._active = False
-                        blob = self.driver.snapshot()
-                        return AttemptResult(
-                            ok=True,
-                            final_text=self._stop["text"],
-                            session_id=self.driver.session_id,
-                            session_blob=blob,
-                            input_tokens=self._stop.get("input_tokens", 0),
-                            output_tokens=self._stop.get("output_tokens", 0),
-                        )
-                    if now > self._deadline:
-                        raise RuntimeError(f"{self.driver.name} attempt timed out")
-                time.sleep(0.025)
+            # Explicit envelope, not a claim of idle CPU: the CLI may be
+            # working while this controller awaits its terminal event.
+            with phase("harness:await_cli"):
+                while True:
+                    with self._lock:
+                        now = time.monotonic()
+                        if self.handle.is_paused():
+                            self._deadline += now - last_poll
+                        last_poll = now
+                        self._poll()
+                        self._check_alive()
+                        if self._stop is not None and self.driver.completed(self._stop):
+                            self._active = False
+                            with phase("harness:snapshot"):
+                                blob = self.driver.snapshot()
+                            return AttemptResult(
+                                ok=True,
+                                final_text=self._stop["text"],
+                                session_id=self.driver.session_id,
+                                session_blob=blob,
+                                input_tokens=self._stop.get("input_tokens", 0),
+                                output_tokens=self._stop.get("output_tokens", 0),
+                            )
+                        if now > self._deadline:
+                            raise RuntimeError(f"{self.driver.name} attempt timed out")
+                    time.sleep(0.025)
         finally:
             try:
                 with self._lock:
                     self._active = False
                     if self.handle is not None:
-                        self.handle.close()
+                        with phase("harness:retire"):
+                            self.handle.close()
             finally:
                 cleanup_config_home(self.driver.root)

@@ -22,6 +22,15 @@ if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
 
 
+class HostDispatchError(RuntimeError):
+    """Preserve retryability across the host/daemon protocol boundary."""
+
+    def __init__(self, item):
+        super().__init__(item["message"])
+        self.status_code = item.get("status_code", 500)
+        self.transient = item.get("transient", False)
+
+
 class HostServicesClient:
     """Thin client wrapping this agent's one bridged connection to its
     `agmanager_host` instance -- the single UDS path any harness (or a
@@ -210,13 +219,25 @@ class HostServicesClient:
                 json={**agency_context, "stream": True},
                 headers=self._attempt_headers(token),
             ) as response:
-                response.raise_for_status()
+                if response.is_error:
+                    await response.aread()
+                    try:
+                        error = response.json()["error"]
+                    except (ValueError, KeyError, TypeError):
+                        response.raise_for_status()
+                    raise HostDispatchError(
+                        {
+                            "message": error.get("message", "host dispatch failed"),
+                            "status_code": response.status_code,
+                            "transient": error.get("transient", response.status_code >= 500),
+                        }
+                    )
                 async for line in response.aiter_lines():
                     if not line:
                         continue
                     item = json.loads(line)
                     if item["type"] == "error":
-                        raise RuntimeError(item["message"])
+                        raise HostDispatchError(item)
                     yield item
                     if item["type"] == "done":
                         return

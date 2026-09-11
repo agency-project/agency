@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import uuid
+from functools import partial
 
 from fastapi import Request
 
@@ -80,24 +82,86 @@ def _responses_content_to_text(content) -> str:
     return "".join(b["text"] for b in _responses_content_to_blocks(content))
 
 
-def _responses_tools_to_agency(tools) -> "list[dict] | None":
-    if not tools:
-        return None
+def _tool_wire_name(kind: str, name: str, namespace: "str | None" = None) -> str:
+    if kind == "function" and not namespace:
+        return name
+    # Chat Completions names have a 64-character limit and no namespace field.
+    identity = json.dumps([kind, namespace, name]).encode()
+    return "agency_" + hashlib.sha256(identity).hexdigest()[:48]
+
+
+def _responses_tool_routes(request: dict) -> dict:
+    routes = {}
+
+    def visit(tools, namespace=None):
+        for tool in tools or []:
+            kind = tool.get("type")
+            if kind == "namespace":
+                scope = ".".join(filter(None, (namespace, tool["name"])))
+                visit(tool.get("tools"), scope)
+            elif kind in ("function", "custom"):
+                name = _tool_wire_name(kind, tool["name"], namespace)
+                routes[name] = {"tool": tool, "namespace": namespace}
+
+    visit(request.get("tools"))
+    inputs = request.get("input")
+    if isinstance(inputs, list):
+        for item in inputs:
+            if isinstance(item, dict) and item.get("type") == "additional_tools":
+                visit(item.get("tools"))
+    return routes
+
+
+def _responses_tools_to_agency(routes) -> "list[dict] | None":
     converted = []
-    for t in tools:
-        if t.get("type") != "function":
-            continue
+    for name, route in routes.items():
+        t, namespace = route["tool"], route["namespace"]
+        description = t.get("description", "")
+        parameters = t.get("parameters") or {"type": "object", "properties": {}}
+        if namespace:
+            description = f"{namespace}.{t['name']}: {description}"
+        if t["type"] == "custom":
+            # JSON-capable providers need an envelope; Codex receives the exact
+            # string again, not JSON text masquerading as JavaScript/a patch.
+            description += "\nSupply the raw tool input as the input string."
+            if t.get("format"):
+                description += "\nTool input format: " + json.dumps(t["format"])
+            parameters = {
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+                "additionalProperties": False,
+            }
         converted.append(
             {
                 "type": "function",
                 "function": {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
                 },
             }
         )
     return converted or None
+
+
+def _tool_use_to_responses(block: dict, routes: "dict | None") -> dict:
+    route = (routes or {}).get(block["name"])
+    name = route["tool"]["name"] if route else block["name"]
+    kind = route["tool"]["type"] if route else "function"
+    item = {"id": f"fc_{uuid.uuid4().hex}", "call_id": block["id"], "name": name}
+    if route and route["namespace"]:
+        item["namespace"] = route["namespace"]
+    if kind == "custom":
+        payload = json.loads(block.get("arguments", "{}"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("input"), str):
+            raise ValueError("Codex custom tool requires a string input")
+        item.update(type="custom_tool_call", input=payload["input"])
+    else:
+        item.update(
+            type="function_call", arguments=block.get("arguments", "{}"), status="completed"
+        )
+    return item
 
 
 def _responses_tool_choice_to_agency(tool_choice):
@@ -105,8 +169,11 @@ def _responses_tool_choice_to_agency(tool_choice):
         return None
     if isinstance(tool_choice, str):
         return tool_choice if tool_choice in ("auto", "required", "none") else None
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-        return {"type": "function", "function": {"name": tool_choice.get("name", "")}}
+    if isinstance(tool_choice, dict) and tool_choice.get("type") in ("function", "custom"):
+        name = _tool_wire_name(
+            tool_choice["type"], tool_choice.get("name", ""), tool_choice.get("namespace")
+        )
+        return {"type": "function", "function": {"name": name}}
     if isinstance(tool_choice, dict) and tool_choice.get("type"):
         return {"type": _responses_native_block_type(tool_choice["type"]), "data": tool_choice}
     return None
@@ -139,7 +206,14 @@ class _CodexBackend(agharness_backend):
             max_steps=max_steps,
         )
 
-    def _write_codex_config(self, config_home, base_url: str, model: str) -> None:
+    def _write_codex_config(
+        self,
+        config_home,
+        base_url: str,
+        model: str,
+        *,
+        has_sandbox_mcp_tools: bool = False,
+    ) -> None:
         toml_text = (
             f'model = "{model}"\n'
             f'model_provider = "{self._PROVIDER_NAME}"\n'
@@ -149,7 +223,22 @@ class _CodexBackend(agharness_backend):
             f'base_url = "{base_url}/v1"\n'
             f'env_key = "{self._ENV_KEY_NAME}"\n'
             f'wire_api = "responses"\n'
+            "\n"
+            "[mcp_servers.agency]\n"
+            f'url = "{base_url}/mcp"\n'
+            f'bearer_token_env_var = "{self._ENV_KEY_NAME}"\n'
+            "required = true\n"
+            'default_tools_approval_mode = "approve"\n'
         )
+        if has_sandbox_mcp_tools:
+            toml_text += (
+                "\n"
+                '[mcp_servers."agency-sandbox"]\n'
+                f'url = "{base_url}/sandbox/mcp"\n'
+                f'bearer_token_env_var = "{self._ENV_KEY_NAME}"\n'
+                "required = true\n"
+                'default_tools_approval_mode = "approve"\n'
+            )
         (config_home / "config.toml").write_text(toml_text)
 
     def register(self, app, router) -> None:
@@ -168,15 +257,54 @@ class _CodexBackend(agharness_backend):
             body = await request.json()
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
+            # Keep routing request-local: one adapter serves multiple tokens.
+            tool_routes = _responses_tool_routes(body)
             if body.get("stream"):
+                from ..clients.host_services_client import HostDispatchError
+
+                frames = stream_response(
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
+                )
+                # This adapter already buffers through `done`. Fetch the first
+                # frame before committing HTTP 200 so a permanent upstream 400
+                # is not turned into a retryable truncated SSE connection.
+                try:
+                    first = await anext(frames)
+                except HostDispatchError as exc:
+                    await frames.aclose()
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "message": str(exc),
+                                "type": "upstream_error",
+                                "transient": exc.transient,
+                            }
+                        },
+                        status_code=exc.status_code,
+                    )
+
+                async def response_frames():
+                    try:
+                        yield first
+                        async for frame in frames:
+                            yield frame
+                    finally:
+                        await frames.aclose()
+
                 return StreamingResponse(
-                    stream_response(
-                        router, token, agency_context, model, self._format_agency_stream_to_harness
-                    ),
+                    response_frames(),
                     media_type="text/event-stream",
                 )
             agency_response = router.dispatch(token, agency_context)
-            return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
+            return JSONResponse(
+                self._format_context_agency_to_harness(
+                    agency_response, model, tool_routes=tool_routes
+                )
+            )
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
         messages: "list[dict]" = []
@@ -197,7 +325,15 @@ class _CodexBackend(agharness_backend):
                 if not isinstance(item, dict):
                     continue
                 itype = item.get("type")
-                if itype == "function_call":
+                if itype == "additional_tools":
+                    continue
+                if itype in ("function_call", "custom_tool_call"):
+                    kind = "custom" if itype == "custom_tool_call" else "function"
+                    arguments = (
+                        json.dumps({"input": item.get("input", "")})
+                        if kind == "custom"
+                        else item.get("arguments", "{}")
+                    )
                     messages.append(
                         {
                             "role": "assistant",
@@ -206,13 +342,15 @@ class _CodexBackend(agharness_backend):
                                     "type": "tool_use",
                                     "index": 0,
                                     "id": item.get("call_id", ""),
-                                    "name": item.get("name", ""),
-                                    "arguments": item.get("arguments", "{}"),
+                                    "name": _tool_wire_name(
+                                        kind, item.get("name", ""), item.get("namespace")
+                                    ),
+                                    "arguments": arguments,
                                 }
                             ],
                         }
                     )
-                elif itype == "function_call_output":
+                elif itype in ("function_call_output", "custom_tool_call_output"):
                     messages.append(
                         {
                             "role": "tool",
@@ -263,13 +401,28 @@ class _CodexBackend(agharness_backend):
                         }
                     )
 
+        # Responses represents parallel calls as separate output items. Chat
+        # Completions requires them in ONE assistant message before any replies.
+        # Preserve all blocks (including interleaved reasoning/commentary), not
+        # separate assistant messages that orphan the preceding tool call.
+        grouped = []
+        for message in messages:
+            if message["role"] == "assistant" and grouped and grouped[-1]["role"] == "assistant":
+                grouped[-1]["blocks"].extend(message["blocks"])
+            else:
+                grouped.append({**message, "blocks": list(message["blocks"])})
+        for message in grouped:
+            for index, block in enumerate(message["blocks"]):
+                block["index"] = index
         return {
-            "messages": messages,
-            "tools": _responses_tools_to_agency(raw_request.get("tools")),
+            "messages": grouped,
+            "tools": _responses_tools_to_agency(_responses_tool_routes(raw_request)),
             "tool_choice": _responses_tool_choice_to_agency(raw_request.get("tool_choice")),
         }
 
-    def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:
+    def _format_context_agency_to_harness(
+        self, agency_response: dict, model: str, *, tool_routes=None
+    ) -> dict:
         message = agency_response["message"]
         output: "list[dict]" = []
         for b in message.get("blocks", []):
@@ -292,16 +445,7 @@ class _CodexBackend(agharness_backend):
                     }
                 )
             elif b["type"] == "tool_use":
-                output.append(
-                    {
-                        "type": "function_call",
-                        "id": f"fc_{uuid.uuid4().hex}",
-                        "call_id": b["id"],
-                        "name": b["name"],
-                        "arguments": b["arguments"],
-                        "status": "completed",
-                    }
-                )
+                output.append(_tool_use_to_responses(b, tool_routes))
             elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
                 output.append(_unknown_block_to_responses(b))
 
@@ -321,7 +465,7 @@ class _CodexBackend(agharness_backend):
             },
         }
 
-    def _format_agency_stream_to_harness(self, agency_stream, model: str):
+    def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
         request_id = f"resp_{uuid.uuid4().hex}"
         yield _sse(
             "response.created",
@@ -426,14 +570,7 @@ class _CodexBackend(agharness_backend):
                         },
                     )
                 elif b["type"] == "tool_use":
-                    call_item = {
-                        "type": "function_call",
-                        "id": f"fc_{uuid.uuid4().hex}",
-                        "call_id": b["id"],
-                        "name": b["name"],
-                        "arguments": b.get("arguments", "{}"),
-                        "status": "completed",
-                    }
+                    call_item = _tool_use_to_responses(b, tool_routes)
                     yield _sse(
                         "response.output_item.added",
                         {

@@ -7,6 +7,7 @@ from dataclasses import asdict
 import httpx
 
 from ...harness.protocol import HarnessAttemptRequest, HarnessAttemptResult
+from ...observability.profiler import agprof
 
 
 class HarnessInteractionClient:
@@ -18,9 +19,13 @@ class HarnessInteractionClient:
         )
 
     def run_harness_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
-        response = self._client.post("/harness_attempt", json=asdict(request))
-        response.raise_for_status()
-        return HarnessAttemptResult(**response.json())
+        # Envelope: includes daemon/CLI/model/tool work. Never attribute its
+        # whole duration to socket overhead or idle time.
+        with agprof.span("harness:attempt_rpc"):
+            response = self._client.post("/harness_attempt", json=asdict(request))
+            response.raise_for_status()
+        with agprof.span("agency:decode_harness_result"):
+            return HarnessAttemptResult(**response.json())
 
     def pause_harness(self) -> None:
         self._client.post("/control/pause").raise_for_status()

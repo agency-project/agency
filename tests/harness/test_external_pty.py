@@ -1,6 +1,7 @@
 import base64
 import json
 import tomllib
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -40,6 +41,13 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
     if name == "codex":
         config = tomllib.loads((tmp_path / "config.toml").read_text())
         assert config["model_providers"]["agency-proxy"]["wire_api"] == "responses"
+        assert config["mcp_servers"]["agency"] == {
+            "url": f"{runtime.harness_base_url}/mcp",
+            "bearer_token_env_var": "AGENCY_PROXY_API_KEY",
+            "required": True,
+            "default_tools_approval_mode": "approve",
+        }
+        assert "agency-sandbox" not in config["mcp_servers"]
         assert {"SessionStart", "Stop", "UserPromptSubmit", "PreToolUse", "PostToolUse"} == set(
             json.loads((tmp_path / "hooks.json").read_text())["hooks"]
         )
@@ -53,6 +61,25 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
         assert config["agent"]["build"]["steps"] == 4
         assert config["provider"]["agency-proxy"]["options"]["apiKey"] == runtime.token
         assert "chat.message" in (tmp_path / "plugin/agpolicy_plugin.js").read_text()
+
+
+def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
+    runtime = replace(runtime, has_sandbox_mcp_tools=True)
+    PtyDriver(
+        agharness_backend.for_config("codex", runtime.agconfig),
+        runtime,
+        tmp_path,
+        None,
+        None,
+        4,
+    )
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["mcp_servers"]["agency-sandbox"] == {
+        "url": f"{runtime.harness_base_url}/sandbox/mcp",
+        "bearer_token_env_var": "AGENCY_PROXY_API_KEY",
+        "required": True,
+        "default_tools_approval_mode": "approve",
+    }
 
 
 class FakeDriver:
@@ -85,6 +112,28 @@ class FakeDriver:
 
     def snapshot(self):
         return b"durable-native-session"
+
+
+def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
+    driver = PtyDriver(
+        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
+    )
+    driver.transcript_path = tmp_path / "transcript.jsonl"
+    driver.transcript_path.write_text(
+        "\n".join(
+            json.dumps({"type": "event_msg", "payload": p})
+            for p in [
+                {"type": "task_started", "turn_id": "old"},
+                {"type": "error", "message": "bad request"},
+            ]
+        )
+        + "\n"
+    )
+    events = driver.events()
+    assert events == [
+        {"kind": "error", "turn_id": "old", "error": "Codex terminal error: bad request"}
+    ]
+    assert driver.events() == []
 
 
 @pytest.fixture

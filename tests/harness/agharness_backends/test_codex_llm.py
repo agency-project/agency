@@ -4,6 +4,7 @@ API <-> agency format, both directions, both streaming and non-streaming."""
 from __future__ import annotations
 
 import json
+import pytest
 
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import _CodexBackend
@@ -15,6 +16,54 @@ def _backend() -> _CodexBackend:
 
 def _text_block(text, index=0):
     return {"type": "text", "index": index, "text": text}
+
+
+def test_parallel_calls_are_one_assistant_message_before_replies():
+    body = {
+        "input": [
+            {"type": "function_call", "name": "a", "call_id": "a", "arguments": "{}"},
+            {"type": "message", "role": "assistant", "content": "commentary"},
+            {"type": "custom_tool_call", "name": "b", "call_id": "b", "input": "text(1)"},
+            {"type": "function_call_output", "call_id": "a", "output": "A"},
+            {"type": "custom_tool_call_output", "call_id": "b", "output": "B"},
+        ]
+    }
+    messages = _backend()._format_context_harness_to_agency(body)["messages"]
+    assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
+    assert [b["index"] for b in messages[0]["blocks"]] == [0, 1, 2]
+    assert [b["id"] for b in messages[0]["blocks"] if b["type"] == "tool_use"] == ["a", "b"]
+    assert [m["blocks"][0]["tool_call_id"] for m in messages[1:]] == ["a", "b"]
+
+
+@pytest.mark.parametrize("status,transient", [(400, False), (503, True)])
+def test_stream_preserves_upstream_error_status(status, transient):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    class Router:
+        def validate_token(self, token):
+            return True
+
+        def resolve_model(self, token):
+            return "m"
+
+        async def dispatch_stream_async(self, token, request):
+            raise HostDispatchError(
+                {"message": "synthetic error", "status_code": status, "transient": transient}
+            )
+            yield
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer fake"},
+            json={"stream": True, "input": "hello"},
+        )
+    assert response.status_code == status
+    assert response.json()["error"]["transient"] is transient
 
 
 def test_harness_to_agency_instructions_and_string_input():
@@ -126,6 +175,193 @@ def test_harness_to_agency_tools_and_tool_choice():
         }
     ]
     assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+
+
+def test_additional_tools_are_definitions_not_assistant_messages():
+    body = {
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "function", "name": "pwd", "parameters": {"type": "object"}}],
+            },
+            {"role": "user", "content": "Run pwd"},
+        ]
+    }
+    converted = _backend()._format_context_harness_to_agency(body)
+    assert converted["messages"] == [{"role": "user", "blocks": [_text_block("Run pwd")]}]
+    assert converted["tools"][0]["function"]["name"] == "pwd"
+
+
+def test_namespaced_custom_tools_round_trip_without_shared_adapter_state():
+    from agency.harness.adapters.codex import _responses_tool_routes
+
+    body = {
+        "input": [
+            {
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "tools": [
+                            {
+                                "type": "custom",
+                                "name": "exec",
+                                "description": "Run code",
+                                "format": {"type": "text"},
+                            },
+                            {"type": "function", "name": "wait", "parameters": {"type": "object"}},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    backend = _backend()
+    converted = backend._format_context_harness_to_agency(body)
+    tools = converted["tools"]
+    assert len(tools) == 2
+    custom_name = tools[0]["function"]["name"]
+    assert len(custom_name) <= 64
+    assert tools[0]["function"]["parameters"]["properties"]["input"]["type"] == "string"
+    code = 'text(await tools.exec_command({cmd: "pwd"}));'
+    response = {
+        "message": {
+            "blocks": [
+                {
+                    "type": "tool_use",
+                    "id": "c1",
+                    "name": custom_name,
+                    "arguments": json.dumps({"input": code}),
+                }
+            ]
+        }
+    }
+    routes = _responses_tool_routes(body)
+    output = backend._format_context_agency_to_harness(response, "m", tool_routes=routes)["output"][
+        0
+    ]
+    assert {k: output[k] for k in ("type", "call_id", "name", "namespace", "input")} == {
+        "type": "custom_tool_call",
+        "call_id": "c1",
+        "name": "exec",
+        "namespace": "functions",
+        "input": code,
+    }
+    history = backend._format_context_harness_to_agency(
+        {"input": [output, {"type": "custom_tool_call_output", "call_id": "c1", "output": "done"}]}
+    )
+    assert history["messages"][0]["blocks"][0]["name"] == custom_name
+    assert json.loads(history["messages"][0]["blocks"][0]["arguments"]) == {"input": code}
+    assert history["messages"][1]["blocks"][0]["text"] == "done"
+    frames = backend._format_agency_stream_to_harness(
+        [{"type": "done", **response}], "m", tool_routes=routes
+    )
+    events = _parse_sse("".join(frames))
+    item = next(d["item"] for t, d in events if t == "response.output_item.done")
+    assert item["type"] == "custom_tool_call" and item["input"] == code
+    # A different request cannot inherit another session's tool route table.
+    other = backend._format_context_agency_to_harness(response, "m")["output"][0]
+    assert other["type"] == "function_call"
+
+
+def test_namespace_function_identity_survives_history_and_forced_choice():
+    from agency.harness.adapters.codex import _responses_tool_routes
+
+    body = {
+        "tools": [
+            {
+                "type": "namespace",
+                "name": namespace,
+                "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+            }
+            for namespace in ("files", "database")
+        ],
+        "tool_choice": {"type": "function", "namespace": "files", "name": "read"},
+    }
+    backend = _backend()
+    converted = backend._format_context_harness_to_agency(body)
+    names = [tool["function"]["name"] for tool in converted["tools"]]
+    assert names[0] != names[1]
+    assert converted["tool_choice"]["function"]["name"] == names[0]
+    response = {
+        "message": {
+            "blocks": [{"type": "tool_use", "id": "c", "name": names[0], "arguments": "{}"}]
+        }
+    }
+    item = backend._format_context_agency_to_harness(
+        response, "m", tool_routes=_responses_tool_routes(body)
+    )["output"][0]
+    assert item["name"] == "read" and item["namespace"] == "files"
+    history = backend._format_context_harness_to_agency({"input": [item]})
+    assert history["messages"][0]["blocks"][0]["name"] == names[0]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_registered_route_restores_custom_calls_for_each_request(stream):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    class Router:
+        def validate_token(self, token):
+            return token == "synthetic-token"
+
+        def resolve_model(self, token):
+            return "m"
+
+        def dispatch(self, token, request):
+            return {
+                "message": {
+                    "blocks": [
+                        {
+                            "type": "tool_use",
+                            "id": "c",
+                            "name": request["tools"][0]["function"]["name"],
+                            "arguments": json.dumps({"input": "text(42)"}),
+                        }
+                    ]
+                }
+            }
+
+        async def dispatch_stream_async(self, token, request):
+            yield {"type": "done", **self.dispatch(token, request)}
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    with TestClient(app) as client:
+        for namespace in ("first", "second"):
+            response = client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer synthetic-token"},
+                json={
+                    "stream": stream,
+                    "input": [
+                        {
+                            "type": "additional_tools",
+                            "tools": [
+                                {
+                                    "type": "namespace",
+                                    "name": namespace,
+                                    "tools": [{"type": "custom", "name": "exec"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            assert response.status_code == 200
+            if stream:
+                item = next(
+                    data["item"]
+                    for kind, data in _parse_sse(response.text)
+                    if kind == "response.output_item.done"
+                )
+            else:
+                item = response.json()["output"][0]
+            assert item["type"] == "custom_tool_call"
+            assert item["namespace"] == namespace
+            assert item["input"] == "text(42)"
 
 
 def test_harness_to_agency_unrecognized_content_item_preserved():

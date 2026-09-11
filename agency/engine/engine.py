@@ -236,18 +236,20 @@ class AgentEngine:
                     agconfig=self.agconfig,
                 )
                 self._agtype_cleanup_paths.update(prepared_paths)
-            host_uds_path = manager.start()
+            with agprof.span("agency:services_start"):
+                host_uds_path = manager.start()
             # start harness manager daemon
             engine_name = str(
                 getattr(self._agent, "agname", getattr(self._agent, "harness", "agent"))
             )
-            handle = ensure_harness_daemon(
-                sandbox,
-                host_uds_path,
-                engine_name,
-                self._agent.harness,
-                agconfig=self.agconfig,
-            )
+            with agprof.span("sandbox:ensure_daemon"):
+                handle = ensure_harness_daemon(
+                    sandbox,
+                    host_uds_path,
+                    engine_name,
+                    self._agent.harness,
+                    agconfig=self.agconfig,
+                )
 
             # Sync current pause state to the daemon before this attempt
             # starts -- closes the race where pause() was requested before
@@ -376,7 +378,8 @@ class AgentEngine:
             return result
         finally:
             try:
-                self.close()
+                with agprof.span("agency:services_close"):
+                    self.close()
             finally:
                 if self._agtype_cleanup_paths:
                     sandbox.remove_files(sorted(self._agtype_cleanup_paths))

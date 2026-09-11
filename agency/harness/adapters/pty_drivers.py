@@ -13,6 +13,8 @@ from .pty_session import MAX_SESSION_BYTES, PtyExecution, restore_session, snaps
 
 def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_session_blob, max_steps):
     from ..agharness import cleanup_config_home, materialize_config_home
+    from ...native_harness.bridge_client import BridgeClient
+    from ...native_harness.profiling import NativeProfiler
 
     root = materialize_config_home(runtime.engine_name, runtime.token, runtime.harness_base_url)
     try:
@@ -20,7 +22,19 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
     except BaseException:
         cleanup_config_home(root)
         raise
-    return PtyExecution(driver, runtime).run(prompt)
+    # Reuse the existing span bridge, without enabling native Python's
+    # automatic function sampler inside the external-harness daemon.
+    bridge = BridgeClient(runtime.harness_base_url, runtime.token, timeout_s=1)
+    profiler = NativeProfiler(bridge)
+    try:
+        try:
+            profiler.enabled = bool(bridge.profiler_settings().get("enabled"))
+        except Exception:
+            profiler.enabled = False
+        driver.profile_span = profiler.span
+        return PtyExecution(driver, runtime).run(prompt)
+    finally:
+        bridge.close()
 
 
 class PtyDriver:
@@ -46,6 +60,7 @@ class PtyDriver:
         self._trusted_directory = False
         self._last_prompt = None
         self._last_turn_id = None
+        self._transcript_turn_id = None
         restore_session(root, self.name, session_id, blob)
         (root / "events").mkdir()
         self.env = {
@@ -64,7 +79,12 @@ class PtyDriver:
         }
         self.argv = [adapter.agconfig.harness_adapter.binary_path or self.name]
         if self.name == "codex":
-            adapter._write_codex_config(root, runtime.harness_base_url, runtime.model or "default")
+            adapter._write_codex_config(
+                root,
+                runtime.harness_base_url,
+                runtime.model or "default",
+                has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
+            )
             with (root / "config.toml").open("a") as config:
                 config.write('\n[projects."/workspace"]\ntrust_level = "trusted"\n')
             self.env.update(CODEX_HOME=str(root), AGENCY_PROXY_API_KEY=runtime.token)
@@ -254,6 +274,22 @@ class PtyDriver:
                     self._rollout_offset += len(line)
                     row = json.loads(line)
                     payload = row.get("payload", {})
+                    if self.name == "codex" and row.get("type") == "event_msg":
+                        event_type = payload.get("type")
+                        if event_type in {"task_started", "turn_started"}:
+                            self._transcript_turn_id = payload.get("turn_id")
+                        elif event_type == "error":
+                            # Native errors can omit turn_id; associate only
+                            # with an observed transcript start, never the
+                            # host's current prompt (which may have changed).
+                            pending.append(
+                                {
+                                    "kind": "error",
+                                    "turn_id": payload.get("turn_id") or self._transcript_turn_id,
+                                    "error": "Codex terminal error: "
+                                    + str(payload.get("message", "request failed")),
+                                }
+                            )
                     if row.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
                         pending.append({"kind": "interrupt", "turn_id": payload.get("turn_id")})
                     params = row.get("params", {})

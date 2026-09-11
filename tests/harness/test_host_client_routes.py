@@ -5,6 +5,7 @@ import json
 import threading
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,43 @@ from agency.harness.clients.host_services_client import HostServicesClient
 from agency.harness.interaction_router import build_router as build_interaction_router
 from agency.harness.mcp_proxy import build_router as build_mcp_router
 from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    def handler(request):
+        if streamed:
+            return httpx.Response(
+                200,
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "message": "synthetic",
+                        "status_code": 400,
+                        "transient": False,
+                    }
+                )
+                + "\n",
+            )
+        return httpx.Response(400, json={"error": {"message": "synthetic", "transient": False}})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: transport)
+    bridge = _bridge(handler)
+
+    async def consume():
+        with pytest.raises(HostDispatchError) as caught:
+            async for _ in bridge.dispatch_stream_async("token", {}):
+                pass
+        assert caught.value.status_code == 400
+        assert caught.value.transient is False
+
+    try:
+        asyncio.run(consume())
+    finally:
+        bridge.client.close()
 
 
 def _bridge(handler, token: str = "token"):
