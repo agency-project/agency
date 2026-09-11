@@ -51,7 +51,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
     )
     skill = agskill(
         name="mock-attempt",
-        system_prompt="mock",
+        prompt="mock",
         policy=agpolicy(tool_hooks={"read_file": mock_policy}),
     )
     host_manager = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())

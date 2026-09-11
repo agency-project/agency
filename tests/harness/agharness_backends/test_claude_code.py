@@ -89,7 +89,7 @@ def test_real_claude_raw_text_end_to_end():
     ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="two_word_greeting_test",
-        system_prompt="Respond with exactly the two words requested, nothing else.",
+        prompt="Respond with exactly the two words requested, nothing else.",
     )
     result = ag.run(skill, agdata(instruction="Say hi in exactly two words."))
     result.wait()
@@ -123,7 +123,7 @@ def test_real_claude_tool_call_history_is_not_flattened():
     ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="claude_tool_history_test",
-        system_prompt=(
+        prompt=(
             "You have a bash tool. Use it to run the exact command the user "
             "gives you, then report its output back in one short sentence."
         ),
@@ -157,7 +157,7 @@ def test_real_claude_structured_output_end_to_end():
     ag = agent(agconfig=cfg, harness="claude_code")
     skill = agskill(
         name="structured_greeting_test",
-        system_prompt="You produce a structured greeting.",
+        prompt="You produce a structured greeting.",
         output_schema=agdata(greeting=str, word_count=int),
     )
     result = ag.run(
@@ -186,7 +186,7 @@ def test_real_claude_history_continues_across_a_fresh_sandbox():
         sandboxconfig(backend="docker"),
         llmconfig(provider="bedrock", model="us.anthropic.claude-sonnet-5"),
     )
-    skill = agskill(name="continuity_test_skill", system_prompt="You are a test assistant.")
+    skill = agskill(name="continuity_test_skill", prompt="You are a test assistant.")
 
     from agency.sandbox.agsandbox import agSandbox
     import uuid

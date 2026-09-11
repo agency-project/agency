@@ -107,7 +107,9 @@ class agllm:
     def for_config(agconfig: "agconfig_cls") -> "agllm":
         from .bedrock import (
             _is_anthropic_bedrock_model,
+            _needs_bedrock_converse,
             _AnthropicBedrockBackend,
+            _BedrockConverseBackend,
             _OpenAICompatibleBedrockBackend,
             _AnthropicAWSBackend,
         )
@@ -123,6 +125,8 @@ class agllm:
         if provider == "bedrock":
             if _is_anthropic_bedrock_model(model):
                 return _AnthropicBedrockBackend(agconfig)
+            if _needs_bedrock_converse(model):
+                return _BedrockConverseBackend(agconfig)
             return _OpenAICompatibleBedrockBackend(agconfig)
         if provider in ("anthropicAWS", "anthropic_aws"):
             return _AnthropicAWSBackend(agconfig)

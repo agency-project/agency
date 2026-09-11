@@ -107,8 +107,10 @@ def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> 
         return agerror(err)
     submitted_output_store[field] = value
     required = set(output_schema._data.keys())
-    still_missing = sorted(required - set(submitted_output_store.keys()))
-    return agdata(result=f"field {field!r} recorded", still_missing=still_missing)
+    missing_output_fields = sorted(required - set(submitted_output_store.keys()))
+    if missing_output_fields == []:
+        missing_output_fields = None
+    return agdata(result=f"field {field!r} recorded", missing_output_fields=missing_output_fields)
 
 
 def _submitted_output(arg: agdata, submitted_output_store: dict) -> agdata:
@@ -215,7 +217,7 @@ class agskill:
     def __init__(
         self,
         name: str,
-        system_prompt: str,
+        prompt: str,
         add_host_mcp_tools: "list[agtool] | None" = None,
         add_sandbox_mcp_tools: "list[agtool] | None" = None,
         input_schema: agdata | None = None,
@@ -224,7 +226,7 @@ class agskill:
         policy: "agpolicy | None" = None,
     ):
         self.name = name
-        self.system_prompt = system_prompt
+        self.prompt = prompt
         self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
@@ -236,8 +238,8 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, extra: str | None = None) -> str:
-        parts = [self.system_prompt]  # [REFACTOR] Maybe rename into skill_prompt?
+    def _build_prompt(self, extra: str | None = None) -> str:
+        parts = [self.prompt]  # [REFACTOR] Maybe rename into skill_prompt?
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
         # lines describing how the LLM should handle that field (e.g. file paths,

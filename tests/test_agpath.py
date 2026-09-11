@@ -122,37 +122,37 @@ def test_check_schema_agpath_hint_rejects_non_string():
 
 
 # ---------------------------------------------------------------------------
-# agskill._build_system_prompt — agpath prompts injected
+# agskill._build_prompt — agpath prompts injected
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_includes_agpath_input_instructions():
+def test_prompt_includes_agpath_input_instructions():
     sk = agskill(
         "move",
         "Do stuff.",
         input_schema=agdata(dest=agpath),
         output_schema=agdata(result=str),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "dest" in prompt
     assert "path" in prompt.lower()
 
 
-def test_system_prompt_includes_agpath_output_instructions():
+def test_prompt_includes_agpath_output_instructions():
     sk = agskill(
         "move",
         "Do stuff.",
         input_schema=agdata(theme=str),
         output_schema=agdata(moved_to=agpath),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "moved_to" in prompt
     assert "content" in prompt.lower()
 
 
-def test_system_prompt_agpath_type_shown_as_path():
+def test_prompt_agpath_type_shown_as_path():
     sk = agskill("t", "", input_schema=agdata(dest=agpath))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"dest": "path"' in prompt
 
 

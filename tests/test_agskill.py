@@ -122,7 +122,7 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
 def make_skill(name="summarise", add_host_mcp_tools=None) -> agskill:
     return agskill(
         name=name,
-        system_prompt="You are a summarisation assistant.",
+        prompt="You are a summarisation assistant.",
         add_host_mcp_tools=add_host_mcp_tools,
     )
 
@@ -162,7 +162,7 @@ def test_check_schema_type_mismatch_with_type_object():
     assert "int" in errors[0]
 
 
-def test_system_prompt_type_names_shown_correctly():
+def test_prompt_type_names_shown_correctly():
     from agency.agtype import agfile
 
     sk = agskill(
@@ -171,7 +171,7 @@ def test_system_prompt_type_names_shown_correctly():
         input_schema=agdata(n=int, s=str, doc=agfile),
         output_schema=agdata(result=float),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"n": "int"' in prompt  # input schema still uses to_json()
     assert '"s": "str"' in prompt
     assert '"doc": "file"' in prompt
@@ -209,7 +209,7 @@ def test_input_schema_missing_field_returns_error():
     # Input schema validation is engine-agnostic, so it needs no live harness.
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(question=str, context=str),
     )
     error = s.input_schema.validate_input(agdata(question="hi"))
@@ -220,7 +220,7 @@ def test_input_schema_missing_field_returns_error():
 def test_input_schema_type_error_returns_error():
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(count=int),
     )
     error = s.input_schema.validate_input(agdata(count="not-an-int"))
@@ -231,7 +231,7 @@ def test_input_schema_type_error_returns_error():
 def test_input_schema_valid_proceeds():
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(text=str),
     )
     assert s.input_schema.validate_input(agdata(text="hello")) is None
@@ -241,7 +241,7 @@ def test_input_schema_description_value_only_checks_presence():
     """Non-type-name values (descriptions) only trigger a missing-key error."""
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(query="the search query"),
     )
     assert s.input_schema.validate_input(agdata(query=42)) is None  # 42 is not type-checked
@@ -263,14 +263,14 @@ def test_input_schema_description_value_only_checks_presence():
 # test_native.py's TestNativeBackendRealEndToEnd).
 
 
-def test_schemas_appended_to_system_prompt():
+def test_schemas_appended_to_prompt():
     s = agskill(
         name="s",
-        system_prompt="Be helpful.",
+        prompt="Be helpful.",
         input_schema=agdata(text=str),
         output_schema=agdata(summary=str),
     )
-    prompt = s._build_system_prompt()
+    prompt = s._build_prompt()
     assert "Be helpful." in prompt
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
@@ -279,9 +279,9 @@ def test_schemas_appended_to_system_prompt():
     assert "string" in prompt  # per-field description for str output
 
 
-def test_no_schemas_system_prompt_unchanged():
-    s = agskill(name="s", system_prompt="Be helpful.")
-    assert s._build_system_prompt() == "Be helpful."
+def test_no_schemas_prompt_unchanged():
+    s = agskill(name="s", prompt="Be helpful.")
+    assert s._build_prompt() == "Be helpful."
 
 
 # test_return_output_* / test_return_tool_* (all fields correct, type
@@ -768,7 +768,7 @@ def test_random_schema_prompt_examples_parseable():
 def test_host_mcp_tools_defaults_to_the_default_set():
     from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
 
-    s = agskill(name="s", system_prompt="")
+    s = agskill(name="s", prompt="")
     assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS]
 
 
@@ -776,27 +776,27 @@ def test_add_host_mcp_tools_extends_the_defaults():
     from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
 
     extra = agtool(name="extra", description="d", fn=_noop)
-    s = agskill(name="s", system_prompt="", add_host_mcp_tools=[extra])
+    s = agskill(name="s", prompt="", add_host_mcp_tools=[extra])
     assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS] + [
         "extra"
     ]
 
 
 def test_sandbox_mcp_tools_defaults_to_empty():
-    s = agskill(name="s", system_prompt="")
+    s = agskill(name="s", prompt="")
     assert s.sandbox_mcp_tools == []
 
 
 def test_add_sandbox_mcp_tools_populates_sandbox_mcp_tools():
     sbx_tool = agtool(name="sbx", description="d", fn=_noop)
-    s = agskill(name="s", system_prompt="", add_sandbox_mcp_tools=[sbx_tool])
+    s = agskill(name="s", prompt="", add_sandbox_mcp_tools=[sbx_tool])
     assert [t.name for t in s.sandbox_mcp_tools] == ["sbx"]
 
 
 def test_policy_defaults_to_a_fresh_agpolicy():
     from agency.agpolicy import agpolicy
 
-    s = agskill(name="s", system_prompt="")
+    s = agskill(name="s", prompt="")
     assert isinstance(s.policy, agpolicy)
     assert s.policy.tool_hooks is None
     assert s.policy.default_to_deny is False
@@ -806,5 +806,5 @@ def test_policy_stored_verbatim_when_supplied():
     from agency.agpolicy import agpolicy
 
     policy = agpolicy(default_to_deny=True)
-    s = agskill(name="s", system_prompt="", policy=policy)
+    s = agskill(name="s", prompt="", policy=policy)
     assert s.policy is policy

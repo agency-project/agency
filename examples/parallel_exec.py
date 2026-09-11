@@ -16,52 +16,38 @@ Run:
 
 import os
 import time
-from pathlib import Path
 
 from agency import agent, agdata, agskill, agteam
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.agtype import agpath
 
-# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+# See ../README.md for Anthropic or Bedrock agconfig examples.
 cfg = agconfig(
     llmconfig(
-        provider="vllm",
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
+        provider="OpenAI_Compatible",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["LLM_API_KEY"],
     )
 )
 
 
 continuation_skill = agskill(
     name="continuation",
-    system_prompt="Continue the given text in one sentence.",
+    prompt="Continue the given text in one sentence.",
     input_schema=agdata(text=str),
     output_schema=agdata(continuation=str),
 )
 
 writer_skill = agskill(
     name="writer",
-    system_prompt=(
+    prompt=(
         "Write the given content to the given file path using the write tool. "
         "The path is inside the sandbox container."
     ),
     input_schema=agdata(file_path=agpath, content=str),
-    output_schema=agdata(path=agpath, status=str),
+    output_schema=agdata(path=agpath),
 )
-
-
-def _make_run_dir(name: str) -> Path:
-    from datetime import datetime
-
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
-
 
 # ---------------------------------------------------------------------------
 # Team 1: sequential chain
@@ -83,15 +69,10 @@ class SequentialChainTeam(agteam):
         print("=" * 60)
 
         t0 = time.perf_counter()
-        r1 = self.agent.run(
-            self.writer, agdata(file_path="/workspace/out.txt", content="first write")
-        )
-        r2 = self.agent.run(
-            self.writer, agdata(file_path="/workspace/out.txt", content="second write")
-        )
+        self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="first write"))
+        self.agent.run(self.writer, agdata(file_path="/workspace/out.txt", content="second write"))
         elapsed = time.perf_counter() - t0
 
-        print(f"  r1 status={r1.status!r}  r2 status={r2.status!r}")
         print(
             f"  total history: {len(self.agent.history.messages)} messages  elapsed {elapsed:.2f}s"
         )
@@ -146,12 +127,7 @@ class ForkFanoutTeam(agteam):
 if __name__ == "__main__":
     from agency import AgError, agsync
 
-    run_dir = _make_run_dir("parallel_exec")
-    agent.log_dir = run_dir / "logs"
-    agent.output_dir = run_dir / "agent_output"
-
     def _script() -> None:
-        print(f"Run dir  : {run_dir}\n")
         try:
             seq_team = SequentialChainTeam()
             seq_team.run()

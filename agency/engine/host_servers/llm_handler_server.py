@@ -46,8 +46,27 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
 
 
 def _payload_hash(payload: dict) -> str:
-    """Content identity for one {role, **block} transcript payload"""
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    """Content identity for one {role, **block} transcript payload.
+
+    A tool_use/tool_result block is immutable once emitted -- its id/
+    tool_call_id never changes -- but the exact same call gets
+    re-serialized in a different (reduced) shape the moment it's replayed
+    back into a later request through a harness's own wire protocol (e.g.
+    native_harness's OpenAI-chatcompletions tool_calls array only carries
+    id/name/arguments, dropping fields the original backend-native block
+    carried like text/signature/data/citations/ts_start/ts_end, and often
+    renumbering `index`). Hashing the whole payload would treat that
+    reduced replay as new content and double-log every tool call/result,
+    so key on the block's own stable identity instead when it has one."""
+    role = payload.get("role")
+    block_type = payload.get("type")
+    if block_type == "tool_use" and payload.get("id"):
+        identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
+    elif block_type == "tool_result" and payload.get("tool_call_id"):
+        identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
+    else:
+        identity = payload
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":

@@ -27,7 +27,7 @@ class _EchoTeam(agteam):
     agconfig = _llm_agconfig(_ECHO_LLM)
 
     def setup(self):
-        self.skill = agskill(name="echo", system_prompt="Echo.")
+        self.skill = agskill(name="echo", prompt="Echo.")
         from agency.agent import agent
 
         self.agent = agent()

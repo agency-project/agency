@@ -161,7 +161,7 @@ def make_agent() -> agent:
 def test_run_returns_pending_bare_agdata():
     """run() is non-blocking and returns a bare, pending agdata directly --
     no wrapper object."""
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
@@ -181,7 +181,7 @@ def test_run_calls_named_agskill():
         called.append(inp.to_dict())
         return agdata(done=True), prev_ctx, []
 
-    skill = agskill(name="dowork", system_prompt="")
+    skill = agskill(name="dowork", prompt="")
     skill._test_execute = fake_execute_react
 
     ag = make_agent()
@@ -221,7 +221,7 @@ def test_scheduled_run_creates_sandbox_facade_with_output_mount(monkeypatch, tmp
         created.append((agname, agconfig))
         return facade
 
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
@@ -286,7 +286,7 @@ def test_run_dispatches_to_agent_engine(harness_name, monkeypatch):
             calls.append(kwargs)
             return agdata(done=True)
 
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}), harness=harness_name)
     assert ag.engine is None
     sandbox = MagicMock()
@@ -308,7 +308,7 @@ def test_run_dispatches_to_agent_engine(harness_name, monkeypatch):
 
 @pytest.mark.parametrize("max_steps", [0, -1, 1.5, "2", True, False])
 def test_run_rejects_invalid_max_steps(max_steps):
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
     ag = agent(agconfig=_llm_agconfig({"api_key": "k", "model": ""}))
 
     with pytest.raises(ValueError, match="max_steps must be a positive integer or None"):
@@ -321,7 +321,7 @@ def test_run_rejects_invalid_max_steps(max_steps):
 
 
 def test_history_updated_after_run():
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         new_msgs = list(prev_ctx.recent_transcript) + [
@@ -414,7 +414,7 @@ def test_skill_add_host_mcp_tools_used_in_run():
 
 
 def test_run_returns_direct_answer_from_engine():
-    skill = agskill(name="qa", system_prompt="Answer questions.")
+    skill = agskill(name="qa", prompt="Answer questions.")
     skill._test_execute = lambda ag, context, inp, max_steps=None: (
         agdata(result='{"answer": "Paris"}'),
         context,
@@ -804,7 +804,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
-    skill_write = agskill(name="write", system_prompt="")
+    skill_write = agskill(name="write", prompt="")
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         new_ctx = agcontext(recent_transcript=[{"role": "assistant", "content": "42"}])
@@ -946,7 +946,7 @@ def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
-    skill_write = agskill(name="write", system_prompt="")
+    skill_write = agskill(name="write", prompt="")
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
@@ -991,7 +991,7 @@ def test_save_all_and_load_all(tmp_path, monkeypatch):
 
     saved_names = set()
 
-    skill_write = agskill(name="write", system_prompt="")
+    skill_write = agskill(name="write", prompt="")
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
@@ -1034,7 +1034,7 @@ def test_load_all_skips_already_live_agent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(ok=True), prev_ctx, []
@@ -1079,7 +1079,7 @@ def test_load_raises_if_agname_already_live(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _make_ckpt_subprocess_mock(_sp.run))
 
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(done=True), prev_ctx, []
@@ -1158,7 +1158,7 @@ def _recorded_event_types(ag) -> list:
 
 def test_skill_error_recorded_when_skill_returns_error():
     """skill_error is recorded when the skill returns agerror(...)."""
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agerror("something went wrong"), prev_ctx, []
@@ -1172,7 +1172,7 @@ def test_skill_error_recorded_when_skill_returns_error():
 
 def test_skill_success_recorded_on_success():
     """skill_success is recorded when the skill returns without error."""
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         return agdata(answer="ok"), prev_ctx, []
@@ -1186,7 +1186,7 @@ def test_skill_success_recorded_on_success():
 
 def test_skill_error_recorded_on_skill_exception():
     """skill_error is recorded when the skill raises an unexpected exception."""
-    skill = agskill(name="s", system_prompt="")
+    skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
         raise RuntimeError("unexpected crash")

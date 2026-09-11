@@ -82,7 +82,7 @@ def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, outp
     resource_pool = resource_pool if resource_pool is not None else SimpleNamespace()
     skill = agskill(
         name="s",
-        system_prompt="p",
+        prompt="p",
         add_host_mcp_tools=add_host_mcp_tools,
         output_schema=output_schema,
     )
@@ -201,7 +201,7 @@ def test_call_tool_does_not_check_policy_itself():
 
     skill = agskill(
         name="s",
-        system_prompt="p",
+        prompt="p",
         add_host_mcp_tools=[tool],
         policy=agpolicy(default_to_deny=True),
     )

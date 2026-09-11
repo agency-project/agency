@@ -131,7 +131,7 @@ lifecycle_gate = agtool(
 
 
 def _config(model: str) -> agconfig_cls:
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ["OPENAI_API_KEY"]
     if not api_key:
         raise SystemExit("OPENAI_API_KEY is required")
     return agconfig_cls(
@@ -140,7 +140,7 @@ def _config(model: str) -> agconfig_cls:
             model=model,
             api_key=api_key,
             max_completion_tokens=2048,
-            reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "none"),
+            reasoning_effort="none",
         )
     )
 
@@ -148,7 +148,7 @@ def _config(model: str) -> agconfig_cls:
 def _skills() -> tuple[agskill, agskill, agskill]:
     controlled = agskill(
         name="lifecycle_controlled",
-        system_prompt=(
+        prompt=(
             "This is a deterministic API conformance task. You MUST call "
             "lifecycle_gate exactly once with the input label before answering. "
             "Do not call any other tool. Wait for the tool result, then respond "
@@ -161,7 +161,7 @@ def _skills() -> tuple[agskill, agskill, agskill]:
     )
     echo = agskill(
         name="lifecycle_echo",
-        system_prompt=(
+        prompt=(
             "Return the input text verbatim. Output only that text, with no quotes, "
             "Markdown, prefix, suffix, or explanation."
         ),
@@ -170,7 +170,7 @@ def _skills() -> tuple[agskill, agskill, agskill]:
     )
     recall = agskill(
         name="lifecycle_recall",
-        system_prompt=(
+        prompt=(
             "Find the most recent earlier standalone user message beginning with "
             "PUBLIC_API_MEMORY:. Return only the text after that prefix, stripped "
             "of surrounding whitespace. Do not return the prefix or explain."

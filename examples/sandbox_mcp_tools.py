@@ -14,19 +14,19 @@ def double(arg):
     return agdata(result=arg.number * 2)
 
 
+# See ../README.md for Anthropic or Bedrock agconfig examples.
 cfg = agconfig(
     llmconfig(
-        provider="openai",
-        model="gpt-5.6-luna",
-        api_key=os.environ.get("OPENAI_API_KEY", ""),
-        reasoning_effort="none",
-        max_completion_tokens=1024,
+        provider="OpenAI_Compatible",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["LLM_API_KEY"],
     )
 )
 
 skill = agskill(
     name="sandbox_tool",
-    system_prompt="Call double exactly once, then return its result.",
+    prompt="Call double exactly once, then return its result.",
     add_sandbox_mcp_tools=[
         agtool(
             "double",
@@ -45,6 +45,6 @@ skill = agskill(
 
 
 if __name__ == "__main__":
-    invocation = agent(agconfig=cfg, harness="claude_code").run(skill, agdata(number=21))
+    invocation = agent(agconfig=cfg).run(skill, agdata(number=21))
     invocation.wait()
     print(invocation.result)

@@ -38,16 +38,13 @@ from agency.agtype import agpath
 # LLM config
 # ---------------------------------------------------------------------------
 
-# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
+# See ../README.md for Anthropic or Bedrock agconfig examples.
 cfg = agconfig(
     llmconfig(
-        provider="vllm",
-        base_url=os.environ.get("LLM_BASE_URL"),
-        model=os.environ.get("LLM_MODEL", ""),
-        api_key=os.environ.get("LLM_API_KEY", ""),
-        temperature=0.7,
-        top_p=0.95,
-        top_k=20,
+        provider="OpenAI_Compatible",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["LLM_API_KEY"],
     )
 )
 FILE_PATH = "/workspace/hello.py"
@@ -58,24 +55,24 @@ FILE_PATH = "/workspace/hello.py"
 
 write_skill = agskill(
     name="write_python",
-    system_prompt=(
+    prompt=(
         "You are a code writing assistant. "
         "Use the write tool to create the requested Python file at the given path."
     ),
     input_schema=agdata(task=str, file_path=agpath),
-    output_schema=agdata(status=str, path=agpath),
+    output_schema=agdata(path=agpath),
 )
 
 fix_skill = agskill(
     name="fix_bug",
-    system_prompt=(
+    prompt=(
         "You are a debugging assistant. "
         "Read the file at the given path, identify the syntax error, fix it using "
         "the write tool, then verify your fix by running the file with bash. "
         "Report the corrected output."
     ),
     input_schema=agdata(task=str, file_path=agpath),
-    output_schema=agdata(status=str, output=str),
+    output_schema=agdata(output=str),
 )
 
 # ---------------------------------------------------------------------------
@@ -116,7 +113,6 @@ def main() -> None:
         ),
     )
     # Resolving the pending result also ensures the skill (and sandbox setup) has finished.
-    print(f"  agent_a status : {result_a.status!r}")
     print(f"  agent_a path   : {result_a.path!r}")
 
     # ── Step 2: harness gets the sandbox and runs the file ───────────────────
@@ -164,7 +160,6 @@ def main() -> None:
             file_path=FILE_PATH,
         ),
     )
-    print(f"  agent_b status : {result_b.status!r}")
     print(f"  agent_b output : {result_b.output!r}")
 
     # ── Step 5: harness runs the fixed file ──────────────────────────────────

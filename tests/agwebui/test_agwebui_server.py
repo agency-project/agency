@@ -754,11 +754,6 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     agent_logger.record_event(
         "agent_config", {"agskill": {"react_max_steps": 7}}, update_latest_snapshot=True
     )
-    agent_logger.record_event(
-        "live_messages",
-        {"messages": [{"role": "assistant", "content": "finished"}]},
-        update_latest_snapshot=True,
-    )
     # One exchange's worth of llm_block rows -- one row per block, matching
     # record_final_transcript()'s real behavior, with the metadata block carrying
     # the token counts and a sibling text block that must be ignored.
@@ -783,13 +778,11 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     assert response.status_code == 200
     detail = response.json()
     assert detail["config"]["agskill"]["react_max_steps"] == 7
-    # The two llm_block rows land after live_messages was recorded, so they
-    # get reconstructed and appended as in-progress content (see
-    # _reconstruct_in_progress_messages) -- both rows share call_label=None
-    # and default to role="assistant", so they group into one message; the
-    # metadata block is kept (only filtered client-side, behind Full Logs).
+    # The two llm_block rows share call_label=None and default to
+    # role="assistant", so they get reconstructed and grouped into one
+    # message (see _reconstruct_in_progress_messages) -- the metadata block
+    # is kept (only filtered client-side, behind Full Logs).
     assert _strip_ts(detail["messages"]) == [
-        {"role": "assistant", "content": "finished"},
         {
             "role": "assistant",
             "blocks": [
@@ -830,13 +823,24 @@ def test_agent_detail_endpoint_sums_tokens_across_multiple_exchanges(server):
     assert detail["tokens"] == {"input": 13, "output": 6}
 
 
-def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_messages(server):
+def test_agent_detail_endpoint_ignores_orchestrator_skill_call_and_live_messages_events(server):
+    """live_messages/skill_call (orchestrator._record_execution_results) are
+    not the canonical transcript source -- agcontext's own transcript has no
+    per-message clock, so every message in one of those snapshots would get
+    stamped with a single blanket skill-finish timestamp. Only
+    llm_block/tool_result rows (record_final_transcript(), each with its own
+    real timestamp) should ever surface in messages."""
     client, run_dir, _srv = server
 
     agent_path = run_dir / "NoSnapshot_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
     agent_logger.record_event(
         "skill_call", {"skill": "run", "history_after": [{"role": "user", "content": "hi"}]}
+    )
+    agent_logger.record_event(
+        "live_messages",
+        {"messages": [{"role": "assistant", "content": "finished"}]},
+        update_latest_snapshot=True,
     )
     agent_logger.stop()
 
@@ -851,12 +855,12 @@ def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_mes
     global_logger.stop()
 
     detail = client.get("/api/agents/NoSnapshot").json()
-    assert _strip_ts(detail["messages"]) == [{"role": "user", "content": "hi"}]
+    assert detail["messages"] == []
 
 
 # ---------------------------------------------------------------------------
-# In-progress transcript reconstruction (live during skill execution --
-# live_messages only updates once, when the skill call finishes)
+# Transcript reconstruction from llm_block/tool_result events (the
+# canonical source -- see _compute_agent_messages)
 # ---------------------------------------------------------------------------
 
 
@@ -923,62 +927,53 @@ def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
     ]
 
 
-def test_reconstruct_in_progress_messages_tool_result_starts_new_assistant_turn():
+def test_reconstruct_in_progress_messages_llm_block_tool_result_starts_new_message():
+    """A tool_result is logged as an llm_block row with role='tool' (see
+    llm_handler_server._new_transcript_payloads()) -- typically under the
+    *same* call_label as the next assistant turn it precedes (both get
+    logged together once that next exchange finalizes), so it's the
+    (call_label, role) key -- not call_label alone -- that must split them
+    into separate messages. (host_interaction_server's own separate
+    `tool_result` *event* is deliberately not read here at all -- see
+    _compute_agent_messages -- since it's a second, differently-formatted
+    record of the same result that only produced duplicate messages.)"""
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
-        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "write"}), 100.0),
         (
-            "tool_result",
-            None,
-            json.dumps({"tool": "write", "arguments": {}, "result": {"ok": True}}),
+            "llm_block",
+            "call_1",
+            json.dumps({"role": "assistant", "type": "tool_use", "name": "write"}),
+            100.0,
+        ),
+        (
+            "llm_block",
+            "call_2",
+            json.dumps({"role": "tool", "type": "tool_result", "tool_call_id": "t1", "text": "ok"}),
             101.0,
         ),
-        ("llm_block", "call_2", json.dumps({"type": "text", "text": "done"}), 102.0),
+        (
+            "llm_block",
+            "call_2",
+            json.dumps({"role": "assistant", "type": "text", "text": "done"}),
+            102.0,
+        ),
     ]
     messages = _reconstruct_in_progress_messages(rows)
     assert messages == [
-        {
-            "role": "assistant",
-            "blocks": [{"type": "tool_use", "name": "write"}],
-            "ts": 100.0,
-        },
+        {"role": "assistant", "blocks": [{"type": "tool_use", "name": "write"}], "ts": 100.0},
         {
             "role": "tool",
-            "blocks": [{"type": "tool_result", "text": json.dumps({"ok": True})}],
+            "blocks": [{"type": "tool_result", "tool_call_id": "t1", "text": "ok"}],
             "ts": 101.0,
         },
         {"role": "assistant", "blocks": [{"type": "text", "text": "done"}], "ts": 102.0},
     ]
 
 
-def test_reconstruct_in_progress_messages_same_call_label_after_tool_result_starts_fresh():
-    """A harness could in principle reuse call_label values across separate
-    exchanges -- a tool_result between them must still split them into two
-    assistant messages, not merge the second exchange's blocks into the
-    first's."""
-    from agency.observability.agwebui.server import _reconstruct_in_progress_messages
-
-    rows = [
-        ("llm_block", "call_1", json.dumps({"type": "tool_use", "name": "a"}), 100.0),
-        ("tool_result", None, json.dumps({"tool": "a", "arguments": {}, "result": 1}), 101.0),
-        ("llm_block", "call_1", json.dumps({"type": "text", "text": "again"}), 102.0),
-    ]
-    messages = _reconstruct_in_progress_messages(rows)
-    assert len(messages) == 3
-    assert messages[0]["role"] == "assistant"
-    assert messages[1]["role"] == "tool"
-    assert messages[2] == {
-        "role": "assistant",
-        "blocks": [{"type": "text", "text": "again"}],
-        "ts": 102.0,
-    }
-
-
-def test_agent_detail_reconstructs_in_progress_content_with_no_live_messages_yet(server):
-    """The very first skill call is still running -- no live_messages
-    snapshot exists at all yet, so messages must come entirely from
-    reconstruction."""
+def test_agent_detail_reconstructs_in_progress_content_from_llm_block_events(server):
+    """The very first skill call is still running -- messages must come
+    entirely from llm_block reconstruction."""
     client, run_dir, _srv = server
 
     agent_path = run_dir / "InProgress_data.sqlite3"

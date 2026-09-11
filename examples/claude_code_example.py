@@ -30,52 +30,25 @@ OpenAI-compatible API example::
 """
 
 import os
-from pathlib import Path
 from agency import agent, agskill, agdata
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.agtype import agpath
 
-# See ../README.md for OpenAI, Anthropic, or Bedrock agconfig examples.
-if os.environ.get("LLM_BASE_URL"):
-    cfg = agconfig(
-        llmconfig(
-            provider="vllm",
-            base_url=os.environ["LLM_BASE_URL"],
-            model=os.environ.get("LLM_MODEL", ""),
-            api_key=os.environ.get("LLM_API_KEY", ""),
-            temperature=0.7,
-            top_p=0.95,
-            top_k=20,
-        )
+# See ../README.md for Anthropic or Bedrock agconfig examples.
+cfg = agconfig(
+    llmconfig(
+        provider="OpenAI_Compatible",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["LLM_API_KEY"],
     )
-else:
-    # Falls back to Bedrock (picks up IAM/AWS_BEARER_TOKEN_BEDROCK from the
-    # environment) when no vLLM endpoint is configured.
-    cfg = agconfig(
-        llmconfig(
-            provider="bedrock", model=os.environ.get("LLM_MODEL", "us.anthropic.claude-sonnet-5")
-        )
-    )
-
-
-def _make_run_dir(name: str):
-    from datetime import datetime
-
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = Path(__file__).parent.parent / "runs" / f"{ts}_{name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+)
 
 
 def main():
-    run_dir = _make_run_dir("claude_code_example")
-    agent.log_dir = run_dir / "logs"
-    agent.output_dir = run_dir / "agent_output"
-    print(f"Run dir  : {run_dir}\n")
-
     file_skill = agskill(
         name="file_manager",
-        system_prompt=(
+        prompt=(
             "You are a file management assistant. "
             "Use the write and read tools to complete the task. "
             "Always confirm what you wrote by reading the file back. "
@@ -86,7 +59,6 @@ def main():
             file_path=agpath,  # datatype for passing path in the sandbox
         ),
         output_schema=agdata(
-            status=str,
             path=agpath,  # datatype for passing path in the sandbox
             content=str,
         ),
@@ -94,7 +66,7 @@ def main():
 
     qa_skill = agskill(
         name="qa",
-        system_prompt=(
+        prompt=(
             "Answer the user's question directly and concisely. "
             "You have access to prior conversation context."
         ),
@@ -114,7 +86,6 @@ def main():
             file_path="/workspace/note.txt",
         ),
     )
-    print(f"   status  : {r1.status!r}")
     print(f"   path    : {r1.path!r}")
     print(f"   content : {r1.content!r}")
     print()

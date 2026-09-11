@@ -69,12 +69,12 @@ def _config_for(spec: ModelSpec) -> agconfig_cls:
 def _probe_skill() -> agskill:
     return agskill(
         name="native_model_compatibility",
-        system_prompt=(
+        prompt=(
             "Use the bash tool exactly once to run the command supplied by the user. "
             "Then submit structured output. Do not infer or fabricate command output."
         ),
         input_schema=agdata(command=str),
-        output_schema=agdata(status=str, proof=str),
+        output_schema=agdata(proof=str),
     )
 
 
@@ -114,9 +114,9 @@ def _run_one(spec: ModelSpec, run_root: Path) -> tuple[bool, str]:
         ).to_dict()
         if "error" in result:
             return False, str(result["error"])
-        ok = bool(result.get("status")) and result.get("proof") == PROBE_TEXT
+        ok = result.get("proof") == PROBE_TEXT
         if ok:
-            return True, f"status={result['status']!r}, proof={result['proof']!r}"
+            return True, f"proof={result['proof']!r}"
         return False, f"unexpected structured output: {result!r}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"

@@ -23,7 +23,7 @@ class agtype:
 
         skill = agskill(
             name="write",
-            system_prompt="...",
+            prompt="...",
             input_schema=agdata(theme=str, background=agfile),
             output_schema=agdata(report=agfile),
         )
@@ -240,7 +240,7 @@ class agfile(agtype):
 
         design_skill = agskill(
             name="design",
-            system_prompt="Create a story design document.",
+            prompt="Create a story design document.",
             input_schema=agdata(theme=str),
             output_schema=agdata(design_doc=agfile),
         )
@@ -391,7 +391,7 @@ class agpath(agtype):
 
         move_skill = agskill(
             name="move_file",
-            system_prompt="Move the file to the given destination.",
+            prompt="Move the file to the given destination.",
             input_schema=agdata(src=agpath, dest=agpath),
             output_schema=agdata(moved_to=agpath),
         )
@@ -461,7 +461,7 @@ class agimage(agtype):
 
         skill = agskill(
             name="describe",
-            system_prompt="Describe the image.",
+            prompt="Describe the image.",
             input_schema=agdata(question=str, photo=agimage),
         )
 
@@ -469,7 +469,7 @@ class agimage(agtype):
 
         skill = agskill(
             name="compare",
-            system_prompt="Compare the images.",
+            prompt="Compare the images.",
             input_schema=agdata(question=str, frames=list[agimage]),
         )
     """
@@ -549,7 +549,7 @@ class agbinary(agtype):
 
         process_skill = agskill(
             name="process_audio",
-            system_prompt="Trim the audio to the first 10 seconds using ffmpeg.",
+            prompt="Trim the audio to the first 10 seconds using ffmpeg.",
             input_schema=agdata(audio=agbinary),
             output_schema=agdata(trimmed=agbinary),
         )
@@ -715,7 +715,7 @@ class agrawstring(agtype):
 
         write_skill = agskill(
             name="write_chapter",
-            system_prompt="You are a novelist. Write the chapter as requested.",
+            prompt="You are a novelist. Write the chapter as requested.",
             input_schema=agdata(prompt=agrawstring),
             output_schema=agdata(chapter=agrawstring),
         )

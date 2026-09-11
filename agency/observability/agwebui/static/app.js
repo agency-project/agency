@@ -9,13 +9,8 @@ const state = {
   agents:      new Map(),  // agname -> { color, state, skill, tool }
   teams:       new Map(),  // team_name -> Set<agname>
   histories:   new Map(),  // agname -> msg[]
-  // agname -> {cursor, html}[] -- tool/llm/syscall event lines, interleaved
-  // into the transcript at render time (see renderHistory()). `cursor` is
-  // how many transcript messages that agent had at the moment this line
-  // arrived, i.e. "render this right after message #cursor-1" -- there is
-  // no true event timestamp on transcript messages to sort against, but
-  // this lines a call up right where it actually happened: after the
-  // assistant's tool_use message, before the tool's result message lands.
+  // agname -> {ts, html}[] -- tool/llm/syscall event lines, interleaved into
+  // the transcript at render time by real timestamp (see renderHistory()).
   systemLogs:  new Map(),
   fullLogsEnabled: false,
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
@@ -415,11 +410,18 @@ function appendAgentLog(termMessage, color, ts) {
 // seen so far for the currently selected agent.
 // ---------------------------------------------------------------------------
 
+// 'tool_result'/'running_tool' are deliberately excluded here -- every
+// *allowed* tool call already renders from the canonical transcript
+// (llm_block's tool_use/tool_result, in renderHistory() below), ungated by
+// the Full Logs checkbox, styled the same "TOOL name ▶/✓" way. Including
+// them here too just double-rendered the same call. 'tool_denied' stays,
+// since a denied call never runs and so has no transcript tool_result to
+// show it any other way.
 const SYSTEM_LOG_TYPES = new Set([
-  'tool_result', 'syscall_result', 'llm_stream_error', 'llm_stream_cancelled',
+  'syscall_result', 'llm_stream_error', 'llm_stream_cancelled',
 ]);
 const SYSTEM_LOG_AGENT_STATES = new Set([
-  'running_tool', 'tool_denied', 'running_syscall', 'syscall_denied',
+  'tool_denied', 'running_syscall', 'syscall_denied',
 ]);
 const SYSTEM_LOG_CAP = 2000;
 
@@ -468,10 +470,9 @@ function formatSyslogLine(termMessage, ts) {
 
 function recordSystemLog(agname, termMessage, ts) {
   const html = formatSyslogLine(termMessage, ts);
-  const cursor = (state.histories.get(agname) || []).length;
   if (!state.systemLogs.has(agname)) state.systemLogs.set(agname, []);
   const lines = state.systemLogs.get(agname);
-  lines.push({ cursor, html });
+  lines.push({ ts: ts || 0, html });
   if (lines.length > SYSTEM_LOG_CAP) lines.shift();
   if (agname === currentAgent()) renderHistory();
 }
@@ -661,22 +662,29 @@ function renderHistory() {
   let syslogIdx = 0;
   const frags = [];
 
-  // Flush every buffered system-log line that arrived at or before the
-  // point where *cursor* transcript messages existed -- see systemLogs'
-  // definition in `state` for why this is a better position signal than
-  // each message's own `ts` (several messages from one already-completed
-  // skill call share that call's single finish timestamp, so sorting
-  // syslog lines against those would misorder them).
-  function flushSyslogsUpTo(cursor) {
-    while (syslogIdx < syslogs.length && syslogs[syslogIdx].cursor <= cursor) {
+  // A tool_use call and its tool_result are two separate transcript
+  // messages, rendered separately, each wherever it actually falls in
+  // message order -- no attempt to reposition a result next to its call.
+  // A tool_result block itself carries no `name` (only tool_call_id), so
+  // this is just a label lookup for the "TOOL name ✓" row below, built
+  // from every tool_use seen so far.
+  const toolNamesByCallId = new Map();
+
+  // Flush every buffered system-log line that happened at or before a given
+  // real timestamp -- each reconstructed message and each syslog line now
+  // carries its own accurate ts (see _compute_agent_messages), so a plain
+  // timestamp merge places each syslog line right where it actually
+  // happened relative to the surrounding transcript messages.
+  function flushSyslogsUpToTs(ts) {
+    while (syslogIdx < syslogs.length && syslogs[syslogIdx].ts <= ts) {
       frags.push(`<div class="msg-syslog">${syslogs[syslogIdx].html}</div>`);
       syslogIdx++;
     }
   }
 
-  flushSyslogsUpTo(0);
   for (let msgIdx = 0; msgIdx < msgs.length; msgIdx++) {
     const msg    = msgs[msgIdx];
+    flushSyslogsUpToTs(msg.ts ?? Infinity);
     const role   = msg.role   || '';
     const blocks = msg.blocks || [];
     // Every block carries an agency-native `type` (text/thinking/tool_use/
@@ -707,10 +715,17 @@ function renderHistory() {
       }
 
     } else if (role === 'assistant') {
+      // Render each block at its own position instead of aggregating text
+      // into one trailing div -- a turn can emit text *before* its tool
+      // calls (e.g. "Verified: ..." then two submit_output calls in the
+      // same response), and pushing that text last regardless of its real
+      // position misrepresents what the model actually said relative to
+      // the tool calls it made.
       for (const b of blocks) {
         if (b.type === 'thinking' && b.text) {
           frags.push(`<div class="msg-thinking">${tsHtml}💭 thinking\n${esc(b.text)}</div>`);
         } else if (b.type === 'tool_use') {
+          if (b.id) toolNamesByCallId.set(b.id, b.name || '?');
           let argsText = '';
           try {
             const raw = JSON.parse(b.arguments || '{}');
@@ -721,7 +736,7 @@ function renderHistory() {
             argsText = esc(b.arguments || '');
           }
           frags.push(
-            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
+            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(b.name || '?')} ▶</span>\n` +
             `<span class="dim">${argsText}</span></div>`
           );
         } else if (b.type === 'metadata' && state.fullLogsEnabled) {
@@ -729,29 +744,30 @@ function renderHistory() {
             `<div class="msg-metadata">${tsHtml}<span class="role-tool-call">◇ metadata</span>\n` +
             `<span class="dim">${esc(JSON.stringify(b))}</span></div>`
           );
+        } else if (b.type === 'text' && b.text) {
+          frags.push(
+            `<div class="msg-assistant">${tsHtml}<span class="role-assistant">◆ assistant</span>\n${esc(b.text)}</div>`
+          );
         }
-      }
-      if (text) {
-        frags.push(
-          `<div class="msg-assistant">${tsHtml}<span class="role-assistant">◆ assistant</span>\n${esc(text)}</div>`
-        );
       }
 
     } else if (role === 'tool') {
+      // Rendered as its own separate row, in whatever message position it
+      // actually falls in -- not attached to/repositioned under its call.
       for (const b of blocks) {
         if (b.type === 'tool_result') {
+          const name = toolNamesByCallId.get(b.tool_call_id) || '?';
           frags.push(
-            `<div class="msg-tool-result">${tsHtml}<span class="dim">← ${esc(b.text || '')}</span></div>`
+            `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(name)} ✓</span>\n` +
+            `<span class="dim">${esc(b.text || '')}</span></div>`
           );
         }
       }
     }
-
-    flushSyslogsUpTo(msgIdx + 1);
   }
   // Anything buffered past the last known message (e.g. arrived in the gap
   // between this render and the next transcript poll) still belongs here.
-  flushSyslogsUpTo(Infinity);
+  flushSyslogsUpToTs(Infinity);
 
   // Running indicator
   const ag = state.agents.get(agname);
