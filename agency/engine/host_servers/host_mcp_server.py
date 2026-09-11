@@ -85,6 +85,7 @@ class HostMcpServer:
         self._data_logger = data_logger
         self._is_cancelled = is_cancelled if is_cancelled is not None else (lambda: False)
         self._persistent_vars: "dict[str, object]" = {}
+        self._persistent_lock = threading.Lock()
         self._mcp_server: "MCPServer | None" = None
 
     def _register_tool(self, server: MCPServer, tool: "agtool") -> None:
@@ -97,10 +98,14 @@ class HostMcpServer:
             # No admit_tool_call() here -- the caller (PreToolUse hook or
             # react_loop.py's bridge check) already admitted; doing it again
             # would double-admit every MCP tool call.
-            persistent = {
-                var_name: self._persistent_vars.setdefault(var_name, factory())
-                for var_name, factory in tool.persistent_vars.items()
-            }
+            persistent = {}
+            # Factories can open resources or build expensive state. Initialize
+            # once across MCP worker threads, then release before calling tools.
+            with self._persistent_lock:
+                for var_name, factory in tool.persistent_vars.items():
+                    if var_name not in self._persistent_vars:
+                        self._persistent_vars[var_name] = factory()
+                    persistent[var_name] = self._persistent_vars[var_name]
             return tool(
                 agdata(**kwargs),
                 sandbox=self._sandbox,

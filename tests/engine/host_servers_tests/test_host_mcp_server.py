@@ -104,6 +104,52 @@ def _tool(server, name):
     return server._mcp_server._tool_manager.get_tool(name)
 
 
+@pytest.mark.parametrize("location", ["host", "sandbox"])
+def test_persistent_factory_runs_once_and_tools_remain_concurrent(location):
+    import threading
+
+    from mcp.server.mcpserver import MCPServer
+
+    from agency.harness.sandbox_mcp import _register_tool
+
+    factory_calls = []
+    barrier = threading.Barrier(4)
+
+    def factory():
+        state = object()
+        factory_calls.append(state)
+        return state
+
+    def use_state(arg, state):
+        barrier.wait(timeout=2)
+        return agdata(identity=id(state))
+
+    tools = [
+        agtool(name, "", use_state, persistent_vars={"state": factory})
+        for name in ("state_a", "state_b")
+    ]
+    if location == "host":
+        server, _, _ = _make_server(add_host_mcp_tools=tools)
+        mcp = server._mcp_server
+    else:
+        mcp = MCPServer(name="state-test")
+        state, lock = {}, threading.Lock()
+        for tool in tools:
+            _register_tool(mcp, tool, state, lock, lambda: True)
+
+    async def calls():
+        return await asyncio.gather(*[mcp.call_tool(tool.name, {}) for tool in tools * 2])
+
+    try:
+        results = asyncio.run(calls())
+    finally:
+        barrier.abort()
+    assert len(factory_calls) == 1
+    for result in results:
+        assert not result.is_error
+        assert json.loads(result.content[0].text) == {"identity": id(factory_calls[0])}
+
+
 def test_build_app_registers_the_default_host_tools_with_no_extras():
     server, _, _ = _make_server(add_host_mcp_tools=None)
     assert _tool_names(server) == _FIXED_TOOL_NAMES

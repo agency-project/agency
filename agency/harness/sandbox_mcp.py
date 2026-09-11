@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import threading
 from typing import Annotated, Any, Callable
 
 import cloudpickle
@@ -35,13 +36,14 @@ def build_app(payload: str, is_active: Callable[[], bool]):
 
     server = MCPServer(name="agency-sandbox-mcp-server")
     persistent_vars: dict[str, object] = {}
+    persistent_lock = threading.Lock()
     names = set()
     for tool in tools:
         try:
             if tool.name in names:
                 raise ValueError("duplicate sandbox tool name")
             names.add(tool.name)
-            _register_tool(server, tool, persistent_vars, is_active)
+            _register_tool(server, tool, persistent_vars, persistent_lock, is_active)
         except Exception as exc:
             raise SandboxMcpSetupError(
                 f"sandbox MCP setup failed registering tool {tool.name!r} ({type(exc).__name__})"
@@ -52,17 +54,18 @@ def build_app(payload: str, is_active: Callable[[], bool]):
     )
 
 
-def _register_tool(server, tool, persistent_vars, is_active) -> None:
+def _register_tool(server, tool, persistent_vars, persistent_lock, is_active) -> None:
     # Each wrapper captures its own reconstructed tool; no host execution
     # context or reverse proxy participates in these calls.
     def call_tool(**kwargs) -> dict:
         if not is_active():
             raise RuntimeError("inactive sandbox MCP attempt")
         persistent = {}
-        for name, factory in tool.persistent_vars.items():
-            if name not in persistent_vars:
-                persistent_vars[name] = factory()
-            persistent[name] = persistent_vars[name]
+        with persistent_lock:
+            for name, factory in tool.persistent_vars.items():
+                if name not in persistent_vars:
+                    persistent_vars[name] = factory()
+                persistent[name] = persistent_vars[name]
         return tool(agdata(**kwargs), **persistent).to_dict()
 
     properties = tool.params.get("properties", {})
