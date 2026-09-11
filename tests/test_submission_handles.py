@@ -56,6 +56,20 @@ def test_cancel_on_an_already_settled_or_unknown_future_is_a_harmless_no_op(tmp_
     ag.cancel(agdata())  # no future at all -- no-op
 
 
+def test_cancel_cannot_cancel_another_agents_result(tmp_path, monkeypatch):
+    from agency import agskill
+    from agency.engine import AgentEngine
+
+    owner = _agent(tmp_path)
+    other = _agent(tmp_path)
+    dependency = Future()
+    monkeypatch.setattr(AgentEngine, "execute", lambda *args, **kwargs: agdata(answer=42))
+    result = owner.run(agskill("owned", ""), agdata(input=agdata(_future=dependency)))
+    other.cancel(result)
+    dependency.set_result(agdata())
+    assert result.wait(timeout=2).to_dict() == {"answer": 42}
+
+
 def test_pause_resume_gate(tmp_path):
     ag = _agent(tmp_path)
     assert ag.is_paused() is False

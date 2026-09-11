@@ -197,6 +197,13 @@ class ExecutionScheduler:
                 for key, nested in list(data.items()):
                     data[key] = materialize(nested)
                 return current
+            # Discovery accepts shared/cyclic containers. Visit mutable
+            # containers once here too, preserving their object identity.
+            if isinstance(current, (dict, list)):
+                marker = id(current)
+                if marker in seen:
+                    return current
+                seen.add(marker)
             if isinstance(current, dict):
                 for key, nested in list(current.items()):
                     current[key] = materialize(nested)

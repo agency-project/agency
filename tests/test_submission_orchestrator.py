@@ -203,3 +203,19 @@ def test_managed_dependency_cycle_through_invocations_fails_without_an_engine(
     assert "dependency cycle detected" in first.wait(timeout=2).error
     assert "dependency cycle detected" in second.wait(timeout=2).error
     execute.assert_not_called()
+
+
+def test_materialization_preserves_cyclic_containers_and_resolves_their_dependencies():
+    scheduler = get_orchestrator().scheduler
+    future = Future()
+    dependency = agdata(_future=future)
+    items = []
+    payload = {"items": items, "dependency": dependency}
+    items.append(payload)
+    found = set()
+    assert scheduler._discover_dependencies(payload, found) is None
+    assert found == {future}
+    future.set_result(agdata(answer=42))
+    resolved = scheduler.materialize_dependencies(payload)
+    assert resolved["items"][0] is resolved
+    assert resolved["dependency"].answer == 42

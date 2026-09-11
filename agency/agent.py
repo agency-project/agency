@@ -463,7 +463,7 @@ class agent:
         still guarantee agcanceled() regardless of timing.
         """
         future = object.__getattribute__(handle, "_future")
-        was_running = self._orchestrator.cancel_request(future)
+        was_running = self._orchestrator.cancel_request(self, future)
         if was_running:
             daemon_handle = self._daemon_handle()
             if daemon_handle is not None:

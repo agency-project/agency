@@ -364,10 +364,10 @@ class agSandbox:
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         with agprof.span("sandbox:destroy"):
-            _live_sandboxes.discard(self)
             self._backend.destroy()
+            self._destroyed = True
+            _live_sandboxes.discard(self)
 
     def fork(self, new_name: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_name* starting from this sandbox's
@@ -394,7 +394,7 @@ class agSandbox:
                 # snapshot directory, not a docker/podman image tag, so it must
                 # be retagged by the same backend class that created it.
                 type(self._backend).tag_image(checkpoint_image, fork_sb._backend._lifecycle_tag())
-            fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
+                fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
         return fork_sb
 
     @property

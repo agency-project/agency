@@ -2128,7 +2128,6 @@ class _ContainerBackendBase(agsandbox_backend):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         container_name = self._container_name()
 
         # Best-effort courtesy signal before rm_container() forces the issue
@@ -2190,6 +2189,7 @@ class _ContainerBackendBase(agsandbox_backend):
 
         if rm_exc is not None:
             raise rm_exc
+        self._destroyed = True
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()

@@ -137,6 +137,36 @@ def _native_launch(captured: dict, stdout: str):
     return launch
 
 
+@pytest.mark.parametrize("outcome", ["timeout", "wait_error", "registration_error"])
+def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome):
+    sandbox = _NativeSandbox()
+    handle = MagicMock()
+    handle.wait.return_value = ("", "", -1)
+    if outcome == "wait_error":
+        handle.wait.side_effect = RuntimeError("wait failed")
+    register = MagicMock()
+    if outcome == "registration_error":
+        register.side_effect = RuntimeError("registration failed")
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch", lambda *args, **kwargs: handle
+    )
+
+    def cleanup(*args):
+        handle.close.assert_called_once_with()
+
+    monkeypatch.setattr("agency.harness.agharness.cleanup_config_home_in_container", cleanup)
+    runtime = replace(_runtime(sandbox=sandbox), register_control_handle=register)
+    kwargs = dict(prompt="work", resume_session_id=None, prior_session_blob=None, max_steps=1)
+    if outcome == "timeout":
+        assert not _NativeBackend(agconfig()).run_daemon_attempt(runtime, **kwargs).ok
+    else:
+        with pytest.raises(RuntimeError, match="failed"):
+            _NativeBackend(agconfig()).run_daemon_attempt(runtime, **kwargs)
+
+
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     sandbox = _NativeSandbox()
     captured: dict = {}

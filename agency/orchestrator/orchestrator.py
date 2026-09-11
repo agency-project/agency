@@ -294,7 +294,7 @@ class GlobalAgentOrchestrator:
         # belongs only to the requested execution, even if it finishes now.
         return engine.redirect(message) if engine is not None else False
 
-    def cancel_request(self, future: "Future") -> bool:
+    def cancel_request(self, ag: "agent", future: "Future") -> bool:
         """Mark whichever request produced *future* as cancelled. Returns
         True iff that request was in "running" state at this instant --
         agent.cancel() uses this as a best-effort gate for whether to also
@@ -315,7 +315,7 @@ class GlobalAgentOrchestrator:
             if request_id is None:
                 return False
             request = self._requests.get(request_id)
-            if request is None:
+            if request is None or request.agent is not ag:
                 return False
             request.cancelled = True
             return request.state == "running"

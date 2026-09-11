@@ -106,6 +106,63 @@ def test_facade_construction_does_not_start_backend():
         sandbox.destroy()
 
 
+def test_fork_without_checkpoint_keeps_lazy_fresh_backend():
+    from agency.sandbox.agsandbox import agSandbox
+
+    parent_backend = MagicMock()
+    child_backend = MagicMock()
+    parent_backend._checkpoint_image = None
+    child_backend._checkpoint_image = None
+    with patch(
+        "agency.sandbox.agsandbox.agsandbox_backend.for_config",
+        side_effect=[parent_backend, child_backend],
+    ):
+        parent = agSandbox("fresh-parent")
+        child = parent.fork("fresh-child")
+    try:
+        assert child._checkpoint_image is None
+        child_backend._ensure_started.assert_not_called()
+    finally:
+        parent.destroy()
+        child.destroy()
+
+
+def test_destroy_can_retry_a_failed_backend_cleanup():
+    from agency.sandbox.agsandbox import agSandbox
+
+    backend = MagicMock()
+    backend.destroy.side_effect = [RuntimeError("removal failed"), None]
+    with patch("agency.sandbox.agsandbox.agsandbox_backend.for_config", return_value=backend):
+        sandbox = agSandbox("retry-cleanup")
+    with pytest.raises(RuntimeError, match="removal failed"):
+        sandbox.destroy()
+    sandbox.destroy()
+    sandbox.destroy()
+    assert backend.destroy.call_count == 2
+
+
+@pytest.mark.parametrize("kind", ["container", "chroot"])
+def test_backend_destroy_remains_retryable_after_removal_failure(kind, tmp_path):
+    from agency.sandbox.container import _ContainerBackendBase
+    from agency.sandbox.chroot import _ChrootBackend
+
+    cls = _ContainerBackendBase if kind == "container" else _ChrootBackend
+    backend = MagicMock()
+    backend._destroyed = False
+    backend._watched_pids = {}
+    backend._checkpoint_image = None
+    backend._accumulator_dir = None
+    backend._root = tmp_path / "sandbox"
+    backend.rm_container.side_effect = [RuntimeError("removal failed"), None]
+    with pytest.raises(RuntimeError, match="removal failed"):
+        cls.destroy(backend)
+    assert not backend._destroyed
+    cls.destroy(backend)
+    cls.destroy(backend)
+    assert backend._destroyed
+    assert backend.rm_container.call_count == 2
+
+
 @pytest.mark.parametrize(
     ("operation", "args"),
     [
