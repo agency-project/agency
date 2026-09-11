@@ -587,3 +587,55 @@ def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch
     execution.handle.is_paused.side_effect = lambda: clock.now < 0.2
     execution._wait_until(lambda: clock.now >= 0.225, "resumed acknowledgment")
     assert clock.now > execution.INPUT_TIMEOUT
+
+
+def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
+    driver = PtyDriver(
+        agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    driver._last_prompt = "[Agency run test]\nprevious prompt"
+    driver._last_turn_id = "turn"
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (["│ ❯   │"], 4, 0, 1),
+        write_terminal=Mock(),
+    )
+
+    def wait_until(predicate, description):
+        assert predicate(), description
+
+    driver.clear_input(handle, wait_until)
+    handle.write_terminal.assert_not_called()
+
+
+@pytest.mark.parametrize("suffix", ["\n", " \n"])
+def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
+    execution.driver.name = "opencode"
+    execution._expected_prompt = "[Agency run test]\ncurrent instruction"
+    execution._turn_id = None
+    execution.driver.pending = [
+        {
+            "kind": "submit",
+            "turn_id": "current",
+            "prompt": execution._expected_prompt + suffix,
+        }
+    ]
+    execution._poll()
+    assert execution._turn_id == "current"
+
+
+def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
+    driver = PtyDriver(
+        agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    driver._last_prompt = "\n".join(["[Agency run test]"] + ["previous line"] * 10)
+    driver._last_turn_id = "turn"
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (["│ ❯ [Pasted: 11 lines]  │"], 24, 0, 1),
+        write_terminal=Mock(),
+    )
+
+    def wait_until(predicate, description):
+        assert predicate(), description
+
+    driver.clear_input(handle, wait_until)
+    handle.write_terminal.assert_called_once_with(b"\x03")

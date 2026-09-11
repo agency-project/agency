@@ -140,7 +140,11 @@ class PtyExecution:
 
     def _poll(self):
         for event in self.driver.events():
-            if event.get("kind") == "submit" and event.get("prompt") == self._expected_prompt:
+            prompt, expected = event.get("prompt"), self._expected_prompt
+            if self.driver.name == "opencode" and isinstance(prompt, str) and expected is not None:
+                # OpenCode can append a newline when persisting bracketed paste.
+                prompt, expected = prompt.rstrip(), expected.rstrip()
+            if event.get("kind") == "submit" and prompt == expected:
                 if event.get("turn_id"):
                     self._turn_id = event["turn_id"]
             if self._turn_id is None or event.get("turn_id") != self._turn_id:
