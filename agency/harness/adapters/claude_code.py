@@ -773,7 +773,7 @@ class _ClaudePtyExecution:
             if kind == "UserPromptSubmit" and payload.get("prompt") == self._expected_prompt:
                 self._acknowledged = True
             elif kind == "Stop":
-                self._stop = payload.get("last_assistant_message")
+                self._stop = payload.get("last_assistant_message") or ""
             elif kind in {"StopFailure", "SessionEnd"}:
                 self._failure = f"Claude {kind}: {payload.get('error', 'session ended')}"
 
@@ -860,8 +860,15 @@ class _ClaudePtyExecution:
             text = self._text(row)
             if row.get("type") == "user" and text == self._expected_prompt:
                 submitted = True
-            if submitted and row.get("type") == "assistant" and text == self._stop:
-                return blob
+            if submitted:
+                if self._stop == "":
+                    # Claude can finish after tool output without persisting a
+                    # final assistant message. Its durable turn marker closes
+                    # that transcript after the Stop hook has returned.
+                    if row.get("type") == "system" and row.get("subtype") == "turn_duration":
+                        return blob
+                elif row.get("type") == "assistant" and text == self._stop:
+                    return blob
         return None
 
     def _interrupt(self):
