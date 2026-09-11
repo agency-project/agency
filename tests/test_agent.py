@@ -66,59 +66,12 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Streaming mock helpers (agskill uses stream=True)
+# Tool fixture
 # ---------------------------------------------------------------------------
-
-
-class _Delta:
-    def __init__(self, content=None, tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls
-        self.model_extra = {}
-        self.reasoning_content = None
-
-
-class _Choice:
-    def __init__(self, delta):
-        self.delta = delta
-
-
-class _Usage:
-    prompt_tokens = 5
-
-
-class _Chunk:
-    def __init__(self, content=None, tool_calls=None, usage=None):
-        self.usage = usage
-        self.choices = (
-            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
-        )
-
-
-class _TCDelta:
-    def __init__(self, name, args_json, call_id):
-        self.id = call_id
-        self.index = 0
-        self.function = _TCFnDelta(name, args_json)
-
-
-class _TCFnDelta:
-    def __init__(self, name, args):
-        self.name = name
-        self.arguments = args
 
 
 def _noop(arg: agdata) -> agdata:
     return agdata()
-
-
-def _direct(content: str) -> list:
-    return [_Chunk(content=content), _Chunk(usage=_Usage())]
-
-
-def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
-    tc = _TCDelta(name, json.dumps(args), call_id)
-    return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
 def _llm_agconfig(d: dict) -> agconfig_cls:

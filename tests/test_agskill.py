@@ -58,10 +58,6 @@ def _noop(arg: agdata) -> agdata:
     return agdata()
 
 
-def _noop_r1(arg: agdata) -> agdata:
-    return agdata(r=1)
-
-
 # ---------------------------------------------------------------------------
 # Streaming mock helpers
 # agskill uses stream=True; the mock must return a list of chunk objects.

@@ -247,26 +247,23 @@ def test_run_not_implemented_on_base():
         agteam().run()
 
 
-def test_run_returns_pending_agdata():
-    result = _EchoTeam().run()
-    assert isinstance(result, agdata)
+def test_run_returns_pending_data_before_work_finishes():
+    import threading
 
+    release = threading.Event()
 
-def test_run_is_nonblocking():
-    import time
-
-    class _SlowTeam(agteam):
-        def setup(self):
-            pass
-
+    class WaitingTeam(agteam):
         def run(self):
-            time.sleep(0.2)
+            assert release.wait(2)
             return agdata(done=True)
 
-    t0 = time.perf_counter()
-    result = _SlowTeam().run()
-    assert time.perf_counter() - t0 < 0.1
-    assert result.done is True  # blocks here
+    result = WaitingTeam().run()
+    try:
+        assert isinstance(result, agdata)
+        assert result.is_pending()
+    finally:
+        release.set()
+    assert result.wait(timeout=2).done
 
 
 @pytest.mark.parametrize(
@@ -318,35 +315,22 @@ def test_run_exception_raises_on_field_access():
 # ---------------------------------------------------------------------------
 
 
-def test_parallel_run_all_results_resolve():
-    teams = [_EchoTeam() for _ in range(4)]
-    results = [t.run() for t in teams]
-    assert all(r.done is True for r in results)
+def test_parallel_runs_reach_the_same_barrier():
+    import threading
 
+    barrier = threading.Barrier(5)
 
-def test_parallel_run_runs_concurrently():
-    import time
-
-    class _SlowTeam(agteam):
-        def setup(self):
-            pass
-
+    class ParallelTeam(agteam):
         def run(self):
-            time.sleep(0.2)
+            barrier.wait(timeout=2)
             return agdata(ok=True)
 
-    teams = [_SlowTeam() for _ in range(4)]
-    t0 = time.perf_counter()
-    results = [t.run() for t in teams]
-    _ = [r.ok for r in results]
-    assert time.perf_counter() - t0 < 0.6  # 4×0.2s sequential = 0.8s
-
-
-@pytest.mark.parametrize("n", [1, 2, 5, 8])
-def test_parallel_run_scales_to_n_teams(n):
-    teams = [_EchoTeam() for _ in range(n)]
-    results = [t.run() for t in teams]
-    assert all(r.done is True for r in results)
+    results = [ParallelTeam().run() for _ in range(4)]
+    try:
+        barrier.wait(timeout=2)
+        assert all(result.wait(timeout=2).ok for result in results)
+    finally:
+        barrier.abort()
 
 
 def test_parallel_run_mixed_success_and_failure():

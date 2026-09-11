@@ -20,14 +20,6 @@ from unittest.mock import MagicMock, patch
 from agency.orchestrator.agresources import agResourcePool
 
 
-def _worker_import_agent():
-    """Top-level so ProcessPoolExecutor can pickle it."""
-    from agency.agent import agent  # noqa: F401
-    import multiprocessing
-
-    return multiprocessing.current_process().name
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -917,16 +909,6 @@ class TestAgSandboxLifecycle:
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content
         sb.destroy()
-
-    # test_files_persist_across_process_pool_tool_calls was retired here:
-    # its whole premise (files written by a real run_in_subprocess=True tool
-    # call, in a ProcessPoolExecutor worker, readable by a subsequent
-    # separately-dispatched worker call) no longer exists -- agtool.__call__
-    # always runs in the calling thread/process now (see agtool.py's own
-    # module docstring), and agency/tools/{write,read}.py's `write`/`read`
-    # tool factories it used are themselves retired (make_write is gone;
-    # test_agsandbox.py's own direct sb.write_file()/read_file() tests
-    # already cover file persistence without any tool-dispatch layer).
 
     @docker
     def test_checkpoint_restore_preserves_files(self):

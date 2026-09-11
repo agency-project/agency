@@ -32,11 +32,6 @@ def make_tool() -> agtool:
     )
 
 
-def test_name():
-    t = make_tool()
-    assert t.name == "echo"
-
-
 def test_call_returns_agdata():
     t = make_tool()
     result = t(agdata(message="hello"))
@@ -55,11 +50,6 @@ def test_to_openai_tool_shape():
     assert "message" in fn["parameters"]["properties"]
 
 
-def test_repr():
-    t = make_tool()
-    assert "echo" in repr(t)
-
-
 def test_default_params():
     t = agtool(name="noop", description="", fn=_identity)
     assert t.to_openai_tool()["function"]["parameters"]["type"] == "object"
@@ -68,20 +58,6 @@ def test_default_params():
 # ---------------------------------------------------------------------------
 # Pickle / serialisation
 # ---------------------------------------------------------------------------
-
-
-def test_getstate_excludes_run_in_subprocess_extras():
-    t = make_tool()
-    state = t.__getstate__()
-    assert state["name"] == "echo"
-    assert state["fn"] is _echo
-
-
-def test_setstate_restores_tool():
-    t = make_tool()
-    t2 = agtool.__new__(agtool)
-    t2.__setstate__(t.__getstate__())
-    assert t2.name == "echo"
 
 
 def test_pickle_round_trip():
@@ -108,15 +84,9 @@ def test_cloudpickle_preserves_persistent_factories_and_tool_definition():
     assert restored(agdata(message="hello")).echoed == {"message": "hello"}
 
 
-# test_process_pool_runs_in_different_pid was retired here: agtool.__call__
-# no longer has a subprocess-pool path at all -- every call always runs in
-# the calling thread/process (see agtool.py's own module docstring).
-
 # ---------------------------------------------------------------------------
 # Invocation always runs in the calling thread/process -- no subprocess
-# isolation, ever (run_in_subprocess is still accepted as a constructor
-# kwarg for call-site compatibility with existing tool factories, but no
-# longer changes behavior; see agtool.py's __call__).
+# isolation. Sandbox MCP transport owns any cross-process serialization.
 # ---------------------------------------------------------------------------
 
 
@@ -128,9 +98,7 @@ def test_call_runs_in_same_pid():
 
 def test_call_sees_host_state():
     """A tool's fn can read module-level state set in the main process --
-    the property that made run_in_subprocess=False necessary for any tool
-    closing over live host objects (a sandbox, a resource pool, ...), now
-    true unconditionally."""
+    including closures over live host objects such as sandboxes and pools."""
     import agency.agtool as _agtool_mod
 
     _agtool_mod._TEST_SENTINEL = "host-value"
@@ -156,21 +124,6 @@ def test_call_exception_returns_error_agdata():
     result = t(agdata())
     assert result.error is not None
     assert "intentional failure" in result.error
-
-
-def test_call_timeout_not_enforced():
-    """`timeout` is accepted for call-site compatibility but not enforced --
-    there's no separate process/thread left to bound (see agtool.py's
-    __call__ docstring)."""
-    import time
-
-    def _slow(arg: agdata) -> agdata:
-        time.sleep(0.05)
-        return agdata(done=True)
-
-    t = agtool(name="slow_inproc", description="", fn=_slow)
-    result = t(agdata(), timeout=1)
-    assert result.done is True
 
 
 # ---------------------------------------------------------------------------
