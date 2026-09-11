@@ -365,14 +365,14 @@ class _NativeBackend(agharness_backend):
 
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    yield _chunk({"content": content})
+                # Publish only the authoritative response after host finalization.
                 continue
 
             tool_call_index = 0
             for b in item["message"].get("blocks", []):
-                if b["type"] == "tool_use":
+                if b["type"] == "text":
+                    yield _chunk({"content": b.get("text", "")})
+                elif b["type"] == "tool_use":
                     yield _chunk(
                         {
                             "tool_calls": [
