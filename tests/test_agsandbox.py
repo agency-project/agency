@@ -172,6 +172,7 @@ def test_backend_destroy_remains_retryable_after_removal_failure(kind, tmp_path)
         ("write_file", ("/workspace/file.txt", "content")),
         ("commit", ()),
         ("stop", ()),
+        ("destroy", ()),
     ],
 )
 def test_public_facade_operation_uses_shared_lock(operation, args):
@@ -179,7 +180,7 @@ def test_public_facade_operation_uses_shared_lock(operation, args):
 
     sandbox = agSandbox.__new__(agSandbox)
     sandbox._agname = "lock-test"
-    sandbox._destroyed = True
+    sandbox._destroyed = operation != "destroy"
     sandbox._lock = threading.RLock()
     sandbox._backend = MagicMock()
 

@@ -7,6 +7,44 @@ import pytest
 from agency.agcontext import agcontext
 
 
+def test_concurrent_resolution_uses_the_captured_future():
+    import threading
+
+    captured = threading.Event()
+    resolved = threading.Event()
+    errors = []
+
+    class InterleavedContext(agcontext):
+        def __getattribute__(self, name):
+            value = super().__getattribute__(name)
+            if name == "_future" and threading.current_thread().name == "slow-resolver":
+                captured.set()
+                assert resolved.wait(2)
+            return value
+
+    future = Future()
+    future.set_result(agcontext(recent_transcript=[{"content": "done"}]))
+    context = InterleavedContext(_future=future)
+
+    def resolve():
+        try:
+            context.resolve_prev_dependencies()
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=resolve, name="slow-resolver")
+    worker.start()
+    try:
+        assert captured.wait(2)
+        context.resolve_prev_dependencies()
+    finally:
+        resolved.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert errors == []
+    assert context.recent_transcript == [{"content": "done"}]
+
+
 # ---------------------------------------------------------------------------
 # Construction and defaults
 # ---------------------------------------------------------------------------

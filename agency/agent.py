@@ -7,6 +7,7 @@ import tarfile
 import threading
 import uuid as _uuid_mod
 import weakref
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -216,6 +217,7 @@ class agent:
             default_db_path=resolve_global_db_path(log_dir),
         )
         self._submission_lock = threading.RLock()
+        self._control_lock = threading.RLock()
         self._sequence = max(
             (
                 int(entry.get("sequence", 0))
@@ -391,14 +393,15 @@ class agent:
         resume() (see HarnessManager._agent_paused). No orchestrator/
         scheduler involvement -- purely agent.py + the sandbox's daemon.
         """
-        self._paused = True
-        handle = self._daemon_handle()
-        if handle is not None:
-            try:
-                with handle.client(timeout_s=10) as client:
-                    client.pause_harness()
-            except Exception as exc:
-                print(f"[agent] WARNING: pause_harness() failed for {self.agname}: {exc}")
+        with self._control_lock:
+            self._paused = True
+            handle = self._daemon_handle()
+            if handle is not None:
+                try:
+                    with handle.client(timeout_s=10) as client:
+                        client.pause_harness()
+                except Exception as exc:
+                    print(f"[agent] WARNING: pause_harness() failed for {self.agname}: {exc}")
         self.data_logger.record_event(
             type="agent_paused",
             payload={"agname": self.agname},
@@ -406,14 +409,15 @@ class agent:
         )
 
     def resume(self) -> None:
-        self._paused = False
-        handle = self._daemon_handle()
-        if handle is not None:
-            try:
-                with handle.client(timeout_s=10) as client:
-                    client.resume_harness()
-            except Exception as exc:
-                print(f"[agent] WARNING: resume_harness() failed for {self.agname}: {exc}")
+        with self._control_lock:
+            self._paused = False
+            handle = self._daemon_handle()
+            if handle is not None:
+                try:
+                    with handle.client(timeout_s=10) as client:
+                        client.resume_harness()
+                except Exception as exc:
+                    print(f"[agent] WARNING: resume_harness() failed for {self.agname}: {exc}")
         self.data_logger.record_event(
             type="agent_resumed",
             payload={"agname": self.agname},
@@ -463,15 +467,12 @@ class agent:
         still guarantee agcanceled() regardless of timing.
         """
         future = object.__getattribute__(handle, "_future")
-        was_running = self._orchestrator.cancel_request(self, future)
-        if was_running:
-            daemon_handle = self._daemon_handle()
-            if daemon_handle is not None:
-                try:
-                    with daemon_handle.client(timeout_s=10) as client:
-                        client.cancel_harness()
-                except Exception as exc:
-                    print(f"[agent] WARNING: cancel_harness() failed for {self.agname}: {exc}")
+        engine = self._orchestrator.cancel_request(self, future)
+        if engine is not None:
+            try:
+                engine.cancel()
+            except Exception as exc:
+                print(f"[agent] WARNING: cancel_harness() failed for {self.agname}: {exc}")
 
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
@@ -546,6 +547,28 @@ class agent:
         except Exception as _e:
             print(f"[agent] WARNING: __del__ log failed for {getattr(self, 'agname', '?')}: {_e}")
 
+    @contextmanager
+    def _resolved_snapshot(self):
+        """Hold a matching committed context and sandbox checkpoint for export.
+
+        Resolve futures before taking the sandbox lock. Once locked, retry if
+        a submission changed the context head while we waited. The lock order
+        matches engine commit: sandbox, then orchestrator, then submission.
+        """
+        while True:
+            with self._orchestrator._event_cond:
+                context = self.context
+            context.resolve_prev_dependencies()
+            sandbox = self.sandbox
+            with sandbox._lock if sandbox is not None else nullcontext():
+                with self._orchestrator._event_cond:
+                    with self._submission_lock:
+                        if self.context is not context or self.sandbox is not sandbox:
+                            continue
+                        snapshot = context.copy()
+                yield snapshot, sandbox
+                return
+
     # ------------------------------------------------------------------
     # Fork
     # ------------------------------------------------------------------
@@ -560,23 +583,20 @@ class agent:
         ag.agconfig = src.agconfig.clone()
         ag.harness = src.harness
         ag.engine = None
-        with src._orchestrator._event_cond:
-            with src._submission_lock:
-                source_context = src.context
-        source_context.resolve_prev_dependencies()
-        with src._orchestrator._event_cond:
-            with src._submission_lock:
-                ag.context = source_context.copy()
-        _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
-        _out = Path(_out_dir) / ag.agname if _out_dir else None
-        sb_cfg = ag.agconfig.clone()
-        sb_cfg.agent.harness = ag.harness
-        if _out is not None:
-            sb_cfg = sb_cfg.clone()
-            sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")
-        ag.sandbox = (
-            src.sandbox.fork(ag.agname, agconfig=sb_cfg) if src.sandbox is not None else None
-        )
+        with src._resolved_snapshot() as (source_context, source_sandbox):
+            ag.context = source_context
+            _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
+            _out = Path(_out_dir) / ag.agname if _out_dir else None
+            sb_cfg = ag.agconfig.clone()
+            sb_cfg.agent.harness = ag.harness
+            if _out is not None:
+                sb_cfg = sb_cfg.clone()
+                sb_cfg.sandbox.add_mount("agent_output", _out, "/agent_output")
+            ag.sandbox = (
+                source_sandbox.fork(ag.agname, agconfig=sb_cfg)
+                if source_sandbox is not None
+                else None
+            )
         ag._owns_sandbox = True
 
         from .agteam import _active_team
@@ -660,73 +680,62 @@ class agent:
         )
         image_tag = f"agency/ckpt-{self.agname}"
 
-        with self._orchestrator._event_cond:
-            with self._submission_lock:
-                checkpoint_context = self.context
+        with self._resolved_snapshot() as (checkpoint_context, sandbox):
+            state = {
+                "agname": self.agname,
+                "parent_agent_id": self._parent_agent_id,
+                "harness": self.harness,
+                "llm_config": _llm_config_snapshot(self.agconfig),
+                "history": checkpoint_context.recent_transcript,
+                "ts": _ts(),
+            }
+            if sandbox is not None and sandbox._checkpoint_image is not None:
+                # Recorded so load() knows which backend's image format
+                # container.tar is in -- a chroot snapshot directory and a
+                # docker/podman image tag are unrelated formats.
+                state["sandbox_image_kind"] = sandbox.image_kind
+            if checkpoint_context.harness_sessions:
+                # Session continuity travels with the agent's own checkpoint, not
+                # with container.tar, so it remains available regardless of which
+                # sandbox this checkpoint is later restored onto.
+                state["harness_sessions"] = checkpoint_context.harness_sessions
+            if checkpoint_context.retained_messages:
+                state["retained_messages"] = checkpoint_context.retained_messages
+            if checkpoint_context.harness_message_cursors:
+                state["harness_message_cursors"] = checkpoint_context.harness_message_cursors
+            state_bytes = json.dumps(state, indent=2).encode()
 
-        if checkpoint_context.is_pending():
-            self.data_logger.record_event(
-                type="agent_checkpoint_waiting",
-                payload={"agname": self.agname},
-                term_message=f"[{self.agname}] CKPT ⏳  waiting for in-flight task to complete...",
-            )
-        checkpoint_context.resolve_prev_dependencies()
-        with self._orchestrator._event_cond:
-            with self._submission_lock:
-                checkpoint_context = checkpoint_context.copy()
+            path.parent.mkdir(parents=True, exist_ok=True)
 
-        state = {
-            "agname": self.agname,
-            "parent_agent_id": self._parent_agent_id,
-            "harness": self.harness,
-            "llm_config": _llm_config_snapshot(self.agconfig),
-            "history": checkpoint_context.recent_transcript,
-            "ts": _ts(),
-        }
-        if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
-            # Recorded so load() knows which backend's image format
-            # container.tar is in -- a chroot snapshot directory and a
-            # docker/podman image tag are unrelated formats.
-            state["sandbox_image_kind"] = self.sandbox.image_kind
-        if checkpoint_context.harness_sessions:
-            # Session continuity travels with the agent's own checkpoint, not
-            # with container.tar, so it remains available regardless of which
-            # sandbox this checkpoint is later restored onto.
-            state["harness_sessions"] = checkpoint_context.harness_sessions
-        if checkpoint_context.retained_messages:
-            state["retained_messages"] = checkpoint_context.retained_messages
-        if checkpoint_context.harness_message_cursors:
-            state["harness_message_cursors"] = checkpoint_context.harness_message_cursors
-        state_bytes = json.dumps(state, indent=2).encode()
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        if self.sandbox is not None and self.sandbox._checkpoint_image is not None:
-            backend_cls = type(self.sandbox._backend)
-            backend_cls.tag_image(self.sandbox._checkpoint_image, image_tag)
-            try:
-                _save_timeout = self.agconfig.agent.checkpoint_save_timeout_s
-                # Scrub the owning process's PID before embedding -- it's
-                # meaningless (and, since a .ckpt file can be restored by
-                # an unrelated process on a different host entirely,
-                # potentially misleading) once outside this process's own
-                # lifetime. load() re-stamps the actually-current
-                # restoring process's PID after import. See
-                # relabel_owner_pid()'s docstring.
-                backend_cls.relabel_owner_pid(image_tag, None, _save_timeout)
-                image_bytes = backend_cls.export_image(image_tag, _save_timeout)
+            if sandbox is not None and sandbox._checkpoint_image is not None:
+                backend_cls = type(sandbox._backend)
+                backend_cls.tag_image(sandbox._checkpoint_image, image_tag)
+                try:
+                    _save_timeout = self.agconfig.agent.checkpoint_save_timeout_s
+                    # Scrub the owning process's PID before embedding -- it's
+                    # meaningless (and, since a .ckpt file can be restored by
+                    # an unrelated process on a different host entirely,
+                    # potentially misleading) once outside this process's own
+                    # lifetime. load() re-stamps the actually-current
+                    # restoring process's PID after import. See
+                    # relabel_owner_pid()'s docstring.
+                    backend_cls.relabel_owner_pid(image_tag, None, _save_timeout)
+                    image_bytes = backend_cls.export_image(image_tag, _save_timeout)
+                    with tarfile.open(path, "w:gz") as tar:
+                        for name, data in [
+                            ("state.json", state_bytes),
+                            ("container.tar", image_bytes),
+                        ]:
+                            info = tarfile.TarInfo(name=name)
+                            info.size = len(data)
+                            tar.addfile(info, io.BytesIO(data))
+                finally:
+                    backend_cls.delete_image(image_tag, force=True)
+            else:
                 with tarfile.open(path, "w:gz") as tar:
-                    for name, data in [("state.json", state_bytes), ("container.tar", image_bytes)]:
-                        info = tarfile.TarInfo(name=name)
-                        info.size = len(data)
-                        tar.addfile(info, io.BytesIO(data))
-            finally:
-                backend_cls.delete_image(image_tag, force=True)
-        else:
-            with tarfile.open(path, "w:gz") as tar:
-                info = tarfile.TarInfo(name="state.json")
-                info.size = len(state_bytes)
-                tar.addfile(info, io.BytesIO(state_bytes))
+                    info = tarfile.TarInfo(name="state.json")
+                    info.size = len(state_bytes)
+                    tar.addfile(info, io.BytesIO(state_bytes))
 
         size_kb = path.stat().st_size // 1024
         self.data_logger.record_event(

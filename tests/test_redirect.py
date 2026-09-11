@@ -239,3 +239,31 @@ def test_daemon_rejects_a_delayed_rpc_for_a_while_b_is_active(runs):
     assert runs.received == []
     assert runs.controls["B"].mock_calls == []
     finish(runs, second, "B")
+
+
+def test_delayed_cancel_rpc_cannot_kill_a_successor(runs):
+    first = submit(runs, "A")
+    finish(runs, first, "A")
+    second = submit(runs, "B")
+    assert runs.started["B"].wait(2)
+    with TestClient(runs.manager._interaction_server.build_app()) as client:
+        response = client.post(
+            "/control/cancel", json={"request_id": object.__getattribute__(first, "_execution_id")}
+        )
+    assert response.status_code == 200
+    runs.controls["B"].kill.assert_not_called()
+    finish(runs, second, "B")
+
+
+def test_cancel_after_admission_before_process_registration_kills_only_that_attempt(runs):
+    manager = runs.manager
+    manager._current_request_id = "A"
+    manager.control("cancel", request_id="A")
+    handle = MagicMock()
+    manager._register_control_handle(handle)
+    handle.kill.assert_called_once_with()
+    manager._clear_control_handle()
+    result = submit(runs, "B")
+    assert runs.started["B"].wait(2)
+    runs.controls["B"].kill.assert_not_called()
+    finish(runs, result, "B")

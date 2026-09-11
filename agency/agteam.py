@@ -1,5 +1,6 @@
 from __future__ import annotations
 import functools
+import threading
 import weakref
 from concurrent.futures import Future
 from contextvars import ContextVar
@@ -95,6 +96,8 @@ class agteam:
             setattr(self, k, v)
         self._agents: weakref.WeakSet = weakref.WeakSet()
         self._run_future: Future | None = None
+        self._run_lock = threading.Lock()
+        self._active_run_futures: set[Future] = set()
         agteam._live_teams.add(self)
 
         parent = _active_team.get(None)
@@ -211,9 +214,19 @@ def _wrap_run(cls) -> None:
                 future.set_exception(exc)
             finally:
                 _active_team.reset(token)
+                with self._run_lock:
+                    self._active_run_futures.discard(future)
 
-        self._run_future = future
-        agprof.spawn_traced(_task).start()
+        with self._run_lock:
+            self._run_future = future
+            self._active_run_futures.add(future)
+        try:
+            agprof.spawn_traced(_task).start()
+        except BaseException as exc:
+            with self._run_lock:
+                self._active_run_futures.discard(future)
+            future.set_exception(exc)
+            raise
         return agdata(_future=future)
 
     cls.run = _async_run

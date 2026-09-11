@@ -29,6 +29,40 @@ class _SimpleTeam(agteam):
         return agdata(done=True)
 
 
+def test_agsync_joins_an_earlier_overlapping_team_run(monkeypatch):
+    import threading
+
+    release = threading.Event()
+    joining_first = threading.Event()
+
+    class Team(agteam):
+        def run(self, blocked):
+            if blocked:
+                assert release.wait(2)
+            return agdata(done=True)
+
+    team = Team()
+    first = team.run(True)
+    future = object.__getattribute__(first, "_future")
+    result = future.result
+
+    def observed_result(*args, **kwargs):
+        joining_first.set()
+        return result(*args, **kwargs)
+
+    monkeypatch.setattr(future, "result", observed_result)
+    team.run(False).wait(timeout=2)
+    worker = threading.Thread(target=agsync, args=(team,))
+    worker.start()
+    try:
+        assert joining_first.wait(2)
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert first.wait(timeout=2).done
+
+
 def _slow_team(delay: float = 0.15):
     class _T(agteam):
         def setup(self):

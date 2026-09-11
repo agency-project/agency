@@ -362,6 +362,7 @@ class HarnessManager:
         # served concurrently with an in-flight attempt, not block behind it.
         self._control_lock = threading.Lock()
         self._current_control_handle: object = None
+        self._current_request_cancelled = False
         self._current_request_id: "str | None" = None
         self._redirect_handler: "Callable[[str], bool] | None" = None
         # Sticky: persists across attempts for this daemon's whole life, so
@@ -386,7 +387,9 @@ class HarnessManager:
         starts. Applies a pause requested before this handle existed."""
         with self._control_lock:
             self._current_control_handle = handle
-            if self._agent_paused:
+            if self._current_request_cancelled:
+                handle.kill()
+            elif self._agent_paused:
                 try:
                     handle.pause()
                 except Exception as exc:
@@ -415,11 +418,17 @@ class HarnessManager:
                 print(f"[harness_daemon] WARNING: redirect delivery failed: {exc}")
                 return False
 
-    def control(self, action: str) -> None:
+    def control(self, action: str, *, request_id: str | None = None) -> None:
         """Backs HarnessInteractionServer's /control/{action} route.
         No-op (not an error) when nothing is currently registered -- see
         agent.py's cancel()/pause()/resume() for why that's safe."""
         with self._control_lock:
+            if action == "cancel" and (
+                request_id is None or request_id != self._current_request_id
+            ):
+                return
+            if action == "cancel":
+                self._current_request_cancelled = True
             if action == "pause":
                 self._agent_paused = True
             elif action == "resume":
@@ -453,6 +462,7 @@ class HarnessManager:
             self._current_attempt_token = token
             with self._control_lock:
                 self._current_request_id = request.request_id
+                self._current_request_cancelled = False
                 self._redirect_handler = None
             try:
                 if request.sandbox_mcp_tools_b64 is not None:

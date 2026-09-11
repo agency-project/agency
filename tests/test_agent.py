@@ -39,6 +39,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
         max_steps=None,
         is_cancelled=lambda: False,
         request_id=None,
+        claim_completion=lambda: True,
     ):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
@@ -52,6 +53,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 max_steps=max_steps,
                 is_cancelled=is_cancelled,
                 request_id=request_id,
+                claim_completion=claim_completion,
             )
         output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps

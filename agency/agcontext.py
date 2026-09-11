@@ -47,9 +47,10 @@ class agcontext:
 
     def resolve_prev_dependencies(self) -> None:
         """Block until the pending future resolves and merge its state into self."""
-        if self._future is None:
+        future = self._future
+        if future is None:
             return
-        prev_ctx = self._future.result()
+        prev_ctx = future.result()
         self.recent_transcript = prev_ctx.recent_transcript
         self.harness_sessions = prev_ctx.harness_sessions
         self.retained_messages = prev_ctx.retained_messages

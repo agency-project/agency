@@ -362,12 +362,13 @@ class agSandbox:
             print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
-        if self._destroyed:
-            return
-        with agprof.span("sandbox:destroy"):
-            self._backend.destroy()
-            self._destroyed = True
-            _live_sandboxes.discard(self)
+        with self._lock:
+            if self._destroyed:
+                return
+            with agprof.span("sandbox:destroy"):
+                self._backend.destroy()
+                self._destroyed = True
+                _live_sandboxes.discard(self)
 
     def fork(self, new_name: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_name* starting from this sandbox's
@@ -384,7 +385,7 @@ class agSandbox:
         The caller owns the returned sandbox and is responsible for calling
         destroy() on it when done.
         """
-        with agprof.span("sandbox:fork"):
+        with self._lock, agprof.span("sandbox:fork"):
             cfg = agconfig if agconfig is not None else self.agconfig
             fork_sb = agSandbox(new_name, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image

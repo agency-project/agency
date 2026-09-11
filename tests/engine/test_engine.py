@@ -142,6 +142,9 @@ class _FakeAgent:
 
     def __init__(self):
         self.agconfig = agconfig_cls()
+        import threading
+
+        self._control_lock = threading.RLock()
         self.sandbox = _FakeSandbox()
         self.harness = "claude_code"
         self.agname = "test-agent"
@@ -229,6 +232,18 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
         def close(self):
             self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def resume_harness(self):
+            pass
+
+        def pause_harness(self):
+            pass
 
     client = _FakeClient()
     holder["client"] = client

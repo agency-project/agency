@@ -151,3 +151,73 @@ def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkey
     assert notice["source"] == "context_notice"
     assert "previous skill call failed" in notice["content"]
     assert "workspace changes have been discarded" in notice["content"]
+
+
+def test_cancel_during_claimed_commit_cannot_discard_the_committed_context(monkeypatch, tmp_path):
+    sandbox = _TransactionSandbox()
+    ag = _agent(tmp_path, sandbox)
+    committing = threading.Event()
+    release_commit = threading.Event()
+
+    def commit():
+        sandbox.events.append("commit")
+        committing.set()
+        assert release_commit.wait(2)
+
+    def harness(self, context, *_args, **_kwargs):
+        context.recent_transcript.append({"role": "assistant", "content": "committed"})
+        return agdata(answer=42)
+
+    sandbox.commit = commit
+    monkeypatch.setattr(AgentEngine, "_execute_harness", harness)
+    result = ag.run(agskill("commit", ""), agdata())
+    assert committing.wait(2)
+    try:
+        ag.cancel(result)
+    finally:
+        release_commit.set()
+    assert result.wait(timeout=2).to_dict() == {"answer": 42}
+    assert ag.history.messages == [{"role": "assistant", "content": "committed"}]
+    assert "discard" not in sandbox.events
+
+
+def test_fork_retries_when_context_advances_while_waiting_for_sandbox(tmp_path):
+    waiting = threading.Event()
+    lock = threading.RLock()
+
+    class SnapshotLock:
+        def __enter__(self):
+            if threading.current_thread().name == "fork-caller":
+                waiting.set()
+            lock.acquire()
+
+        def __exit__(self, *args):
+            lock.release()
+
+    class SnapshotSandbox(_TransactionSandbox):
+        def __init__(self, version):
+            super().__init__()
+            self.version = version
+            self._lock = SnapshotLock()
+
+        def fork(self, *args, **kwargs):
+            with self._lock:
+                return SnapshotSandbox(self.version)
+
+    sandbox = SnapshotSandbox("old")
+    source = _agent(tmp_path, sandbox)
+    source.context = agcontext(recent_transcript=[{"version": "old"}])
+    children = []
+    worker = threading.Thread(
+        target=lambda: children.append(agent.fork(source)), name="fork-caller"
+    )
+    with sandbox._lock:
+        worker.start()
+        assert waiting.wait(2)
+        with source._orchestrator._event_cond:
+            source.context = agcontext(recent_transcript=[{"version": "new"}])
+            sandbox.version = "new"
+    worker.join(2)
+    assert not worker.is_alive()
+    assert children[0].sandbox.version == "new"
+    assert children[0].history.messages == [{"version": "new"}]
