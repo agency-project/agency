@@ -387,6 +387,65 @@ def _controlled_server(backend) -> LlmHandlerServer:
 
 
 # ---------------------------------------------------------------------------
+# _payload_hash -- transcript dedup identity
+# ---------------------------------------------------------------------------
+
+
+def test_payload_hash_treats_native_and_replayed_tool_use_as_the_same_call():
+    """A tool_use block gets logged once in its rich, backend-native shape
+    (with extra bookkeeping fields like text/signature/data/citations/
+    ts_start/ts_end) and again in the reduced shape native_harness's
+    OpenAI-chatcompletions wire protocol reconstructs when that same call is
+    replayed back into a later request (id/name/arguments only, and often a
+    different `index`) -- these must hash identically so the second one
+    doesn't get double-logged."""
+    rich = {
+        "role": "assistant",
+        "type": "tool_use",
+        "index": 1,
+        "text": "",
+        "signature": "",
+        "id": "call_1",
+        "name": "write",
+        "arguments": '{"a": 1}',
+        "data": None,
+        "citations": None,
+        "ts_start": 123.0,
+        "ts_end": 123.0,
+    }
+    replayed = {
+        "role": "assistant",
+        "type": "tool_use",
+        "index": 0,
+        "id": "call_1",
+        "name": "write",
+        "arguments": '{"a": 1}',
+    }
+    assert mod._payload_hash(rich) == mod._payload_hash(replayed)
+
+
+def test_payload_hash_distinguishes_different_tool_use_calls():
+    a = {"role": "assistant", "type": "tool_use", "index": 0, "id": "call_1", "name": "write"}
+    b = {"role": "assistant", "type": "tool_use", "index": 0, "id": "call_2", "name": "write"}
+    assert mod._payload_hash(a) != mod._payload_hash(b)
+
+
+def test_payload_hash_distinguishes_different_tool_results():
+    a = {"role": "tool", "type": "tool_result", "index": 0, "tool_call_id": "call_1", "text": "ok"}
+    b = {"role": "tool", "type": "tool_result", "index": 0, "tool_call_id": "call_2", "text": "ok"}
+    assert mod._payload_hash(a) != mod._payload_hash(b)
+
+
+def test_payload_hash_falls_back_to_whole_payload_for_other_block_types():
+    """text/thinking/metadata blocks have no id-like stable identity field --
+    unaffected by this change, still hashed on full content as before."""
+    a = {"role": "assistant", "type": "text", "index": 0, "text": "hi"}
+    b = {"role": "assistant", "type": "text", "index": 0, "text": "bye"}
+    assert mod._payload_hash(a) != mod._payload_hash(b)
+    assert mod._payload_hash(a) == mod._payload_hash(dict(a))
+
+
+# ---------------------------------------------------------------------------
 # resolve_model / context_limit
 # ---------------------------------------------------------------------------
 

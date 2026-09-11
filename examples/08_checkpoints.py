@@ -15,7 +15,7 @@ from _common import close_sandboxes, run_example, tutorial_config
 
 WRITE_STATE = agskill(
     name="write_checkpoint_state",
-    system_prompt=(
+    prompt=(
         "Use the shell to write the exact text CHECKPOINTED to /workspace/checkpoint.txt, "
         "then return that same word as confirmation."
     ),

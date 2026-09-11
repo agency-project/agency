@@ -138,34 +138,34 @@ def test_recover_sandbox_failure_leaves_path_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_includes_agbinary_input_instructions():
+def test_prompt_includes_agbinary_input_instructions():
     sk = agskill(
         "process",
         "Do stuff.",
         input_schema=agdata(audio=agbinary),
         output_schema=agdata(result=str),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "audio" in prompt
     assert "binary" in prompt.lower()
 
 
-def test_system_prompt_includes_agbinary_output_instructions():
+def test_prompt_includes_agbinary_output_instructions():
     sk = agskill(
         "process",
         "Do stuff.",
         output_schema=agdata(trimmed=agbinary),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "trimmed" in prompt
     assert "binary" in prompt.lower()
 
 
-def test_system_prompt_agbinary_type_shown_as_binary_file():
+def test_prompt_agbinary_type_shown_as_binary_file():
     sk = agskill("t", "", input_schema=agdata(data=agbinary))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"data": "binary_file"' in prompt
 
 

@@ -120,32 +120,32 @@ def test_agdata_serializes_list_agimage():
 
 
 # ---------------------------------------------------------------------------
-# agskill._build_system_prompt — agimage fields included
+# agskill._build_prompt — agimage fields included
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_includes_agimage_input_instructions():
+def test_prompt_includes_agimage_input_instructions():
     sk = agskill(
         "describe",
         "Describe the image.",
         input_schema=agdata(question=str, photo=agimage),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "photo" in prompt
     assert "image" in prompt.lower()
 
 
-def test_system_prompt_includes_list_agimage_instructions():
+def test_prompt_includes_list_agimage_instructions():
     sk = agskill(
         "compare",
         "Compare images.",
         input_schema=agdata(question=str, frames=list[agimage]),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "frames" in prompt
 
 
-def test_system_prompt_agimage_no_sandbox_warning():
+def test_prompt_agimage_no_sandbox_warning():
     # agimage is not file-backed so the "File-backed fields" banner should
     # still appear (the banner is shared), but the prompt for agimage itself
     # should reference "image", not "read tool"
@@ -154,7 +154,7 @@ def test_system_prompt_agimage_no_sandbox_warning():
         "Describe.",
         input_schema=agdata(photo=agimage),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "photo" in prompt
     assert "read tool" not in prompt
 

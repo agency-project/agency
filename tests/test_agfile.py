@@ -118,45 +118,45 @@ def test_check_schema_agfile_hint_rejects_non_string():
 
 
 # ---------------------------------------------------------------------------
-# agskill._build_system_prompt — agfile prompts injected
+# agskill._build_prompt — agfile prompts injected
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_includes_agfile_input_instructions():
+def test_prompt_includes_agfile_input_instructions():
     sk = agskill(
         "design",
         "Do stuff.",
         input_schema=agdata(background=agfile),
         output_schema=agdata(result=str),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "background" in prompt
     assert "read tool" in prompt
 
 
-def test_system_prompt_includes_agfile_output_instructions():
+def test_prompt_includes_agfile_output_instructions():
     sk = agskill(
         "design",
         "Do stuff.",
         input_schema=agdata(theme=str),
         output_schema=agdata(report=agfile),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "report" in prompt
     assert "write" in prompt.lower()
 
 
-def test_system_prompt_no_agfile_fields_no_file_backed_warning():
+def test_prompt_no_agfile_fields_no_file_backed_warning():
     sk = agskill("t", "Do stuff.", input_schema=agdata(x=str), output_schema=agdata(y=int))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed" not in prompt
 
 
-def test_system_prompt_agfile_type_shown_as_file():
+def test_prompt_agfile_type_shown_as_file():
     sk = agskill("t", "", input_schema=agdata(doc=agfile))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"doc": "file"' in prompt
 
 

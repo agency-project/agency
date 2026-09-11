@@ -94,16 +94,14 @@ def main() -> None:
     cfg, run_dir = tutorial_config("03_tools_and_policy")
     host_skill = agskill(
         name="host_tool_example",
-        system_prompt=(
-            "Call host_identity exactly once with label tutorial, then report only its label."
-        ),
+        prompt=("Call host_identity exactly once with label tutorial, then report only its label."),
         add_host_mcp_tools=[HOST_IDENTITY],
         input_schema=agdata(task=str),
         output_schema=agdata(label=str),
     )
     sandbox_skill = agskill(
         name="sandbox_tool_example",
-        system_prompt=(
+        prompt=(
             "Call sandbox_double exactly once with the supplied number, then report its result."
         ),
         add_sandbox_mcp_tools=[SANDBOX_DOUBLE],

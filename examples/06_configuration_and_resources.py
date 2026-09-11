@@ -70,7 +70,7 @@ def main() -> None:
     learner = Agent("configured", agconfig=cfg, harness="native")
     inspect_resources = agskill(
         name="inspect_resources",
-        system_prompt="Call get_current_resources and return its resource totals.",
+        prompt="Call get_current_resources and return its resource totals.",
         input_schema=agdata(request=str),
         output_schema=agdata(total_cpus=int, total_memory_mb=int, total_gpus=int),
     )

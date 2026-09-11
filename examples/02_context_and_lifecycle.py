@@ -12,21 +12,21 @@ from _common import close_sandboxes, run_example, tutorial_config
 
 RAW_ECHO = agskill(
     name="raw_echo",
-    system_prompt="Return only the requested final word, with no punctuation or explanation.",
+    prompt="Return only the requested final word, with no punctuation or explanation.",
     input_schema=agdata(request=agrawstring),
     output_schema=agdata(answer=agrawstring),
 )
 
 MAKE_TEXT = agskill(
     name="make_text",
-    system_prompt="Return the requested token exactly.",
+    prompt="Return the requested token exactly.",
     input_schema=agdata(token=str),
     output_schema=agdata(text=str),
 )
 
 WRAP_TEXT = agskill(
     name="wrap_text",
-    system_prompt="Wrap the supplied text in square brackets.",
+    prompt="Wrap the supplied text in square brackets.",
     input_schema=agdata(text=str),
     output_schema=agdata(wrapped=str),
 )

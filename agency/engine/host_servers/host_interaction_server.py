@@ -378,6 +378,8 @@ class HostInteractionServer:
                 if opened is not None:
                     self._open_spans[span_id] = opened
                 return
+            if start_ts is None and opened is not None:
+                start_ts = opened._wall0 / 1e9
             if opened is not None:
                 end_perf_ns, end_wall_ns = self._wall_clock_to_perf_ns(end_ts)
                 opened.end(

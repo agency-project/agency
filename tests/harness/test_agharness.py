@@ -50,7 +50,7 @@ def test_cleanup_config_home_is_idempotent(tmp_path):
 
 
 def test_build_user_turn_prompt_delegates_to_skill():
-    skill = agskill(name="s", system_prompt="do the thing")
+    skill = agskill(name="s", prompt="do the thing")
     content = agharness.build_user_turn_prompt(skill, agdata(task="go"))
     assert "go" in content if isinstance(content, str) else True
     assert content == skill._build_user_content(agdata(task="go"))

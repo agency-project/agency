@@ -37,32 +37,33 @@ def test_agrawstring_recover_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# _build_system_prompt — JSON blocks omitted for agrawstring
+# _build_prompt — JSON blocks omitted for agrawstring
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_no_input_json_when_raw_input():
+def test_prompt_no_input_json_when_raw_input():
     sk = agskill("t", "Write a story.", input_schema=agdata(prompt=agrawstring))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Input JSON format" not in prompt
 
 
-def test_system_prompt_no_output_json_when_raw_output():
+def test_prompt_no_output_json_when_raw_output():
     sk = agskill("t", "Write a story.", output_schema=agdata(story=agrawstring))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Output JSON format" not in prompt
     assert "plain text" in prompt.lower()
 
 
-def test_system_prompt_keeps_json_for_normal_output():
+def test_prompt_keeps_json_for_normal_output():
     sk = agskill("t", "Summarise.", output_schema=agdata(summary=str))
-    prompt = sk._build_system_prompt()
-    assert "return_summary" in prompt
+    prompt = sk._build_prompt()
+    assert "submit_output" in prompt
+    assert "summary" in prompt
 
 
-def test_system_prompt_keeps_input_json_for_normal_input():
+def test_prompt_keeps_input_json_for_normal_input():
     sk = agskill("t", "Summarise.", input_schema=agdata(text=str))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Input JSON format" in prompt
 
 

@@ -549,38 +549,36 @@ _TOKEN_TOTALS_SQL = (
 
 
 def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
-    """The full current transcript for one agent's own db: the last
-    completed-skill-call snapshot (live_messages) plus whatever's happened
-    since (finalized exchanges not yet folded into a new live_messages, and
-    the exchange still actively streaming, if any). Shared by the HTTP pull
-    path (_fetch_agent_detail) and the push path (_tail_and_broadcast's
+    """The full current transcript for one agent's own db, built entirely
+    from what llm_handler_server._finalize_success() persists via
+    record_final_transcript() (llm_block events) plus whatever exchange is
+    still actively streaming. Shared by the HTTP pull path
+    (_fetch_agent_detail) and the push path (_tail_and_broadcast's
     messages_snapshot broadcast) so both compute it identically.
 
-    Each returned message carries a best-effort `ts` for the client's
-    timestamp display -- individual messages inside one already-completed
-    skill call share that call's single finish timestamp (agcontext's own
-    transcript has no per-message clock), while an in-progress or still-
-    streaming exchange gets the real timestamp of whichever row started it."""
-    row = con.execute(
-        "SELECT payload, timestamp FROM latest_values WHERE type='live_messages'"
-    ).fetchone()
-    if row is not None:
-        base_messages = _json_object(row[0]).get("messages", [])
-        base_ts = row[1]
-        live_messages_ts = row[1]
-    else:
-        call_row = con.execute(
-            "SELECT payload, timestamp FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        base_messages = _json_object(call_row[0]).get("history_after", []) if call_row else []
-        base_ts = call_row[1] if call_row else 0.0
-        live_messages_ts = 0.0
-    for message in base_messages:
-        message.setdefault("ts", base_ts)
-    in_progress = con.execute(
+    Deliberately does NOT read orchestrator.py's live_messages/skill_call
+    events -- those snapshot agcontext's own transcript, which carries no
+    per-message clock, so every message in one of those snapshots gets
+    stamped with a single blanket skill-finish timestamp. That made a
+    completed skill's own initial prompt render as if it happened *after*
+    the tool calls it triggered, once a later skill sharing the same
+    history finished. llm_block rows, by contrast, are each logged with a
+    real timestamp at the moment they actually happened, so they're the
+    canonical source for every message, not just the still-running tail.
+
+    Also deliberately does NOT read host_interaction_server's own
+    `tool_result` events here -- that's a *second*, independent record of
+    the same tool call (host_interaction_server._record_completion(),
+    logged the instant the tool finishes, versus llm_block's role='tool'
+    row, logged once the exchange that consumed it finalizes) -- reading
+    both produced two renderings of the same result, one double-JSON-
+    encoded (json.dumps() over an already-JSON result string) and one not.
+    The `tool_result` *events* still drive the immediate "Full Logs"
+    syslog line (recordSystemLog in app.js) for live feedback; they just
+    shouldn't also feed the canonical message transcript."""
+    finalized = con.execute(
         "SELECT type, call_label, payload, timestamp FROM events "
-        "WHERE type IN ('llm_block','tool_result') AND timestamp > ? ORDER BY id",
-        (live_messages_ts,),
+        "WHERE type = 'llm_block' ORDER BY id"
     ).fetchall()
     # record_final_transcript() atomically clears every stream_deltas row for a
     # call_label the moment that exchange finishes (moving it to the
@@ -590,10 +588,8 @@ def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
         "SELECT call_label, payload, timestamp FROM stream_deltas "
         "WHERE type='llm_stream_delta' ORDER BY id"
     ).fetchall()
-    return (
-        base_messages
-        + _reconstruct_in_progress_messages(in_progress)
-        + _reconstruct_streaming_messages(streaming_rows)
+    return _reconstruct_in_progress_messages(finalized) + _reconstruct_streaming_messages(
+        streaming_rows
     )
 
 
@@ -648,54 +644,44 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
 
 
 def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str, float]]") -> "list[dict]":
-    """live_messages only gets (re)written once, when a skill call finishes
-    (orchestrator._record_execution_results) -- there's no persisted
-    snapshot of an in-flight skill's transcript to read. But
-    llm_handler_server._finalize_success() persists each new transcript
-    block incrementally the moment its exchange finishes
+    """The canonical transcript builder for one agent's db, given every
+    llm_block row ever recorded (see _compute_agent_messages) -- not just an
+    in-flight skill's tail. llm_handler_server._finalize_success() persists
+    each new transcript block the moment its exchange finishes
     (record_final_transcript()) -- one events row per {role, **block}
     payload, content-diffed against everything already logged this
     attempt (see _new_transcript_payloads()), so it's whatever's actually
-    new: the response, but also a changed system prompt or a harness-
-    injected mid-run message, whichever role it turns out to carry.
-    tool_result rows (host_mcp_server.call_tool) are the same. Reconstruct
-    the still-running skill's messages from those, in the same {role,
-    blocks} shape as a real transcript entry, so the interaction panel
-    keeps advancing during execution instead of only at completion.
+    new: the response, but also a changed system prompt, a tool result (role
+    'tool'), or a harness-injected mid-run message, whichever role it turns
+    out to carry. Reconstruct every message from those, in the same {role,
+    blocks} shape as a real transcript entry, each carrying the real
+    timestamp of the row that produced it -- so the interaction panel
+    keeps advancing during execution instead of only at completion, and a
+    completed skill's messages keep their true individual times instead of
+    all collapsing to one blanket finish timestamp.
 
-    Each llm_block row's payload is {"role": ..., **block} -- role is
-    popped back off to decide grouping and the message's own role; the
-    rest of the payload IS the block, metadata blocks included (they are
-    not filtered here -- only at render time, gated behind the client's
-    Full Logs toggle, same as everything else this can't assume the shape
-    of). Consecutive rows sharing one (call_label, role) key group into a
-    single message -- a system/user block logged alongside an exchange's
-    response shares that response's call_label but not its role, so it
-    gets its own message; a tool_result row always starts fresh and resets
-    the key, mirroring how a real transcript alternates turns."""
+    Each row's payload is {"role": ..., **block} -- role is popped back off
+    to decide grouping and the message's own role; the rest of the payload
+    IS the block, metadata blocks included (they are not filtered here --
+    only at render time, gated behind the client's Full Logs toggle, same
+    as everything else this can't assume the shape of). Consecutive rows
+    sharing one (call_label, role) key group into a single message -- a
+    tool_result row (role='tool') typically shares its call_label with the
+    assistant turn that follows it (both get logged together once that next
+    exchange finalizes), but the differing role still splits them into
+    separate messages, mirroring how a real transcript alternates turns."""
     messages: "list[dict]" = []
     current_key: "object" = object()  # sentinel, never equals a real (call_label, role)
     current_blocks: "list[dict] | None" = None
-    for event_type, call_label, payload_json, ts in rows:
+    for _event_type, call_label, payload_json, ts in rows:
         payload = _json_object(payload_json)
-        if event_type == "llm_block":
-            role = payload.pop("role", "assistant")
-            key = (call_label, role)
-            if key != current_key or current_blocks is None:
-                current_blocks = []
-                messages.append({"role": role, "blocks": current_blocks, "ts": ts})
-                current_key = key
-            current_blocks.append(payload)
-        elif event_type == "tool_result":
-            current_key = object()
-            current_blocks = None
-            messages.append(
-                {
-                    "role": "tool",
-                    "blocks": [{"type": "tool_result", "text": json.dumps(payload.get("result"))}],
-                    "ts": ts,
-                }
-            )
+        role = payload.pop("role", "assistant")
+        key = (call_label, role)
+        if key != current_key or current_blocks is None:
+            current_blocks = []
+            messages.append({"role": role, "blocks": current_blocks, "ts": ts})
+            current_key = key
+        current_blocks.append(payload)
     return messages
 
 

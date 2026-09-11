@@ -32,9 +32,8 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
     )
     agent_logger.record_event("agent_config", {"temperature": 0.2}, update_latest_snapshot=True)
     agent_logger.record_event(
-        "live_messages",
-        {"messages": [{"role": "assistant", "content": "done"}]},
-        update_latest_snapshot=True,
+        "llm_block",
+        {"role": "assistant", "content": "done"},
         flush=True,
     )
     agent_logger.stop()
@@ -58,7 +57,7 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
     # (real wall-clock time, not something to assert an exact literal for).
     (message,) = detail["messages"]
     assert isinstance(message.pop("ts", None), (int, float))
-    assert message == {"role": "assistant", "content": "done"}
+    assert message == {"role": "assistant", "blocks": [{"content": "done"}]}
     assert _fetch_agent_detail(global_path, "missing")["error"] == "unknown agent"
 
 
@@ -77,11 +76,11 @@ def test_team_uses_global_logger_instead_of_own_database(tmp_path):
         for row in _rows(
             logger.db_path,
             "SELECT type FROM events WHERE object='agteam' AND name=?",
-            (team.team_name,),
+            (team.name,),
         )
     }
     assert {"team_created", "team_registered"} <= event_types
-    assert not (tmp_path / f"{team.team_name}_data.sqlite3").exists()
+    assert not (tmp_path / f"{team.name}_data.sqlite3").exists()
 
 
 def test_resource_pool_uses_global_logger_instead_of_own_database(tmp_path):

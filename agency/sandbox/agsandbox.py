@@ -47,16 +47,16 @@ class agSandbox:
 
     def __init__(
         self,
-        agname: str,
+        name: str,
         checkpoint_image: str | None = None,
         agconfig: "agconfig_cls | None" = None,
     ) -> None:
         with agprof.span("sandbox:create"):
-            self._initialize(agname, checkpoint_image, agconfig)
+            self._initialize(name, checkpoint_image, agconfig)
 
     def _initialize(
         self,
-        agname: str,
+        name: str,
         checkpoint_image: str | None,
         agconfig: "agconfig_cls | None",
     ) -> None:
@@ -71,7 +71,7 @@ class agSandbox:
         # so this never raises, even when the same base *agname* is used to
         # construct multiple sandboxes -- each gets its own auto-suffixed
         # claim instead.
-        self._agname = _agname.allocate_agname(agname, prefix="sandbox")
+        self._agname = _agname.allocate_agname(name, prefix="sandbox")
         # AgentEngine holds this for a complete execution so two agents sharing
         # this facade cannot interleave harness or teardown operations.
         self._lock = threading.RLock()
@@ -369,11 +369,11 @@ class agSandbox:
             _live_sandboxes.discard(self)
             self._backend.destroy()
 
-    def fork(self, new_agname: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
-        """Return a new agSandbox for *new_agname* starting from this sandbox's
+    def fork(self, new_name: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
+        """Return a new agSandbox for *new_name* starting from this sandbox's
         current checkpoint image.  If no checkpoint exists the fork starts fresh.
 
-        *new_agname* doesn't need to already be unique -- like every
+        *new_name* doesn't need to already be unique -- like every
         agSandbox construction, it's automatically deduplicated (see
         __init__'s docstring below).
 
@@ -386,7 +386,7 @@ class agSandbox:
         """
         with agprof.span("sandbox:fork"):
             cfg = agconfig if agconfig is not None else self.agconfig
-            fork_sb = agSandbox(new_agname, agconfig=cfg)
+            fork_sb = agSandbox(new_name, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image
             if checkpoint_image:
                 # type(self._backend), not the docker-only agSandbox.tag_image

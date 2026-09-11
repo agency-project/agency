@@ -22,7 +22,7 @@ def main() -> None:
     profile_dir = run_dir / "profile"
     report = agskill(
         name="observable_run",
-        system_prompt="Return the supplied state in a short sentence.",
+        prompt="Return the supplied state in a short sentence.",
         input_schema=agdata(state=str),
         output_schema=agdata(message=str),
     )

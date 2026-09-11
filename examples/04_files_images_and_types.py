@@ -31,7 +31,7 @@ def main() -> None:
 
     transform = agskill(
         name="transform_artifacts",
-        system_prompt=(
+        prompt=(
             "Use bash to run `mkdir -p /workspace/outputs`, then run `tr '[:lower:]' "
             "'[:upper:]' < DOCUMENT_PATH > /workspace/outputs/uppercase.txt`, replacing "
             "DOCUMENT_PATH with the document path in the input. Copy the binary input "
@@ -61,7 +61,7 @@ def main() -> None:
     raw_learner = Agent("raw-text", agconfig=cfg)
     raw = agskill(
         name="raw_text",
-        system_prompt="Return exactly the requested word and nothing else.",
+        prompt="Return exactly the requested word and nothing else.",
         input_schema=agdata(prompt=agrawstring),
         output_schema=agdata(answer=agrawstring),
     )
@@ -84,7 +84,7 @@ def main() -> None:
     vision = Agent("vision", agconfig=cfg, harness="native")
     describe = agskill(
         name="describe_image",
-        system_prompt="Describe the attached image very briefly.",
+        prompt="Describe the attached image very briefly.",
         input_schema=agdata(question=str, image=agimage),
         output_schema=agdata(description=str),
     )

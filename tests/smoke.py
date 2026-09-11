@@ -75,7 +75,7 @@ def smoke_write_read_cycle():
     """Skill uses write then read inside the sandbox container, then answers."""
     file_skill = agskill(
         name="file_ops",
-        system_prompt="You manage files. Use write and read tools.",
+        prompt="You manage files. Use write and read tools.",
     )
     # No tools= → uses default sandboxed tool list; files live in container
     ag = agent(agconfig=LLM_AGCONFIG)
@@ -100,8 +100,8 @@ def smoke_write_read_cycle():
 
 def smoke_history_shared_across_skills():
     """Two different skills share and accumulate history."""
-    skill_a = agskill(name="a", system_prompt="Skill A")
-    skill_b = agskill(name="b", system_prompt="Skill B")
+    skill_a = agskill(name="a", prompt="Skill A")
+    skill_b = agskill(name="b", prompt="Skill B")
     ag = agent(agconfig=LLM_AGCONFIG)
 
     with patch("openai.OpenAI") as MockClient:
@@ -120,7 +120,7 @@ def smoke_skill_own_tools():
     """add_tools on a skill extends the default sandboxed tools."""
     skill_t = agtool(name="skill_tool", description="", fn=_skill_tool_fn)
 
-    skill = agskill(name="s", system_prompt="", add_tools=[skill_t])
+    skill = agskill(name="s", prompt="", add_tools=[skill_t])
     ag = agent(agconfig=LLM_AGCONFIG)
 
     responses = [_tool_call("skill_tool", {}), _direct("{}")]

@@ -29,7 +29,7 @@ def main() -> None:
     cfg, run_dir = tutorial_config("01_basic_agent")
     summarize = agskill(
         name="summarize",
-        system_prompt="Summarize the topic for the requested audience in one sentence.",
+        prompt="Summarize the topic for the requested audience in one sentence.",
         input_schema=agdata(topic=str, audience=str),
         output_schema=agdata(summary=str),
     )

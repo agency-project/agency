@@ -383,7 +383,7 @@ class AgentEngine:
             else:
                 user_content = [{"type": "text", "text": retained}, *user_content]
         return PromptPayload(
-            system_instruction=skill._build_system_prompt(),
+            system_instruction=skill._build_prompt(),
             user_content=user_content,
         )
 

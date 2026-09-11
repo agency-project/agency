@@ -9,14 +9,14 @@ from _common import close_sandboxes, run_example, tutorial_config
 
 RESEARCH = agskill(
     name="research_one",
-    system_prompt="Return one short practical fact about the supplied topic.",
+    prompt="Return one short practical fact about the supplied topic.",
     input_schema=agdata(topic=str),
     output_schema=agdata(fact=str),
 )
 
 MERGE = agskill(
     name="merge_research",
-    system_prompt="Combine the supplied research results into one concise paragraph.",
+    prompt="Combine the supplied research results into one concise paragraph.",
     input_schema=agdata(items=list),
     output_schema=agdata(report=str),
 )

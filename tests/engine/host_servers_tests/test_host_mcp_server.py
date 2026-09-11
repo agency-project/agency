@@ -82,7 +82,7 @@ def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, outp
     resource_pool = resource_pool if resource_pool is not None else SimpleNamespace()
     skill = agskill(
         name="s",
-        system_prompt="p",
+        prompt="p",
         add_host_mcp_tools=add_host_mcp_tools,
         output_schema=output_schema,
     )
@@ -201,7 +201,7 @@ def test_call_tool_does_not_check_policy_itself():
 
     skill = agskill(
         name="s",
-        system_prompt="p",
+        prompt="p",
         add_host_mcp_tools=[tool],
         policy=agpolicy(default_to_deny=True),
     )
@@ -403,6 +403,22 @@ def test_submit_output_rejects_a_value_of_the_wrong_type():
     assert result.content[0].text  # check_field's own error message, not asserting exact text
     body = result.content[0].text
     assert "error" in body
+
+
+def test_submit_output_coerces_a_stringified_number_for_an_int_field():
+    """submit_output's own tool schema declares no type for `value` -- a
+    model routinely emits a numeric field as a quoted string (e.g. "42")
+    since it has no signal the field is actually typed int. That must be
+    accepted, not rejected as a type mismatch."""
+    server, _, _ = _make_server(output_schema=agdata(count=int))
+    result = _call(server, "submit_output", {"field": "count", "value": "42"})
+    assert result.is_error is False
+
+
+def test_submit_output_coerces_a_stringified_bool_for_a_bool_field():
+    server, _, _ = _make_server(output_schema=agdata(flag=bool))
+    result = _call(server, "submit_output", {"field": "flag", "value": "true"})
+    assert result.is_error is False
 
 
 def test_submit_output_records_a_valid_field_and_reports_still_missing():

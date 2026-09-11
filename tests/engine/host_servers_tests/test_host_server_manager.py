@@ -395,7 +395,7 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
         llm_usage_tracker=LlmUsageTracker(),
     )
     sandbox = SimpleNamespace()
-    skill = agskill(name="s", system_prompt="p", policy=agpolicy())
+    skill = agskill(name="s", prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()
     manager = HostServerManager(agent, sandbox, skill, resource_pool)
     try:

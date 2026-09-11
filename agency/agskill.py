@@ -95,6 +95,39 @@ def _daemon_release(arg: agdata, sandbox) -> agdata:
     return agdata(message=f"PID {pid} released as daemon -- will not block skill completion")
 
 
+def _coerce_submitted_value(hint, value):
+    """submit_output's own tool schema declares no type for `value` (one
+    tool serves every output field, whatever its real type) -- so a model
+    has nothing telling it a given field is numeric/boolean, and routinely
+    emits it as a quoted string (e.g. "42" instead of 42) since that's the
+    one type it can always produce. Cast to the schema's real declared
+    type before validating, rather than rejecting a value the model had
+    no way to type correctly in the first place. Only ever narrows a str
+    to what the field hint actually is -- a value already of the right
+    type (or one that fails to parse) passes through unchanged, so
+    check_field still reports a real mismatch as an error."""
+    if not isinstance(value, str) or not isinstance(hint, type):
+        return value
+    if issubclass(hint, bool):
+        low = value.strip().lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+        return value
+    if issubclass(hint, int):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    if issubclass(hint, float):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
 def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> agdata:
     if output_schema is None:
         return agerror("this skill declares no output_schema -- nothing to submit")
@@ -102,13 +135,16 @@ def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> 
     value = arg._data["value"]
     if field not in output_schema._data:
         return agerror(f"unknown output field {field!r}")
+    value = _coerce_submitted_value(output_schema._data[field], value)
     err = output_schema.check_field(field, value)
     if err is not None:
         return agerror(err)
     submitted_output_store[field] = value
     required = set(output_schema._data.keys())
-    still_missing = sorted(required - set(submitted_output_store.keys()))
-    return agdata(result=f"field {field!r} recorded", still_missing=still_missing)
+    missing_output_fields = sorted(required - set(submitted_output_store.keys()))
+    if missing_output_fields == []:
+        missing_output_fields = None
+    return agdata(result=f"field {field!r} recorded", missing_output_fields=missing_output_fields)
 
 
 def _submitted_output(arg: agdata, submitted_output_store: dict) -> agdata:
@@ -215,7 +251,7 @@ class agskill:
     def __init__(
         self,
         name: str,
-        system_prompt: str,
+        prompt: str,
         add_host_mcp_tools: "list[agtool] | None" = None,
         add_sandbox_mcp_tools: "list[agtool] | None" = None,
         input_schema: agdata | None = None,
@@ -224,7 +260,7 @@ class agskill:
         policy: "agpolicy | None" = None,
     ):
         self.name = name
-        self.system_prompt = system_prompt
+        self.prompt = prompt
         self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
@@ -236,8 +272,8 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, extra: str | None = None) -> str:
-        parts = [self.system_prompt]  # [REFACTOR] Maybe rename into skill_prompt?
+    def _build_prompt(self, extra: str | None = None) -> str:
+        parts = [self.prompt]  # [REFACTOR] Maybe rename into skill_prompt?
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
         # lines describing how the LLM should handle that field (e.g. file paths,

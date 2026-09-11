@@ -36,7 +36,7 @@ def test_execute_transports_only_explicit_sandbox_tools(monkeypatch):
 
     skill = agskill(
         name="transport",
-        system_prompt="test",
+        prompt="test",
         add_host_mcp_tools=[agtool("host", "", host_only)],
         add_sandbox_mcp_tools=[agtool("sandbox", "local", lambda arg: arg)],
     )
@@ -59,7 +59,7 @@ def test_sandbox_tool_serialization_failure_returns_error_and_retires_token(monk
 
     skill = agskill(
         name="broken",
-        system_prompt="test",
+        prompt="test",
         add_sandbox_mcp_tools=[agtool("broken", "", Unserializable())],
     )
     engine = AgentEngine(_FakeAgent())
@@ -305,7 +305,7 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "the-prompt"
     )
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_system_prompt=lambda: "the-system")
+    skill = SimpleNamespace(_build_prompt=lambda: "the-system")
     payload = engine._build_prompt_payload(skill, SimpleNamespace())
     assert payload == PromptPayload(
         system_instruction="the-system",
@@ -320,7 +320,7 @@ def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "current request"
     )
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_system_prompt=lambda: "system")
+    skill = SimpleNamespace(_build_prompt=lambda: "system")
 
     payload = engine._build_prompt_payload(
         skill,
@@ -343,7 +343,7 @@ def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content(mo
     current = [{"type": "text", "text": "current request"}]
     monkeypatch.setattr(agharness, "build_user_turn_prompt", lambda *_args: current)
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_system_prompt=lambda: "system")
+    skill = SimpleNamespace(_build_prompt=lambda: "system")
 
     payload = engine._build_prompt_payload(
         skill,
@@ -1185,7 +1185,7 @@ def test_build_execution_result_populates_recent_transcript_from_llm_handler_ser
     ]
     engine._host_server_manager, seen = _fake_host_server_manager_with_transcript(transcript)
     context = agcontext()
-    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+    skill = SimpleNamespace(output_schema=None, _build_prompt=lambda: "system")
 
     result = engine._build_execution_result(
         context,
@@ -1207,7 +1207,7 @@ def test_build_execution_result_uses_collected_structured_output():
     )
     skill = SimpleNamespace(
         output_schema=agschema(agdata(summary=str, count=int)),
-        _build_system_prompt=lambda: "system",
+        _build_prompt=lambda: "system",
     )
 
     result = engine._build_execution_result(
@@ -1226,7 +1226,7 @@ def test_build_execution_result_accepts_valid_structured_json_without_mcp_calls(
     engine._host_server_manager, _ = _fake_host_server_manager_with_transcript([])
     skill = SimpleNamespace(
         output_schema=agschema(agdata(summary=str, count=int)),
-        _build_system_prompt=lambda: "system",
+        _build_prompt=lambda: "system",
     )
 
     result = engine._build_execution_result(
@@ -1247,7 +1247,7 @@ def test_build_execution_result_reports_incomplete_structured_output():
     )
     skill = SimpleNamespace(
         output_schema=agschema(agdata(summary=str, count=int)),
-        _build_system_prompt=lambda: "system",
+        _build_prompt=lambda: "system",
     )
 
     result = engine._build_execution_result(
@@ -1265,7 +1265,7 @@ def test_build_execution_result_reports_incomplete_structured_output():
 def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
     engine = AgentEngine(_FakeAgent())
     engine._host_server_manager, _ = _fake_host_server_manager_with_transcript([])
-    skill = SimpleNamespace(output_schema=None, _build_system_prompt=lambda: "system")
+    skill = SimpleNamespace(output_schema=None, _build_prompt=lambda: "system")
 
     failed = engine._build_execution_result(
         agcontext(),
