@@ -16,7 +16,7 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
     from ...native_harness.bridge_client import BridgeClient
     from ...native_harness.profiling import NativeProfiler
 
-    root = materialize_config_home(runtime.engine_name, runtime.token, runtime.harness_base_url)
+    root = materialize_config_home(runtime.engine_name)
     try:
         driver = PtyDriver(adapter, runtime, root, resume_session_id, prior_session_blob, max_steps)
     except BaseException:

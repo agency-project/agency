@@ -45,20 +45,13 @@ class agdata:
             with agprof.span("sync:result_wait"):
                 resolved = f.result()
         if not isinstance(resolved, agdata):
-            as_pending = getattr(resolved, "_as_pending_agdata", None)
-            if not callable(as_pending):
-                raise TypeError(
-                    "pending agdata future resolved to an incompatible value: "
-                    f"{type(resolved).__name__}"
-                )
-            resolved = as_pending()
+            raise TypeError(
+                "pending agdata future resolved to an incompatible value: "
+                f"{type(resolved).__name__}"
+            )
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)
-
-    def _as_pending_agdata(self) -> "agdata":
-        """Return the common pending-data representation used by the scheduler."""
-        return self
 
     def is_pending(self) -> bool:
         """Return True if this agdata is still waiting for a future result."""
@@ -128,10 +121,6 @@ class agdata:
     @staticmethod
     def _to_serializable(obj):
         """Recursively convert agdata objects (including nested ones) to plain types."""
-        if not isinstance(obj, agdata):
-            as_pending = getattr(obj, "_as_pending_agdata", None)
-            if callable(as_pending):
-                obj = as_pending()
         if isinstance(obj, type) and issubclass(obj, agtype):
             return obj.schema_type()
         if isinstance(obj, type):
@@ -214,10 +203,6 @@ class agdata:
 
     @staticmethod
     def _resolve_dependency(value):
-        if not isinstance(value, agdata):
-            as_pending = getattr(value, "_as_pending_agdata", None)
-            if callable(as_pending):
-                value = as_pending()
         if isinstance(value, agdata):
             value._resolve()
             return value

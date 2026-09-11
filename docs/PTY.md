@@ -1,9 +1,7 @@
 # External harness PTYs
 
 Codex, Grok Build, and OpenCode run their interactive terminal interfaces under
-the daemon's existing ptrace supervisor. Their old headless commands, pipe-input
-paths, and stdout/JSON result parsers are removed; there is no legacy fallback.
-Claude Code keeps its existing PTY adapter. Native keeps its existing process,
+the daemon's existing ptrace supervisor. Claude Code uses its own PTY adapter. Native uses its standalone process,
 pipe transport, model loop, and session format; it never enters the PTY runner.
 
 ## Ownership and lifecycle

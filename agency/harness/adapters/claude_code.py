@@ -56,13 +56,6 @@ def _session_path(config_home: str, session_id: str) -> str:
     return f"{config_home}/projects/{_session_slug(config_home)}/{session_id}.jsonl"
 
 
-def _read_session_blob(path: str) -> "bytes | None":
-    try:
-        return Path(path).read_bytes()
-    except (FileNotFoundError, OSError):
-        return None
-
-
 def _write_session_blob(path: str, data: bytes) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_bytes(data)
@@ -244,9 +237,7 @@ class _ClaudeCodeBackend(agharness_backend):
         from .. import agharness
 
         resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        config_home = agharness.materialize_config_home(
-            runtime.engine_name, runtime.token, runtime.harness_base_url
-        )
+        config_home = agharness.materialize_config_home(runtime.engine_name)
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(

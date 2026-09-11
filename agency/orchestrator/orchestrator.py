@@ -74,7 +74,6 @@ class _ExecutionRequest:
     terminal_error: str = ""
     terminal_state: str = "failed"
     terminal_event: str = "request_failed"
-    terminal_counts_as_failure: bool = True
 
 
 @dataclass
@@ -197,10 +196,7 @@ class GlobalAgentOrchestrator:
         """
         self._validate_max_steps(max_steps)
         if not isinstance(skill_input, agdata):
-            as_pending = getattr(skill_input, "_as_pending_agdata", None)
-            if not callable(as_pending):
-                raise TypeError("skill_input must be an agdata or pending result handle")
-            skill_input = as_pending()
+            raise TypeError("skill_input must be an agdata")
 
         result_future: "Future[agdata]" = Future()
         context_future: "Future[agcontext]" = Future()
@@ -977,7 +973,6 @@ class GlobalAgentOrchestrator:
         request.terminal_error = message
         request.terminal_state = terminal_state
         request.terminal_event = event_type
-        request.terminal_counts_as_failure = counts_as_failure
         self._end_phase_span_locked(request)
         self._end_run_span_locked(
             request,

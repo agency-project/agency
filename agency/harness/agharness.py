@@ -1,15 +1,7 @@
-"""Thin, engine-agnostic glue shared by every `agharness_backends/*`
-concrete backend.
+"""Shared isolated configuration directories and MCP endpoint configuration.
 
-Deliberately small -- per-harness config-file format and CLI argv
-construction stay in each concrete backend, not here. This module only
-holds what's genuinely shared: an isolated per-launch config-home
-directory (so concurrent harness-driven agents never see each other's
-token/base_url, and a run leaves no trace in the user's own `~/.claude`/
-`~/.codex`/`~/.config/opencode`), and prompt construction that reuses
-agskill's own existing code rather than re-implementing it -- the skill's
-task is delivered to the harness as a plain user-turn prompt, never
-injected as the harness's own system prompt or as a tool.
+CLI dialects and session formats belong to the concrete adapters. Skill
+prompt construction belongs to agskill.
 """
 
 from __future__ import annotations
@@ -23,18 +15,15 @@ from ..utils.agutil import agency_config_homes_dir
 
 if TYPE_CHECKING:
     from ..agent import agent
-    from ..agdata import agdata
-    from ..agskill import agskill
 
 
 def _runtime_name(owner: "agent | str") -> str:
     return owner if isinstance(owner, str) else owner.agname
 
 
-def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Path:
+def materialize_config_home(ag: "agent | str") -> Path:
     """Create a fresh, isolated directory for one harness launch's config
-    home. Concrete backends write their own harness-specific config files
-    (env vars, provider blocks, etc. pointing at *base_url* with *token*)
+    home. Concrete backends write their own harness-specific gateway config
     into this directory -- what to write is backend-specific, only the
     "give me an isolated directory" part is shared. Nested under this run's
     own config_homes/ directory (agutil.agency_config_homes_dir()) rather
@@ -49,15 +38,6 @@ def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Pat
 
 def cleanup_config_home(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
-
-
-def is_container_backed(sandbox) -> bool:
-    """True for a docker/podman-backed sandbox (`IMAGE_KIND == "container"`),
-    False for chroot or no sandbox at all. A container-backed harness launch
-    needs the in-container ptrace bridge and in-container
-    config-home materialization below; chroot's harness launch already runs
-    on the bare host (the jail IS a real host directory) and needs neither."""
-    return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
 
 
 def materialize_config_home_in_container(ag: "agent | str", sandbox, token: str) -> str:
@@ -105,21 +85,10 @@ def mcp_config_for(
     return config
 
 
-# [REFACTOR] Why do we have this wrapper?
-def build_user_turn_prompt(skill: "agskill", skill_input: "agdata") -> "str | list":
-    """The skill's task, delivered as a plain user-turn prompt -- reuses
-    agskill's own prompt-construction code so a harness sees exactly the
-    same JSON-input convention the native ReAct loop's first user message
-    uses."""
-    return skill._build_user_content(skill_input)
-
-
 __all__ = [
     "materialize_config_home",
     "cleanup_config_home",
-    "is_container_backed",
     "materialize_config_home_in_container",
     "cleanup_config_home_in_container",
     "mcp_config_for",
-    "build_user_turn_prompt",
 ]

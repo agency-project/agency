@@ -160,10 +160,6 @@ class ExecutionScheduler:
         seen: set[int] = set()
 
         def materialize(current: object) -> object:
-            if not isinstance(current, agdata):
-                as_pending = getattr(current, "_as_pending_agdata", None)
-                if callable(as_pending):
-                    current = as_pending()
             if isinstance(current, agdata):
                 marker = id(current)
                 if marker in seen:
@@ -177,13 +173,10 @@ class ExecutionScheduler:
                         )
                     resolved = future.result()
                     if not isinstance(resolved, agdata):
-                        as_pending = getattr(resolved, "_as_pending_agdata", None)
-                        if not callable(as_pending):
-                            raise TypeError(
-                                "dependency future resolved to an incompatible value: "
-                                f"{type(resolved).__name__}"
-                            )
-                        resolved = as_pending()
+                        raise TypeError(
+                            "dependency future resolved to an incompatible value: "
+                            f"{type(resolved).__name__}"
+                        )
                     if isinstance(resolved, agerror):
                         raise RuntimeError(resolved.error)
                     resolved = materialize(resolved)
@@ -245,10 +238,6 @@ class ExecutionScheduler:
         seen: set[int] = set()
 
         def visit(current: object, *, from_future: bool = False) -> "str | None":
-            if not isinstance(current, agdata):
-                as_pending = getattr(current, "_as_pending_agdata", None)
-                if callable(as_pending):
-                    current = as_pending()
             if isinstance(current, agerror):
                 return current.error if from_future else None
             if isinstance(current, agdata):

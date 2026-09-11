@@ -49,7 +49,7 @@ from .sandbox.agsandbox import agSandbox
 from .llm.usage_tracker import LlmUsageTracker
 from .configs.agconfig import agconfig as agconfig_cls
 
-from .agname import agname as _agname  # [REFACTOR] Why underscore?
+from .agname import agname as _agname
 from .observability.profiler import agprof
 
 if TYPE_CHECKING:
@@ -86,8 +86,8 @@ class agent:
         agent.log_dir        = Path("runs/logs")
 
     The GPU/CPU/memory pool is no longer a class-level override on ``agent``
-    -- it's owned by the process-wide orchestrator, constructed eagerly at
-    import time. Override it via ``get_orchestrator().agresource_pool = ...``
+    -- it's owned by the process-wide orchestrator, created lazily when the
+    orchestrator is first requested. Override it via ``get_orchestrator().agresource_pool = ...``
     instead.
     """
 
@@ -153,16 +153,13 @@ class agent:
         self.agconfig: "agconfig_cls" = _src_agconfig.clone()
 
         self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
-        self._parent_agent_id: "str | None" = (
-            None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
-        )
+        self._parent_agent_id: "str | None" = None
 
         self.harness: str = harness if harness is not None else self.agconfig.agent.harness
         self.context: agcontext = agcontext()
         # Sandbox is created lazily on first skill run; container provisioning
         # is expensive and agents may be constructed without ever running a skill.
         self.sandbox: "agSandbox | None" = sandbox
-        self._owns_sandbox = sandbox is None
         self.engine: "AgentEngine | None" = None
 
         from .agteam import _active_team
@@ -278,17 +275,8 @@ class agent:
         return self.agconfig.clone()
 
     # ------------------------------------------------------------------
-    # Properties # [REFACTOR] Why as properties?
+    # Properties
     # ------------------------------------------------------------------
-
-    @property
-    def ctx(self) -> agcontext:
-        """Compatibility alias for the one authoritative ``context`` chain."""
-        return self.context
-
-    @ctx.setter
-    def ctx(self, value: agcontext) -> None:
-        self.context = value
 
     @property
     def output_path(self) -> Path | None:
@@ -597,7 +585,6 @@ class agent:
                 if source_sandbox is not None
                 else None
             )
-        ag._owns_sandbox = True
 
         from .agteam import _active_team
 
@@ -830,7 +817,6 @@ class agent:
             if checkpoint
             else None
         )
-        ag._owns_sandbox = True
 
         ag._finish_construction(
             event_type="agent_loaded",

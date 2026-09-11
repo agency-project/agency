@@ -1,6 +1,6 @@
 # Agency
 
-A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Submission is lazy: dependency-blocked, pause-gated, and host-only context-message requests create no engine or sandbox infrastructure before dispatch. A sandbox is created only after an engine-backed request is admitted, then its transaction is committed or discarded before output context and results are published.
+A multi-agent framework with sandboxed execution, isolated filesystems, GPU access control, and automatic background-process tracking. Submission is lazy: dependency-blocked requests create no execution infrastructure until dispatch, and host-only context messages never create it. A sandbox is created only after an engine-backed request is admitted, then its transaction is committed or discarded before output context and results are published.
 
 Agents are non-blocking by default. `agent.run()` returns a pending `agdata` immediately. It can be awaited, passed into another skill, or read through attribute access; Agency privately retains the execution identity needed by `redirect()` and `cancel()`. A process-wide, event-driven orchestrator holds dependency-blocked work without occupying a worker or execution slot, then dispatches eligible work onto a reusable worker pool. Every dispatch still receives a fresh `AgentEngine`. Concurrency is unlimited by default and can be capped globally.
 
@@ -98,7 +98,7 @@ third.wait()
 | `await ag.asyncio_run(skill, skill_input, max_steps=None)` | Submit work and await the resolved result. |
 | `ag.redirect(result, message)` | Deliver to that active execution or queue future context. |
 | `ag.queue_message(message)` | Enqueue ordered future context. |
-| `ag.pause()` | Freeze the current harness process; pause future launches until resumed. |
+| `ag.pause()` | Freeze the current harness process and hold subsequently launched harnesses paused until resumed. |
 | `ag.resume()` | Resume the harness and clear the persistent pause request. |
 | `ag.is_paused()` | Report whether pause was requested. |
 | `ag.cancel(result)` | Cancel the execution that produced that result. |
@@ -208,7 +208,7 @@ See [`examples/README.md`](examples/README.md) for more details on each example.
 
 **`GlobalAgentOrchestrator`** -- the process-wide scheduler, dependency resolver, context-only message executor, ready queue, and reusable execution-worker owner. Submission, control changes, dependency completion, engine completion, and shutdown push events to one condition-backed scheduler thread; there is no completion polling. Its asynchronous global collector stores scheduler, team, and resource events plus a lightweight agent-database catalog in `agency.sqlite3`; detailed agent history remains in each agent's own database. Configure active engine capacity with `agconfig(orchestratorconfig(max_concurrent_engines=...))`, and inspect, flush, or stop it through `get_orchestrator().snapshot()`, `.flush()`, and `.shutdown()`.
 
-**`agtool`** — a named callable an LLM can invoke via function calling. It exposes an OpenAI-compatible tool schema and calls its function directly in the execution-owning process and thread, preserving closures over live host state. The optional timeout argument is retained for call-site compatibility but is not enforced by `agtool` itself. Sandbox commit or rollback belongs to the enclosing request transaction.
+**`agtool`** — a named callable an LLM can invoke via function calling. It exposes an OpenAI-compatible tool schema and calls its function directly in the execution-owning process and thread, preserving closures over live host state. The caller controls blocking behavior; `agtool` does not impose a timeout. Sandbox commit or rollback belongs to the enclosing request transaction.
 
 **`agdata`** — a lightweight dict wrapper that travels between agents, skills, and tools. A pending result resolves on field access, `wait()`, `to_dict()`, `to_json()`, or `await`, and can be passed anywhere pending `agdata` is accepted. It also supports JSON serialisation and schema validation.
 

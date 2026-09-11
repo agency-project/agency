@@ -197,10 +197,6 @@ def _wrap_run(cls) -> None:
             token = _active_team.set(self)
             try:
                 result = original(self, *args, **kwargs)
-                if not isinstance(result, agdata):
-                    as_pending = getattr(result, "_as_pending_agdata", None)
-                    if callable(as_pending):
-                        result = as_pending()
                 future.set_result(result if isinstance(result, agdata) else agdata(result=result))
             except Exception as exc:
                 tb = traceback.format_exc()

@@ -28,7 +28,6 @@ class agtool:
         fn: "Callable[..., agdata]",
         params: dict | None = None,
         log_fn: "Callable[[agtool, agdata, agdata, int], None] | None" = None,
-        run_in_subprocess: bool = True,
         persistent_vars: "dict[str, Callable[[], object]] | None" = None,
     ):
         self.name = name
@@ -36,7 +35,6 @@ class agtool:
         self.fn = fn
         self.params = params or {"type": "object", "properties": {}}
         self._log_fn = log_fn
-        self.run_in_subprocess = run_in_subprocess
         self.persistent_vars = persistent_vars or {}
 
     # ------------------------------------------------------------------
@@ -52,13 +50,11 @@ class agtool:
             "fn": self.fn,
             "params": self.params,
             "_log_fn": self._log_fn,
-            "run_in_subprocess": self.run_in_subprocess,
             "persistent_vars": self.persistent_vars,
         }
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        self.run_in_subprocess = state.get("run_in_subprocess", True)
         self.persistent_vars = state.get("persistent_vars", {})
 
     # ------------------------------------------------------------------
