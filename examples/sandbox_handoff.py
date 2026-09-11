@@ -27,8 +27,6 @@ Run:
 """
 
 import os
-from pathlib import Path
-from datetime import datetime
 
 from agency import agent, agskill, agdata
 from agency.configs.agconfig import agconfig, llmconfig
@@ -94,17 +92,10 @@ def _run_file(sandbox, label: str) -> None:
 
 
 def main() -> None:
-    run_dir = Path("runs") / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_sandbox_handoff"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    agent.log_dir = run_dir / "logs"
-    agent.output_dir = run_dir / "agent_output"
-
-    print(f"Run dir : {run_dir}\n")
-
     # ── Step 1: first agent writes hello.py ─────────────────────────────────
     _sep("Step 1 — agent_a writes hello.py")
 
-    agent_a = agent(agconfig=cfg)
+    agent_a = agent(agconfig=cfg, name="agent_a")
     result_a = agent_a.run(
         write_skill,
         agdata(
@@ -146,7 +137,7 @@ def main() -> None:
     # ── Step 4: second agent receives the sandbox and fixes the bug ──────────
     _sep("Step 4 — agent_b receives the sandbox and fixes the bug")
 
-    agent_b = agent(agconfig=cfg)
+    agent_b = agent(agconfig=cfg, name="agent_b")
     agent_b.sandbox = sandbox
 
     result_b = agent_b.run(

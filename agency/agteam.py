@@ -104,16 +104,16 @@ class agteam:
         from .agname import agname as _agname
 
         _base = config.get("name") or f"{type(self).__name__}"
-        self.team_name: str = _agname.allocate_agname(_base, prefix="team")
-        parent_team_name = parent.team_name if parent is not None else None
+        self.name: str = _agname.allocate_agname(_base, prefix="team")
+        parent_team_name = parent.name if parent is not None else None
 
         self.data_logger = get_orchestrator(self.agconfig).data_logger
         self.data_logger.record_event(
             type="team_created",
-            payload={"team": self.team_name, "parent_team": parent_team_name},
-            name=self.team_name,
+            payload={"team": self.name, "parent_team": parent_team_name},
+            name=self.name,
             object="agteam",
-            term_message=f"[{self.team_name}] CREATED  parent={parent_team_name}",
+            term_message=f"[{self.name}] CREATED  parent={parent_team_name}",
         )
 
         token = _active_team.set(self)
@@ -124,8 +124,8 @@ class agteam:
 
         self.data_logger.record_event(
             type="team_registered",
-            payload={"team_name": self.team_name, "agents": [a.agname for a in self._agents]},
-            name=self.team_name,
+            payload={"team_name": self.name, "agents": [a.agname for a in self._agents]},
+            name=self.name,
             object="agteam",
             update_latest_snapshot=True,
         )
@@ -203,8 +203,8 @@ def _wrap_run(cls) -> None:
                 tb = traceback.format_exc()
                 self.data_logger.record_event(
                     type="team_run_failed",
-                    payload={"team": self.team_name, "traceback": tb},
-                    name=self.team_name,
+                    payload={"team": self.name, "traceback": tb},
+                    name=self.name,
                     object="agteam",
                     term_message=tb,
                 )

@@ -405,6 +405,22 @@ def test_submit_output_rejects_a_value_of_the_wrong_type():
     assert "error" in body
 
 
+def test_submit_output_coerces_a_stringified_number_for_an_int_field():
+    """submit_output's own tool schema declares no type for `value` -- a
+    model routinely emits a numeric field as a quoted string (e.g. "42")
+    since it has no signal the field is actually typed int. That must be
+    accepted, not rejected as a type mismatch."""
+    server, _, _ = _make_server(output_schema=agdata(count=int))
+    result = _call(server, "submit_output", {"field": "count", "value": "42"})
+    assert result.is_error is False
+
+
+def test_submit_output_coerces_a_stringified_bool_for_a_bool_field():
+    server, _, _ = _make_server(output_schema=agdata(flag=bool))
+    result = _call(server, "submit_output", {"field": "flag", "value": "true"})
+    assert result.is_error is False
+
+
 def test_submit_output_records_a_valid_field_and_reports_still_missing():
     server, _, _ = _make_server(output_schema=agdata(summary=str, count=int))
     result = _call(server, "submit_output", {"field": "summary", "value": "hello"})

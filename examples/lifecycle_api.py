@@ -14,11 +14,11 @@ Claude Code additionally supports delivery to an active execution through its PT
 Run with profiling enabled to produce both lifecycle evidence and measured
 profiler artifacts::
 
-    export OPENAI_API_KEY="..."
+    export LLM_BASE_URL="..." LLM_MODEL="..." LLM_API_KEY="..."
     AGENCY_PROFILE=1 \
     AGENCY_PROFILE_SCOPE=workload \
     AGENCY_PROFILE_DIR="$PWD/runs/lifecycle_api_profile" \
-      uv run python examples/lifecycle_api.py --model gpt-5.6-luna
+      uv run python examples/lifecycle_api.py
 
 The process exits nonzero on the first failed invariant. ``verification.json``
 records every passed check without recording credentials. A profiled run also
@@ -28,7 +28,6 @@ reports success.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
@@ -48,6 +47,19 @@ from agency import (
     agtool,
 )
 from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
+from agency.utils.agutil import agency_runs_dir
+
+# See ../README.md for Anthropic or Bedrock agconfig examples.
+cfg = agconfig_cls(
+    llmconfig(
+        provider="OpenAI_Compatible",
+        base_url=os.environ["LLM_BASE_URL"],
+        model=os.environ["LLM_MODEL"],
+        api_key=os.environ["LLM_API_KEY"],
+    )
+)
+
+CONTROL_TIMEOUT_S = 180.0
 
 ORDERED_MEMORY = "ORDERED-CONTEXT-731"
 CANCEL_MEMORY = "CANCEL-CONTEXT-947"
@@ -128,21 +140,6 @@ lifecycle_gate = agtool(
         "required": ["label"],
     },
 )
-
-
-def _config(model: str) -> agconfig_cls:
-    api_key = os.environ["OPENAI_API_KEY"]
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY is required")
-    return agconfig_cls(
-        llmconfig(
-            provider="openai",
-            model=model,
-            api_key=api_key,
-            max_completion_tokens=2048,
-            reasoning_effort="none",
-        )
-    )
 
 
 def _skills() -> tuple[agskill, agskill, agskill]:
@@ -447,7 +444,7 @@ def _exercise(config: agconfig_cls, evidence: dict, timeout_s: float) -> None:
     controlled, echo, recall = _skills()
 
     def new_agent(name: str) -> Agent:
-        return Agent(agname=name, agconfig=config, harness="native")
+        return Agent(name=name, agconfig=config, harness="native")
 
     try:
         _exercise_ordered_chain(
@@ -535,30 +532,7 @@ def _verify_profile(profile_dir: Path, evidence: dict) -> dict:
     }
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=os.environ.get("LIFECYCLE_MODEL", "gpt-5.6-luna"))
-    parser.add_argument(
-        "--control-timeout",
-        type=float,
-        default=180.0,
-        help="seconds allowed for each live model or control boundary",
-    )
-    parser.add_argument(
-        "--run-root",
-        type=Path,
-        default=Path(
-            os.environ.get(
-                "LIFECYCLE_RUN_ROOT",
-                Path(__file__).resolve().parent.parent / "runs",
-            )
-        ),
-    )
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = _parse_args()
     profile_requested = os.environ.get("AGENCY_PROFILE", "").strip().lower() in {"1", "true"}
     if profile_requested and agprof.profile_scope() != "workload":
         raise SystemExit(
@@ -566,30 +540,22 @@ def main() -> int:
             "exist before in-process verification"
         )
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    run_dir = args.run_root.resolve() / f"{timestamp}_lifecycle_api"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    Agent.log_dir = run_dir / "logs"
-    Agent.output_dir = run_dir / "agent_output"
-    verification_path = run_dir / "verification.json"
+    verification_path = agency_runs_dir() / "lifecycle_api_verification.json"
     profile_dir = Path(os.environ.get("AGENCY_PROFILE_DIR", "agprof_trace")).resolve()
     evidence = {
         "schema_version": 1,
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "model": args.model,
+        "model": cfg.llm.model,
         "harness": "native",
-        "run_dir": str(run_dir),
         "profile_requested": profile_requested,
         "profile_dir": str(profile_dir) if profile_requested else None,
         "events": [],
     }
 
-    print(f"Lifecycle run directory: {run_dir}", flush=True)
     try:
-        config = _config(args.model)
         with agprof.workload():
-            _exercise(config, evidence, args.control_timeout)
+            _exercise(cfg, evidence, CONTROL_TIMEOUT_S)
         if profile_requested:
             profile_evidence = _verify_profile(profile_dir, evidence)
             evidence["profile"] = profile_evidence
@@ -615,4 +581,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from agency.observability.agwebui import agwebui
+
+    # agwebui.run() calls its fn with no way to get a return value back out,
+    # and (by default) lingers until Ctrl+C once fn returns -- neither works
+    # for this script, which needs a real nonzero exit code the moment
+    # verification finishes, for an automated caller to check. Capture
+    # main()'s result in an outer-scope box instead, and skip lingering.
+    _exit_code = [1]
+
+    def _run() -> None:
+        _exit_code[0] = main()
+
+    agwebui.run(_run, port=8012, linger=False)
+    raise SystemExit(_exit_code[0])

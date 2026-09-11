@@ -61,7 +61,7 @@ def main():
         output_schema=agdata(answer=str),
     )
 
-    ag = agent(agconfig=cfg)
+    ag = agent(agconfig=cfg, name="example")
 
     print(">> [file_manager] write and verify a note")
     r1 = ag.run(

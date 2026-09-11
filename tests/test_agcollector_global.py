@@ -76,11 +76,11 @@ def test_team_uses_global_logger_instead_of_own_database(tmp_path):
         for row in _rows(
             logger.db_path,
             "SELECT type FROM events WHERE object='agteam' AND name=?",
-            (team.team_name,),
+            (team.name,),
         )
     }
     assert {"team_created", "team_registered"} <= event_types
-    assert not (tmp_path / f"{team.team_name}_data.sqlite3").exists()
+    assert not (tmp_path / f"{team.name}_data.sqlite3").exists()
 
 
 def test_resource_pool_uses_global_logger_instead_of_own_database(tmp_path):

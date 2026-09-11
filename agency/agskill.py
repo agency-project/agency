@@ -95,6 +95,39 @@ def _daemon_release(arg: agdata, sandbox) -> agdata:
     return agdata(message=f"PID {pid} released as daemon -- will not block skill completion")
 
 
+def _coerce_submitted_value(hint, value):
+    """submit_output's own tool schema declares no type for `value` (one
+    tool serves every output field, whatever its real type) -- so a model
+    has nothing telling it a given field is numeric/boolean, and routinely
+    emits it as a quoted string (e.g. "42" instead of 42) since that's the
+    one type it can always produce. Cast to the schema's real declared
+    type before validating, rather than rejecting a value the model had
+    no way to type correctly in the first place. Only ever narrows a str
+    to what the field hint actually is -- a value already of the right
+    type (or one that fails to parse) passes through unchanged, so
+    check_field still reports a real mismatch as an error."""
+    if not isinstance(value, str) or not isinstance(hint, type):
+        return value
+    if issubclass(hint, bool):
+        low = value.strip().lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+        return value
+    if issubclass(hint, int):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    if issubclass(hint, float):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
 def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> agdata:
     if output_schema is None:
         return agerror("this skill declares no output_schema -- nothing to submit")
@@ -102,6 +135,7 @@ def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> 
     value = arg._data["value"]
     if field not in output_schema._data:
         return agerror(f"unknown output field {field!r}")
+    value = _coerce_submitted_value(output_schema._data[field], value)
     err = output_schema.check_field(field, value)
     if err is not None:
         return agerror(err)

@@ -196,12 +196,12 @@ def test_multiple_agents_in_setup_all_registered():
     assert team.a2 is not team.a3
 
 
-def test_agent_agname_kwarg_accepted():
+def test_agent_name_kwarg_accepted():
     from agency.agent import agent
 
     class _T(agteam):
         def setup(self):
-            self.ag = agent(agname="my-custom-agent")
+            self.ag = agent(name="my-custom-agent")
 
         def run(self):
             pass
@@ -453,8 +453,19 @@ def test_many_instances_each_have_own_agent_list():
 
 
 def test_kwargs_can_shadow_non_reserved_names():
+    """`name` itself is reserved now (see test_name_kwarg_seeds_team_name below)
+    -- this exercises the same **config passthrough mechanism (setattr for
+    every kwarg not otherwise used) via a kwarg that isn't."""
+    team = _EchoTeam(custom_field="custom_value")
+    assert team.custom_field == "custom_value"
+
+
+def test_name_kwarg_seeds_team_name():
+    """`name` is reserved: it seeds the auto-suffixed identity name (see
+    agteam.__init__'s `_base = config.get("name") or ...`), not a literal
+    passthrough attribute."""
     team = _EchoTeam(name="custom_name")
-    assert team.name == "custom_name"
+    assert team.name == "team_custom_name_0000"
 
 
 def test_setup_exception_propagates_from_init():

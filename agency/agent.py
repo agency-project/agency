@@ -94,24 +94,24 @@ class agent:
 
     # Fallback: agent(agconfig=...) not given -> use this if set. Same "set
     # once before creating agents" convention as log_dir/output_dir above, so
-    # scripts that construct agents directly (agent(agname=...), with no
+    # scripts that construct agents directly (agent(name=...), with no
     # agconfig= kwarg) still pick up a run-wide agconfig.
     default_agconfig: "ClassVar[agconfig_cls | None]" = None
 
     def __init__(
         self,
-        agname: str | None = None,
+        name: str | None = None,
         *,
         sandbox: "agSandbox | None" = None,
         agconfig: "agconfig_cls | None" = None,
         harness: "str | None" = None,
     ):
         with agprof.span("agent:create"):
-            self._initialize(agname, sandbox, agconfig, harness)
+            self._initialize(name, sandbox, agconfig, harness)
 
     def _initialize(
         self,
-        agname: "str | None",
+        name: "str | None",
         sandbox: "agSandbox | None",
         agconfig: "agconfig_cls | None",
         harness: "str | None",
@@ -150,7 +150,7 @@ class agent:
         # ag.change_config(new_cfg) to change it live -- see that method.
         self.agconfig: "agconfig_cls" = _src_agconfig.clone()
 
-        self.agname: _agname = _agname.allocate_agname(agname, prefix="agent")
+        self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
         self._parent_agent_id: "str | None" = (
             None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
         )
@@ -169,7 +169,7 @@ class agent:
         if _team is not None:
             _team._agents.add(self)
 
-        team_name = _team.team_name if _team is not None else None
+        team_name = _team.name if _team is not None else None
 
         _llm_config = _llm_config_snapshot(self.agconfig)
         team_tag = f"  team={team_name}" if team_name else ""
@@ -531,10 +531,10 @@ class agent:
     # Fork
     # ------------------------------------------------------------------
     @classmethod
-    def fork(cls, src: "agent", agname: str | None = None) -> "agent":
+    def fork(cls, src: "agent", name: str | None = None) -> "agent":
         """Return an independent agent forked from *src*."""
         ag: agent = cls.__new__(cls)
-        ag.agname = _agname.allocate_agname(agname, prefix="agent")
+        ag.agname = _agname.allocate_agname(name, prefix="agent")
         ag._parent_agent_id = str(src.agname)
         # Cloned so the fork's own agconfig is independent of src's -- see
         # the matching comment in __init__.
@@ -565,7 +565,7 @@ class agent:
         _team = _active_team.get(None)
         if _team is not None:
             _team._agents.add(ag)
-        team_name = _team.team_name if _team is not None else None
+        team_name = _team.name if _team is not None else None
 
         ag._finish_construction(
             event_type="agent_forked",
@@ -817,4 +817,4 @@ class agent:
         return ag
 
     def __repr__(self) -> str:
-        return f"agent(agname={self.agname!r})"
+        return f"agent(name={self.agname!r})"

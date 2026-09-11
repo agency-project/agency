@@ -111,7 +111,7 @@ third.wait()
 |---|---|
 | `ag.change_config(new_config)` | Replace the agent's live configuration with a clone of `new_config`. |
 | `ag.get_config_copy()` | Return an independent copy of the current configuration. |
-| `Agent.fork(source, agname=None)` | Create an independent agent from the source's resolved context, configuration, and sandbox snapshot. |
+| `Agent.fork(source, name=None)` | Create an independent agent from the source's resolved context, configuration, and sandbox snapshot. |
 | `ag.save(path)` | Save one agent checkpoint. |
 | `Agent.load(path, agconfig=None)` | Restore one agent checkpoint. |
 | `Agent.save_all(directory)` | Save every live agent and return the checkpoint paths. |

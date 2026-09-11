@@ -57,11 +57,9 @@ writer_skill = agskill(
 class SequentialChainTeam(agteam):
     """One agent runs two file-write tasks sequentially via the history chain."""
 
-    agconfig = cfg
-
     def setup(self) -> None:
         self.writer = writer_skill
-        self.agent = agent()
+        self.agent = agent(agconfig=cfg)
 
     def run(self) -> None:
         print("=" * 60)
@@ -87,8 +85,6 @@ class SequentialChainTeam(agteam):
 class ForkFanoutTeam(agteam):
     """Forks one agent per text; all summaries run concurrently."""
 
-    agconfig = cfg
-
     # Default texts — override at construction time via texts=[ ... ]
     _default_texts = [
         "The quick brown fox jumps over ",
@@ -98,7 +94,7 @@ class ForkFanoutTeam(agteam):
 
     def setup(self) -> None:
         self.continuation = continuation_skill
-        self.parent = agent()
+        self.parent = agent(agconfig=cfg, name="parent")
 
     def run(self) -> None:
         print("=" * 60)

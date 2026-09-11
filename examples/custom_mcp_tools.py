@@ -44,7 +44,13 @@ skill = agskill(
 )
 
 
-if __name__ == "__main__":
+def main() -> None:
     invocation = agent(agconfig=cfg).run(skill, agdata(number=21))
     invocation.wait()
     print(invocation.result)
+
+
+if __name__ == "__main__":
+    from agency.observability.agwebui import agwebui
+
+    agwebui.run(main, port=8011)

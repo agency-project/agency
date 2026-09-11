@@ -343,7 +343,7 @@ def test_fork_and_checkpoint_preserve_messages_cursors_and_sequence(tmp_path):
     expected_retained_messages = ag.context.retained_messages
     ag.context.harness_message_cursors["claude_code"] = 1
 
-    forked = agent.fork(ag, agname="message-fork")
+    forked = agent.fork(ag, name="message-fork")
     assert forked.context.retained_messages == ag.context.retained_messages
     assert forked.context.harness_message_cursors == {"claude_code": 1}
     assert forked.context.retained_messages is not ag.context.retained_messages
