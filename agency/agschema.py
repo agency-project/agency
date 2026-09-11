@@ -26,11 +26,12 @@ from .configs.agconfig import agconfig as agconfig_cls
 
 def _lenient_json_object(raw_text: str) -> dict:
     """Parse *raw_text* as a JSON object, tolerating a harness's model
-    wrapping its final answer in prose and/or a markdown code fence
-    despite being asked for raw JSON only
-    (`agharness.build_output_format_instruction`'s instruction is not
-    always followed strictly -- confirmed against a real response from a
-    real Claude model: 'Perfect! All tasks have been completed
+    wrapping its final answer in prose and/or a markdown code fence even
+    though it was never asked to reply in JSON at all -- structured output
+    is normally submitted via MCP tool calls (return_<field>/submit_output),
+    so this is a lenient, unprompted fallback recovery for whenever a model
+    states its answer as JSON anyway (confirmed against a real response
+    from a real Claude model: 'Perfect! All tasks have been completed
     successfully. Let me provide the final status:\\n\\n```json\\n{...}\\n```').
 
     Tries, in order: the raw text as-is; the contents of a ```...```

@@ -194,7 +194,7 @@ def test_adapter_http_dispatch_reaches_real_profiler(engine, monkeypatch, tmp_pa
     from agency.llm.usage_tracker import LlmUsageTracker
 
     class EventLogger(Logger):
-        def finalize_stream(self, *args, **kwargs):
+        def record_final_transcript(self, *args, **kwargs):
             pass
 
     classes = {

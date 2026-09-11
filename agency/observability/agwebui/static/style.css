@@ -56,6 +56,11 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   white-space: pre-wrap;
   word-break: break-all;
 }
+#shared-log a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+#shared-log a:hover { text-decoration: underline; }
 
 /* Interaction pane — lower 7 parts */
 #interaction {
@@ -85,7 +90,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   flex-shrink: 0;
 }
 
-#system-log-toggle {
+#full-logs-toggle {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -94,8 +99,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   cursor: pointer;
   white-space: nowrap;
 }
-#system-log-toggle:hover { color: var(--text); }
-#system-log-toggle input { cursor: pointer; accent-color: var(--border-log); }
+#full-logs-toggle:hover { color: var(--text); }
+#full-logs-toggle input { cursor: pointer; accent-color: var(--border-log); }
 
 #nav-bar button {
   background: none;
@@ -208,20 +213,6 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   color: var(--yellow);
   white-space: nowrap;
 }
-
-.profiler-links {
-  font-size: 10px;
-  font-weight: normal;
-  letter-spacing: 0;
-  white-space: nowrap;
-  display: flex;
-  gap: 8px;
-}
-.profiler-links a {
-  color: var(--cyan);
-  text-decoration: none;
-}
-.profiler-links a:hover { text-decoration: underline; }
 
 .right-title { color: var(--text); border-bottom-color: var(--border); }
 
@@ -347,13 +338,14 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 /* ------------------------------------------------------- History pane */
 
-.msg-system     { color: var(--dim); font-size: 11px; margin: 1px 0; }
+.msg-system     { margin: 3px 0; }
 .msg-user       { margin: 3px 0; }
 .msg-thinking   { color: var(--dim); font-style: italic; margin: 3px 0; border-left: 2px solid var(--border); padding-left: 6px; }
 .msg-tool-call  { margin: 3px 0; }
 .msg-assistant  { margin: 3px 0; }
 .msg-tool-result{ color: var(--dim); margin: 2px 0; }
 .msg-syslog     { margin: 3px 0; }
+.msg-metadata   { margin: 3px 0; }
 .msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
 .msg-paused     { color: var(--red); }
 

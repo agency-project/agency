@@ -22,23 +22,6 @@ from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
 
-class _CancelFlag:
-    """Minimal stand-in for the ``is_cancelled`` callable ``LlmHandlerServer`` is given."""
-
-    def __init__(self) -> None:
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def is_cancelled(self) -> bool:
-        return self._cancelled
-
-
-def _new_invocation(skill_name: str = "external") -> _CancelFlag:
-    return _CancelFlag()
-
-
 # ---------------------------------------------------------------------------
 # Fakes -- duck-typed to match what serialize helpers read via getattr,
 # same shape openai/anthropic SDK objects expose.
@@ -153,7 +136,7 @@ class _FakeDataLogger:
         self.stream_delta_history.append(entry)
         self.operations.append(("delta", call_label, payload))
 
-    def finalize_stream(
+    def record_final_transcript(
         self, call_label, type, payloads, term_message=None, print_to_terminal=True
     ):
         self.stream_deltas = [d for d in self.stream_deltas if d[2] != call_label]
@@ -391,11 +374,10 @@ class _BlockingToolBackend(_RecordingBackend):
         yield {"type": "usage", "usage": None, "stop_reason": "tool_use"}
 
 
-def _controlled_server(backend, invocation) -> LlmHandlerServer:
+def _controlled_server(backend) -> LlmHandlerServer:
     server = LlmHandlerServer(
         _cfg(model="gpt-test"),
         _FakeDataLogger(),
-        is_cancelled=invocation.is_cancelled if invocation is not None else None,
         request_id="test-request",
         skill_name="test-skill",
         usage_tracker=LlmUsageTracker(),
@@ -824,85 +806,6 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     ]
 
 
-# ---------------------------------------------------------------------------
-# invocation controls / message safe boundaries
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_pre_model_stop_returns_conflict_without_calling_provider(streaming: bool):
-    invocation = _new_invocation()
-    backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
-    invocation.cancel()
-
-    response = TestClient(server.build_app()).post(
-        "/dispatch", json={"messages": _completed_tool_history(), "stream": streaming}
-    )
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "error": {"message": "agent invocation cancelled", "transient": False}
-    }
-    assert backend.requests == []
-    assert server._data_logger.events == []
-    assert server._data_logger.finalized == []
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_cancel_during_model_suppresses_post_model_tool_delivery(streaming: bool):
-    invocation = _new_invocation()
-    backend = _BlockingToolBackend()
-    server = _controlled_server(backend, invocation)
-    request = {"messages": _completed_tool_history(), "stream": streaming}
-
-    if streaming:
-        stream = server.start_stream(request)
-    else:
-        outcome = {}
-
-        def run_dispatch() -> None:
-            try:
-                outcome["result"] = server.dispatch(request)
-            except BaseException as exc:
-                outcome["error"] = exc
-
-        worker = threading.Thread(target=run_dispatch, daemon=True)
-        worker.start()
-
-    assert backend.entered.wait(timeout=2.0)
-    invocation.cancel()
-    backend.release.set()
-
-    if streaming:
-        terminal = _drain(stream)[-1]
-        stream._thread.join(timeout=2.0)
-        assert terminal == {
-            "type": "error",
-            "message": "agent invocation cancelled",
-            "transient": False,
-            "status_code": 409,
-        }
-    else:
-        worker.join(timeout=2.0)
-        assert not worker.is_alive()
-        assert "result" not in outcome
-        assert str(outcome["error"]) == "agent invocation cancelled"
-        assert outcome["error"].status_code == 409
-
-    logger = server._data_logger
-    assert len(logger.events) == 1
-    assert logger.finalized == [
-        (
-            logger.events[0][2],
-            "llm_stream_error",
-            [{"error": "_DispatchError: agent invocation cancelled"}],
-        )
-    ]
-    if streaming:
-        assert logger.events[0][2] == stream.call_label
-
-
 def test_unclassified_first_stream_read_error_always_wakes_consumer():
     def create(**kwargs):
         del kwargs
@@ -931,9 +834,8 @@ def test_unclassified_first_stream_read_error_always_wakes_consumer():
 
 
 def test_controlled_paths_preserve_logger_call_labels_and_finalization():
-    invocation = _new_invocation()
     backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
+    server = _controlled_server(backend)
     handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
 
     assert _drain(handle)[-1]["type"] == "done"
@@ -950,8 +852,7 @@ def test_malformed_nonstream_result_finalizes_the_logger_call_label():
             self.requests.append(("nonstream", copy.deepcopy(request)))
             return {"usage": None, "message": {"role": "assistant", "blocks": []}}
 
-    invocation = _new_invocation()
-    server = _controlled_server(MalformedBackend(), invocation)
+    server = _controlled_server(MalformedBackend())
 
     with pytest.raises(KeyError, match="stop_reason"):
         server.dispatch({"messages": _completed_tool_history()})
@@ -1013,29 +914,6 @@ def test_stream_spawn_failure_finalizes_the_logger_call_label(monkeypatch):
             logger.events[0][2],
             "llm_stream_error",
             [{"error": "RuntimeError: spawn failed"}],
-        )
-    ]
-
-
-def test_stream_spawn_failure_observes_control_cancel(monkeypatch):
-    invocation = _new_invocation()
-    server = _controlled_server(_RecordingBackend(), invocation)
-
-    def cancel_then_fail(*_args, **_kwargs):
-        invocation.cancel()
-        raise RuntimeError("spawn failed")
-
-    monkeypatch.setattr(agprof, "spawn_traced", cancel_then_fail)
-
-    with pytest.raises(mod._DispatchError, match="agent invocation cancelled"):
-        server.start_stream({"messages": _completed_tool_history()})
-
-    logger = server._data_logger
-    assert logger.finalized == [
-        (
-            logger.events[0][2],
-            "llm_stream_error",
-            [{"error": "_DispatchError: agent invocation cancelled"}],
         )
     ]
 
@@ -1138,9 +1016,8 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
 
 
 def test_stream_logger_records_every_provider_item_in_order_before_finalize():
-    invocation = _new_invocation()
     backend = _RecordingBackend()
-    server = _controlled_server(backend, invocation)
+    server = _controlled_server(backend)
     handle = server.start_stream({"messages": _completed_tool_history(), "stream": True})
 
     assert _drain(handle)[-1]["type"] == "done"
@@ -1566,7 +1443,7 @@ def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypat
 
 def test_stream_http_disconnect_before_first_item_joins_producer():
     backend = _BlockingToolBackend()
-    server = _controlled_server(backend, invocation=None)
+    server = _controlled_server(backend)
 
     async def scenario() -> None:
         disconnect = asyncio.Event()

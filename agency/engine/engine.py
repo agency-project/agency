@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import threading
 import uuid
 from typing import TYPE_CHECKING, Callable
@@ -221,6 +220,7 @@ class AgentEngine:
             resource_pool,
             is_cancelled=is_cancelled,
             request_id=request_id,
+            recent_transcript=context.recent_transcript,
         )
         with self._services_lock:
             self._host_server_manager = manager
@@ -296,28 +296,6 @@ class AgentEngine:
             # Captured before the loop may reassign `prompt` to a retry prompt --
             # the needle must stay the original user turn, not a retry prompt.
             initial_prompt = prompt
-            # The real transcript only gains this turn once the whole skill
-            # call finishes (orchestrator._record_execution_results' live_
-            # messages snapshot) -- log it now too, structured the same way,
-            # so the webui's in-progress reconstruction (server.py's
-            # _reconstruct_in_progress_messages) can show it immediately
-            # instead of leaving the user's own message invisible for
-            # however long this attempt takes.
-            user_content = getattr(initial_prompt, "user_content", initial_prompt)
-            self._agent.data_logger.record_event(
-                type="user_message",
-                payload={
-                    "blocks": [
-                        {
-                            "type": "text",
-                            "text": user_content
-                            if isinstance(user_content, str)
-                            else json.dumps(user_content),
-                        }
-                    ]
-                },
-                flush=True,
-            )
             retries_left = skill.max_output_schema_retries
             attempt: "HarnessAttemptResult | None" = None
             prior_session = context.harness_sessions.get(self._agent.harness)
@@ -407,7 +385,6 @@ class AgentEngine:
         return PromptPayload(
             system_instruction=skill._build_system_prompt(),
             user_content=user_content,
-            output_instruction=agharness.build_output_format_instruction(skill),
         )
 
     @staticmethod
@@ -518,7 +495,11 @@ class AgentEngine:
         attempt: "HarnessAttemptResult",
         sandbox: agSandbox,
     ) -> "agdata | None":
-        """Handle the plain JSON response contract used by non-MCP harnesses."""
+        """Recover structured output from a model's final text, in case it
+        stated its answer as JSON without being asked to (the model is never
+        instructed to do this -- see agschema._lenient_json_object) --
+        structured output is normally submitted via the return_<field>/
+        submit_output MCP tools instead."""
         from ..agdata import agerror
 
         output_schema = skill.output_schema

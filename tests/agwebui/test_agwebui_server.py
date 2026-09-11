@@ -760,7 +760,7 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
         update_latest_snapshot=True,
     )
     # One exchange's worth of llm_block rows -- one row per block, matching
-    # finalize_stream()'s real behavior, with the metadata block carrying
+    # record_final_transcript()'s real behavior, with the metadata block carrying
     # the token counts and a sibling text block that must be ignored.
     agent_logger.record_event(
         "llm_block",
@@ -785,11 +785,18 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     assert detail["config"]["agskill"]["react_max_steps"] == 7
     # The two llm_block rows land after live_messages was recorded, so they
     # get reconstructed and appended as in-progress content (see
-    # _reconstruct_in_progress_messages) -- the metadata block is dropped,
-    # the text block becomes a trailing assistant message.
+    # _reconstruct_in_progress_messages) -- both rows share call_label=None
+    # and default to role="assistant", so they group into one message; the
+    # metadata block is kept (only filtered client-side, behind Full Logs).
     assert _strip_ts(detail["messages"]) == [
         {"role": "assistant", "content": "finished"},
-        {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "hi"}]},
+        {
+            "role": "assistant",
+            "blocks": [
+                {"type": "metadata", "new_prompt_tokens": 15, "usage": {"completion_tokens": 5}},
+                {"type": "text", "index": 0, "text": "hi"},
+            ],
+        },
     ]
     assert detail["state"] == {}
     assert detail["tokens"] == {"input": 15, "output": 5}
@@ -829,7 +836,7 @@ def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_mes
     agent_path = run_dir / "NoSnapshot_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
     agent_logger.record_event(
-        "skill_call", {"skill": "run", "history_delta": [{"role": "user", "content": "hi"}]}
+        "skill_call", {"skill": "run", "history_after": [{"role": "user", "content": "hi"}]}
     )
     agent_logger.stop()
 
@@ -853,17 +860,20 @@ def test_agent_detail_endpoint_falls_back_to_skill_call_history_when_no_live_mes
 # ---------------------------------------------------------------------------
 
 
-def test_reconstruct_in_progress_messages_includes_leading_user_message():
-    """engine.py logs a user_message event as soon as it builds the initial
-    prompt -- reconstruction must surface it as its own leading 'user'-role
-    message, before whatever the assistant has said so far."""
+def test_reconstruct_in_progress_messages_leading_user_block_gets_its_own_message():
+    """A harness-injected user message (e.g. the initial prompt, or a
+    mid-run system/user edit) shares the exchange's call_label but carries
+    role="user" in its {role, **block} payload (see
+    _new_transcript_payloads) -- reconstruction keys on (call_label, role),
+    so it must split into its own leading message before the assistant's
+    own response blocks, even though both rows share call_label."""
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
         (
-            "user_message",
-            None,
-            json.dumps({"blocks": [{"type": "text", "text": "do the thing"}]}),
+            "llm_block",
+            "call_1",
+            json.dumps({"role": "user", "type": "text", "text": "do the thing"}),
             100.0,
         ),
         ("llm_block", "call_1", json.dumps({"type": "text", "text": "working on it"}), 101.0),
@@ -884,6 +894,9 @@ def test_reconstruct_in_progress_messages_includes_leading_user_message():
 
 
 def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
+    """Consecutive rows sharing (call_label, role) group into one message --
+    metadata blocks are kept here (not dropped), since filtering only
+    happens client-side behind the Full Logs toggle."""
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
@@ -903,6 +916,7 @@ def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
             "blocks": [
                 {"type": "thinking", "text": "hmm"},
                 {"type": "tool_use", "name": "write", "arguments": "{}"},
+                {"type": "metadata", "usage": {}},
             ],
             "ts": 100.0,
         }
@@ -998,7 +1012,7 @@ def test_agent_detail_reconstructs_in_progress_content_with_no_live_messages_yet
 
 
 # ---------------------------------------------------------------------------
-# Still-streaming exchange reconstruction (finalize_stream() hasn't run yet
+# Still-streaming exchange reconstruction (record_final_transcript() hasn't run yet
 # for this exchange -- read the raw deltas straight from stream_deltas)
 # ---------------------------------------------------------------------------
 
@@ -1108,7 +1122,7 @@ def test_reconstruct_streaming_messages_no_rows_returns_empty():
 
 
 def test_agent_detail_includes_currently_streaming_exchange(server):
-    """finalize_stream() hasn't cleared stream_deltas for this exchange yet
+    """record_final_transcript() hasn't cleared stream_deltas for this exchange yet
     (it's still in progress) -- the panel must show it anyway, not wait for
     completion."""
     client, run_dir, _srv = server

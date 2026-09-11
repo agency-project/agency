@@ -426,7 +426,7 @@ def test_record_span_does_not_touch_latest_values(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# record_stream_delta() / finalize_stream()
+# record_stream_delta() / record_final_transcript()
 # ---------------------------------------------------------------------------
 
 
@@ -445,7 +445,7 @@ def test_record_stream_delta_only_touches_stream_deltas(tmp_path):
     dc.stop()
 
 
-def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
+def test_record_final_transcript_deletes_flushed_deltas_and_appends_events(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
@@ -453,7 +453,7 @@ def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
     dc.flush()
     assert len(_select_all(db_path, "stream_deltas")) == 2
 
-    dc.finalize_stream("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
+    dc.record_final_transcript("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
 
     assert _select_all(db_path, "stream_deltas") == []
     events = _select_all(db_path, "events")
@@ -464,27 +464,27 @@ def test_finalize_stream_deletes_flushed_deltas_and_appends_events(tmp_path):
     dc.stop()
 
 
-def test_finalize_stream_clears_not_yet_flushed_pending_deltas(tmp_path):
+def test_record_final_transcript_clears_not_yet_flushed_pending_deltas(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     assert len(dc._stream_delta_rows) == 1
 
-    dc.finalize_stream("c1", type="llm_block", payloads=[])
+    dc.record_final_transcript("c1", type="llm_block", payloads=[])
 
     assert dc._stream_delta_rows == []
     assert _select_all(db_path, "stream_deltas") == []
     dc.stop()
 
 
-def test_finalize_stream_only_clears_matching_call_label(tmp_path):
+def test_record_final_transcript_only_clears_matching_call_label(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     dc.record_stream_delta("llm_stream_delta", {"text": "x"}, call_label="c2")
     dc.flush()
 
-    dc.finalize_stream("c1", type="llm_block", payloads=[{"text": "h"}])
+    dc.record_final_transcript("c1", type="llm_block", payloads=[{"text": "h"}])
 
     remaining = _select_all(db_path, "stream_deltas")
     assert len(remaining) == 1
@@ -492,10 +492,10 @@ def test_finalize_stream_only_clears_matching_call_label(tmp_path):
     dc.stop()
 
 
-def test_finalize_stream_writes_one_event_row_per_payload(tmp_path):
+def test_record_final_transcript_writes_one_event_row_per_payload(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.finalize_stream(
+    dc.record_final_transcript(
         "c1", type="llm_block", payloads=[{"type": "thinking"}, {"type": "text", "text": "hi"}]
     )
     events = _select_all(db_path, "events")
@@ -505,10 +505,10 @@ def test_finalize_stream_writes_one_event_row_per_payload(tmp_path):
     dc.stop()
 
 
-def test_finalize_stream_safe_with_no_prior_deltas(tmp_path):
+def test_record_final_transcript_safe_with_no_prior_deltas(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.finalize_stream("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
+    dc.record_final_transcript("c1", type="llm_block", payloads=[{"type": "text", "text": "hi"}])
     assert len(_select_all(db_path, "events")) == 1
     dc.stop()
 

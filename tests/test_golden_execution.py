@@ -106,7 +106,7 @@ def _write_replay(path):
     logger.start()
     try:
         for index, answer in enumerate((ANSWER,) * 8):
-            logger.finalize_stream(
+            logger.record_final_transcript(
                 f"golden-{index}",
                 type="llm_block",
                 payloads=[

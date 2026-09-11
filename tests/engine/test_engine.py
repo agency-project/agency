@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -166,7 +165,15 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
 
     class _FakeHostServerManager:
         def __init__(
-            self, agent, sandbox, skill, resource_pool, *, is_cancelled=None, request_id=None
+            self,
+            agent,
+            sandbox,
+            skill,
+            resource_pool,
+            *,
+            is_cancelled=None,
+            request_id=None,
+            recent_transcript=None,
         ):
             self.agent = agent
             self.sandbox = sandbox
@@ -174,6 +181,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.resource_pool = resource_pool
             self.is_cancelled = is_cancelled
             self.request_id = request_id
+            self.recent_transcript = recent_transcript
             self.started = False
             self.stopped = False
             self.change_config_calls = []
@@ -296,14 +304,12 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
     monkeypatch.setattr(
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "the-prompt"
     )
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: "the-format")
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "the-system")
     payload = engine._build_prompt_payload(skill, SimpleNamespace())
     assert payload == PromptPayload(
         system_instruction="the-system",
         user_content="the-prompt",
-        output_instruction="the-format",
     )
 
 
@@ -313,7 +319,6 @@ def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
     monkeypatch.setattr(
         agharness, "build_user_turn_prompt", lambda skill, skill_input: "current request"
     )
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda skill: None)
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "system")
 
@@ -337,7 +342,6 @@ def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content(mo
 
     current = [{"type": "text", "text": "current request"}]
     monkeypatch.setattr(agharness, "build_user_turn_prompt", lambda *_args: current)
-    monkeypatch.setattr(agharness, "build_output_format_instruction", lambda _skill: None)
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(_build_system_prompt=lambda: "system")
 
@@ -681,7 +685,11 @@ def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypa
     )
     with pytest.raises(RuntimeError, match="launch failed"):
         engine.execute(
-            SimpleNamespace(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
+            SimpleNamespace(recent_transcript=[]),
+            skill,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            engine._agent.sandbox,
         )
     assert holder["manager"].started is True
     assert holder["manager"].stopped is True
@@ -721,51 +729,6 @@ def test_execute_calls_run_prompt_once_and_returns_execution_result_on_first_suc
     assert manager.stopped is True
     assert holder["attempt_client_timeout_s"] is None
     assert result is execution
-
-
-def test_execute_logs_user_message_event_with_initial_prompt_content(monkeypatch):
-    """The webui's in-progress transcript reconstruction (server.py's
-    _reconstruct_in_progress_messages) needs this event to show the user's
-    initial turn before the skill call finishes -- see engine.py's comment
-    at the record_event(type="user_message", ...) call site."""
-    _install_fake_host_server_manager(
-        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
-    )
-    engine = AgentEngine(_FakeAgent())
-    prompt = PromptPayload("system", "hello there")
-    monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: prompt)
-    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(result="done"))
-    skill = SimpleNamespace(
-        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
-    )
-
-    engine.execute(agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox)
-
-    user_message_events = [e for e in engine._agent.data_logger.events if e[0] == "user_message"]
-    assert len(user_message_events) == 1
-    _type, payload, _call_label, _snapshot = user_message_events[0]
-    assert payload == {"blocks": [{"type": "text", "text": "hello there"}]}
-
-
-def test_execute_logs_user_message_event_with_multimodal_content_as_json(monkeypatch):
-    _install_fake_host_server_manager(
-        monkeypatch, results=[HarnessAttemptResult(ok=True, final_text="done")]
-    )
-    engine = AgentEngine(_FakeAgent())
-    multimodal = [{"type": "text", "text": "what is this?"}, {"type": "image_url", "image_url": {}}]
-    prompt = PromptPayload("system", multimodal)
-    monkeypatch.setattr(engine, "_build_prompt_payload", lambda skill, skill_input: prompt)
-    monkeypatch.setattr(engine, "_build_execution_result", lambda *_args: agdata(result="done"))
-    skill = SimpleNamespace(
-        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
-    )
-
-    engine.execute(agcontext(), skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox)
-
-    user_message_events = [e for e in engine._agent.data_logger.events if e[0] == "user_message"]
-    assert len(user_message_events) == 1
-    _type, payload, _call_label, _snapshot = user_message_events[0]
-    assert payload == {"blocks": [{"type": "text", "text": json.dumps(multimodal)}]}
 
 
 def test_execute_selects_only_retained_messages_after_the_harness_cursor(monkeypatch):
@@ -1106,7 +1069,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     skill = SimpleNamespace(
         sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
     )
-    context = SimpleNamespace(marker="ctx", harness_sessions={})
+    context = SimpleNamespace(marker="ctx", harness_sessions={}, recent_transcript=[])
 
     result = engine.execute(
         context, skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox

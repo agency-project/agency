@@ -54,26 +54,3 @@ def test_build_user_turn_prompt_delegates_to_skill():
     content = agharness.build_user_turn_prompt(skill, agdata(task="go"))
     assert "go" in content if isinstance(content, str) else True
     assert content == skill._build_user_content(agdata(task="go"))
-
-
-def test_build_output_format_instruction_none_when_no_schema():
-    skill = agskill(name="s", system_prompt="do the thing")
-    assert agharness.build_output_format_instruction(skill) is None
-
-
-def test_build_output_format_instruction_none_for_raw_string_schema():
-    from agency.agtype import agrawstring
-
-    skill = agskill(name="s", system_prompt="do the thing", output_schema=agdata(text=agrawstring))
-    assert agharness.build_output_format_instruction(skill) is None
-
-
-def test_build_output_format_instruction_present_for_structured_schema():
-    skill = agskill(
-        name="s", system_prompt="do the thing", output_schema=agdata(answer=str, count=int)
-    )
-    instruction = agharness.build_output_format_instruction(skill)
-    assert instruction is not None
-    assert "JSON object" in instruction
-    assert "answer" in instruction
-    assert "count" in instruction

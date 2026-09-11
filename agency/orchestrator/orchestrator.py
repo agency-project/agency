@@ -794,7 +794,7 @@ class GlobalAgentOrchestrator:
                         f"[{ag.agname}] SKILL ✓  {skill.name}  output={list(result_dict)}"
                     ),
                 )
-            transcript = list(updated_context.recent_transcript)
+            history_after = list(updated_context.recent_transcript)
             logger.record_event(
                 type="skill_call",
                 payload={
@@ -803,14 +803,14 @@ class GlobalAgentOrchestrator:
                     "ts_end": ts_end,
                     "input": input_dict,
                     "output": result_dict,
-                    "history_len": len(transcript),
+                    "history_len": len(history_after),
                     "history_before": history_before,
-                    "history_delta": transcript,
+                    "history_after": history_after,
                 },
             )
             logger.record_event(
                 type="live_messages",
-                payload={"messages": transcript},
+                payload={"messages": history_after},
                 update_latest_snapshot=True,
                 flush=True,
             )

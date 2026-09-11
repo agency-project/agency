@@ -532,7 +532,7 @@ def _json_object(value: str) -> dict:
         return {}
 
 
-# finalize_stream() writes one `events` row per block (not one row per
+# record_final_transcript() writes one `events` row per block (not one row per
 # exchange holding a blocks array) -- so the metadata block for an exchange
 # is its own row, type='llm_block', with its own $.type=='metadata' inside
 # payload; new_prompt_tokens is top-level (llm_handler_server._tag_metadata_
@@ -572,17 +572,17 @@ def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
         call_row = con.execute(
             "SELECT payload, timestamp FROM events WHERE type='skill_call' ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        base_messages = _json_object(call_row[0]).get("history_delta", []) if call_row else []
+        base_messages = _json_object(call_row[0]).get("history_after", []) if call_row else []
         base_ts = call_row[1] if call_row else 0.0
         live_messages_ts = 0.0
     for message in base_messages:
         message.setdefault("ts", base_ts)
     in_progress = con.execute(
         "SELECT type, call_label, payload, timestamp FROM events "
-        "WHERE type IN ('user_message','llm_block','tool_result') AND timestamp > ? ORDER BY id",
+        "WHERE type IN ('llm_block','tool_result') AND timestamp > ? ORDER BY id",
         (live_messages_ts,),
     ).fetchall()
-    # finalize_stream() atomically clears every stream_deltas row for a
+    # record_final_transcript() atomically clears every stream_deltas row for a
     # call_label the moment that exchange finishes (moving it to the
     # permanent events rows read above) -- so whatever remains here is, by
     # construction, exactly the exchange(s) still streaming right now.
@@ -650,46 +650,49 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
 def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str, float]]") -> "list[dict]":
     """live_messages only gets (re)written once, when a skill call finishes
     (orchestrator._record_execution_results) -- there's no persisted
-    snapshot of an in-flight skill's transcript to read. But each LLM
-    exchange's response blocks are already persisted incrementally, one
-    events row per block, the moment that exchange finishes streaming
-    (finalize_stream()); tool_result rows (host_mcp_server.call_tool) are
-    the same. Reconstruct the still-running skill's messages from those,
-    in the same {role, blocks} shape as a real transcript entry, so the
-    interaction panel keeps advancing during execution instead of only at
-    completion.
+    snapshot of an in-flight skill's transcript to read. But
+    llm_handler_server._finalize_success() persists each new transcript
+    block incrementally the moment its exchange finishes
+    (record_final_transcript()) -- one events row per {role, **block}
+    payload, content-diffed against everything already logged this
+    attempt (see _new_transcript_payloads()), so it's whatever's actually
+    new: the response, but also a changed system prompt or a harness-
+    injected mid-run message, whichever role it turns out to carry.
+    tool_result rows (host_mcp_server.call_tool) are the same. Reconstruct
+    the still-running skill's messages from those, in the same {role,
+    blocks} shape as a real transcript entry, so the interaction panel
+    keeps advancing during execution instead of only at completion.
 
-    Metadata blocks are dropped (bookkeeping, not chat content). Blocks
-    are grouped into one assistant message per call_label (each LLM
-    exchange gets its own call_label); a tool_result row becomes its own
-    'tool'-role message and always starts a fresh assistant message after
-    it, mirroring how a real transcript alternates turns. A user_message
-    row (engine.py logs one right as it builds this attempt's initial
-    prompt) becomes its own leading 'user'-role message the same way."""
+    Each llm_block row's payload is {"role": ..., **block} -- role is
+    popped back off to decide grouping and the message's own role; the
+    rest of the payload IS the block, metadata blocks included (they are
+    not filtered here -- only at render time, gated behind the client's
+    Full Logs toggle, same as everything else this can't assume the shape
+    of). Consecutive rows sharing one (call_label, role) key group into a
+    single message -- a system/user block logged alongside an exchange's
+    response shares that response's call_label but not its role, so it
+    gets its own message; a tool_result row always starts fresh and resets
+    the key, mirroring how a real transcript alternates turns."""
     messages: "list[dict]" = []
-    current_call_label: "object" = object()  # sentinel, never equals a real call_label
+    current_key: "object" = object()  # sentinel, never equals a real (call_label, role)
     current_blocks: "list[dict] | None" = None
     for event_type, call_label, payload_json, ts in rows:
-        block = _json_object(payload_json)
-        if event_type == "user_message":
-            current_call_label = object()
-            current_blocks = None
-            messages.append({"role": "user", "blocks": block.get("blocks", []), "ts": ts})
-        elif event_type == "llm_block":
-            if block.get("type") == "metadata":
-                continue
-            if call_label != current_call_label or current_blocks is None:
+        payload = _json_object(payload_json)
+        if event_type == "llm_block":
+            role = payload.pop("role", "assistant")
+            key = (call_label, role)
+            if key != current_key or current_blocks is None:
                 current_blocks = []
-                messages.append({"role": "assistant", "blocks": current_blocks, "ts": ts})
-                current_call_label = call_label
-            current_blocks.append(block)
+                messages.append({"role": role, "blocks": current_blocks, "ts": ts})
+                current_key = key
+            current_blocks.append(payload)
         elif event_type == "tool_result":
-            current_call_label = object()
+            current_key = object()
             current_blocks = None
             messages.append(
                 {
                     "role": "tool",
-                    "blocks": [{"type": "tool_result", "text": json.dumps(block.get("result"))}],
+                    "blocks": [{"type": "tool_result", "text": json.dumps(payload.get("result"))}],
                     "ts": ts,
                 }
             )
@@ -725,7 +728,7 @@ def _merge_stream_item(block: dict, stream_item: dict) -> None:
 
 def _reconstruct_streaming_messages(rows: "list[tuple[str, str, float]]") -> "list[dict]":
     """The exchange (if any) that's still streaming right now -- not yet
-    finalized into a permanent events row (finalize_stream() only runs once
+    finalized into a permanent events row (record_final_transcript() only runs once
     the whole exchange completes), so without this the panel would freeze
     for however long that one exchange takes (can be several real seconds)
     even though the raw deltas are already landing on disk continuously.

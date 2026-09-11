@@ -85,11 +85,16 @@ def test_construction_captures_run_context_for_llm_requests(tmp_path, monkeypatc
     assert manager._llm_handler_server._parent_context is parent_context
 
 
-def test_construction_binds_one_cancel_check_to_both_control_servers(tmp_path):
+def test_construction_binds_cancel_check_to_the_interaction_server(tmp_path):
+    """llm_handler_server no longer takes is_cancelled: the harness's own
+    OS process is now killed directly on cancel (agent.cancel() ->
+    cancel_harness()), so the host-side LLM handler has nothing left to
+    cooperatively re-check. host_interaction_server (tool calls) still
+    does."""
     is_cancelled = lambda: False  # noqa: E731
     manager, _, _ = _make_manager(tmp_path, is_cancelled=is_cancelled)
 
-    assert manager._llm_handler_server._is_cancelled is is_cancelled
+    assert not hasattr(manager._llm_handler_server, "_is_cancelled")
     assert manager._interaction_server._is_cancelled is is_cancelled
 
 

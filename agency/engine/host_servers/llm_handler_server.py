@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import itertools
 import json
 import queue
@@ -11,7 +12,7 @@ import time
 import uuid
 from concurrent.futures import Future
 from contextlib import suppress
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import FastAPI, Request
@@ -32,8 +33,6 @@ TRANSIENT_DISPATCH_EXCS = (
 
 _STREAM_QUEUE_MAXSIZE = 256
 _STREAM_JOIN_TIMEOUT_S = 5.0
-_INTERNAL_COMPACTION_KIND = "compaction"
-_INVOCATION_CANCELLED_MESSAGE = "agent invocation cancelled"
 
 
 def _annotate(span, **metadata) -> None:
@@ -46,33 +45,19 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
 
 
-def _extract_metadata_usage(metadata_block: dict) -> "tuple[dict, object]":
-    """Read usage/stop_reason back off a metadata block, regardless of
-    whether it was built directly by a backend's batch path (usage/
-    stop_reason as top-level keys) or assembled by the streaming path's
-    generic block-delta merge loop (usage/stop_reason nested inside `data`
-    fragments, since that loop only ever forwards -- never interprets --
-    the `data` field).
+def _payload_hash(payload: dict) -> str:
+    """Content identity for one {role, **block} transcript payload"""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
-    A stream can legitimately split usage and stop_reason across two
-    separate fragments -- e.g. OpenAI's stream_options.include_usage sends
-    a finish_reason-bearing chunk and a separate usage-only trailer chunk --
-    so each field is found independently (most recent fragment that has it
-    wins), not assumed to land on the same fragment."""
-    if "usage" in metadata_block:
-        return metadata_block.get("usage") or {}, metadata_block.get("stop_reason")
-    data = metadata_block.get("data")
-    usage: "dict | None" = None
-    stop_reason = None
-    if isinstance(data, list):
-        for fragment in reversed(data):
-            if not isinstance(fragment, dict):
-                continue
-            if usage is None and fragment.get("usage"):
-                usage = fragment["usage"]
-            if stop_reason is None and fragment.get("stop_reason") is not None:
-                stop_reason = fragment["stop_reason"]
-    return usage or {}, stop_reason
+
+def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
+    """(status_code, transient) for a known LLM-backend failure category, or
+    None if *error* isn't one of them (caller re-raises it unmodified)."""
+    if isinstance(error, BAD_REQUEST_EXCS):
+        return 400, False
+    if isinstance(error, TRANSIENT_DISPATCH_EXCS):
+        return 503, True
+    return None
 
 
 class _DispatchError(Exception):
@@ -172,7 +157,12 @@ class _StreamHandle:
             while self._queue.empty() and not self._cancel_event.is_set():
                 self._queue_condition.wait()
             if self._cancel_event.is_set():
-                return self._cancelled_item()
+                return {
+                    "type": "error",
+                    "message": "LLM stream cancelled",
+                    "transient": False,
+                    "status_code": 499,
+                }
             item = self._queue.get_nowait()
             self._queue_condition.notify_all()
             return item
@@ -228,15 +218,6 @@ class _StreamHandle:
             raise cancel_error
         return stopped
 
-    @staticmethod
-    def _cancelled_item() -> dict:
-        return {
-            "type": "error",
-            "message": "LLM stream cancelled",
-            "transient": False,
-            "status_code": 499,
-        }
-
 
 class LlmHandlerServer:
     def __init__(
@@ -246,9 +227,9 @@ class LlmHandlerServer:
         usage_tracker: "LlmUsageTracker",
         *,
         parent_context=None,
-        is_cancelled: "Callable[[], bool] | None" = None,
         request_id: "str | None" = None,
         skill_name: "str | None" = None,
+        recent_transcript: "list[dict] | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -264,9 +245,14 @@ class LlmHandlerServer:
         # Non-streaming exchanges only
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
-        self._is_cancelled = is_cancelled if is_cancelled is not None else (lambda: False)
         self._request_id = request_id
         self._skill_name = skill_name
+
+        self._logged_block_hashes: "set[str]" = {
+            _payload_hash({"role": message.get("role"), **block})
+            for message in (recent_transcript or [])
+            for block in (message.get("blocks") or [])
+        }
         self.change_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
@@ -306,20 +292,6 @@ class LlmHandlerServer:
         messages.append(best["response"])
         return messages
 
-    def _record_exchange(
-        self, request: dict, message: dict, usage: "dict | None", finish_reason: "str | None"
-    ) -> None:
-        entry = {
-            "request": request,
-            "response": message,
-            "usage": usage,
-            "finish_reason": finish_reason,
-            "streaming": False,
-            "ts": time.time(),
-        }
-        with self._transcript_lock:
-            self._transcript.append(entry)
-
     def _tag_metadata_block(
         self,
         request_messages: "list[dict]",
@@ -333,7 +305,22 @@ class LlmHandlerServer:
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
             return
-        usage, stop_reason = _extract_metadata_usage(metadata_block)
+        if "usage" in metadata_block:
+            usage = metadata_block.get("usage") or {}
+            stop_reason = metadata_block.get("stop_reason")
+        else:
+            usage = None
+            stop_reason = None
+            data = metadata_block.get("data")
+            if isinstance(data, list):
+                for fragment in reversed(data):
+                    if not isinstance(fragment, dict):
+                        continue
+                    if usage is None and fragment.get("usage"):
+                        usage = fragment["usage"]
+                    if stop_reason is None and fragment.get("stop_reason") is not None:
+                        stop_reason = fragment["stop_reason"]
+            usage = usage or {}
         prompt_tokens = usage.get("prompt_tokens", 0) or 0
         completion_tokens = usage.get("completion_tokens", 0) or 0
         metadata_block["usage"] = usage
@@ -376,12 +363,12 @@ class LlmHandlerServer:
 
         def finalize_error(error: BaseException) -> None:
             nonlocal finalized
-            self._finalize_error(call_label, error)
+            self._finalize_terminal(call_label, kind="error", error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
-            self._finalize_cancelled(call_label)
+            self._finalize_terminal(call_label, kind="cancelled")
             finalized = True
 
         def complete_failure(error: BaseException) -> None:
@@ -407,24 +394,6 @@ class LlmHandlerServer:
                 t0 = time.perf_counter()
                 try:
                     result = self._backend.dispatch(request)
-                except BAD_REQUEST_EXCS as error:
-                    with suppress(BaseException):
-                        _annotate(
-                            attempt_span,
-                            outcome="failure",
-                            error_type=type(error).__name__,
-                        )
-                    complete_failure(error)
-                    raise _DispatchError(str(error), status_code=400, transient=False) from error
-                except TRANSIENT_DISPATCH_EXCS as error:
-                    with suppress(BaseException):
-                        _annotate(
-                            attempt_span,
-                            outcome="failure",
-                            error_type=type(error).__name__,
-                        )
-                    complete_failure(error)
-                    raise _DispatchError(str(error), status_code=503, transient=True) from error
                 except BaseException as error:
                     with suppress(BaseException):
                         _annotate(
@@ -433,42 +402,39 @@ class LlmHandlerServer:
                             error_type=type(error).__name__,
                         )
                     complete_failure(error)
-                    raise
-
-                usage = result["usage"]
-                message = result["message"]
-                stop_reason = result["stop_reason"]
-                blocks = message["blocks"]
-                if self._is_cancelled():
-                    try:
-                        self._raise_if_stopped()
-                    except BaseException as error:
-                        with suppress(BaseException):
-                            _annotate(
-                                attempt_span,
-                                outcome="failure",
-                                error_type=type(error).__name__,
-                            )
-                        complete_failure(error)
+                    classified = _classify_dispatch_exception(error)
+                    if classified is None:
                         raise
+                    status_code, transient = classified
+                    raise _DispatchError(
+                        str(error), status_code=status_code, transient=transient
+                    ) from error
+
                 ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(usage or {}).get("prompt_tokens"),
-                    output_tokens=(usage or {}).get("completion_tokens"),
+                    input_tokens=(result["usage"] or {}).get("prompt_tokens"),
+                    output_tokens=(result["usage"] or {}).get("completion_tokens"),
                     ttft_ms=ttft_ms,
                 )
-                self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
-                self._record_exchange(request, message, usage, stop_reason)
-                self._finalize_success(call_label, blocks)
+                self._tag_metadata_block(request["messages"], result["message"], ttft_ms=ttft_ms)
+                with self._transcript_lock:
+                    self._transcript.append(
+                        {
+                            "request": request,
+                            "response": result["message"],
+                            "usage": result["usage"],
+                            "finish_reason": result["stop_reason"],
+                            "streaming": False,
+                            "ts": time.time(),
+                        }
+                    )
+                self._finalize_success(call_label, request, result["message"])
                 finalized = True
                 return result
         except BaseException as error:
             if not finalized:
-                # Span creation/entry, initial annotation, and other outer
-                # infrastructure failures still cross the post-error control
-                # boundary before their logger label is terminated.
                 complete_failure(error)
             raise
 
@@ -520,14 +486,8 @@ class LlmHandlerServer:
                 thread.start()
                 self._handles.append(handle)
             return handle
-        except BaseException as exc:
-            error = exc
+        except BaseException as error:
             was_cancelled = handle._cancel_event.is_set()
-            if self._is_cancelled():
-                try:
-                    self._raise_if_stopped()
-                except _DispatchError as stopped_error:
-                    error = stopped_error
             with suppress(BaseException):
                 handle.cancel()
             with self._handles_lock:
@@ -535,10 +495,10 @@ class LlmHandlerServer:
                     self._handles.remove(handle)
             handle._thread = None
             if was_cancelled:
-                self._finalize_cancelled(call_label)
+                self._finalize_terminal(call_label, kind="cancelled")
                 raise _RequestAborted from error
-            self._finalize_error(call_label, error)
-            raise error
+            self._finalize_terminal(call_label, kind="error", error=error)
+            raise
 
     def stop(self) -> None:
         with self._handles_lock:
@@ -746,59 +706,66 @@ class LlmHandlerServer:
         abort_event: "threading.Event | None" = None,
     ) -> dict:
         prepared = copy.deepcopy(request)
-        internal_kind = prepared.pop("agency_internal_kind", None)
+        prepared.pop("agency_internal_kind", None)
         if abort_event is not None and abort_event.is_set():
             raise _RequestAborted
-        if internal_kind != _INTERNAL_COMPACTION_KIND and self._is_cancelled():
-            self._raise_if_stopped()
         return prepared
 
-    def _raise_if_stopped(self) -> None:
-        if self._is_cancelled():
-            raise _DispatchError(_INVOCATION_CANCELLED_MESSAGE, status_code=409, transient=False)
-
-    def _invocation_stop_error(self) -> "_DispatchError | None":
-        """Whether the invocation was cancelled while a model call was in
-        flight -- checked again after a successful dispatch so a result
-        never gets delivered for an invocation that's already dead."""
-        try:
-            self._raise_if_stopped()
-        except _DispatchError as error:
-            return error
-        return None
-
-    def _finalize_error(self, call_label: "str | None", error: BaseException) -> None:
+    def _finalize_terminal(
+        self,
+        call_label: "str | None",
+        *,
+        kind: str,
+        error: "BaseException | None" = None,
+    ) -> None:
+        """Record this exchange's non-success outcome."""
         agname = getattr(self._data_logger, "_default_name", None)
-        self._data_logger.finalize_stream(
+        if kind == "cancelled":
+            payloads = [{"cancelled": True}]
+            suffix = "cancelled"
+        else:
+            suffix = f"{type(error).__name__}: {error}"
+            payloads = [{"error": suffix}]
+        self._data_logger.record_final_transcript(
             call_label,
-            type="llm_stream_error",
-            payloads=[{"error": f"{type(error).__name__}: {error}"}],
-            term_message=f"[{agname}] LLM    ✗  {type(error).__name__}: {error}",
-            print_to_terminal=False,
-        )
-
-    def _finalize_cancelled(self, call_label: "str | None") -> None:
-        agname = getattr(self._data_logger, "_default_name", None)
-        self._data_logger.finalize_stream(
-            call_label,
-            type="llm_stream_cancelled",
-            payloads=[{"cancelled": True}],
-            term_message=f"[{agname}] LLM    ✗  cancelled",
-            print_to_terminal=False,
-        )
-
-    def _finalize_success(self, call_label: "str | None", payloads: "list[dict]") -> None:
-        self._data_logger.finalize_stream(
-            call_label,
-            type="llm_block",
+            type=f"llm_stream_{kind}",
             payloads=payloads,
+            term_message=f"[{agname}] LLM    ✗  {suffix}",
+            print_to_terminal=False,
         )
 
-    def _build_kwargs(self, request: dict) -> dict:
-        kwargs = self._backend.build_kwargs(request["messages"], request.get("tools"))
-        if request.get("tool_choice") is not None:
-            kwargs["tool_choice"] = request["tool_choice"]
-        return kwargs
+    def _new_transcript_payloads(
+        self, request: dict, response_message: "dict | None"
+    ) -> "list[dict]":
+        """Diff this exchange's full state (request + response) against
+        every payload already logged this attempt, returning only what's
+        new."""
+        candidates: "list[dict]" = []
+        for message in request.get("messages") or []:
+            role = message.get("role")
+            for block in message.get("blocks") or []:
+                candidates.append({"role": role, **block})
+        if response_message is not None:
+            role = response_message.get("role", "assistant")
+            for block in response_message.get("blocks") or []:
+                candidates.append({"role": role, **block})
+        new_payloads = []
+        for payload in candidates:
+            digest = _payload_hash(payload)
+            if digest in self._logged_block_hashes:
+                continue
+            self._logged_block_hashes.add(digest)
+            new_payloads.append(payload)
+        return new_payloads
+
+    def _finalize_success(
+        self, call_label: "str | None", request: dict, response_message: "dict | None"
+    ) -> None:
+        payloads = self._new_transcript_payloads(request, response_message)
+        if payloads:
+            self._data_logger.record_final_transcript(
+                call_label, type="llm_block", payloads=payloads
+            )
 
     def _run_stream_producer(
         self,
@@ -813,21 +780,21 @@ class LlmHandlerServer:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_error(handle.call_label, error)
+            self._finalize_terminal(handle.call_label, kind="error", error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_cancelled(handle.call_label)
+            self._finalize_terminal(handle.call_label, kind="cancelled")
             finalized = True
 
-        def finalize_success(payloads: "list[dict]") -> None:
+        def finalize_success(response_message: dict) -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_success(handle.call_label, payloads)
+            self._finalize_success(handle.call_label, request, response_message)
             finalized = True
 
         def publish_error(
@@ -878,20 +845,6 @@ class LlmHandlerServer:
                     first_item = next(stream_iter)
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
-                    stop_error = self._invocation_stop_error()
-                    if stop_error is not None:
-                        _annotate(
-                            attempt_span, outcome="failure", error_type=type(stop_error).__name__
-                        )
-                        if handle._cancel_event.is_set():
-                            finalize_cancelled()
-                            return
-                        publish_error(
-                            stop_error,
-                            status_code=stop_error.status_code,
-                            transient=stop_error.transient,
-                        )
-                        return
                     empty_message = {"role": "assistant", "blocks": []}
                     enqueued = handle.register_stream_exchange(
                         {
@@ -907,21 +860,7 @@ class LlmHandlerServer:
                     if not enqueued:
                         finalize_cancelled()
                         return
-                    finalize_success([])
-                    return
-                except BAD_REQUEST_EXCS as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    if handle._cancel_event.is_set():
-                        finalize_cancelled()
-                        return
-                    publish_error(e, status_code=400, transient=False)
-                    return
-                except TRANSIENT_DISPATCH_EXCS as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
-                    if handle._cancel_event.is_set():
-                        finalize_cancelled()
-                        return
-                    publish_error(e, status_code=503, transient=True)
+                    finalize_success(empty_message)
                     return
                 except BaseException as e:
                     # A producer thread must always publish a first terminal
@@ -931,7 +870,9 @@ class LlmHandlerServer:
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
-                    publish_error(e, status_code=500, transient=False)
+                    classified = _classify_dispatch_exception(e)
+                    status_code, transient = classified if classified is not None else (500, False)
+                    publish_error(e, status_code=status_code, transient=transient)
                     return
                 ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                 _annotate(attempt_span, ttft_ms=ttft_ms)
@@ -999,18 +940,6 @@ class LlmHandlerServer:
                             block["data"].append(stream_item["data"])
                         block["ts_end"] = now
                         message = _blocks_to_message(blocks)
-                        # Deliberately never pass an item here: this keeps
-                        # register_stream_exchange()'s queue-full backpressure
-                        # wait from ever triggering for a per-delta call (that
-                        # wait is gated on `item is not None`), so this loop
-                        # can never block on how fast -- or whether at all --
-                        # the harness-facing consumer drains the queue. The
-                        # upstream provider is always fully drained regardless
-                        # of the harness's own state (paused, slow, or gone);
-                        # only the one final "done" event below is ever
-                        # actually delivered. `response=message` still keeps
-                        # the transcript's latest-known partial content
-                        # current for a mid-stream disconnect/cancel.
                         handle.register_stream_exchange(response=message)
                 except BaseException as e:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
@@ -1028,14 +957,6 @@ class LlmHandlerServer:
 
                 if handle._cancel_event.is_set():
                     finalize_cancelled()
-                    return
-                stop_error = self._invocation_stop_error()
-                if stop_error is not None:
-                    publish_error(
-                        stop_error,
-                        status_code=stop_error.status_code,
-                        transient=stop_error.transient,
-                    )
                     return
                 _annotate(
                     attempt_span,
@@ -1061,7 +982,7 @@ class LlmHandlerServer:
                     finalize_cancelled()
                     return
                 self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
-                finalize_success(message["blocks"])
+                finalize_success(message)
         except BaseException as e:
             if not finalized:
                 if handle._cancel_event.is_set():

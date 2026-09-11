@@ -17,7 +17,7 @@ const state = {
   // this lines a call up right where it actually happened: after the
   // assistant's tool_use message, before the tool's result message lands.
   systemLogs:  new Map(),
-  systemLogsEnabled: false,
+  fullLogsEnabled: false,
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
@@ -167,39 +167,60 @@ setInterval(async () => {
 // Profiler artifacts
 // ---------------------------------------------------------------------------
 
-const $profilerLinks = document.getElementById('profiler-links');
-
 function fmtBytes(n) {
   if (n >= 1_048_576) return (n / 1_048_576).toFixed(1) + 'MB';
   if (n >= 1024)      return (n / 1024).toFixed(1) + 'KB';
   return n + 'B';
 }
 
-// Profiler output (agprof.trace.json/summary.json/summary.md) only appears
-// once this run's profiling session stops -- normally at the very end of
-// the run (see server.py's _profiler_dir() docstring) -- so poll for it
-// rather than expecting it on page load, and stop once it shows up since
-// it's written once, not continuously.
-async function pollProfilerFiles() {
-  try {
-    const r = await fetch('/api/profiler/files');
-    const j = await r.json();
-    const files = j.files || [];
-    if (!files.length) return false;
-    $profilerLinks.innerHTML = files
-      .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)} (${fmtBytes(f.size)})</a>`)
-      .join('');
-    $profilerLinks.classList.remove('hidden');
-    return true;
-  } catch {
-    return false;
+// agprof writes its output files (trace/summary/sqlite3) at its own pace,
+// under names/timing this client has no reason to know or guess -- rather
+// than tracking which specific files mean "done" (fragile: a rename or a
+// newly added output file would silently stop showing up), just render
+// whatever /api/profiler/files currently reports and keep refreshing it.
+// One persistent line is updated in place (not re-appended) each poll, so
+// a file list that's still growing never produces duplicate log lines.
+let _profilerLogLineEl = null;
+let _profilerPollTimer = null;
+
+function _renderProfilerFiles(files) {
+  if (!files.length) return;
+  const links = files
+    .map(f => `<a href="/api/profiler/download/${encodeURIComponent(f.name)}" download>${esc(f.name)}</a> (${fmtBytes(f.size)})`)
+    .join('  ');
+  const html = `<span style="color:var(--yellow)">Profiler output:</span>  ${links}`;
+  if (_profilerLogLineEl) {
+    _profilerLogLineEl.innerHTML = html;
+  } else {
+    _profilerLogLineEl = _appendLogLine(html);
   }
 }
 
-const _profilerPollTimer = setInterval(async () => {
-  if (await pollProfilerFiles()) clearInterval(_profilerPollTimer);
-}, 10_000);
-pollProfilerFiles();
+async function checkProfilerFiles() {
+  if (wsClosed) {
+    clearInterval(_profilerPollTimer);
+    return;
+  }
+  try {
+    const r = await fetch('/api/profiler/files');
+    const j = await r.json();
+    _renderProfilerFiles(j.files || []);
+  } catch {}
+}
+
+// Armed once, the first time the run is known to be over -- from the
+// "done" event, whether pushed live or replayed from this agent db's tail
+// on a client that only connects after the run already finished (see
+// server.py's _fetch_tail_events(): "done" is always that db's very last
+// event, so it's always within the replayed tail window). Nothing polls
+// before that: the profiler's own files (profile_data.sqlite3 especially)
+// exist from early in the run, long before it's actually finished, so
+// checking earlier would only mean showing/updating this line too soon.
+function armProfilerPolling() {
+  if (_profilerPollTimer !== null) return;
+  _profilerPollTimer = setInterval(checkProfilerFiles, 3_000);
+  checkProfilerFiles();
+}
 
 // Reset all agent/log state before replaying a historical window.
 function clearAgentState() {
@@ -259,7 +280,7 @@ $tlLiveBtn.addEventListener('click', () => {
 
 const $sharedLog        = document.getElementById('shared-log');
 const $agentHistory     = document.getElementById('agent-history');
-const $systemLogCheckbox = document.getElementById('system-log-checkbox');
+const $fullLogsCheckbox = document.getElementById('full-logs-checkbox');
 const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
 const $navLabel         = document.getElementById('nav-label');
@@ -357,6 +378,7 @@ function _appendLogLine(html) {
   if (logAutoScroll) $sharedLog.scrollTop = $sharedLog.scrollHeight;
   // Cap at 5000 lines to prevent unbounded growth
   while ($sharedLog.children.length > 5000) $sharedLog.removeChild($sharedLog.firstChild);
+  return div;
 }
 
 function appendLog(line) {
@@ -455,14 +477,14 @@ function recordSystemLog(agname, termMessage, ts) {
 }
 
 try {
-  const stored = localStorage.getItem('agency_system_logs_enabled');
-  state.systemLogsEnabled = stored === null ? false : stored === '1';
+  const stored = localStorage.getItem('agency_full_logs_enabled');
+  state.fullLogsEnabled = stored === null ? false : stored === '1';
 } catch {}
-$systemLogCheckbox.checked = state.systemLogsEnabled;
+$fullLogsCheckbox.checked = state.fullLogsEnabled;
 
-$systemLogCheckbox.addEventListener('change', () => {
-  state.systemLogsEnabled = $systemLogCheckbox.checked;
-  try { localStorage.setItem('agency_system_logs_enabled', state.systemLogsEnabled ? '1' : '0'); } catch {}
+$fullLogsCheckbox.addEventListener('change', () => {
+  state.fullLogsEnabled = $fullLogsCheckbox.checked;
+  try { localStorage.setItem('agency_full_logs_enabled', state.fullLogsEnabled ? '1' : '0'); } catch {}
   renderHistory();
 });
 
@@ -635,7 +657,7 @@ function renderHistory() {
   updateInteractionTitle();
 
   const msgs    = state.histories.get(agname) || [];
-  const syslogs = state.systemLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
+  const syslogs = state.fullLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
   let syslogIdx = 0;
   const frags = [];
 
@@ -670,7 +692,12 @@ function renderHistory() {
     const tsHtml = msg.ts ? `<span class="log-ts">${fmtTs(msg.ts)}</span> ` : '';
 
     if (role === 'system') {
-      if (text) frags.push(`<div class="msg-system">${tsHtml}─── sys: ${esc(text)}</div>`);
+      if (text && state.fullLogsEnabled) {
+        frags.push(
+          `<div class="msg-system">${tsHtml}<span class="role-tool-call">⚑ system</span>\n` +
+          `<span class="dim">${esc(text)}</span></div>`
+        );
+      }
 
     } else if (role === 'user') {
       if (text) {
@@ -696,6 +723,11 @@ function renderHistory() {
           frags.push(
             `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ ${esc(b.name || '?')}</span>\n` +
             `<span class="dim">${argsText}</span></div>`
+          );
+        } else if (b.type === 'metadata' && state.fullLogsEnabled) {
+          frags.push(
+            `<div class="msg-metadata">${tsHtml}<span class="role-tool-call">◇ metadata</span>\n` +
+            `<span class="dim">${esc(JSON.stringify(b))}</span></div>`
           );
         }
       }
@@ -863,6 +895,10 @@ function handleEvent(ev) {
 
     case 'done':
       appendLog('\x1b[1;32m✓ All done\x1b[0m  —  press Ctrl+C in the terminal to exit');
+      // The run's profiling session (if any) has already stopped by the
+      // time this event fires -- see armProfilerPolling()'s docstring --
+      // so start polling right now instead of never checking at all.
+      armProfilerPolling();
       break;
   }
 

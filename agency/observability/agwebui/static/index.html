@@ -11,7 +11,7 @@
   <div id="app">
     <div id="left">
       <div id="shared-log-container">
-        <div class="panel-title" id="shared-log-title">Shared Log<span class="badge-group"><span class="profiler-links hidden" id="profiler-links" title="Profiler output for this run"></span><span class="resource-badge" id="resource-stats"></span></span></div>
+        <div class="panel-title" id="shared-log-title">Shared Log<span class="badge-group"><span class="resource-badge" id="resource-stats"></span></span></div>
         <div id="timeline-bar">
           <span id="timeline-from"></span>
           <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" disabled>
@@ -27,8 +27,8 @@
           <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
           <span id="nav-label"></span>
           <button id="nav-next" title="Next agent (] or Tab)">&#8594;</button>
-          <label id="system-log-toggle" title="Interleave this agent's tool/LLM/syscall events into its transcript">
-            <input type="checkbox" id="system-log-checkbox"> System Logs
+          <label id="full-logs-toggle" title="Show everything: system messages, tool/LLM/syscall events, and raw metadata">
+            <input type="checkbox" id="full-logs-checkbox"> Full Logs
           </label>
         </div>
       </div>

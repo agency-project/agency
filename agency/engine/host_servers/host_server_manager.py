@@ -68,6 +68,7 @@ class HostServerManager:
         *,
         is_cancelled: "Callable[[], bool] | None" = None,
         request_id: "str | None" = None,
+        recent_transcript: "list[dict] | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
@@ -79,9 +80,9 @@ class HostServerManager:
             self._data_logger,
             agent.llm_usage_tracker,
             parent_context=agprof.current_span_context(),
-            is_cancelled=is_cancelled,
             request_id=request_id,
             skill_name=skill.name,
+            recent_transcript=recent_transcript,
         )
         self._interaction_server = HostInteractionServer(
             skill,
