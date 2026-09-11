@@ -143,3 +143,67 @@ def test_grok_auxiliary_request_is_answered_without_model_dispatch(stream, auxil
     assert ("Agency session" if auxiliary == "title" else "Agency turn") in response.text
     bridge.dispatch.assert_not_called()
     bridge.dispatch_stream.assert_not_called()
+
+
+def test_codex_disconnect_before_first_frame_closes_upstream():
+    import asyncio
+    import json
+
+    async def exercise():
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def stream(*args):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+                yield {}
+            finally:
+                closed.set()
+
+        app = FastAPI()
+        bridge = SimpleNamespace(
+            validate_token=lambda token: True,
+            resolve_model=lambda token: "test-model",
+            dispatch_stream_async=stream,
+        )
+        _CodexBackend(agconfig()).register(app, bridge)
+        body = json.dumps({"stream": True, "input": "test cancellation"}).encode()
+        sent_body = False
+        responses = []
+
+        async def receive():
+            nonlocal sent_body
+            if not sent_body:
+                sent_body = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            responses.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/responses",
+            "raw_path": b"/v1/responses",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer test"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 80),
+        }
+        task = asyncio.create_task(app(scope, receive, send))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(closed.wait(), 2)
+            await asyncio.wait_for(task, 2)
+            assert responses[0]["status"] == 499
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
