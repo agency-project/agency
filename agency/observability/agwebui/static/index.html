@@ -34,16 +34,20 @@
         <div id="shared-log"></div>
       </div>
       <div id="interaction">
-        <div class="panel-title" id="interaction-title">No agents</div>
-        <div id="agent-history"></div>
-        <div id="nav-bar">
-          <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
-          <span id="nav-label"></span>
-          <button id="nav-next" title="Next agent (] or Tab)">&#8594;</button>
-          <label id="full-logs-toggle" title="Show everything: system messages, tool/LLM/syscall events, and raw metadata">
-            <input type="checkbox" id="full-logs-checkbox"> Full Logs
-          </label>
+        <div id="panel-main">
+          <div class="panel-title" id="interaction-title">No agents</div>
+          <div id="agent-history"></div>
+          <div id="nav-bar">
+            <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
+            <span id="nav-label"></span>
+            <button id="nav-next" title="Next agent (] or Tab)">&#8594;</button>
+            <label id="full-logs-toggle" title="Show everything: system messages, tool/LLM/syscall events, and raw metadata">
+              <input type="checkbox" id="full-logs-checkbox"> Full Logs
+            </label>
+          </div>
         </div>
+        <div id="side-panels"></div>
+        <div id="drop-overlay">Drop into panel</div>
       </div>
     </div>
     <div id="right">

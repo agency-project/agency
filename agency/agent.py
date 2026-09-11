@@ -176,7 +176,8 @@ class agent:
                 "llm_config": _llm_config,
             },
             term_message=(
-                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{team_tag}"
+                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}"
+                f"  harness={self.harness}{team_tag}"
             ),
             reuse_data_logger_configs=True,
         )

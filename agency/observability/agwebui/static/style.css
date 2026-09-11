@@ -16,6 +16,14 @@
   --yellow:           #ffaf00;
   --green:            #5fd75f;
   --red:              #ff5555;
+  /* Message-body brightness scale (white ratio against --text's grey,
+     212,212,212) -- user/assistant read at full brightness (plain --text,
+     no class needed); system/tool/syscall step down from there so a
+     glance at shade alone says how far a line is from the model's own
+     words. */
+  --body-system:      rgba(212,212,212,0.9);
+  --body-tool:        rgba(212,212,212,0.8);
+  --body-syscall:     rgba(212,212,212,0.7);
   --font: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
   --fs:               12.5px;
 }
@@ -62,17 +70,124 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 }
 #shared-log a:hover { text-decoration: underline; }
 
-/* Interaction pane — lower 7 parts */
+/* Interaction pane — lower 7 parts. Row layout: the main (nav-driven) panel
+   plus zero or more agents pinned as side panels, for side-by-side
+   comparison -- see #side-panels and .side-panel below. */
 #interaction {
+  position: relative;
   flex: 7;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   border: 1px solid var(--border-interact);
   border-top: none;
   overflow: hidden;
 }
 
+/* VS Code-style drop indicator -- hidden until an agent is actually being
+   dragged over the pane (#interaction's drag-over class, toggled by its
+   drag handlers below), never a persistent hint. */
+#drop-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  background: rgba(74,158,255,0.15);
+  border: 2px solid var(--border-log);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: bold;
+  pointer-events: none;
+  z-index: 10;
+}
+#interaction.drag-over #drop-overlay { display: flex; }
+
+#panel-main {
+  flex: 1;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 #agent-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Pinned agents, dropped from the list on the right (see .agent-entry's
+   draggable + #interaction's drop handler) -- each panel's width is set
+   inline by app.js (state.panelWidths), dragged via the .panel-resizer
+   immediately to its left; the strip scrolls horizontally past however
+   many fit. */
+#side-panels {
+  display: flex;
+  flex-direction: row;
+  flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.side-panel {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+/* Draggable divider between #panel-main and the first side panel, and
+   between every consecutive pair -- a wide invisible hit-area (easy to
+   grab) with a thin visible line at rest, widening on hover/drag. */
+.panel-resizer {
+  flex: 0 0 5px;
+  width: 5px;
+  cursor: col-resize;
+  position: relative;
+}
+.panel-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+}
+.panel-resizer:hover::after,
+.panel-resizer.resizing::after {
+  left: 0;
+  width: 5px;
+  background: var(--border-log);
+}
+
+body.resizing-panels {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.side-panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.side-panel-close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+.side-panel-close:hover { color: var(--red); }
+
+.side-panel-history {
   flex: 1;
   overflow-y: auto;
   padding: 4px 8px;
@@ -343,7 +458,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .msg-thinking   { color: var(--dim); font-style: italic; margin: 3px 0; border-left: 2px solid var(--border); padding-left: 6px; }
 .msg-tool-call  { margin: 3px 0; }
 .msg-assistant  { margin: 3px 0; }
-.msg-tool-result{ color: var(--dim); margin: 2px 0; }
+.msg-tool-result{ margin: 2px 0; }
 .msg-syslog     { margin: 3px 0; }
 .msg-metadata   { margin: 3px 0; }
 .msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
@@ -353,6 +468,11 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .role-tool-call { color: var(--yellow); font-weight: bold; }
 .role-assistant { color: var(--green);  font-weight: bold; }
 .dim            { opacity: 0.5; }
+
+/* Message-body brightness tiers -- see --body-* above. */
+.body-system    { color: var(--body-system); }
+.body-tool      { color: var(--body-tool); }
+.body-syscall   { color: var(--body-syscall); }
 
 /* ----------------------------------------------------------- Timeline */
 

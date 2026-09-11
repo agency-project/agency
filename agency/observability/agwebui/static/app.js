@@ -10,12 +10,14 @@ const state = {
   teams:       new Map(),  // team_name -> Set<agname>
   histories:   new Map(),  // agname -> msg[]
   // agname -> {ts, html}[] -- tool/llm/syscall event lines, interleaved into
-  // the transcript at render time by real timestamp (see renderHistory()).
+  // the transcript at render time by real timestamp (see buildHistoryHtml()).
   systemLogs:  new Map(),
   fullLogsEnabled: false,
   tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
+  pinnedAgents: [],        // [agname] dropped onto the interaction pane as side panels
+  panelWidths: new Map(),  // agname -> side panel width in px (see .panel-resizer)
   focusedIdx: 0,
   autoSelected: false,     // true once the first agent has been auto-selected
   activeTab:  'all',       // 'all' | 'live' | 'idle' | 'finished'
@@ -224,9 +226,11 @@ function clearAgentState() {
   state.histories.clear();
   state.systemLogs.clear();
   state.agentOrder = [];
+  state.pinnedAgents = [];
   state.focusedIdx = 0;
   state.autoSelected = false;
   $sharedLog.innerHTML = '';
+  $sidePanels.innerHTML = '';
   renderAgentList();
   renderHistory();
 }
@@ -274,7 +278,9 @@ $tlLiveBtn.addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 
 const $sharedLog        = document.getElementById('shared-log');
+const $interaction      = document.getElementById('interaction');
 const $agentHistory     = document.getElementById('agent-history');
+const $sidePanels       = document.getElementById('side-panels');
 const $fullLogsCheckbox = document.getElementById('full-logs-checkbox');
 const $agentList        = document.getElementById('agent-list');
 const $interactionTitle = document.getElementById('interaction-title');
@@ -404,7 +410,7 @@ function appendAgentLog(termMessage, color, ts) {
 
 // ---------------------------------------------------------------------------
 // Per-agent system log (tool/LLM/syscall events) -- kept out of the shared
-// log; interleaved into that agent's own transcript instead (renderHistory()
+// log; interleaved into that agent's own transcript instead (buildHistoryHtml()
 // below), gated by the "System Logs" checkbox. Lines are always buffered
 // per-agent regardless of the checkbox, so toggling it on replays everything
 // seen so far for the currently selected agent.
@@ -412,7 +418,7 @@ function appendAgentLog(termMessage, color, ts) {
 
 // 'tool_result'/'running_tool' are deliberately excluded here -- every
 // *allowed* tool call already renders from the canonical transcript
-// (llm_block's tool_use/tool_result, in renderHistory() below), ungated by
+// (llm_block's tool_use/tool_result, in buildHistoryHtml() below), ungated by
 // the Full Logs checkbox, styled the same "TOOL name ▶/✓" way. Including
 // them here too just double-rendered the same call. 'tool_denied' stays,
 // since a denied call never runs and so has no transcript tool_result to
@@ -437,6 +443,10 @@ function isSystemLogEvent(ev) {
 // header-row-then-newline-then-body shape as an assistant's own tool_use
 // block (.msg-tool-call), instead of as one flat line.
 const SYSLOG_ICON = { TOOL: '⚙', SYSCALL: '⌘', LLM: '✦' };
+// Body brightness tier per label -- TOOL/SYSCALL get the same tiers their
+// canonical transcript/system counterparts use; LLM (stream error/cancelled)
+// is itself a system-level notice, not agent-authored content.
+const SYSLOG_BODY_CLASS = { TOOL: 'body-tool', SYSCALL: 'body-syscall', LLM: 'body-system' };
 const SYSLOG_LINE_RE = /^\[[^\]]+\]\s+(TOOL|SYSCALL|LLM)\s*([▶✓✗?])\s+([\s\S]*)$/;
 
 function formatSyslogLine(termMessage, ts) {
@@ -465,7 +475,8 @@ function formatSyslogLine(termMessage, ts) {
   const nameHtml = name ? `  ${esc(name)}` : '';
   const header =
     `${tsHtml} <span class="role-tool-call">${icon} ${esc(label)}${nameHtml} ${esc(mark)}</span>`;
-  return body ? `${header}\n<span class="dim">${esc(body)}</span>` : header;
+  const bodyClass = SYSLOG_BODY_CLASS[label] || 'body-system';
+  return body ? `${header}\n<span class="${bodyClass}">${esc(body)}</span>` : header;
 }
 
 function recordSystemLog(agname, termMessage, ts) {
@@ -474,7 +485,7 @@ function recordSystemLog(agname, termMessage, ts) {
   const lines = state.systemLogs.get(agname);
   lines.push({ ts: ts || 0, html });
   if (lines.length > SYSTEM_LOG_CAP) lines.shift();
-  if (agname === currentAgent()) renderHistory();
+  refreshAgentView(agname);
 }
 
 try {
@@ -627,7 +638,7 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
     statusHtml = `<span class="dim">${esc(skill || '')} - running</span>`;
   }
 
-  return `<div class="agent-entry${focusedClass}" data-agname="${esc(agname)}" style="padding-left:${indent}px">
+  return `<div class="agent-entry${focusedClass}" data-agname="${esc(agname)}" draggable="true" title="Drag onto the log panel to compare side-by-side" style="padding-left:${indent}px">
     <div class="agent-name">${dot} <span style="color:${color}">${esc(agname)}</span></div>
     <div class="agent-status">${statusHtml}</div>
   </div>`;
@@ -643,20 +654,10 @@ $agentHistory.addEventListener('scroll', () => {
   histAutoScroll = $agentHistory.scrollHeight - $agentHistory.scrollTop - $agentHistory.clientHeight < 40;
 });
 
-function renderHistory() {
-  const agname = currentAgent();
-  const visible = visibleOrder();
-  const n   = visible.length;
-  const idx = n ? state.focusedIdx % n : 0;
-
-  if (!agname) {
-    updateInteractionTitle();
-    $agentHistory.innerHTML = '';
-    return;
-  }
-
-  updateInteractionTitle();
-
+// Builds one agent's transcript HTML -- shared by the main (nav-driven)
+// panel and every pinned side panel (see #side-panels below), so a pinned
+// agent renders exactly the same way it would as the focused one.
+function buildHistoryHtml(agname) {
   const msgs    = state.histories.get(agname) || [];
   const syslogs = state.fullLogsEnabled ? (state.systemLogs.get(agname) || []) : [];
   let syslogIdx = 0;
@@ -703,7 +704,7 @@ function renderHistory() {
       if (text && state.fullLogsEnabled) {
         frags.push(
           `<div class="msg-system">${tsHtml}<span class="role-tool-call">⚑ system</span>\n` +
-          `<span class="dim">${esc(text)}</span></div>`
+          `<span class="body-system">${esc(text)}</span></div>`
         );
       }
 
@@ -737,7 +738,7 @@ function renderHistory() {
           }
           frags.push(
             `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(b.name || '?')} ▶</span>\n` +
-            `<span class="dim">${argsText}</span></div>`
+            `<span class="body-tool">${argsText}</span></div>`
           );
         } else if (b.type === 'metadata' && state.fullLogsEnabled) {
           frags.push(
@@ -759,7 +760,7 @@ function renderHistory() {
           const name = toolNamesByCallId.get(b.tool_call_id) || '?';
           frags.push(
             `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(name)} ✓</span>\n` +
-            `<span class="dim">${esc(b.text || '')}</span></div>`
+            `<span class="body-tool">${esc(b.text || '')}</span></div>`
           );
         }
       }
@@ -783,9 +784,181 @@ function renderHistory() {
     frags.push(`<div class="msg-running${st === 'paused' ? ' msg-paused' : ''}">▶ ${esc(label)}</div>`);
   }
 
-  $agentHistory.innerHTML = frags.join('');
-  if (histAutoScroll) $agentHistory.scrollTop = $agentHistory.scrollHeight;
+  return frags.join('');
 }
+
+function renderHistory() {
+  const agname = currentAgent();
+  updateInteractionTitle();
+
+  if (!agname) {
+    $agentHistory.innerHTML = '';
+  } else {
+    $agentHistory.innerHTML = buildHistoryHtml(agname);
+    if (histAutoScroll) $agentHistory.scrollTop = $agentHistory.scrollHeight;
+  }
+  renderSidePanels();
+}
+
+// ---------------------------------------------------------------------------
+// Side panels -- agents dragged from the list on the right and dropped onto
+// the interaction pane, so their logs render next to the focused agent's
+// for direct comparison. Each panel keeps its own scroll-lock (mirroring
+// histAutoScroll above) and is refreshed whenever that agent's data changes,
+// independent of whichever agent is currently focused.
+// ---------------------------------------------------------------------------
+
+const panelAutoScroll = new Map(); // agname -> bool, true = pinned to bottom
+const panelElements   = new Map(); // agname -> { resizer, panel, historyEl }
+const DEFAULT_PANEL_WIDTH = 300;
+const MIN_PANEL_WIDTH = 160;
+
+function pinAgent(agname) {
+  if (!agname || !state.agents.has(agname)) return;
+  if (state.pinnedAgents.includes(agname)) return;
+  state.pinnedAgents.push(agname);
+  renderSidePanels();
+  // Don't wait for the next 200ms poll tick -- fetch this agent's messages
+  // immediately so the new panel isn't blank for a beat.
+  loadAgentDetail(agname);
+}
+
+function unpinAgent(agname) {
+  state.pinnedAgents = state.pinnedAgents.filter(a => a !== agname);
+  renderSidePanels();
+}
+
+// Drag .panel-resizer (immediately to *agname*'s panel's left) to resize
+// just that panel -- #panel-main is flex:1 and every other panel keeps its
+// own width, so only the dragged panel's width ever needs to change.
+function attachPanelResizer(resizer, agname) {
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const els = panelElements.get(agname);
+    if (!els) return;
+    const startX = e.clientX;
+    const startWidth = els.panel.getBoundingClientRect().width;
+    resizer.classList.add('resizing');
+    document.body.classList.add('resizing-panels');
+
+    function setWidth(px) {
+      const width = Math.max(MIN_PANEL_WIDTH, Math.round(px));
+      state.panelWidths.set(agname, width);
+      els.panel.style.flex = `0 0 ${width}px`;
+      els.panel.style.width = `${width}px`;
+    }
+    // The resizer sits at this panel's LEFT edge -- dragging it right
+    // narrows the panel (its left edge moves toward its fixed right edge),
+    // dragging left widens it, hence the subtraction.
+    function onMove(ev) { setWidth(startWidth - (ev.clientX - startX)); }
+    function onUp() {
+      resizer.classList.remove('resizing');
+      document.body.classList.remove('resizing-panels');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+}
+
+function renderSidePanels() {
+  // Drop panels (and their resizer) for agents no longer pinned.
+  for (const [agname, els] of [...panelElements]) {
+    if (!state.pinnedAgents.includes(agname)) {
+      els.resizer.remove();
+      els.panel.remove();
+      panelElements.delete(agname);
+      panelAutoScroll.delete(agname);
+      state.panelWidths.delete(agname);
+    }
+  }
+
+  for (const agname of state.pinnedAgents) {
+    let els = panelElements.get(agname);
+    if (!els) {
+      const ag = state.agents.get(agname) || { color: '#d4d4d4' };
+
+      const resizer = document.createElement('div');
+      resizer.className = 'panel-resizer';
+      attachPanelResizer(resizer, agname);
+
+      const panel = document.createElement('div');
+      panel.className = 'side-panel';
+      panel.dataset.agname = agname;
+      panel.innerHTML =
+        `<div class="panel-title side-panel-title">` +
+          `<span style="color:${ag.color || '#d4d4d4'}">${esc(agname)}</span>` +
+          `<button class="side-panel-close" title="Unpin">&times;</button>` +
+        `</div>` +
+        `<div class="side-panel-history"></div>`;
+      panel.querySelector('.side-panel-close').addEventListener('click', () => unpinAgent(agname));
+      const historyEl = panel.querySelector('.side-panel-history');
+      panelAutoScroll.set(agname, true);
+      historyEl.addEventListener('scroll', () => {
+        panelAutoScroll.set(agname, historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight < 40);
+      });
+
+      els = { resizer, panel, historyEl };
+      panelElements.set(agname, els);
+    }
+    // Re-appending an already-attached node moves it -- this keeps DOM
+    // order in sync with state.pinnedAgents with no separate reorder step.
+    $sidePanels.appendChild(els.resizer);
+    $sidePanels.appendChild(els.panel);
+
+    const width = state.panelWidths.get(agname) || DEFAULT_PANEL_WIDTH;
+    els.panel.style.flex = `0 0 ${width}px`;
+    els.panel.style.width = `${width}px`;
+
+    els.historyEl.innerHTML = buildHistoryHtml(agname);
+    if (panelAutoScroll.get(agname) !== false) els.historyEl.scrollTop = els.historyEl.scrollHeight;
+  }
+}
+
+// An agent's data changed -- refresh wherever it's currently shown (the
+// main panel if focused, a side panel if pinned, both, or neither).
+function refreshAgentView(agname) {
+  if (agname === currentAgent()) {
+    renderHistory(); // also refreshes side panels
+  } else if (state.pinnedAgents.includes(agname)) {
+    renderSidePanels();
+  }
+}
+
+// A custom MIME type (not plain 'text/plain') so the overlay only ever
+// reacts to one of our own agent entries being dragged -- not some
+// unrelated drag (a link, an image, a browser tab) passing over the pane.
+const AGENT_DRAG_TYPE = 'application/x-agency-agname';
+
+function isAgentDrag(e) {
+  return e.dataTransfer.types.includes(AGENT_DRAG_TYPE);
+}
+
+$interaction.addEventListener('dragover', e => {
+  if (!isAgentDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+let _dragDepth = 0;
+$interaction.addEventListener('dragenter', e => {
+  if (!isAgentDrag(e)) return;
+  e.preventDefault();
+  _dragDepth++;
+  $interaction.classList.add('drag-over');
+});
+$interaction.addEventListener('dragleave', e => {
+  if (!isAgentDrag(e)) return;
+  _dragDepth = Math.max(0, _dragDepth - 1);
+  if (_dragDepth === 0) $interaction.classList.remove('drag-over');
+});
+$interaction.addEventListener('drop', e => {
+  if (!isAgentDrag(e)) return;
+  e.preventDefault();
+  _dragDepth = 0;
+  $interaction.classList.remove('drag-over');
+  pinAgent(e.dataTransfer.getData(AGENT_DRAG_TYPE));
+});
 
 // ---------------------------------------------------------------------------
 // Event handlers
@@ -881,7 +1054,7 @@ function handleEvent(ev) {
         reorderAgents();
       }
       renderAgentList();
-      if (ev.agname === currentAgent()) renderHistory();
+      refreshAgentView(ev.agname);
       break;
     }
 
@@ -894,7 +1067,7 @@ function handleEvent(ev) {
 
     case 'messages_snapshot':
       state.histories.set(ev.agname, ev.messages || []);
-      if (ev.agname === currentAgent()) renderHistory();
+      refreshAgentView(ev.agname);
       break;
 
     case 'resource_update':
@@ -953,23 +1126,28 @@ function reorderAgents() {
   }
 }
 
-let agentDetailGeneration = 0;
+// agname -> generation counter, guarding against that agent's own responses
+// landing out of order (see the overlap comment below) -- scoped per agent
+// since the focused agent and every pinned side panel now poll
+// concurrently and must not invalidate each other.
+const agentDetailGenerations = new Map();
 // agname -> signature of the last content actually rendered. Polled every
 // 200ms, but the underlying data usually only changes once per LLM/tool
-// exchange -- rebuilding #agent-history's entire innerHTML unconditionally
-// on every tick was pure churn most of the time, and repeatedly replacing
-// that subtree risked jittering scrollTop enough to flip histAutoScroll to
-// false (see its listener below), silently freezing the visible view while
-// content kept accumulating underneath.
+// exchange -- rebuilding a panel's entire innerHTML unconditionally on
+// every tick was pure churn most of the time, and repeatedly replacing
+// that subtree risked jittering scrollTop enough to flip its autoscroll
+// flag to false, silently freezing the visible view while content kept
+// accumulating underneath.
 const agentDetailSignatures = new Map();
 
 async function loadAgentDetail(agname) {
   if (!agname) return;
-  const generation = ++agentDetailGeneration;
+  const generation = (agentDetailGenerations.get(agname) || 0) + 1;
+  agentDetailGenerations.set(agname, generation);
   try {
     const response = await fetch('/api/agents/' + encodeURIComponent(agname));
     const detail = await response.json();
-    if (generation !== agentDetailGeneration || agname !== currentAgent()) return;
+    if (agentDetailGenerations.get(agname) !== generation) return;
     if (detail.error) {
       appendLog('[agent detail] ' + detail.error);
       return;
@@ -1003,10 +1181,10 @@ async function loadAgentDetail(agname) {
       });
     }
     renderAgentList();
-    if (changed) renderHistory();
-    updateInteractionTitle();
+    if (changed) refreshAgentView(agname);
+    if (agname === currentAgent()) updateInteractionTitle();
   } catch (error) {
-    if (generation === agentDetailGeneration) {
+    if (agentDetailGenerations.get(agname) === generation) {
       appendLog('[agent detail] fetch failed: ' + error);
     }
   }
@@ -1075,6 +1253,15 @@ $agentList.addEventListener('click', e => {
     renderHistory();
     loadAgentDetail(agname);
   }
+});
+
+// Drag an agent entry onto the interaction pane (see #interaction's drop
+// handler above) to pin it there as a side panel.
+$agentList.addEventListener('dragstart', e => {
+  const entry = e.target.closest('.agent-entry');
+  if (!entry) return;
+  e.dataTransfer.effectAllowed = 'copy';
+  e.dataTransfer.setData(AGENT_DRAG_TYPE, entry.dataset.agname);
 });
 
 // ---------------------------------------------------------------------------
@@ -1213,21 +1400,20 @@ ws.onerror = () => {
   appendLog('\x1b[31m[web ui] connection error\x1b[0m');
 };
 
-// The interaction panel (messages/state/config/tokens) only ever refreshes
-// on an explicit selection (click, Tab/arrow, auto-select) -- /api/agents/
-// {agname} is a pull, not something the live event stream pushes updates
-// for. Poll the currently selected agent while connected so its own
-// messages/state/tokens keep advancing without the user re-clicking it.
-// loadAgentDetail() already guards a response landing after the selection
-// moved on (agentDetailGeneration / agname !== currentAgent()), so this is
-// safe to fire even mid-fetch or mid-navigation.
+// The interaction panel(s) (messages/state/config/tokens) only ever refresh
+// on an explicit selection or pin -- /api/agents/{agname} is a pull, not
+// something the live event stream pushes updates for. Poll the focused
+// agent AND every pinned side panel while connected, so all of them keep
+// advancing without the user re-clicking/re-dragging anything.
+// loadAgentDetail() already guards a response landing after that agent's
+// own generation moved on, so this is safe to fire even mid-fetch.
 //
 // Self-rescheduling setTimeout, NOT setInterval: setInterval fires on a
 // fixed wall-clock cadence regardless of whether the previous call has
 // resolved yet. If a round trip ever takes longer than the interval, calls
-// start overlapping -- and since each overlapping call bumps
-// agentDetailGeneration before the earlier one's fetch resolves, every
-// single response arrives already stale and gets silently discarded.
+// start overlapping -- and since each overlapping call bumps that agent's
+// own generation before the earlier one's fetch resolves, every single
+// response for it arrives already stale and gets silently discarded.
 // Confirmed this was happening for real: every response stale, latency
 // ~600ms against a 200ms interval -- permanent starvation once overlap
 // begins (each overlapping request competes for the browser's per-host
@@ -1239,7 +1425,9 @@ async function _pollAgentDetailLoop() {
   if (wsClosed) return;
   if (state.timeline.liveMode) {
     const agname = currentAgent();
-    if (agname) await loadAgentDetail(agname);
+    const toPoll = new Set(state.pinnedAgents);
+    if (agname) toPoll.add(agname);
+    await Promise.all([...toPoll].map(loadAgentDetail));
   }
   setTimeout(_pollAgentDetailLoop, 200);
 }
