@@ -128,6 +128,11 @@ class HostInteractionServer:
                         "call_id": call_id,
                         "timing": "hook_boundary",
                         "provenance": "host_observed",
+                        **(
+                            agprof.detail_metadata("tool.arguments", attributes.get("arguments"))
+                            if kind == "tool"
+                            else {}
+                        ),
                     },
                     parent_context=self.current_open_context(),
                 )
@@ -191,6 +196,14 @@ class HostInteractionServer:
                     "timing": timing,
                     "provenance": "container_asserted" if timing == "exact" else "host_observed",
                     "clock_uncertainty_ns": _CLOCK_SLACK_NS if timing == "exact" else 0,
+                    **(
+                        {
+                            **agprof.detail_metadata("tool.result", extra.get("result")),
+                            **agprof.detail_metadata("tool.error", extra.get("error")),
+                        }
+                        if kind == "tool"
+                        else {}
+                    ),
                 },
                 **overrides,
             )

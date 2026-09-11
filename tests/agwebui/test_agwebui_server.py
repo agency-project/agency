@@ -215,7 +215,7 @@ def _strip_ts(messages: list) -> list:
 
 
 @pytest.fixture()
-def server(tmp_path):
+def server(tmp_path, monkeypatch):
     """Yield (TestClient, run_dir, srv_module) with a fresh server state."""
     import agency.observability.agwebui.server as srv
     from fastapi.testclient import TestClient
@@ -231,6 +231,8 @@ def server(tmp_path):
     old_agent_log_cursors = srv._agent_log_cursors
     old_agent_color_assignments = srv._agent_color_assignments
     old_agent_color_next = srv._agent_color_next
+
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
 
     # Point the server at a fresh temp directory
     srv._run_dir = tmp_path
@@ -1206,3 +1208,52 @@ def test_profiler_download_reports_404_for_a_whitelisted_but_missing_file(server
     client, _run_dir, _srv = server
     resp = client.get("/api/profiler/download/summary.md")
     assert resp.status_code == 404
+
+
+def test_profiler_serves_only_configured_run_trace(server, monkeypatch, tmp_path):
+    client, run_dir, srv = server
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    assert client.get("/api/profiler/trace").status_code == 404
+    assert client.get("/api/profiler").json()["trace_available"] is False
+    profile_dir = run_dir / "profiler"
+    profile_dir.mkdir()
+    monkeypatch.setenv("AGENCY_PROFILE_DIR", str(profile_dir))
+    trace = {"traceEvents": [{"ph": "X", "name": "tool:read"}]}
+    (profile_dir / "agprof.trace.json").write_text(json.dumps(trace))
+    response = client.get("/api/profiler/trace")
+    assert response.json() == trace
+    assert client.get("/api/profiler/download/agprof.trace.json").json() == trace
+    assert client.get("/api/profiler/files").json()["files"][0]["name"] == "agprof.trace.json"
+    assert response.headers["cache-control"] == "no-store"
+    assert client.get("/api/profiler").json()["trace_available"] is True
+    # An explicit profiler output directory takes precedence over the log dir.
+    configured = tmp_path / "separate-profile"
+    configured.mkdir()
+    monkeypatch.setenv("AGENCY_PROFILE_DIR", str(configured))
+    assert client.get("/api/profiler/trace").status_code == 404
+    (configured / "agprof.trace.json").write_text('{"traceEvents": []}')
+    assert client.get("/api/profiler/trace").json() == {"traceEvents": []}
+    # There is no client-controlled filename or traversal route.
+    assert client.get("/api/profiler/trace/other.json").status_code == 404
+
+
+def test_profiler_tab_is_part_of_dashboard(server):
+    client, _, _ = server
+    html = client.get("/").text
+    assert 'id="view-profiler"' in html
+    assert 'id="profiler-frame"' in html
+    assert "/static/profiler.js" in html
+    assert client.get("/static/profiler.js").status_code == 200
+
+
+def test_profiler_viewer_and_downloads_share_default_sibling_directory(server, monkeypatch):
+    client, run_dir, srv = server
+    monkeypatch.setattr(srv, "_run_dir", run_dir / "logs")
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    directory = run_dir / "profiler"
+    directory.mkdir()
+    trace = {"traceEvents": []}
+    (directory / "agprof.trace.json").write_text(json.dumps(trace))
+    assert client.get("/api/profiler").json()["trace_available"] is True
+    assert client.get("/api/profiler/trace").json() == trace
+    assert client.get("/api/profiler/download/agprof.trace.json").json() == trace

@@ -39,6 +39,37 @@ def _bridge_for(app: TestClient) -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_native_span_persists_complete_timestamps(tmp_path, fails):
+    import sqlite3
+
+    from agency.configs.agconfig import agconfig, dataloggerconfig
+    from agency.observability.agdatalogger import agDataLogger
+
+    db_path = str(tmp_path / "native.sqlite")
+    logger = agDataLogger(agconfig(dataloggerconfig(db_path=db_path)))
+    logger.start()
+    try:
+        server = HostInteractionServer(SimpleNamespace(policy=agpolicy()), logger, "test-agent")
+        native = NativeProfiler(_bridge_for(TestClient(server.build_app())))
+        native.enabled = True
+        try:
+            with native.span("turn0"):
+                if fails:
+                    raise RuntimeError("test failure")
+        except RuntimeError:
+            assert fails
+        assert not native.failed
+    finally:
+        logger.stop()
+    with sqlite3.connect(db_path) as connection:
+        start, end, attributes = connection.execute(
+            "SELECT start_ts, end_ts, attributes FROM spans WHERE span_name = 'turn0'"
+        ).fetchone()
+    assert 0 < start <= end
+    assert json.loads(attributes)["outcome"] == ("failure" if fails else "success")
+
+
 def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
@@ -69,6 +100,9 @@ def test_native_turn_tool_hierarchy_and_measured_duration(monkeypatch, tmp_path)
     assert records["turn0"][8] == records["run0:task:agent"][7]
     assert records["tool:read"][3] == duration
     assert records["tool:read"][6]["provenance"] == "container_asserted"
+    assert json.loads(records["tool:read"][6]["tool.arguments"]) == {}
+    assert records["tool:read"][6]["tool.result"] == "ok"
+    assert records["tool:read"][6]["tool.result_truncated"] is False
 
 
 def test_record_span_opens_closes_and_nests_without_any_harness_specific_state(

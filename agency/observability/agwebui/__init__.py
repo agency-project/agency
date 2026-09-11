@@ -243,6 +243,10 @@ class agwebui:
                     f"Stop the existing server before starting a new run."
                 )
 
+        from .build_perfetto import ensure_viewer
+
+        ensure_viewer()
+
         if run_dir is None:
             # Same directory every agent()/agteam() already writes its own
             # agDataLogger database to (unless overridden via `log_dir` on

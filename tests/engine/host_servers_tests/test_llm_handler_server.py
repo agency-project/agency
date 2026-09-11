@@ -705,6 +705,42 @@ def test_start_stream_uses_spawn_traced(monkeypatch):
     assert calls[0][2] == {"daemon": True}
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_llm_trace_includes_transcript_and_token_counts(tmp_path, streaming):
+    def create(**kwargs):
+        usage = _FakeUsage(prompt_tokens=12, completion_tokens=3, total_tokens=15)
+        if streaming:
+            return iter(
+                [
+                    _FakeChunk([_FakeChoice(delta=_FakeDelta(content="Hello"))]),
+                    _FakeChunk([_FakeChoice(delta=_FakeDelta(), finish_reason="stop")]),
+                    _FakeChunk([], usage=usage),
+                ]
+            )
+        return _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="Hello"), finish_reason="stop")], usage
+        )
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False, auto_functions=False):
+        server, _ = _make_server(create_fn=create)
+        request = {"messages": [{"role": "user", "content": "hi"}]}
+        if streaming:
+            handle = server.start_stream(request)
+            assert _drain(handle)[-1]["type"] == "done"
+            handle._thread.join(timeout=2)
+        else:
+            server.dispatch(request)
+    trace = json.loads((tmp_path / "agprof.trace.json").read_text())
+    args = next(e["args"] for e in trace["traceEvents"] if e.get("name") == "llm:attempt[0]")
+    assert args["input_tokens"] == 12
+    assert args["output_tokens"] == 3
+    assert args["total_tokens"] == 15
+    assert args["stop_reason"] == "stop"
+    assert json.loads(args["llm.messages"])[0]["content"] == "hi"
+    assert json.loads(args["llm.response"])["blocks"][0]["text"] == "Hello"
+    assert args["llm.response_truncated"] is False
+
+
 def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tmp_path):
     """The LLM attempt remains a child of the agent run across HTTP + thread hops."""
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)

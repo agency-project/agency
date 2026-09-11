@@ -380,6 +380,16 @@ def _read_schedstat() -> "int | None":
         return None
 
 
+def detail_metadata(name: str, value, *, max_chars: int = 32_768) -> dict:
+    """Snapshot readable span details with an explicit per-field size limit."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return {
+        name: text[:max_chars],
+        f"{name}_truncated": len(text) > max_chars,
+        f"{name}_chars": len(text),
+    }
+
+
 def _otel_attribute(value):
     """Return an OTel-compatible scalar/sequence without losing metadata."""
     if isinstance(value, (bool, str, bytes, int, float)):

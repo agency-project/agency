@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import sqlite3
 import threading
@@ -111,7 +112,8 @@ _PROFILER_FILENAMES = ("summary.md", "summary.json", "agprof.trace.json", "profi
 
 
 def _profiler_dir() -> Path:
-    return _run_dir.parent / "profiler"
+    override = os.environ.get("AGENCY_PROFILE_DIR")
+    return Path(override) if override else _run_dir.parent / "profiler"
 
 
 def _list_profiler_files() -> dict:
@@ -770,6 +772,11 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
+app.mount(
+    "/perfetto",
+    StaticFiles(directory=str(_STATIC / "perfetto"), html=True, check_dir=False),
+    name="perfetto",
+)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
 
@@ -788,6 +795,29 @@ async def _no_cache_static(request, call_next):
 @app.get("/")
 async def index():
     return FileResponse(_STATIC / "index.html")
+
+
+def _profile_trace_path() -> Path:
+    return _profiler_dir() / "agprof.trace.json"
+
+
+@app.get("/api/profiler")
+async def profiler_status():
+    trace = _profile_trace_path()
+    return {
+        "viewer_available": (_STATIC / "perfetto" / "index.html").is_file(),
+        "trace_available": trace.is_file(),
+    }
+
+
+@app.get("/api/profiler/trace")
+async def profiler_trace():
+    trace = _profile_trace_path()
+    if not trace.is_file():
+        return JSONResponse(
+            {"error": "No completed profiler trace for this run yet."}, status_code=404
+        )
+    return FileResponse(trace, media_type="application/json", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")
@@ -982,12 +1012,19 @@ async def _tail_and_broadcast() -> None:
 if __name__ == "__main__":
     import uvicorn
 
+    if __package__:
+        from .build_perfetto import ensure_viewer
+    else:
+        from build_perfetto import ensure_viewer
+
     parser = argparse.ArgumentParser(description="agwebui standalone server")
     parser.add_argument(
         "--run-dir", required=True, help="log_dir shared with the execution process's agents"
     )
     parser.add_argument("--port", type=int, default=7860)
     parsed = parser.parse_args()
+
+    ensure_viewer()
 
     _run_dir = Path(parsed.run_dir)
     _command_dir = _run_dir / "ui_commands"

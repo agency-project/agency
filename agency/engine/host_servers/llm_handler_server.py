@@ -45,6 +45,28 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
 
 
+def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason) -> dict:
+    from ...observability.profiler import agprof
+
+    usage = usage or {}
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    response = {
+        **message,
+        "blocks": [block for block in message.get("blocks", []) if block.get("type") != "metadata"],
+    }
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "stop_reason": stop_reason,
+        **agprof.detail_metadata("llm.response", response),
+    }
+
+
 def _payload_hash(payload: dict) -> str:
     """Content identity for one {role, **block} transcript payload.
 
@@ -409,6 +431,8 @@ class LlmHandlerServer:
                     attempt_span,
                     model=self._backend.model,
                     provider=type(self._backend).__name__,
+                    call_label=call_label,
+                    **agprof.detail_metadata("llm.messages", request.get("messages", [])),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -433,8 +457,9 @@ class LlmHandlerServer:
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(result["usage"] or {}).get("prompt_tokens"),
-                    output_tokens=(result["usage"] or {}).get("completion_tokens"),
+                    **_response_profile_metadata(
+                        result["message"], result["usage"], result["stop_reason"]
+                    ),
                     ttft_ms=ttft_ms,
                 )
                 self._tag_metadata_block(request["messages"], result["message"], ttft_ms=ttft_ms)
@@ -859,7 +884,11 @@ class LlmHandlerServer:
                 ),
             ) as attempt_span:
                 _annotate(
-                    attempt_span, model=self._backend.model, provider=type(self._backend).__name__
+                    attempt_span,
+                    model=self._backend.model,
+                    provider=type(self._backend).__name__,
+                    call_label=handle.call_label,
+                    **agprof.detail_metadata("llm.messages", request.get("messages", [])),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -870,6 +899,7 @@ class LlmHandlerServer:
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
                     empty_message = {"role": "assistant", "blocks": []}
+                    _annotate(attempt_span, **_response_profile_metadata(empty_message, None, None))
                     enqueued = handle.register_stream_exchange(
                         {
                             "type": "done",
@@ -966,7 +996,14 @@ class LlmHandlerServer:
                         message = _blocks_to_message(blocks)
                         handle.register_stream_exchange(response=message)
                 except BaseException as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
+                    _annotate(
+                        attempt_span,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        **_response_profile_metadata(
+                            _blocks_to_message(blocks), usage, stop_reason
+                        ),
+                    )
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
@@ -985,8 +1022,7 @@ class LlmHandlerServer:
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(usage or {}).get("prompt_tokens"),
-                    output_tokens=(usage or {}).get("completion_tokens"),
+                    **_response_profile_metadata(_blocks_to_message(blocks), usage, stop_reason),
                 )
                 message = _blocks_to_message(blocks)
                 enqueued = handle.register_stream_exchange(
