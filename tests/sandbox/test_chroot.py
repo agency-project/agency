@@ -862,16 +862,7 @@ class TestChrootBackendFileIO:
 @chroot
 class TestChrootBackendLifecycle:
     def test_ensure_started_does_not_wipe_workspace_across_worker_processes(self):
-        """Regression test: tool calls with run_in_subprocess=True (the
-        default) each get a fresh cloudpickled copy of the backend, so a
-        per-process flag would be False in every worker's own copy
-        regardless of what an earlier worker already did. _ensure_started()
-        must use the workspace directory's existence on disk as ground
-        truth -- otherwise every worker's first touch re-runs
-        _materialize_workspace() and wipes out whatever a *different*
-        worker already wrote (this exact bug shipped and was caught against
-        a real chroot-backed run: a file written by one tool dispatch was
-        gone by the time the very next dispatch tried to read it back)."""
+        """Serialized backend copies must reuse the same committed workspace."""
         import pickle
 
         orig = _make_backend()
@@ -1352,30 +1343,3 @@ class TestAgentSaveLoadWithChrootBackend:
             if ag2 is not None and ag2.sandbox is not None:
                 ag2.sandbox.destroy()
                 agname._allocated.discard(str(ag2.agname))
-
-
-# ---------------------------------------------------------------------------
-# Real ProcessPoolExecutor dispatch -- the actual code path a live agent run
-# uses (run_in_subprocess=True, the default), as opposed to calling a
-# backend's methods directly in-process. This is what surfaced the
-# _ensure_started()/stop() worker-vs-main-process bugs fixed above: calling
-# a tool's .fn() directly, or driving the backend object in one process,
-# never exercises cloudpickle sending a fresh copy of the sandbox to a
-# ProcessPoolExecutor worker for every single call.
-# ---------------------------------------------------------------------------
-
-
-@chroot
-class TestChrootSandboxedToolsDispatch:
-    """Retired: every test here (test_files_persist_across_process_pool_
-    tool_calls, test_bash_then_read_across_process_pool_tool_calls,
-    test_agent_run_offloads_and_reads_back_large_input) existed specifically
-    to prove state (files written via one tool call) survived being
-    dispatched to a SEPARATE ProcessPoolExecutor worker process for a
-    subsequent tool call. That dispatch mechanism no longer exists at all --
-    agtool.__call__ always runs in the calling thread/process now (see
-    agtool.py's own module docstring) -- so there is no separate worker
-    process left for state to need to survive crossing into; the underlying
-    concern (does the chroot backend correctly persist files across ordinary
-    sequential operations) is already covered by TestAgSandboxFileIO-style
-    direct sandbox.write_file()/read_file() tests elsewhere in this file."""

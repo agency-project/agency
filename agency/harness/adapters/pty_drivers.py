@@ -16,7 +16,7 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
     from ...native_harness.bridge_client import BridgeClient
     from ...native_harness.profiling import NativeProfiler
 
-    root = materialize_config_home(runtime.engine_name, runtime.token, runtime.harness_base_url)
+    root = materialize_config_home(runtime.engine_name)
     try:
         driver = PtyDriver(adapter, runtime, root, resume_session_id, prior_session_blob, max_steps)
     except BaseException:
@@ -187,11 +187,21 @@ class PtyDriver:
                     committed = True
             if not committed:
                 marker = self._last_prompt.split("\n", 1)[0]
-                wait_until(
-                    lambda: any("│ ❯ " + marker in line for line in handle.terminal_screen()[0]),
-                    "restored Grok input",
-                )
-                handle.write_terminal(b"\x03")
+                pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
+
+                def restored_input():
+                    lines, _x, y, _generation = handle.terminal_screen()
+                    # Grok collapses a restored multiline paste into a token.
+                    # The prompt marker then appears only in the old transcript.
+                    return (
+                        self.ready(handle)
+                        or any("│ ❯ " + marker in line for line in lines)
+                        or pasted in lines[y]
+                    )
+
+                wait_until(restored_input, "restored Grok input")
+                if not self.ready(handle):
+                    handle.write_terminal(b"\x03")
 
     def interrupt_pending(self, handle):
         return any("esc again to interrupt" in line for line in handle.terminal_screen()[0])

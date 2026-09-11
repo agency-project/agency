@@ -45,6 +45,28 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
 
 
+def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason) -> dict:
+    from ...observability.profiler import agprof
+
+    usage = usage or {}
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    response = {
+        **message,
+        "blocks": [block for block in message.get("blocks", []) if block.get("type") != "metadata"],
+    }
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "stop_reason": stop_reason,
+        **agprof.detail_metadata("llm.response", response),
+    }
+
+
 def _payload_hash(payload: dict) -> str:
     """Content identity for one {role, **block} transcript payload. Keys on
     the block's own stable id/tool_call_id when present, since the same
@@ -398,6 +420,8 @@ class LlmHandlerServer:
                     attempt_span,
                     model=self._backend.model,
                     provider=type(self._backend).__name__,
+                    call_label=call_label,
+                    **agprof.detail_metadata("llm.messages", request.get("messages", [])),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -422,8 +446,9 @@ class LlmHandlerServer:
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(result["usage"] or {}).get("prompt_tokens"),
-                    output_tokens=(result["usage"] or {}).get("completion_tokens"),
+                    **_response_profile_metadata(
+                        result["message"], result["usage"], result["stop_reason"]
+                    ),
                     ttft_ms=ttft_ms,
                 )
                 self._tag_metadata_block(request["messages"], result["message"], ttft_ms=ttft_ms)
@@ -630,21 +655,24 @@ class LlmHandlerServer:
 
     def build_app(self) -> FastAPI:
         app = FastAPI()
+        # Endpoint caches may outlive this app; only the app owns invocation state.
+        app.state.llm_handler_server = self
 
         @app.post("/dispatch")
         async def _dispatch(http_request: Request):
+            server = http_request.app.state.llm_handler_server
             request = await http_request.json()
             try:
                 if request.get("stream"):
                     abort_event = threading.Event()
-                    handle = self._new_stream_handle(abort_event)
-                    worker, result = self._spawn_http_worker(
-                        self.start_stream,
+                    handle = server._new_stream_handle(abort_event)
+                    worker, result = server._spawn_http_worker(
+                        server.start_stream,
                         request,
                         abort_event=abort_event,
                         _handle=handle,
                     )
-                    disconnected = await self._wait_for_http_worker(
+                    disconnected = await server._wait_for_http_worker(
                         http_request,
                         worker,
                         result,
@@ -654,7 +682,7 @@ class LlmHandlerServer:
                     if disconnected:
                         raise ClientDisconnect
                     result.result()
-                    item = await self._first_stream_item(http_request, handle)
+                    item = await server._first_stream_item(http_request, handle)
                     if item["type"] == "error":
                         if not handle.cancel_and_join():
                             raise RuntimeError("LLM stream producer did not stop")
@@ -671,12 +699,12 @@ class LlmHandlerServer:
 
                 abort_event = threading.Event()
 
-                worker, result = self._spawn_http_worker(
-                    self.dispatch,
+                worker, result = server._spawn_http_worker(
+                    server.dispatch,
                     request,
                     abort_event=abort_event,
                 )
-                disconnected = await self._wait_for_http_worker(
+                disconnected = await server._wait_for_http_worker(
                     http_request,
                     worker,
                     result,
@@ -694,12 +722,14 @@ class LlmHandlerServer:
                 raise ClientDisconnect from error
 
         @app.get("/resolve_model")
-        def _resolve_model() -> JSONResponse:
-            return JSONResponse({"model": self.resolve_model()})
+        def _resolve_model(http_request: Request) -> JSONResponse:
+            server = http_request.app.state.llm_handler_server
+            return JSONResponse({"model": server.resolve_model()})
 
         @app.get("/context_limit")
-        def _context_limit() -> JSONResponse:
-            return JSONResponse({"context_limit": self.context_limit()})
+        def _context_limit(http_request: Request) -> JSONResponse:
+            server = http_request.app.state.llm_handler_server
+            return JSONResponse({"context_limit": server.context_limit()})
 
         return app
 
@@ -843,7 +873,11 @@ class LlmHandlerServer:
                 ),
             ) as attempt_span:
                 _annotate(
-                    attempt_span, model=self._backend.model, provider=type(self._backend).__name__
+                    attempt_span,
+                    model=self._backend.model,
+                    provider=type(self._backend).__name__,
+                    call_label=handle.call_label,
+                    **agprof.detail_metadata("llm.messages", request.get("messages", [])),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -854,6 +888,7 @@ class LlmHandlerServer:
                 except StopIteration:
                     _annotate(attempt_span, outcome="success")
                     empty_message = {"role": "assistant", "blocks": []}
+                    _annotate(attempt_span, **_response_profile_metadata(empty_message, None, None))
                     enqueued = handle.register_stream_exchange(
                         {
                             "type": "done",
@@ -950,7 +985,14 @@ class LlmHandlerServer:
                         message = _blocks_to_message(blocks)
                         handle.register_stream_exchange(response=message)
                 except BaseException as e:
-                    _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
+                    _annotate(
+                        attempt_span,
+                        outcome="failure",
+                        error_type=type(e).__name__,
+                        **_response_profile_metadata(
+                            _blocks_to_message(blocks), usage, stop_reason
+                        ),
+                    )
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
@@ -969,8 +1011,7 @@ class LlmHandlerServer:
                 _annotate(
                     attempt_span,
                     outcome="success",
-                    input_tokens=(usage or {}).get("prompt_tokens"),
-                    output_tokens=(usage or {}).get("completion_tokens"),
+                    **_response_profile_metadata(_blocks_to_message(blocks), usage, stop_reason),
                 )
                 message = _blocks_to_message(blocks)
                 enqueued = handle.register_stream_exchange(

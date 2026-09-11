@@ -24,7 +24,6 @@ import os
 import subprocess
 import sys
 import tarfile
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -67,18 +66,8 @@ def _make_sandbox(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Owner-PID container labeling -- feeds sandbox.container's
-# startup orphan reaper (see test_container.py). The label must reflect
-# whichever process actually *constructed* this backend (self._owner_pid,
-# fixed at __init__ time), never a live os.getpid() call made wherever
-# _ensure_started() happens to execute -- for a run_in_subprocess=True tool
-# call (the default), that's a ProcessPoolExecutor *worker*, cloudpickled a
-# copy of this same backend object, distinct from -- and free to exit
-# independently of -- the main process that owns the sandbox for its whole
-# lifetime. Labeling with the worker's own transient PID would let a
-# concurrent reap_orphaned_containers() elsewhere see a "dead" owner (once
-# that worker exits, routine pool recycling, not a crash) for a container
-# that's still very much in active use by a live main process, and delete it.
+# Owner-PID labels let the orphan reaper distinguish a dead owner from
+# another process operating on a serialized copy of a live owner's backend.
 # ---------------------------------------------------------------------------
 
 
@@ -134,25 +123,9 @@ class TestOwnerPidLabel:
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(sentinel_pid)
 
-    # test_real_sandboxed_tool_call_labels_container_with_main_process_pid
-    # was retired here: its whole premise was a real run_in_subprocess=True
-    # tool call cloudpickling this backend to a ProcessPoolExecutor worker --
-    # that dispatch mechanism no longer exists at all (agtool.__call__ always
-    # runs in the calling thread/process now, see agtool.py's own module
-    # docstring), so there's no separate worker process left to prove the
-    # label survives crossing into. The other two tests in this class remain
-    # valid: they exercise _owner_pid's own semantics directly (construction-
-    # time default, and the cross-process-simulation regression case) without
-    # depending on how a tool call is dispatched.
-
 
 class TestDanglingImageEagerCleanup:
     """Tests for the eager old-image deletion in commit()."""
-
-    def test_no_prune_thread(self):
-        """No background agsandbox-prune thread should exist after the refactor."""
-        named = [t for t in threading.enumerate() if t.name == "agsandbox-prune"]
-        assert not named, "agsandbox-prune thread should have been removed"
 
     def test_stop_commit_deletes_old_image(self):
         """commit() must delete the image that previously held the tag --

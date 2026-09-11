@@ -20,14 +20,6 @@ from unittest.mock import MagicMock, patch
 from agency.orchestrator.agresources import agResourcePool
 
 
-def _worker_import_agent():
-    """Top-level so ProcessPoolExecutor can pickle it."""
-    from agency.agent import agent  # noqa: F401
-    import multiprocessing
-
-    return multiprocessing.current_process().name
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -106,6 +98,63 @@ def test_facade_construction_does_not_start_backend():
         sandbox.destroy()
 
 
+def test_fork_without_checkpoint_keeps_lazy_fresh_backend():
+    from agency.sandbox.agsandbox import agSandbox
+
+    parent_backend = MagicMock()
+    child_backend = MagicMock()
+    parent_backend._checkpoint_image = None
+    child_backend._checkpoint_image = None
+    with patch(
+        "agency.sandbox.agsandbox.agsandbox_backend.for_config",
+        side_effect=[parent_backend, child_backend],
+    ):
+        parent = agSandbox("fresh-parent")
+        child = parent.fork("fresh-child")
+    try:
+        assert child._checkpoint_image is None
+        child_backend._ensure_started.assert_not_called()
+    finally:
+        parent.destroy()
+        child.destroy()
+
+
+def test_destroy_can_retry_a_failed_backend_cleanup():
+    from agency.sandbox.agsandbox import agSandbox
+
+    backend = MagicMock()
+    backend.destroy.side_effect = [RuntimeError("removal failed"), None]
+    with patch("agency.sandbox.agsandbox.agsandbox_backend.for_config", return_value=backend):
+        sandbox = agSandbox("retry-cleanup")
+    with pytest.raises(RuntimeError, match="removal failed"):
+        sandbox.destroy()
+    sandbox.destroy()
+    sandbox.destroy()
+    assert backend.destroy.call_count == 2
+
+
+@pytest.mark.parametrize("kind", ["container", "chroot"])
+def test_backend_destroy_remains_retryable_after_removal_failure(kind, tmp_path):
+    from agency.sandbox.container import _ContainerBackendBase
+    from agency.sandbox.chroot import _ChrootBackend
+
+    cls = _ContainerBackendBase if kind == "container" else _ChrootBackend
+    backend = MagicMock()
+    backend._destroyed = False
+    backend._watched_pids = {}
+    backend._checkpoint_image = None
+    backend._accumulator_dir = None
+    backend._root = tmp_path / "sandbox"
+    backend.rm_container.side_effect = [RuntimeError("removal failed"), None]
+    with pytest.raises(RuntimeError, match="removal failed"):
+        cls.destroy(backend)
+    assert not backend._destroyed
+    cls.destroy(backend)
+    cls.destroy(backend)
+    assert backend._destroyed
+    assert backend.rm_container.call_count == 2
+
+
 @pytest.mark.parametrize(
     ("operation", "args"),
     [
@@ -115,6 +164,7 @@ def test_facade_construction_does_not_start_backend():
         ("write_file", ("/workspace/file.txt", "content")),
         ("commit", ()),
         ("stop", ()),
+        ("destroy", ()),
     ],
 )
 def test_public_facade_operation_uses_shared_lock(operation, args):
@@ -122,7 +172,7 @@ def test_public_facade_operation_uses_shared_lock(operation, args):
 
     sandbox = agSandbox.__new__(agSandbox)
     sandbox._agname = "lock-test"
-    sandbox._destroyed = True
+    sandbox._destroyed = operation != "destroy"
     sandbox._lock = threading.RLock()
     sandbox._backend = MagicMock()
 
@@ -859,16 +909,6 @@ class TestAgSandboxLifecycle:
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content
         sb.destroy()
-
-    # test_files_persist_across_process_pool_tool_calls was retired here:
-    # its whole premise (files written by a real run_in_subprocess=True tool
-    # call, in a ProcessPoolExecutor worker, readable by a subsequent
-    # separately-dispatched worker call) no longer exists -- agtool.__call__
-    # always runs in the calling thread/process now (see agtool.py's own
-    # module docstring), and agency/tools/{write,read}.py's `write`/`read`
-    # tool factories it used are themselves retired (make_write is gone;
-    # test_agsandbox.py's own direct sb.write_file()/read_file() tests
-    # already cover file persistence without any tool-dispatch layer).
 
     @docker
     def test_checkpoint_restore_preserves_files(self):

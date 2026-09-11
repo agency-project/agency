@@ -63,7 +63,36 @@ human label in this order:
 4. Python's meaningful runtime thread name;
 5. the generic `Python worker` fallback.
 
-The resource sampler also assigns semantic process names from the command,
-entrypoint, and sandbox registration. Every sampled PID receives an
-`alive (sampled)` bar bounded by its first and last sampler observations. This
-bar describes process lifetime; it does not replace function or semantic spans.
+The Perfetto trace contains one process group for the Agency harness. Its
+semantic spans, host Python calls, resource counters, and GPU leases appear
+there. Helper-process groups, sampled process-lifetime bars, and automatic
+Python calls from other processes are not exported. Semantic agent and tool
+spans reported from containers remain on the harness timeline.
+
+The resource sampler still collects per-process metrics for the JSON and
+Markdown summaries; those metrics do not create extra Perfetto process groups.
+
+Parent-child spans, including same-track tool and Python spans, are connected
+by Perfetto flow arrows (`agprof.relationship`). Select a related span to inspect
+its incoming/outgoing connections. Explicit semantic parent IDs take precedence;
+automatic Python and legacy spans use their nearest enclosing slice on the same
+track. Flow arguments distinguish `explicit_parent` from `same_track_nesting`.
+Missing explicit parents and unrelated top-level spans are not linked. Nesting
+does not imply causality across threads.
+
+## LLM and tool details
+
+Select an `llm:attempt[...]` span in Perfetto to inspect `llm.messages`,
+`llm.response`, the model, stop reason, and reported input/output/total token
+counts. Streamed responses collect usage from provider metadata trailers;
+missing usage remains unavailable rather than being reported as zero.
+The `call_label` links the attempt to its logged exchange.
+
+Tool spans include `tool.arguments`, `tool.result`, and `tool.error`, alongside
+their existing outcome and timing. Arguments are captured at admission so
+interrupted tools still show their inputs. These transcript and tool fields
+contain application content and are exported with the trace.
+
+Each detail field is limited to 32,768 characters. The accompanying
+`<field>_truncated` and `<field>_chars` attributes indicate whether the content
+was cut and its original serialized length. Structured details are JSON text.

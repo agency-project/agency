@@ -312,12 +312,6 @@ def agency_runs_dir():
     return root
 
 
-def agency_cache_root():
-    """Root for cross-run cache state, under `~/.cache/agency` by default
-    (override via `AGENCY_CACHE_ROOT`)."""
-    return Path(os.environ.get("AGENCY_CACHE_ROOT", str(Path.home() / ".cache" / "agency")))
-
-
 # Default log directory -- shared by agent.py and orchestrator.py (both need
 # it, and neither may import the other at module level), and moved out of
 # agent.py for that reason.

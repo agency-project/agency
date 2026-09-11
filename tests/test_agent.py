@@ -39,6 +39,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
         max_steps=None,
         is_cancelled=lambda: False,
         request_id=None,
+        claim_completion=lambda: True,
     ):
         stub = getattr(skill, "_test_execute", None)
         if stub is None:
@@ -52,6 +53,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
                 max_steps=max_steps,
                 is_cancelled=is_cancelled,
                 request_id=request_id,
+                claim_completion=claim_completion,
             )
         output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps
@@ -64,59 +66,12 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Streaming mock helpers (agskill uses stream=True)
+# Tool fixture
 # ---------------------------------------------------------------------------
-
-
-class _Delta:
-    def __init__(self, content=None, tool_calls=None):
-        self.content = content
-        self.tool_calls = tool_calls
-        self.model_extra = {}
-        self.reasoning_content = None
-
-
-class _Choice:
-    def __init__(self, delta):
-        self.delta = delta
-
-
-class _Usage:
-    prompt_tokens = 5
-
-
-class _Chunk:
-    def __init__(self, content=None, tool_calls=None, usage=None):
-        self.usage = usage
-        self.choices = (
-            [_Choice(_Delta(content, tool_calls))] if (content is not None or tool_calls) else []
-        )
-
-
-class _TCDelta:
-    def __init__(self, name, args_json, call_id):
-        self.id = call_id
-        self.index = 0
-        self.function = _TCFnDelta(name, args_json)
-
-
-class _TCFnDelta:
-    def __init__(self, name, args):
-        self.name = name
-        self.arguments = args
 
 
 def _noop(arg: agdata) -> agdata:
     return agdata()
-
-
-def _direct(content: str) -> list:
-    return [_Chunk(content=content), _Chunk(usage=_Usage())]
-
-
-def _tool_resp(name: str, args: dict, call_id: str = "c1") -> list:
-    tc = _TCDelta(name, json.dumps(args), call_id)
-    return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
 def _llm_agconfig(d: dict) -> agconfig_cls:
@@ -950,6 +905,8 @@ def test_save_scrubs_and_load_restamps_owner_pid_label(tmp_path, monkeypatch):
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
         ag.sandbox.write_file("/workspace/id.txt", f"{inp.agname}\n")
+        # This execution double bypasses AgentEngine's transaction commit.
+        ag.sandbox.commit()
         return agdata(ok=True), prev_ctx, []
 
     skill_write._test_execute = fake_write

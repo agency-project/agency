@@ -230,7 +230,7 @@ def test_real_external_interrupt_acknowledgment_and_resumed_session(
         if mode == "generation":
             assert backend.interrupted.is_set()
     finally:
-        daemon.control("cancel")
+        daemon.control("cancel", request_id=daemon._current_request_id)
         if worker is not None:
             worker.join(5)
         daemon.stop()

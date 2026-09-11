@@ -40,8 +40,10 @@ class HarnessInteractionClient:
     def resume_harness(self) -> None:
         self._client.post("/control/resume").raise_for_status()
 
-    def cancel_harness(self) -> None:
-        self._client.post("/control/cancel").raise_for_status()
+    def cancel_harness(self, request_id: str) -> None:
+        self._client.post(
+            "/control/cancel", json={"request_id": request_id}, timeout=10
+        ).raise_for_status()
 
     def is_ready(self) -> bool:
         response = self._client.get("/health")

@@ -149,13 +149,6 @@ class TestOwnerPidLabel:
         run_cmd = self._captured_run_cmd(sb)
         assert self._label_value(run_cmd) == str(sentinel_pid)
 
-    # test_real_sandboxed_tool_call_labels_container_with_main_process_pid
-    # was retired here: same reason as test_docker.py's identically-named
-    # test -- its premise (a real run_in_subprocess=True tool call
-    # cloudpickling this backend to a ProcessPoolExecutor worker) no longer
-    # exists at all (agtool.__call__ always runs in the calling thread/
-    # process now). The other two tests in this class remain valid.
-
 
 class TestDanglingImageEagerCleanup:
     """Tests for the eager old-image deletion in commit(). Mirrors
@@ -462,7 +455,7 @@ class TestDanglingImageEagerCleanup:
         try:
             sb.exec("echo one")
             before = _dangling_ids()
-            with patch.object(sb._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 sb.commit()
             after = _dangling_ids()
 
@@ -1101,7 +1094,7 @@ class TestCheckpointAccumulator:
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
         t0 = time.time()
-        with patch.object(sb._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             sb.commit()  # this cycle commits AND squashes
         elapsed = time.time() - t0
 

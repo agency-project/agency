@@ -68,9 +68,11 @@ active interactive external harness receives it through its PTY; otherwise it
 is queued once as future context. A redirect never resumes a paused agent.
 
 `cancel()` is idempotent. Work cancelled while dependency-blocked or queued is
-settled without creating execution infrastructure. Running work observes
-cancellation at safe boundaries, and the transaction fence prevents a late
-successful sandbox commit from winning after cancellation.
+observed when dependencies and capacity permit dispatch. The fresh engine
+returns cancellation before provisioning a sandbox. Cancellation does not
+resolve an outstanding input dependency. Running work receives an exact-run
+kill RPC and checks cancellation before commit. A completion claim that wins
+first makes subsequent cancellation a no-op.
 
 ## Agent-wide pause and resume
 
@@ -82,8 +84,9 @@ worker.resume()
 ```
 
 Pause is an agent-wide persistent request. It freezes an active harness process
-when possible and keeps later engine-backed submissions from launching until
-`resume()`. Queued work consumes no worker or engine-capacity slot. There is no
+when possible and holds newly launched harness processes paused until
+`resume()`. Pause does not gate scheduler admission: a paused execution can
+occupy a worker, sandbox, and engine-capacity slot. There is no
 public `Invocation.pause()`, `agent.suspend()`, or `agent.destroy()` API.
 Sandbox cleanup is owned by `agSandbox`; callers that explicitly use a sandbox
 can call `sandbox.destroy()`.

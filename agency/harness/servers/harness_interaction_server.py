@@ -33,7 +33,7 @@ class HarnessInteractionServer:
         uds_path: str,
         attempt_handler: Callable[[HarnessAttemptRequest], HarnessAttemptResult],
         *,
-        control_handler: "Callable[[str], None] | None" = None,
+        control_handler: "Callable[..., None] | None" = None,
         redirect_handler: "Callable[[str, str], bool] | None" = None,
         startup_timeout_s: float = 10.0,
         shutdown_timeout_s: float = 10.0,
@@ -94,7 +94,7 @@ class HarnessInteractionServer:
             return JSONResponse({"delivered": delivered})
 
         @app.post("/control/{action}")
-        def _control(action: str) -> JSONResponse:
+        def _control(action: str, payload: dict | None = None) -> JSONResponse:
             # A sync route -- like /harness_attempt above -- runs in
             # Starlette's threadpool, so this is served concurrently even
             # while /harness_attempt's handler is still blocked in its own
@@ -103,7 +103,13 @@ class HarnessInteractionServer:
                 return JSONResponse({"error": "no control handler configured"}, status_code=501)
             if action not in ("pause", "resume", "cancel"):
                 return JSONResponse({"error": f"unknown action {action!r}"}, status_code=404)
-            self._control_handler(action)
+            if action == "cancel":
+                request_id = (payload or {}).get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    return JSONResponse({"error": "missing request_id"}, status_code=400)
+                self._control_handler(action, request_id=request_id)
+            else:
+                self._control_handler(action)
             return JSONResponse({"ok": True})
 
         return app

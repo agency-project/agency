@@ -31,8 +31,8 @@ def _make_agent(agname="test-agent"):
 
 def test_materialize_config_home_creates_isolated_directory():
     ag = _make_agent()
-    d1 = agharness.materialize_config_home(ag, token="t1", base_url="http://x")
-    d2 = agharness.materialize_config_home(ag, token="t2", base_url="http://x")
+    d1 = agharness.materialize_config_home(ag)
+    d2 = agharness.materialize_config_home(ag)
     assert d1.is_dir()
     assert d2.is_dir()
     assert d1 != d2  # each launch gets its own directory

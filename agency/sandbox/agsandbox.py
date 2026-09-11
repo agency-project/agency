@@ -356,26 +356,27 @@ class agSandbox:
             print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
-        if self._destroyed:
-            return
-        self._destroyed = True
-        with agprof.span("sandbox:destroy"):
-            _live_sandboxes.discard(self)
-            self._backend.destroy()
+        with self._lock:
+            if self._destroyed:
+                return
+            with agprof.span("sandbox:destroy"):
+                self._backend.destroy()
+                self._destroyed = True
+                _live_sandboxes.discard(self)
 
     def fork(self, new_name: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
         """Return a new agSandbox for *new_name* starting from this
         sandbox's checkpoint image (fresh if none exists; *new_name*
         auto-deduplicated). Without *agconfig*, inherits this sandbox's
         own config unchanged. Caller must destroy() the result."""
-        with agprof.span("sandbox:fork"):
+        with self._lock, agprof.span("sandbox:fork"):
             cfg = agconfig if agconfig is not None else self.agconfig
             fork_sb = agSandbox(new_name, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image
             if checkpoint_image:
                 # Backend's own class, not the docker-only forwarder: a chroot checkpoint isn't a docker/podman tag.
                 type(self._backend).tag_image(checkpoint_image, fork_sb._backend._lifecycle_tag())
-            fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
+                fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
         return fork_sb
 
     @property

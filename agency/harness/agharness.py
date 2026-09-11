@@ -1,12 +1,8 @@
-"""Thin, engine-agnostic glue shared by every `agharness_backends/*`
-concrete backend.
+"""Shared isolated configuration directories and MCP endpoint configuration
+for every harness backend.
 
-Deliberately small -- per-harness config-file format and CLI argv
-construction stay in each concrete backend, not here. This module only
-holds what's genuinely shared: an isolated per-launch config-home
-directory (so concurrent harness-driven agents never see each other's
-token/base_url, and a run leaves no trace in the user's own `~/.claude`/
-`~/.codex`/`~/.config/opencode`).
+Deliberately small: per-harness CLI dialects and session formats belong to
+the concrete adapters, and skill prompt construction belongs to agskill.
 """
 
 from __future__ import annotations
@@ -26,7 +22,7 @@ def _runtime_name(owner: "agent | str") -> str:
     return owner if isinstance(owner, str) else owner.agname
 
 
-def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Path:
+def materialize_config_home(ag: "agent | str") -> Path:
     """Create a fresh, isolated config-home directory for one harness
     launch; concrete backends write their own harness-specific files into
     it. Nested under this run's config_homes/ dir so it's cleaned up with
@@ -40,12 +36,6 @@ def materialize_config_home(ag: "agent | str", token: str, base_url: str) -> Pat
 
 def cleanup_config_home(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
-
-
-def is_container_backed(sandbox) -> bool:
-    """True for a docker/podman-backed sandbox; chroot's jail is already a
-    real host directory and needs neither ptrace bridge nor this."""
-    return sandbox is not None and getattr(sandbox._backend, "IMAGE_KIND", "") == "container"
 
 
 def materialize_config_home_in_container(ag: "agent | str", sandbox, token: str) -> str:
@@ -91,7 +81,6 @@ def mcp_config_for(
 __all__ = [
     "materialize_config_home",
     "cleanup_config_home",
-    "is_container_backed",
     "materialize_config_home_in_container",
     "cleanup_config_home_in_container",
     "mcp_config_for",

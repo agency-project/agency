@@ -899,10 +899,11 @@ class TestProfilerContainerRegistration:
                 sb._register_prof_container()
         run.assert_not_called()
 
-    def test_registration_discovers_cgroup_v2_and_podman_conmon_scope(self):
+    @pytest.mark.parametrize("payload_suffix", ["", "/container"])
+    def test_registration_discovers_cgroup_v2_and_podman_conmon_scope(self, payload_suffix):
         sb = self._sb()
         inspect = MagicMock(returncode=0, stdout=f"{self._CONTAINER_ID}|4242\n".encode())
-        cgroup = f"0::/user.slice/libpod-{self._CONTAINER_ID}.scope\n"
+        cgroup = f"0::/user.slice/libpod-{self._CONTAINER_ID}.scope{payload_suffix}\n"
         conmon = f"/sys/fs/cgroup/user.slice/libpod-conmon-{self._CONTAINER_ID}.scope"
 
         with patch.object(_container.agprof, "enabled", return_value=True):
@@ -924,7 +925,7 @@ class TestProfilerContainerRegistration:
         ]
         started.assert_called_once_with(
             "research_agent",
-            f"/sys/fs/cgroup/user.slice/libpod-{self._CONTAINER_ID}.scope",
+            f"/sys/fs/cgroup/user.slice/libpod-{self._CONTAINER_ID}.scope{payload_suffix}",
             conmon,
             "conmon",
         )

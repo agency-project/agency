@@ -113,7 +113,11 @@ def _iter_trace_events(
     trace_pid,
     origin_ns,
 ):
-    """Yield Chrome-trace events without retaining the full event array."""
+    """Yield harness-only Chrome events without retaining the full event array.
+
+    Helper-process counters remain available to summary generation, but do
+    not create separate process groups in the application timeline.
+    """
 
     def to_us(timestamp_ns: int) -> float:
         return (timestamp_ns - origin_ns) / 1e3
@@ -137,6 +141,24 @@ def _iter_trace_events(
         "args": {"name": root_name},
     }
     thread_ids = set()
+    relationship_spans = {}
+    slices = []
+
+    def register_slice(event):
+        event["args"]["trace_span_id"] = f"slice:{len(slices)}"
+        # Keep only relationship fields; streamed transcripts/results may be large.
+        node = {key: event[key] for key in ("tid", "ts", "dur")}
+        node["args"] = {
+            key: event["args"][key]
+            for key in ("trace_span_id", "span_id", "parent_span_id")
+            if key in event["args"]
+        }
+        slices.append(node)
+        span_id = node["args"].get("span_id")
+        if span_id is not None:
+            relationship_spans[_trace_id(span_id)] = node
+        return event
+
     for record in records:
         tid, name, t0, wall, cpu, runq, metadata, span_id, parent_span_id = _record_fields(record)
         thread_ids.add(tid)
@@ -155,16 +177,18 @@ def _iter_trace_events(
             args["span_id"] = _trace_id(span_id)
         if parent_span_id is not None:
             args["parent_span_id"] = _trace_id(parent_span_id)
-        yield {
-            "ph": "X",
-            "pid": trace_pid,
-            "tid": tid,
-            "ts": to_us(t0),
-            "dur": max(1.0, wall / 1e3),
-            "name": name,
-            "cat": "agprof",
-            "args": args,
-        }
+        yield register_slice(
+            {
+                "ph": "X",
+                "pid": trace_pid,
+                "tid": tid,
+                "ts": to_us(t0),
+                "dur": max(1.0, wall / 1e3),
+                "name": name,
+                "cat": "agprof",
+                "args": args,
+            }
+        )
 
     for interrupted in interrupted_spans:
         t0 = interrupted.get("started_ns")
@@ -178,24 +202,18 @@ def _iter_trace_events(
             if key not in ("thread_id", "label", "started_ns", "duration_ms")
         }
         args["outcome"] = "interrupted"
-        yield {
-            "ph": "X",
-            "pid": trace_pid,
-            "tid": tid,
-            "ts": to_us(t0),
-            "dur": max(1.0, float(interrupted.get("duration_ms", 0.0)) * 1e3),
-            "name": interrupted.get("label", "interrupted"),
-            "cat": "agprof",
-            "args": args,
-        }
-
-    def trace_pid_for(process_pid: int, at_ns=None) -> int:
-        candidates = [info for info in process_info.values() if info.get("pid") == process_pid]
-        if at_ns is not None:
-            candidates = [info for info in candidates if info.get("first_seen_ns", at_ns) <= at_ns]
-        if not candidates:
-            return trace_pid if process_pid == profile_root_pid else process_pid
-        return max(candidates, key=lambda info: info.get("first_seen_ns", 0))["trace_pid"]
+        yield register_slice(
+            {
+                "ph": "X",
+                "pid": trace_pid,
+                "tid": tid,
+                "ts": to_us(t0),
+                "dur": max(1.0, float(interrupted.get("duration_ms", 0.0)) * 1e3),
+                "name": interrupted.get("label", "interrupted"),
+                "cat": "agprof",
+                "args": args,
+            }
+        )
 
     desired_names = {}
 
@@ -205,7 +223,8 @@ def _iter_trace_events(
             desired_names[key] = (priority, name)
 
     for (process_pid, tid), (priority, name) in thread_labels.items():
-        prefer(trace_pid_for(process_pid), tid, name, priority)
+        if process_pid == root_pid:
+            prefer(trace_pid, tid, name, priority)
 
     from .agprof import _infer_auto_thread_label, _span_thread_label
 
@@ -217,26 +236,73 @@ def _iter_trace_events(
     automatic_by_thread = {}
     for record in automatic_records:
         process_pid, tid, _name, _file, _line, started_ns, _duration, _outcome = record[:8]
-        lane_pid = trace_pid_for(process_pid, started_ns)
+        if process_pid != root_pid:
+            continue
+        lane_pid = trace_pid
         automatic_by_thread.setdefault((lane_pid, tid), []).append(record)
         runtime_name = record[8] if len(record) > 8 else "Python thread"
         runtime_priority = 10 if runtime_name in {"Python thread", "Python worker"} else 70
         prefer(lane_pid, tid, runtime_name, runtime_priority)
-        yield {
-            "ph": "X",
-            "pid": lane_pid,
-            "tid": tid,
-            "ts": to_us(started_ns),
-            "dur": max(1.0, record[6] / 1e3),
-            "name": record[2],
-            "cat": "python.auto",
+        yield register_slice(
+            {
+                "ph": "X",
+                "pid": lane_pid,
+                "tid": tid,
+                "ts": to_us(started_ns),
+                "dur": max(1.0, record[6] / 1e3),
+                "name": record[2],
+                "cat": "python.auto",
+                "args": {
+                    "file": record[3],
+                    "line": record[4],
+                    "outcome": record[7],
+                    "automatic": True,
+                },
+            }
+        )
+    # Explicit semantic parentage takes precedence. For Python/legacy slices,
+    # connect the nearest enclosing slice on the same track, matching the
+    # nesting visible in Perfetto. Never infer causality across tracks.
+    enclosing = {}
+    stacks = {}
+    for event in sorted(slices, key=lambda e: (e["ts"], -e["dur"])):
+        stack = stacks.setdefault(event["tid"], [])
+        end = event["ts"] + event["dur"]
+        while stack and (
+            stack[-1]["ts"] + stack[-1]["dur"] < end
+            or stack[-1]["ts"] + stack[-1]["dur"] <= event["ts"]
+        ):
+            stack.pop()
+        if stack:
+            enclosing[event["args"]["trace_span_id"]] = stack[-1]
+        stack.append(event)
+
+    for flow_id, child in enumerate(slices, start=1):
+        parent_id = child["args"].get("parent_span_id")
+        if parent_id is not None:
+            parent = relationship_spans.get(_trace_id(parent_id))
+            relationship = "explicit_parent"
+        else:
+            parent = enclosing.get(child["args"]["trace_span_id"])
+            relationship = "same_track_nesting"
+        if parent is None or parent is child or parent["ts"] > child["ts"]:
+            continue
+        flow = {
+            "pid": trace_pid,
+            "cat": "agprof.relationship",
+            "name": "parent → child",
+            "id": flow_id,
             "args": {
-                "file": record[3],
-                "line": record[4],
-                "outcome": record[7],
-                "automatic": True,
+                "relationship": relationship,
+                "parent_trace_span_id": parent["args"]["trace_span_id"],
+                "child_trace_span_id": child["args"]["trace_span_id"],
+                "parent_span_id": parent["args"].get("span_id"),
+                "child_span_id": child["args"].get("span_id"),
             },
         }
+        yield {**flow, "ph": "s", "tid": parent["tid"], "ts": parent["ts"]}
+        yield {**flow, "ph": "f", "tid": child["tid"], "ts": child["ts"], "bp": "e"}
+
     for key, lane_records in automatic_by_thread.items():
         inferred = _infer_auto_thread_label(lane_records)
         if inferred is not None:
@@ -259,66 +325,13 @@ def _iter_trace_events(
             "args": {"sort_index": sort_index},
         }
 
-    process_identities = set(process_info)
-    for sort_index, identity in enumerate(
-        sorted(
-            process_identities,
-            key=lambda key: process_info.get(key, {}).get("first_seen_ns", 0),
-        ),
-        start=1,
-    ):
-        info = process_info.get(identity)
-        if info is None:
-            continue
-        process_pid = info["trace_pid"]
-        yield {
-            "ph": "M",
-            "pid": process_pid,
-            "tid": 0,
-            "name": "process_name",
-            "args": {"name": info["display_name"]},
-        }
-        yield {
-            "ph": "M",
-            "pid": process_pid,
-            "tid": 0,
-            "name": "process_sort_index",
-            "args": {"sort_index": sort_index},
-        }
-        yield {
-            "ph": "M",
-            "pid": process_pid,
-            "tid": 0,
-            "name": "process_labels",
-            "args": {
-                "labels": f"cgroup={info['cgroup']}; cmdline={info['cmdline'] or info['comm']}"
-            },
-        }
-        first_seen = info.get("first_seen_ns")
-        last_seen = info.get("last_seen_ns", first_seen)
-        if first_seen is not None and last_seen is not None:
-            yield {
-                "ph": "M",
-                "pid": process_pid,
-                "tid": "process-lifetime",
-                "name": "thread_name",
-                "args": {"name": "process lifetime (sampled)"},
-            }
-            yield {
-                "ph": "X",
-                "pid": process_pid,
-                "tid": "process-lifetime",
-                "ts": to_us(first_seen),
-                "dur": max(1.0, (last_seen - first_seen) / 1e3),
-                "name": "alive (sampled)",
-                "cat": "process",
-                "args": {"timing": "bounded by sampler observations"},
-            }
-
+    root_trace_pid = root_info.get("trace_pid", trace_pid) if root_info else trace_pid
     for observation in observations:
+        if observation.get("trace_pid", trace_pid) not in {trace_pid, root_trace_pid}:
+            continue
         yield {
             "ph": "C",
-            "pid": observation.get("trace_pid", trace_pid),
+            "pid": trace_pid,
             "tid": 0,
             "ts": to_us(observation["timestamp_ns"]),
             "name": observation["trace_name"],

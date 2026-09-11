@@ -142,4 +142,5 @@ def test_real_agent_harness_override_prepares_installation(harness):
         assert sandbox.agconfig.agent.harness == harness
         assert prepare_harness_executable(sandbox, harness, config)
     finally:
-        owner.destroy().wait(timeout=45)
+        if owner.sandbox is not None:
+            owner.sandbox.destroy()

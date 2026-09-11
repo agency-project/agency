@@ -35,12 +35,13 @@ def event(kind, **payload):
     temporary.replace(path)
 
 
-def row(role, text):
+def row(role, text, **fields):
     with transcript.open("a") as out:
         out.write(
             json.dumps(
                 {
                     "type": role,
+                    **fields,
                     "message": {
                         "content": [
                             {"type": "text", "text": text},
@@ -94,6 +95,9 @@ while True:
     if mode == "unacknowledged" and prompt.startswith("[Agency redirect]"):
         continue
     event("UserPromptSubmit", prompt=prompt)
-    if prompt.startswith("[Agency redirect]") or mode == "finished":
+    if mode == "finished_empty":
+        row("system", "", subtype="turn_duration")
+        event("Stop")
+    elif prompt.startswith("[Agency redirect]") or mode == "finished":
         row("assistant", "scripted final")
         event("Stop", last_assistant_message="scripted final")

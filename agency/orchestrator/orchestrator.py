@@ -63,6 +63,7 @@ class _ExecutionRequest:
     submitted_wall_ns: int
     state: str = "submitted"
     cancelled: bool = False
+    completion_claimed: bool = False
     message: "str | None" = None
     dependencies: set[Future] = field(default_factory=set)
     producer_ids: set[str] = field(default_factory=set)
@@ -73,7 +74,6 @@ class _ExecutionRequest:
     terminal_error: str = ""
     terminal_state: str = "failed"
     terminal_event: str = "request_failed"
-    terminal_counts_as_failure: bool = True
 
 
 @dataclass
@@ -196,10 +196,7 @@ class GlobalAgentOrchestrator:
         """
         self._validate_max_steps(max_steps)
         if not isinstance(skill_input, agdata):
-            as_pending = getattr(skill_input, "_as_pending_agdata", None)
-            if not callable(as_pending):
-                raise TypeError("skill_input must be an agdata or pending result handle")
-            skill_input = as_pending()
+            raise TypeError("skill_input must be an agdata")
 
         result_future: "Future[agdata]" = Future()
         context_future: "Future[agcontext]" = Future()
@@ -294,21 +291,28 @@ class GlobalAgentOrchestrator:
         # belongs only to the requested execution, even if it finishes now.
         return engine.redirect(message) if engine is not None else False
 
-    def cancel_request(self, future: "Future") -> bool:
-        """Mark whichever request produced *future* as cancelled. Returns
-        True iff that request was "running" at this instant -- a
-        best-effort gate for whether agent.cancel() should try killing a
-        live harness process. No scheduler scan needed: the engine's own
-        checkpoints observe it regardless."""
+    def cancel_request(self, ag: "agent", future: "Future") -> "AgentEngine | None":
+        """Cancel an owned request unless its transaction already claimed completion.
+
+        Return its exact active engine for a request-scoped kill RPC. Queued
+        work observes cancellation when its dependencies allow dispatch.
+        """
         with self._event_cond:
             request_id = self._future_producers.get(future)
             if request_id is None:
-                return False
+                return None
             request = self._requests.get(request_id)
-            if request is None:
-                return False
+            if request is None or request.agent is not ag or request.completion_claimed:
+                return None
             request.cancelled = True
-            return request.state == "running"
+            return request.engine if request.state == "running" else None
+
+    def _claim_completion(self, request: _ExecutionRequest) -> bool:
+        with self._event_cond:
+            if request.cancelled:
+                return False
+            request.completion_claimed = True
+            return True
 
     def snapshot(self) -> OrchestratorSnapshot:
         with self._event_cond:
@@ -684,6 +688,7 @@ class GlobalAgentOrchestrator:
                 sandbox=sandbox,
                 max_steps=request.max_steps,
                 is_cancelled=lambda: request.cancelled,
+                claim_completion=lambda: self._claim_completion(request),
                 request_id=request.request_id,
             )
             # A skill-level failure is a rolled-back transaction even when the
@@ -968,7 +973,6 @@ class GlobalAgentOrchestrator:
         request.terminal_error = message
         request.terminal_state = terminal_state
         request.terminal_event = event_type
-        request.terminal_counts_as_failure = counts_as_failure
         self._end_phase_span_locked(request)
         self._end_run_span_locked(
             request,

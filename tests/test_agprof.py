@@ -321,6 +321,18 @@ def test_stop_reports_and_reraises_fatal_trace_failure(monkeypatch, tmp_path, fa
     assert messages[1] == f"[agprof] WARNING: trace output failed: {failure}"
 
 
+def test_span_details_bound_text_and_snapshot_structured_values():
+    value = {"path": "calc.py"}
+    metadata = agprof.detail_metadata("tool.arguments", value)
+    value["path"] = "changed.py"
+    assert json.loads(metadata["tool.arguments"]) == {"path": "calc.py"}
+    assert metadata["tool.arguments_truncated"] is False
+    large = agprof.detail_metadata("tool.result", "x" * 40_000)
+    assert len(large["tool.result"]) == 32_768
+    assert large["tool.result_truncated"] is True
+    assert large["tool.result_chars"] == 40_000
+
+
 def test_agprof_print_flushes(monkeypatch):
     calls = []
     monkeypatch.setattr("builtins.print", lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -330,12 +342,13 @@ def test_agprof_print_flushes(monkeypatch):
     assert calls == [(("[agprof] message",), {"flush": True})]
 
 
-def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
+def test_perfetto_trace_emits_harness_spans_counters_and_gpu_leases():
     second = 1_000_000_000
     process_info = {
-        "101-10": {
-            "display_name": "python (PID 101)",
-            "trace_pid": 101,
+        "42-10": {
+            "display_name": "python (PID 42)",
+            "trace_pid": 42,
+            "pid": 42,
             "first_seen_ns": 0,
             "cgroup": "/workload",
             "cmdline": "python job.py",
@@ -367,8 +380,8 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
         ),
     ]
     samples = [
-        (second, "proc:101-10:cpu_s", 1.0),
-        (1_200_000_000, "proc:101-10:cpu_s", 1.04),
+        (second, "proc:42-10:cpu_s", 1.0),
+        (1_200_000_000, "proc:42-10:cpu_s", 1.04),
     ]
 
     trace = agprof_trace.build_trace(
@@ -394,7 +407,7 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
     assert tool["args"]["runqueue_ms"] == "n/a"
     assert counter == {
         "ph": "C",
-        "pid": 101,
+        "pid": 42,
         "tid": 0,
         "ts": 200_000.0,
         "name": "cpu_percent",
@@ -406,10 +419,111 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
     assert lease["dur"] == 250_000.0
     assert any(
         event.get("name") == "process_name"
-        and event.get("pid") == 101
-        and event["args"]["name"] == "python (PID 101)"
+        and event.get("pid") == 42
+        and event["args"]["name"] == "python (PID 42)"
         for event in events
     )
+
+
+def test_trace_exports_only_harness_process_in_memory_and_on_disk(tmp_path):
+    kwargs = dict(
+        pid=42,
+        profile_root_pid=101,
+        started_ns=0,
+        process_info={
+            "root": {"pid": 101, "trace_pid": 101, "display_name": "Agency harness"},
+            "helper": {"pid": 202, "trace_pid": 202, "display_name": "podman exec"},
+        },
+        automatic_records=[
+            (101, 7, "app.run", __file__, 1, 1000, 1000, "return"),
+            (202, 7, "helper.run", __file__, 1, 1000, 1000, "return"),
+            (-2, 8, "remote.run", __file__, 1, 1000, 1000, "return"),
+        ],
+        thread_labels={(101, 7): (90, "Agency worker"), (202, 7): (90, "helper")},
+        observations=[
+            {"timestamp_ns": 1000, "trace_pid": 101, "trace_name": "rss_mb", "value": 20},
+            {"timestamp_ns": 1000, "trace_pid": 202, "trace_name": "helper_rss", "value": 5},
+            {"timestamp_ns": 1000, "trace_name": "gpu0:util_pct", "value": 50},
+        ],
+    )
+    records = [(7, "tool:read", 1000, 1000, None, None)]
+    trace = agprof_trace.build_trace(records, [], **kwargs)
+    path = agprof_trace.write_trace(tmp_path, records, [], **kwargs)
+    assert json.loads(path.read_text()) == trace
+    events = trace["traceEvents"]
+    assert {event["pid"] for event in events} == {42}
+    names = {event["name"] for event in events}
+    assert {"app.run", "tool:read", "rss_mb", "gpu0:util_pct"} <= names
+    assert names.isdisjoint({"helper.run", "remote.run", "helper_rss", "alive (sampled)"})
+    assert sum(event["name"] == "process_name" for event in events) == 1
+
+
+def test_trace_links_explicit_parents_including_same_thread_and_interrupted_spans(tmp_path):
+    records = [
+        (2, "llm:attempt[0]", 2000, 1000, None, None, {}, 2, 1),
+        (1, "run0:task:agent", 1000, 9000, None, None, {}, 1, None),
+        (1, "nested", 3000, 1000, None, None, {}, 3, 1),
+        (3, "orphan", 3000, 1000, None, None, {}, 4, 99),
+        (4, "legacy", 3000, 1000, None, None),
+    ]
+    kwargs = dict(
+        pid=42,
+        process_info={},
+        observations=[],
+        started_ns=0,
+        interrupted_spans=[
+            {
+                "thread_id": 5,
+                "label": "tool:read",
+                "started_ns": 4000,
+                "duration_ms": 1,
+                "span_id": "0000000000000005",
+                "parent_span_id": "0000000000000001",
+            }
+        ],
+    )
+    trace = agprof_trace.build_trace(records, [], **kwargs)
+    assert (
+        json.loads(agprof_trace.write_trace(tmp_path, records, [], **kwargs).read_text()) == trace
+    )
+    flows = [event for event in trace["traceEvents"] if event.get("cat") == "agprof.relationship"]
+    assert len(flows) == 6
+    starts = {event["id"]: event for event in flows if event["ph"] == "s"}
+    ends = {event["id"]: event for event in flows if event["ph"] == "f"}
+    assert starts.keys() == ends.keys()
+    assert {event["tid"] for event in ends.values()} == {1, 2, 5}
+    for flow_id, start in starts.items():
+        end = ends[flow_id]
+        assert start["tid"] == 1
+        assert start["ts"] == 1.0 <= end["ts"]
+        assert start["pid"] == end["pid"] == 42
+        assert end["bp"] == "e"
+        assert start["args"] == end["args"]
+
+
+def test_trace_links_python_and_legacy_nesting_without_linking_unrelated_tracks():
+    trace = agprof_trace.build_trace(
+        [(1, "tool:read", 3000, 2000, None, None)],
+        [],
+        pid=42,
+        process_info={},
+        observations=[],
+        started_ns=0,
+        automatic_records=[
+            (42, 1, "outer", "app.py", 1, 1000, 10000, "return"),
+            (42, 1, "inner", "app.py", 2, 2000, 5000, "return"),
+            (42, 2, "unrelated", "app.py", 3, 3000, 2000, "return"),
+            (99, 1, "helper", "app.py", 4, 3000, 2000, "return"),
+        ],
+    )
+    events = trace["traceEvents"]
+    names = {e["args"]["trace_span_id"]: e["name"] for e in events if e["ph"] == "X"}
+    links = [e["args"] for e in events if e["ph"] == "s"]
+    assert {(names[e["parent_trace_span_id"]], names[e["child_trace_span_id"]]) for e in links} == {
+        ("outer", "inner"),
+        ("inner", "tool:read"),
+    }
+    assert all(e["relationship"] == "same_track_nesting" for e in links)
 
 
 def test_perfetto_trace_keeps_interrupted_spans():
@@ -434,7 +548,11 @@ def test_perfetto_trace_keeps_interrupted_spans():
     span = next(event for event in trace["traceEvents"] if event.get("ph") == "X")
     assert span["ts"] == 0.0
     assert span["dur"] == 2500.0
-    assert span["args"] == {"reason": "session stopped", "outcome": "interrupted"}
+    assert span["args"] == {
+        "reason": "session stopped",
+        "outcome": "interrupted",
+        "trace_span_id": "slice:0",
+    }
 
 
 def test_write_trace_streams_json_without_building_one_giant_string(monkeypatch, tmp_path):
@@ -653,7 +771,7 @@ def test_real_session_keeps_semantic_spans_and_automatic_calls(monkeypatch, tmp_
     assert agprof.summary_metrics()["automatic_function_metrics"]["captured"] > 0
 
 
-def test_trace_emits_semantic_thread_name_and_sampled_process_lifetime():
+def test_trace_emits_semantic_thread_name_without_sampled_process_lifetime():
     process_info = {
         "101-10": {
             "pid": 101,
@@ -686,9 +804,8 @@ def test_trace_emits_semantic_thread_name_and_sampled_process_lifetime():
         and event["args"]["name"] == "Agency tool dispatcher"
         for event in events
     )
-    lifetime = next(event for event in events if event.get("name") == "alive (sampled)")
-    assert lifetime["pid"] == 101
-    assert lifetime["dur"] == 5.0
+    assert not any(event.get("name") == "alive (sampled)" for event in events)
+    assert {event["pid"] for event in events} == {101}
 
 
 def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
@@ -1037,7 +1154,8 @@ def test_environment_cgroup_adopts_current_dir_after_user_scope_landing(tmp_path
     (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
     (tmp_path / "memory.current").write_text("0")
     (tmp_path / "cgroup.procs").write_text(f"{__import__('os').getpid()}\n")
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    # Record an undo entry even when this variable was initially absent.
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP", "")
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", "1")
     monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: tmp_path)
     monkeypatch.setattr(
@@ -1506,3 +1624,31 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     agwebui_module.agwebui.run(fn, run_dir=tmp_path, port=17860, linger=False)
 
     assert events[:3] == ["profile-start", "workload", "profile-stop"]
+
+
+@pytest.mark.parametrize("failure", ["cgroup", "thread_start"])
+def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("sampler startup failed")
+
+    if failure == "cgroup":
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", fail)
+    else:
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", lambda: tmp_path)
+        monkeypatch.setattr(agprof._Sampler, "start", fail)
+    try:
+        with pytest.raises(RuntimeError, match="sampler startup failed"):
+            agprof.start(tmp_path / "failed", sample_hz=10, sample_gpu=False)
+        assert not agprof.enabled()
+        assert agprof._profile_data_logger is None
+        with agprof.session(tmp_path / "retry", sample_hz=0, sample_gpu=False):
+            with agprof.span("retry_succeeded"):
+                pass
+        assert any(row[1] == "retry_succeeded" for row in agprof.profile_records())
+    finally:
+        # The regression must not poison other tests when run against old code.
+        if agprof._sampler is not None and not agprof._sampler.is_alive():
+            agprof._sampler = None
+        agprof.stop()

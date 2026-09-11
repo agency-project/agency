@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import shutil
@@ -269,13 +270,26 @@ class _CodexBackend(agharness_backend):
                     model,
                     partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
                 )
+
                 # This adapter already buffers through `done`. Fetch the first
                 # frame before committing HTTP 200 so a permanent upstream 400
                 # is not turned into a retryable truncated SSE connection.
+                async def wait_for_disconnect():
+                    while (await request.receive())["type"] != "http.disconnect":
+                        pass
+
+                first_task = asyncio.create_task(anext(frames))
+                disconnect_task = asyncio.create_task(wait_for_disconnect())
+                first_received = False
                 try:
-                    first = await anext(frames)
+                    done, _ = await asyncio.wait(
+                        {first_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if disconnect_task in done:
+                        return JSONResponse({"error": "client disconnected"}, status_code=499)
+                    first = first_task.result()
+                    first_received = True
                 except HostDispatchError as exc:
-                    await frames.aclose()
                     return JSONResponse(
                         {
                             "error": {
@@ -286,6 +300,17 @@ class _CodexBackend(agharness_backend):
                         },
                         status_code=exc.status_code,
                     )
+                finally:
+                    import anyio
+
+                    # A disconnect before HTTP headers must cancel the blocked
+                    # model read just as a later StreamingResponse disconnect does.
+                    with anyio.CancelScope(shield=True):
+                        first_task.cancel()
+                        disconnect_task.cancel()
+                        await asyncio.gather(first_task, disconnect_task, return_exceptions=True)
+                        if not first_received:
+                            await frames.aclose()
 
                 async def response_frames():
                     try:

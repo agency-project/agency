@@ -99,6 +99,7 @@ class _NativeBackend(agharness_backend):
             runtime.engine_name, sandbox, uuid.uuid4().hex
         )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
+        handle = None
         try:
             if resume_session_id and prior_session_blob is not None:
                 sandbox.write_file_bytes(
@@ -187,7 +188,13 @@ class _NativeBackend(agharness_backend):
                 session_blob=session_blob,
             )
         finally:
-            agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
+            try:
+                if handle is not None:
+                    # wait() returning -1 leaves the timed-out process alive.
+                    # Reap it before deleting files it may still be using.
+                    handle.close()
+            finally:
+                agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -357,14 +364,14 @@ class _NativeBackend(agharness_backend):
 
         for item in agency_stream:
             if item["type"] == "delta":
-                content = item.get("content")
-                if content:
-                    yield _chunk({"content": content})
+                # Publish only the authoritative response after host finalization.
                 continue
 
             tool_call_index = 0
             for b in item["message"].get("blocks", []):
-                if b["type"] == "tool_use":
+                if b["type"] == "text":
+                    yield _chunk({"content": b.get("text", "")})
+                elif b["type"] == "tool_use":
                     yield _chunk(
                         {
                             "tool_calls": [

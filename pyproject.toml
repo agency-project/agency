@@ -58,16 +58,8 @@ line-length = 100
 # deliberately later rather than fixing/suppressing a wall of pre-existing
 # style findings just to turn a rule on.
 #
-# S110/S112 (flake8-bandit try-except-pass/try-except-continue) added
-# deliberately narrow: catches an except body that does nothing at all (no
-# log, no re-raise) -- true silent swallowing, not the many legitimate
-# best-effort `except Exception as e: print(f"WARNING: {e}")` catches
-# elsewhere in this codebase, which still surface a message. 28 pre-existing
-# hits exist across the repo (agresources.py's GPU/memory-detection
-# fallback probing, a few agwebui/agllm/agterm/agschema spots, two test
-# files) -- like the pycodestyle rules above, this is not being retroactively
-# fixed wall-to-wall; pre-commit only lints changed files by default, so
-# this only blocks *new* silent-swallow patterns going forward.
+# S110/S112 catch silent exception swallowing. Intentional best-effort
+# cleanup sites carry local explanations or report the failure.
 select = ["F", "S110", "S112"]
 
 [tool.pytest.ini_options]

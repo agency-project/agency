@@ -87,6 +87,12 @@ class AgentEngine:
             # a late redirect never contacts a hibernated persistent daemon.
             return client.redirect_harness(self._request_id, message)
 
+    def cancel(self) -> None:
+        with self._services_lock:
+            client = self._sandbox_interaction_client
+            if not self._services_closed and client is not None:
+                client.cancel_harness(self._request_id)
+
     @property
     def host_server_manager(self) -> "HostServerManager":
         if self._host_server_manager is None:
@@ -103,6 +109,7 @@ class AgentEngine:
         max_steps: "int | None" = None,
         is_cancelled: "Callable[[], bool]" = lambda: False,
         request_id: "str | None" = None,
+        claim_completion: "Callable[[], bool]" = lambda: True,
     ) -> "agdata":
         """Execute one request and own its complete sandbox transaction."""
 
@@ -131,6 +138,8 @@ class AgentEngine:
                     return self._controlled_error()
                 if isinstance(output, agerror):
                     return output
+                if not claim_completion():
+                    return self._controlled_error()
                 with agprof.span("teardown:commit"):
                     try:
                         sandbox.commit()
@@ -258,14 +267,16 @@ class AgentEngine:
             # is what actually holds it; agent.pause()/resume() reach the
             # SAME daemon directly whenever one already exists). No
             # blocking wait, no Event -- the daemon is what stays paused.
-            if self._agent.is_paused():
+            with self._agent._control_lock:
                 try:
                     with handle.client(timeout_s=10) as client:
-                        client.pause_harness()
+                        if self._agent.is_paused():
+                            client.pause_harness()
+                        else:
+                            client.resume_harness()
                 except Exception as exc:
                     print(
-                        f"[engine] WARNING: pause_harness() sync failed for "
-                        f"{self._agent.agname}: {exc}"
+                        f"[engine] WARNING: pause state sync failed for {self._agent.agname}: {exc}"
                     )
 
             # Obtain Host -> Sandbox handle

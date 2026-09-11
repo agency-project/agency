@@ -271,10 +271,9 @@ def _parse_sse(text):
     return events
 
 
-def test_agency_stream_to_harness_text_stream_ends_with_done():
+def test_agency_stream_to_harness_emits_committed_text_and_ends_with_done():
     stream = [
-        {"type": "delta", "content": "Hel"},
-        {"type": "delta", "content": "lo"},
+        {"type": "delta", "content": "discarded draft"},
         {
             "type": "done",
             "message": {
@@ -288,8 +287,12 @@ def test_agency_stream_to_harness_text_stream_ends_with_done():
     frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "m"))
     events = _parse_sse(frames)
     assert events[-1] == "[DONE]"
-    content_deltas = [e["choices"][0]["delta"].get("content") for e in events[:2]]
-    assert content_deltas == ["Hel", "lo"]
+    content_deltas = [
+        e["choices"][0]["delta"]["content"]
+        for e in events
+        if isinstance(e, dict) and e["choices"] and "content" in e["choices"][0]["delta"]
+    ]
+    assert content_deltas == ["Hello"]
     finish_chunk = next(
         e
         for e in events

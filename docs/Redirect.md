@@ -44,8 +44,7 @@ Codex, Grok Build, and OpenCode use the shared PTY attempt runner and register
 the same delivery callback. Their native turn IDs fence delayed completion and
 interruption events; a redirect returns true only after its exact prompt is
 acknowledged by the CLI. See [PTY architecture](PTY.md) for each CLI's dialect.
-Native remains non-PTY and receives queued context. The public API, scheduler,
-and RPC protocol are unchanged.
+Native remains non-PTY and receives queued context.
 
 Tests:
 

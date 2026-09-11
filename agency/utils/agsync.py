@@ -66,9 +66,13 @@ def _agsync_impl(*targets) -> None:
     # abandoned mid-run. Collect exceptions and re-raise after everything joins.
     errors: list[BaseException] = []
     for team in teams:
-        if team._run_future is not None:
+        with team._run_lock:
+            futures = set(team._active_run_futures)
+            if team._run_future is not None:
+                futures.add(team._run_future)
+        for future in futures:
             try:
-                team._run_future.result()
+                future.result()
             except Exception as exc:
                 errors.append(exc)
 

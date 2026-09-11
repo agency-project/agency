@@ -380,6 +380,16 @@ def _read_schedstat() -> "int | None":
         return None
 
 
+def detail_metadata(name: str, value, *, max_chars: int = 32_768) -> dict:
+    """Snapshot readable span details with an explicit per-field size limit."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return {
+        name: text[:max_chars],
+        f"{name}_truncated": len(text) > max_chars,
+        f"{name}_chars": len(text),
+    }
+
+
 def _otel_attribute(value):
     """Return an OTel-compatible scalar/sequence without losing metadata."""
     if isinstance(value, (bool, str, bytes, int, float)):
@@ -1445,6 +1455,7 @@ class _Sampler(threading.Thread):
 
     def __init__(self, hz: float, sample_gpu: bool) -> None:
         super().__init__(daemon=True, name="agprof-sampler")
+        self._process_cgroup = _process_cgroup_dir()
         self._interval = 1.0 / hz
         self._stop_ev = threading.Event()
         self._nvml = None
@@ -1461,7 +1472,6 @@ class _Sampler(threading.Thread):
             except Exception:
                 _health["gpu_initialization_failures"] += 1
                 self._nvml = None
-        self._process_cgroup = _process_cgroup_dir()
         self._proc_root = Path("/proc")
         self._clock_ticks = os.sysconf("SC_CLK_TCK")
         self._page_mb = os.sysconf("SC_PAGE_SIZE") / 2**20
@@ -1805,7 +1815,11 @@ class _Sampler(threading.Thread):
 
     def halt(self) -> None:
         self._stop_ev.set()
-        self.join(timeout=2)
+        if self.ident is not None:
+            self.join(timeout=2)
+        elif self._nvml is not None:
+            # Thread.start() can fail before run() owns NVML shutdown.
+            self._nvml.nvmlShutdown()
 
 
 def next_index(key: str = "run") -> int:
@@ -1930,21 +1944,34 @@ def start(
         _last_summary = None
         _last_run_summary = None
         started_ns = time.perf_counter_ns()
-        if auto_settings is not None:
-            try:
+        try:
+            if auto_settings is not None:
                 _enable_auto_functions(auto_settings)
-            except Exception:
-                otel_session.stop()
-                raise
-        _out_dir = Path(out_dir) if out_dir is not None else None
-        _profiler = otel_session
-        _session = otel_session
-        _session_started_ns = started_ns
-        _session_sample_hz = sample_hz
-        _session_sample_gpu = sample_gpu
-        if sample_hz > 0:
-            _sampler = _Sampler(sample_hz, sample_gpu)
-            _sampler.start()
+            _out_dir = Path(out_dir) if out_dir is not None else None
+            _profiler = otel_session
+            _session = otel_session
+            _session_started_ns = started_ns
+            _session_sample_hz = sample_hz
+            _session_sample_gpu = sample_gpu
+            if sample_hz > 0:
+                _sampler = _Sampler(sample_hz, sample_gpu)
+                _sampler.start()
+        except BaseException:
+            # A failed start must not reserve the process-wide session or
+            # retain monitoring callbacks, a provider, or an open database.
+            sampler = _sampler
+            _session = _profiler = _sampler = None
+            _out_dir = _session_started_ns = None
+            _profile_session_id = _profile_data_logger = None
+            cleanups = [_disable_auto_functions, otel_session.stop, profile_data_logger.stop]
+            if sampler is not None:
+                cleanups.insert(0, sampler.halt)
+            for cleanup in cleanups:
+                try:
+                    cleanup()
+                except Exception as exc:
+                    _agprof_print(f"[agprof] WARNING: failed-start cleanup failed: {exc}")
+            raise
     return otel_session
 
 

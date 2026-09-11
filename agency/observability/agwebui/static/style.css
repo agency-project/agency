@@ -24,7 +24,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 #app {
   display: flex;
-  height: 100vh;
+  height: calc(100vh - 38px);
   font-family: var(--font);
   font-size: var(--fs);
   line-height: 1.45;
@@ -502,3 +502,13 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 #config-modal-actions button:hover { border-color: var(--border-log); color: var(--cyan); }
 #config-update, #config-update-all { border-color: var(--green); color: var(--green); }
 #config-update:hover, #config-update-all:hover { border-color: var(--green); color: var(--green); }
+
+/* The embedded viewer shares the dashboard server and keeps its own state. */
+#view-tabs { height: 38px; display: flex; gap: 6px; padding: 4px 10px; border-bottom: 1px solid var(--border); }
+#view-tabs button, #profiler-toolbar button { padding: 4px 12px; background: var(--bg2); color: var(--text); border: 1px solid var(--border); cursor: pointer; }
+#view-tabs button.active { border-color: var(--cyan); color: var(--cyan); }
+#app[hidden], #profiler-view[hidden], #profiler-frame[hidden] { display: none; }
+#profiler-view { height: calc(100vh - 38px); display: flex; flex-direction: column; }
+#profiler-toolbar { display: flex; gap: 12px; align-items: center; padding: 8px 12px; font: 12px var(--font); }
+#profiler-status { flex: 1; }
+#profiler-frame { width: 100%; flex: 1; border: 0; background: var(--bg); }

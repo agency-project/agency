@@ -190,22 +190,15 @@ def test_normal_agdata_pending_is_false():
     assert d.is_pending() is False
 
 
-class _PendingWrapper:
-    def __init__(self, value: agdata):
-        future: Future[agdata] = Future()
-        future.set_result(value)
-        self.pending = agdata(_future=future)
-
-    def _as_pending_agdata(self):
-        return self.pending
-
-    def _resolve(self):
-        self.pending._resolve()
+def _pending(value):
+    future = Future()
+    future.set_result(value)
+    return agdata(_future=future)
 
 
-def test_wait_all_and_recursive_dependency_resolution_accept_pending_protocol():
-    first = _PendingWrapper(agdata(answer=1))
-    second = _PendingWrapper(agdata(answer=2))
+def test_wait_all_and_recursive_dependency_resolution_accept_pending_data():
+    first = _pending(agdata(answer=1))
+    second = _pending(agdata(answer=2))
     values = [first, second]
     assert agdata.wait_all(values) is values
 
@@ -229,8 +222,8 @@ class _ModelValue:
         return {"result": self.result}
 
 
-def test_nested_serialization_materializes_pending_protocol_tuples_and_models():
-    wrapped = _PendingWrapper(agdata(result="literal"))
+def test_nested_serialization_materializes_pending_data_tuples_and_models():
+    wrapped = _pending(agdata(result="literal"))
     value = agdata(
         tuple_value=(wrapped,),
         dataclass_value=_StructuredValue(wrapped),

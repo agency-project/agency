@@ -21,7 +21,16 @@ pytestmark = pytest.mark.skipif(not ptrace_available(), reason="Linux ptrace req
 @pytest.mark.timeout(15)
 @pytest.mark.parametrize(
     "mode",
-    ["running", "restored", "exit", "unacknowledged", "finished", "completion_race", "paused"],
+    [
+        "running",
+        "restored",
+        "exit",
+        "unacknowledged",
+        "finished",
+        "finished_empty",
+        "completion_race",
+        "paused",
+    ],
 )
 def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, mode, monkeypatch):
     (tmp_path / "events").mkdir()
@@ -82,18 +91,20 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
         assert not worker.is_alive()
         data = (tmp_path / "input.bin").read_bytes()
         expected_input = b"\x1b[200~[Agency run]\noriginal prompt\x1b[201~\r"
-        if mode != "finished":
+        if mode not in {"finished", "finished_empty"}:
             expected_input += b"\x1b"  # Escape interrupts Claude's active turn.
         if mode == "restored":
             expected_input += b"\x1b\x1b"
-        if mode not in {"finished", "completion_race", "exit"}:
+        if mode not in {"finished", "finished_empty", "completion_race", "exit"}:
             expected_input += b"\x1b[200~[Agency redirect]\n" + message.encode() + b"\x1b[201~\r"
         assert data == expected_input
         assert b"\x03" not in data
-        if mode in {"finished", "completion_race"}:
+        if mode in {"finished", "finished_empty", "completion_race"}:
             assert delivered is False
             assert len(results) == 1
             assert not errors
+            if mode == "finished_empty":
+                assert results[0].final_text == ""
         elif mode in {"exit", "unacknowledged"}:
             assert delivered is False
             assert errors

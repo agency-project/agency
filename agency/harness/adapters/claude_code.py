@@ -56,13 +56,6 @@ def _session_path(config_home: str, session_id: str) -> str:
     return f"{config_home}/projects/{_session_slug(config_home)}/{session_id}.jsonl"
 
 
-def _read_session_blob(path: str) -> "bytes | None":
-    try:
-        return Path(path).read_bytes()
-    except (FileNotFoundError, OSError):
-        return None
-
-
 def _write_session_blob(path: str, data: bytes) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_bytes(data)
@@ -244,9 +237,7 @@ class _ClaudeCodeBackend(agharness_backend):
         from .. import agharness
 
         resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        config_home = agharness.materialize_config_home(
-            runtime.engine_name, runtime.token, runtime.harness_base_url
-        )
+        config_home = agharness.materialize_config_home(runtime.engine_name)
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(
@@ -782,7 +773,7 @@ class _ClaudePtyExecution:
             if kind == "UserPromptSubmit" and payload.get("prompt") == self._expected_prompt:
                 self._acknowledged = True
             elif kind == "Stop":
-                self._stop = payload.get("last_assistant_message")
+                self._stop = payload.get("last_assistant_message") or ""
             elif kind in {"StopFailure", "SessionEnd"}:
                 self._failure = f"Claude {kind}: {payload.get('error', 'session ended')}"
 
@@ -869,8 +860,15 @@ class _ClaudePtyExecution:
             text = self._text(row)
             if row.get("type") == "user" and text == self._expected_prompt:
                 submitted = True
-            if submitted and row.get("type") == "assistant" and text == self._stop:
-                return blob
+            if submitted:
+                if self._stop == "":
+                    # Claude can finish after tool output without persisting a
+                    # final assistant message. Its durable turn marker closes
+                    # that transcript after the Stop hook has returned.
+                    if row.get("type") == "system" and row.get("subtype") == "turn_duration":
+                        return blob
+                elif row.get("type") == "assistant" and text == self._stop:
+                    return blob
         return None
 
     def _interrupt(self):

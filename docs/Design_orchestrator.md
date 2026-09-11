@@ -45,12 +45,11 @@ Each event runs a complete cycle: resolve every waiting request, detect managed 
 Dispatch requires all of the following:
 
 - predecessor and explicit input dependencies are resolved;
-- the agent is not paused;
-- the request is not terminal or cancelled;
+- the request is ready and not terminal;
 - no other engine-backed request is active for that agent;
 - global engine capacity is available.
 
-`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. Dependency-blocked and queued requests held behind agent pause consume no engine capacity; context-only messages never claim it. A request that was already running when its harness process was paused remains active and retains its slot.
+`max_concurrent_engines=None` preserves effectively unlimited cross-agent concurrency. A positive integer caps active engine-backed requests across the process. Dependency-blocked requests consume no engine capacity; context-only messages never claim it. Pause is enforced by the harness daemon, so even a request submitted while paused can dispatch and retain its slot. Cancelled queued requests dispatch when dependencies and capacity permit, then return cancellation before sandbox provisioning.
 
 ## Reusable workers, fresh engines
 
@@ -66,11 +65,11 @@ Engine completion is posted back to the scheduler. The worker never publishes pu
 
 `queue_message()` registers a request with kind `context_message` and returns `None`. Once its predecessor resolves, the scheduler copies that context and appends the validated retained message. This path does not create an `AgentEngine`, sandbox, daemon, host server, harness, or model request, and it does not use an execution worker or global engine slot.
 
-Agent pause is not a dispatch gate for a ready context message. Any unresolved predecessor still blocks it through the ordinary context chain, including a running request whose harness is paused.
+Agent pause is not a scheduler dispatch gate. Any unresolved predecessor still blocks it through the ordinary context chain, including a running request whose harness is paused.
 
 ## Controls and terminal settlement
 
-Queued cancellation, dependency failure, and scheduler rejection are handled on the scheduler thread without creating execution infrastructure. Running cancellation is observed through the internal request at safe boundaries; the completion claim in the engine transaction prevents a late successful commit from winning after cancellation.
+Dependency failure and scheduler rejection settle on the scheduler thread without execution infrastructure. Queued cancellation waits for normal dispatch and is then observed before sandbox provisioning. Running cancellation uses the exact engine and execution ID for a daemon kill RPC. Its state change races atomically with the engine completion claim; whichever wins determines whether the working transaction can commit.
 
 Ordinary skill failure discards its working context and appends the canonical retained rollback notice. Cancellation passes through committed predecessor context without that notice.
 

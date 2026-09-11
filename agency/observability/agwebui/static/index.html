@@ -8,6 +8,19 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <nav id="view-tabs" aria-label="Views">
+    <button id="view-run" class="active" aria-pressed="true">Run</button>
+    <button id="view-profiler" aria-pressed="false">Profiler</button>
+  </nav>
+  <section id="profiler-view" hidden>
+    <div id="profiler-toolbar">
+      <span id="profiler-status" role="status"></span>
+      <button id="profiler-reload">Reload trace</button>
+      <button id="profiler-open">Open trace file</button>
+      <input id="profiler-file" type="file" accept=".json,.pftrace,.perfetto-trace,.gz" hidden>
+    </div>
+    <iframe id="profiler-frame" title="Perfetto profiler" hidden></iframe>
+  </section>
   <div id="app">
     <div id="left">
       <div id="shared-log-container">
@@ -64,5 +77,6 @@
     </div>
   </div>
   <script src="/static/app.js"></script>
+  <script src="/static/profiler.js"></script>
 </body>
 </html>

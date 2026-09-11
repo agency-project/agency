@@ -923,13 +923,15 @@ class _ContainerBackendBase(agsandbox_backend):
                 "cgroup v1 hosts are not supported"
             )
         cgroup_dir = "/sys/fs/cgroup" + rel
-        leaf = os.path.basename(os.path.normpath(cgroup_dir))
-        expected_leaves = {
+        # Podman's systemd driver can place the payload in a `container`
+        # child of its libpod scope. Match the exact ID-bearing component
+        # anywhere in the path, retaining the remote-daemon identity check.
+        expected_names = {
             container_id,
             f"docker-{container_id}.scope",
             f"libpod-{container_id}.scope",
         }
-        if leaf not in expected_leaves:
+        if expected_names.isdisjoint(os.path.normpath(cgroup_dir).split(os.sep)):
             raise RuntimeError(
                 f"agprof: local cgroup for runtime PID {pid} does not match container "
                 f"{container_id[:12]} — the docker/podman daemon may be remote or VM-backed"
@@ -1922,7 +1924,6 @@ class _ContainerBackendBase(agsandbox_backend):
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         container_name = self._container_name()
 
         # Best-effort courtesy signal before rm_container() forces the issue
@@ -1984,6 +1985,7 @@ class _ContainerBackendBase(agsandbox_backend):
 
         if rm_exc is not None:
             raise rm_exc
+        self._destroyed = True
 
     def _lifecycle_tag(self) -> str:
         return f"agency/lifecycle-{self._name}".lower()

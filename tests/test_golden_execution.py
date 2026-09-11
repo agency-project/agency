@@ -38,6 +38,7 @@ from agency.configs.agconfig import (
 )
 
 from agency.engine.host_servers import llm_handler_server
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.llm.mock import _MockBackend
 
 
@@ -187,7 +188,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
     config = agconfig(
         agentconfig(harness=harness, log_dir=str(directory / "logs")),
         sandboxconfig(backend="docker", base_image=golden_image),
-        resourcesconfig(idle_cpus=1, idle_memory="1g"),
+        resourcesconfig(idle_cpus=1, idle_memory="2g"),
         llmconfig(
             provider="mock",
             model="claude-sonnet-4-6",
@@ -197,6 +198,15 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
         ),
     )
     backend = _GoldenReplay(config)
+    ready = threading.Event()
+    record_span = HostInteractionServer.record_span
+
+    def observe_ready(server, name, start_ts, end_ts, *args, **kwargs):
+        record_span(server, name, start_ts, end_ts, *args, **kwargs)
+        if name == "harness:await_cli" and start_ts is not None and end_ts is None:
+            ready.set()
+
+    monkeypatch.setattr(HostInteractionServer, "record_span", observe_ready)
     monkeypatch.setattr(llm_handler_server.agllm, "for_config", lambda config: backend)
     skill = agskill(
         "golden_execution",
@@ -214,6 +224,10 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
         with agprof.span("ag.run(): first"):
             result = ag.run(skill, agdata(instruction=INPUT), max_steps=4)
         assert backend.entered.wait(WAIT_SECONDS), "first model request never arrived"
+        if harness in {"codex", "opencode", "grok"}:
+            # The model request can precede native prompt acknowledgment. The
+            # await span starts only after that acknowledgment enables controls.
+            assert ready.wait(WAIT_SECONDS), "native prompt was not acknowledged"
         first_context = _text(backend.requests[0]["messages"], "user")
         assert INPUT in first_context
         assert QUEUED in first_context
@@ -236,7 +250,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
             time.sleep(0.25)
         with agprof.span("ag.redirect(): active execution"):
             ag.redirect(result, REDIRECT)
-        if harness == "claude_code":
+        if harness != "native":
             assert backend.interrupted.wait(5), "redirect did not interrupt the model stream"
         else:
             backend.release.set()
@@ -245,7 +259,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
         assert result.to_dict() == {"answer": ANSWER}
         current_requests = list(backend.requests)
         assert all(FUTURE not in _text(r["messages"], "user") for r in current_requests)
-        if harness == "claude_code":
+        if harness != "native":
             assert len(current_requests) >= 2
             assert REDIRECT in _text(current_requests[-1]["messages"], "user")
         else:
@@ -293,4 +307,4 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
             original_error.add_note(f"Golden cleanup also failed: {cleanup_error!r}")
         finally:
             if ag.sandbox is not None:
-                ag.sandbox.rm_container()
+                ag.sandbox.destroy()

@@ -614,3 +614,23 @@ def test_build_app_complete_syscall_route_records_result_and_span():
     assert response.json() == {"ok": True}
     assert [e[0] for e in logger.events] == ["syscall_call", "agent_state", "syscall_result"]
     assert len(logger.spans) == 1
+
+
+def test_cached_routes_do_not_retain_server_after_app_is_released():
+    import gc
+    import weakref
+
+    server = _make_server()
+    reference = weakref.ref(server)
+    app = server.build_app()
+    # FastAPI caches endpoint classification independently of the app lifetime.
+    from fastapi.routing import APIRoute
+
+    cached_endpoints = [route.endpoint for route in app.routes if isinstance(route, APIRoute)]
+    del server
+    gc.collect()
+    assert reference() is not None, "the live app must own its server"
+    del app
+    gc.collect()
+    assert reference() is None, "cached endpoints must not retain completed requests"
+    assert cached_endpoints
