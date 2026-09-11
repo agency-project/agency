@@ -63,9 +63,8 @@ def _flatten_unknown_data(data):
 
 
 def _toml_string(value: str) -> str:
-    """Quote a string for inclusion in a hand-written TOML file -- only
-    the escapes actually needed for the values this module writes
-    (prompt text never goes through here; only config values do)."""
+    """Quote a string for a hand-written TOML file -- only the escapes
+    this module's config values actually need."""
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 

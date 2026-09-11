@@ -91,11 +91,10 @@ class _NativeBackend(agharness_backend):
             sandbox, ["httpx", "httpx2", "mcp", "html2text"], timeout_s=180
         )
 
-        # Fresh scratch space per ATTEMPT (not reused across a structured-
-        # output retry the way the pre-refactor version reused one across
-        # the whole execute() call) -- session continuity across attempts
-        # flows through AttemptResult.session_blob/resume_session_id now,
-        # not directory reuse, so each attempt can be fully self-contained.
+        # Fresh scratch space per ATTEMPT, never reused across a
+        # structured-output retry: session continuity across attempts flows
+        # through AttemptResult.session_blob/resume_session_id, not
+        # directory reuse, so each attempt can be fully self-contained.
         scratch_dir = agharness.materialize_config_home_in_container(
             runtime.engine_name, sandbox, uuid.uuid4().hex
         )

@@ -37,15 +37,8 @@ _active: "agwebui | None" = None
 
 
 def _merge_config_fields(agconfig: Any, config: dict) -> None:
-    """Mutate *agconfig*'s own namespaces in place, field by field, rather
-    than replacing it with a new object. *config* is shaped like
-    ``agconfig.safe_snapshot()``'s output: ``{"llm": {...}, "sandbox":
-    {...}}``. agconfig.clone() (called by every agent()/agteam()
-    construction) just snapshots whatever is currently set -- so anything
-    that hasn't cloned this exact object yet will pick up the change on its
-    next construction, with no cooperation needed from whatever code holds
-    another reference to it (e.g. a user script's own module-level config
-    variable)."""
+    """Mutate agconfig's namespaces in place (not a new object) so any
+    as-yet-uncloned reference to it also picks up the change."""
     agconfig.update(**config)
 
 
@@ -66,11 +59,10 @@ def _apply_config_update(target: Any, config: dict, agconfig_cls: Any) -> None:
 
 
 def _all_agteam_subclasses(cls):
-    """Every agteam subclass currently defined, at any depth -- found via
-    Python's own subclass tracking (__subclasses__()), not a framework
-    registry. This is how a team class's own agconfig class attribute (e.g.
-    `agconfig = LLM_CONFIG` in a user script) gets reached without the
-    framework needing to know that attribute, or the script, exists."""
+    """Every agteam subclass at any depth, via Python's own
+    `__subclasses__()` tracking, not a framework registry -- how a team's
+    `agconfig` class attribute gets reached without the framework knowing
+    it exists."""
     for sub in cls.__subclasses__():
         yield sub
         yield from _all_agteam_subclasses(sub)

@@ -241,23 +241,10 @@ class agname(str):
     @classmethod
     def allocate_agname(cls, name: str | None = None, *, prefix: str | None = None) -> "agname":
         """Return a unique name in the form <base>_XXXX and mark it in-use.
-
-        If ``name`` is given, it is used as the base (e.g. ``"Worker"`` →
-        ``"Worker_0000"``).  If ``name`` is ``None``, the next noun from the
-        built-in ``_NOUNS`` list is chosen automatically, cycling back to the
-        start after the last entry.
-
-        ``prefix``, when given, is applied to the base *after* the None/noun
-        resolution above (e.g. ``prefix="agent"`` turns the auto-picked noun
-        ``"alex"`` into base ``"agent_alex"``, or a caller-supplied ``"Worker"``
-        into ``"agent_Worker"``) -- so every object kind that passes one gets a
-        self-describing name whether it was auto-picked or user-supplied,
-        without a separate code path for either case. It also guarantees that
-        kind's names can never collide with another kind's, the same way
-        agSandbox's own ``"sandbox_"`` prefix always has.
-
-        XXXX is a 4-character base-36 suffix (1 679 616 unique values per base).
-        """
+        If ``name`` is None, the next ``_NOUNS`` entry is used automatically.
+        ``prefix``, applied after that resolution, makes every object
+        kind's names self-describing and collision-free against other
+        kinds' names."""
         with cls._lock:
             if name is None:
                 name = _NOUNS[cls._noun_index % len(_NOUNS)]

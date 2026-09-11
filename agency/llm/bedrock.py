@@ -61,10 +61,8 @@ def _needs_bedrock_converse(model: str) -> bool:
 
 
 def _is_bedrock_bearer_token(api_key: "str | None") -> bool:
-    """A Bedrock API key (e.g. "ABSK...") is a single opaque bearer token.
-    AWS access/secret key pairs for SigV4 signing are always
-    "ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]" -- the colon is what
-    distinguishes the two."""
+    """A Bedrock API key is one opaque bearer token; AWS SigV4 pairs
+    always contain a colon ("ACCESS:SECRET[:SESSION]")."""
     return bool(api_key) and ":" not in api_key
 
 

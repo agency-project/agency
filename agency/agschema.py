@@ -135,10 +135,8 @@ class agschema:
         return errors
 
     def check_field(self, field_name: str, value) -> "str | None":
-        """Validate a single (field_name, value) pair against the schema type hint.
-
-        Returns an error string, or None if valid.
-        """
+        """Validate a single (field_name, value) pair; returns an error
+        string, or None if valid."""
         return validate_value_against_type_hint(self._data[field_name], value)
 
     # ------------------------------------------------------------------

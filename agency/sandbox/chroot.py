@@ -96,27 +96,27 @@ scan-and-match this all runs through -- it backs `get_live_pids()`,
 `_has_pending_background_work()`, and (via `_kill_all_sandbox_processes()`)
 actual teardown, all from the exact same /proc read. Reading another
 process's process-group id (unlike its `/proc/<pid>/root`) needs no ptrace
-permission at all, and -- unlike the abandoned baseline scan -- PGID
-membership is a real, kernel-tracked relationship established once at spawn
-time, immune to however much unrelated churn a busy host generates, and
+permission at all, and PGID membership is a real, kernel-tracked
+relationship established once at spawn time, immune to however much
+unrelated churn a busy host generates, and
 confirmed empirically to survive reparenting (a child that outlives its
 exited parent keeps the same pgid) as well as to catch a child spawned
 *after* the `exec()` call that backgrounded its parent already returned --
 something a before/after diff limited to that one call's own window could
 never see. It's also a relationship `_kill_all_sandbox_processes()` can
-safely act on destructively via `os.killpg()` -- unlike the abandoned
-baseline scan, which could never verify a candidate pid's ownership well
-enough to justify SIGKILLing it.
+safely act on destructively via `os.killpg()`, since PGID membership is an
+independently kernel-verified relationship for each candidate pid, not
+merely inferred.
 
-One real cost of dropping per-PID diff tracking: `get_live_pids()` can no
-longer report how long an individual PID has been running (there is no
-longer a per-PID capture timestamp) -- `pid_status_summary()` here lists
-matched PIDs without an elapsed-time figure, unlike docker/podman's version.
-Given the diff mechanism's own reporting was already only approximately
-attributable to a specific PID's true spawn time for any child discovered
-late, this is a small, honest precision loss in exchange for a mechanism
-that no longer needs to exist in two different forms for two different
-purposes (fine-grained-but-blind-to-later-children vs. coarse-but-complete).
+`get_live_pids()` cannot report how long an individual PID has been
+running -- there is no per-PID capture timestamp to report one from --
+so `pid_status_summary()` here lists matched PIDs without an elapsed-time
+figure, unlike docker/podman's version. A per-PID timestamp would only
+ever be approximately attributable to a specific PID's true spawn time
+for any child discovered late, so this is a small, honest precision loss
+in exchange for one mechanism that serves both purposes (fine-grained-
+but-blind-to-later-children vs. coarse-but-complete) instead of needing
+two.
 
 The accepted trade-off: a process that calls `setsid()`/`setpgid()` to
 detach into its own new group -- a common, legitimate daemonizing idiom
@@ -195,18 +195,11 @@ _chroot_unshare_prefix_cache: "list[str] | None" = None
 
 
 def chroot_available() -> bool:
-    """Return True if unprivileged user namespaces + chroot are usable on this
-    host, cached for the process lifetime.
-
-    Three checks, since any one alone can give a false positive:
-    ``/proc/sys/kernel/unprivileged_userns_clone`` (when present -- it's
-    Debian/Ubuntu-specific; distros that ship it enabled by default in the
-    upstream kernel don't have the file at all) must not be explicitly
-    disabled, and a live ``unshare --user --map-root-user`` -- either bare or
-    wrapped in ``rootlesskit`` (see ``_probe_chroot_available``) -- must
-    actually succeed, since AppArmor/seccomp policies can block unprivileged
-    user namespaces even when the sysctl allows them.
-    """
+    """True if unprivileged user namespaces + chroot are usable on this
+    host, cached for the process lifetime. Checks the sysctl gate (when
+    present) plus a live `unshare --user --map-root-user` probe, since
+    AppArmor/seccomp can block user namespaces even when the sysctl
+    allows them."""
     global _chroot_available_cache
     if _chroot_available_cache is not None:
         return _chroot_available_cache
@@ -218,18 +211,9 @@ def chroot_available() -> bool:
 
 def _unshare_prefix_candidates() -> "list[list[str]]":
     """Candidate prefixes for creating an unprivileged user+mount namespace,
-    tried in order.
-
-    Plain ``unshare`` works on most hosts and is tried first so hosts where
-    it already works don't gain a dependency on ``rootlesskit``. Some
-    distros (Ubuntu with ``kernel.apparmor_restrict_unprivileged_userns=1``,
-    the default since 24.04) deny ``CLONE_NEWUSER`` to unconfined binaries
-    like a bare ``unshare`` call, but still allow it for ``rootlesskit`` --
-    which ships its own AppArmor profile explicitly granting ``userns``, the
-    same exemption rootless Docker/Podman rely on to keep working under that
-    policy. Wrapping ``unshare`` in ``rootlesskit --net=none`` reuses that
-    same exemption for the chroot backend, with no root/sudo/setcap needed.
-    """
+    tried in order: plain `unshare` first, then `rootlesskit`-wrapped for
+    distros that deny CLONE_NEWUSER to unconfined binaries but exempt
+    rootlesskit's own AppArmor profile."""
     candidates = [["unshare"]]
     if shutil.which("rootlesskit") is not None:
         candidates.append(["rootlesskit", "--net=none", "unshare"])
@@ -271,11 +255,8 @@ def _probe_chroot_available() -> bool:
 
 
 def _chroot_unshare_prefix() -> "list[str]":
-    """The unshare invocation prefix _ChrootBackend should use to actually
-    create its jail's namespace -- whichever candidate chroot_available()
-    found working (bare ``unshare``, or ``rootlesskit``-wrapped). Calling
-    chroot_available() first guarantees the cache is populated regardless of
-    call order, since it's the only thing that runs the probe."""
+    """The unshare prefix that actually works on this host, as found by
+    `chroot_available()` (called here to guarantee the cache is populated)."""
     chroot_available()
     return _chroot_unshare_prefix_cache or ["unshare"]
 
@@ -314,32 +295,12 @@ _NVIDIA_INDEXED_DEV_RE = re.compile(r"^nvidia(\d+)$")
 
 
 def _chroot_gpu_dev_paths(gpu_ids: "list[int]") -> "list[str]":
-    """Return absolute host device paths to bind-mount into a jail for the
-    specific *gpu_ids* leased to it (or [] if none are leased), cached for
-    the process lifetime -- mirrors container.py's _gpu_flags()' nvidia-vs-amd
-    detection (nvidia-smi on PATH => NVIDIA, else AMD/ROCm).
-
-    Scoped to just the leased GPU's own compute node plus the shared control
-    devices every GPU needs regardless of index (nvidiactl/nvidia-uvm for
-    NVIDIA, /dev/kfd for AMD) -- mirrors what docker's `--gpus device=N`/
-    podman's CDI actually bind into a container, rather than every compute
-    node on the host. See this module's docstring for the residual caveat:
-    there is still no per-GPU cgroup device filter here, so this only
-    prevents the *default* jail setup from exposing every GPU -- a process
-    that discovers and opens another leased jail's device node directly
-    (if it somehow knows the path) is not blocked by anything at the kernel
-    level the way a real cgroup device filter would.
-
-    Without this, a GPU *lease* (CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES,
-    handled identically to the container backend -- see module docstring)
-    is scheduled successfully but the device itself is unreachable inside
-    the jail, same root cause as /dev/null above: the old whole-directory
-    /dev bind silently failed for every device file, GPU included, so this
-    was ALREADY true before the /dev fix above, not something it changed.
-
-    Returns [] on a GPU-less host, and [] when gpu_ids is empty (no GPU
-    leased) -- CPU-only hosts and un-leased jails pay nothing extra here.
-    """
+    """Host device paths to bind-mount into a jail for *gpu_ids* (or [] if
+    none leased): the leased GPU's own compute node plus the shared
+    control devices every GPU needs, mirroring what docker/podman actually
+    attach. No per-GPU cgroup filter, so this only gates the default
+    setup, not a process that opens another leased jail's device node
+    directly."""
     if not gpu_ids:
         return []
     all_paths = _all_chroot_gpu_dev_paths()
@@ -481,35 +442,24 @@ class _ChrootBackend(agsandbox_backend):
         return self.get_live_pids()
 
     def get_live_pids(self) -> "set[int]":
-        """Every PID whose process group is one of this jail's tracked
-        `_invocation_pgids` -- the sole tracking mechanism for this backend
-        (see module docstring). Same scan-and-match as
-        `_has_pending_background_work()`; both call `_live_pgid_matched_pids()`
-        so they can never disagree with each other the way a separate
-        diff-based `get_live_pids()` and PGID-based `_has_pending_background_work()`
-        could."""
+        """Every PID sharing one of this jail's tracked `_invocation_pgids`
+        (see module docstring)."""
         return self._live_pgid_matched_pids()
 
     def pid_status_summary(self) -> str:
         """Same purpose as `agsandbox_backend.pid_status_summary()`, but
-        without a per-PID elapsed-time figure -- there is no longer a
-        per-PID capture timestamp to report one from (see module docstring
-        for why dropping per-PID diff tracking cost that precision). Also
-        never needs the base version's "not individually trackable" fallback:
-        get_live_pids() and _has_pending_background_work() are both backed
-        by the exact same scan here, so they can never disagree about
-        whether anything is running.
-        """
+        without a per-PID elapsed-time figure (no per-PID capture
+        timestamp here). Never needs the base version's "not individually
+        trackable" fallback, since get_live_pids()/
+        _has_pending_background_work() share one scan."""
         live = self.get_live_pids()
         if not live:
             return "no background processes running"
         return ", ".join(f"PID {pid}" for pid in sorted(live))
 
     def _has_pending_background_work(self) -> bool:
-        """See `agsandbox_backend._has_pending_background_work()`'s
-        docstring for why the default (just checking `_watched_pids`) isn't
-        safe here -- gates whether `agSandbox.wait_for_processes()` bothers
-        waiting at all before a skill's result is delivered."""
+        """Whether any tracked process is still running (see the base
+        class's docstring for why `_watched_pids` alone isn't safe here)."""
         return bool(self._live_pgid_matched_pids())
 
     def _live_pgid_matched_pids(self) -> "set[int]":
@@ -520,20 +470,14 @@ class _ChrootBackend(agsandbox_backend):
         `_has_pending_background_work()`, and (via
         `_kill_all_sandbox_processes()`) actual teardown.
 
-        Replaces the host-wide "anything not in the startup baseline"
-        scan this module used before: PGID membership is a real,
-        kernel-tracked relationship established once at spawn time and
-        never renumbered, so it can't be confused with unrelated churn
-        elsewhere on a busy shared host regardless of how much of it there
-        is -- confirmed empirically as a real (not just theoretical)
-        problem with the baseline-based scan, which could see a busy host
-        as perpetually non-clear. It also matters for
-        `_kill_all_sandbox_processes()`: unlike the old baseline scan
-        (which could never be safely used to decide what to SIGKILL, since
-        it couldn't verify a candidate pid's ownership -- see that
-        method's docstring history), a PGID match IS a verified,
+        PGID membership is a real, kernel-tracked relationship established
+        once at spawn time and never renumbered, so it can't be confused
+        with unrelated churn elsewhere on a busy shared host regardless of
+        how much of it there is. It also matters for
+        `_kill_all_sandbox_processes()`: a PGID match is a verified,
         kernel-checked relationship, safe to act on destructively via
-        `os.killpg()`.
+        `os.killpg()` precisely because it doesn't depend on guessing a
+        candidate pid's ownership.
 
         The accepted trade-off (see this module's docstring for the full
         rationale): a process that calls `setsid()`/`setpgid()` to detach
@@ -619,45 +563,12 @@ class _ChrootBackend(agsandbox_backend):
         return alive_pids
 
     def _kill_all_sandbox_processes(self) -> None:
-        """SIGKILL every process group in `_invocation_pgids` (see
-        `_live_pgid_matched_pids()`'s docstring for why this is safe to act
-        on destructively). Best-effort: called from `stop()`/`destroy()`/
-        `restore()` before tearing down or overwriting the workspace.
-
-        `os.killpg()` on a tracked invocation group is a verified, kernel
-        -checked operation -- not a guess the way the old baseline scan's
-        candidates were -- so it's safe to use here: a delayed child never
-        individually captured by a before/after diff still shares its
-        invocation's PGID, and so still gets killed here. The accepted
-        residual gap: a `setsid`-detached descendant (see
-        `_live_pgid_matched_pids()`'s docstring) has its own PGID and is
-        not reachable through this mechanism.
-
-        There is a separate, low-probability residual risk inherent to any
-        PID-based system: if the invocation's original group leader has
-        already exited and the kernel has since recycled that exact PID
-        number for an unrelated new process that also happens to become a
-        group leader, `killpg()` would signal that unrelated group instead.
-        Considered acceptable given how narrow the window is (recorded
-        PGIDs are only ever acted on within this same sandbox's lifetime,
-        typically seconds to minutes) and that avoiding it entirely would
-        require PID-file-descriptor-based process handles, a materially
-        larger change.
-
-        Unlike `_ContainerBackendBase` (whose `kill {pids}` must go through
-        `docker/podman exec`, since its processes live in the container's
-        own namespace, then gets a hard guarantee for free from container
-        removal itself regardless of what was tracked), chroot's tracked
-        process groups are already host-native, so a plain `os.killpg()`
-        reaches them directly -- no shell/unshare round-trip needed. There
-        is also no container-removal-style implicit kill here: chroot has
-        no cgroup/namespace boundary whose teardown could guarantee
-        termination, so this explicit step is the only thing that stops a
-        jail's background work from outliving `destroy()` (which would
-        otherwise delete the jail root out from under a still-running
-        process) or surviving `stop()`/`restore()` rewriting the workspace
-        underneath it.
-        """
+        """SIGKILL every process group in `_invocation_pgids` (safe to act
+        on destructively per `_live_pgid_matched_pids()`'s docstring).
+        Best-effort; called from `stop()`/`destroy()`/`restore()` before
+        tearing down or overwriting the workspace. Reaches processes
+        directly via `os.killpg()`, since chroot has no cgroup/namespace
+        boundary to guarantee termination otherwise."""
         import signal
 
         for pgid in list(self._invocation_pgids):
@@ -672,28 +583,9 @@ class _ChrootBackend(agsandbox_backend):
                 )
 
     def _ensure_started(self) -> None:
-        """Create the jail's workspace directory on first use, restoring it
-        from ``_checkpoint_image`` if one was given at construction time.
-
-        Ground truth is always the workspace directory's existence on disk
-        -- there is no ``self._started`` cache. A per-instance flag would be
-        unreliable if multiple backend views share the workspace, exactly the
-        problem ``_ContainerBackendBase`` solves by querying the container runtime
-        (``_container_running()``) rather than trusting a flag. There's no
-        daemon here, so the workspace directory itself is the cross-process
-        source of truth: materializing from a checkpoint every time some
-        worker's copy finds the workspace missing (when it's actually
-        present, just not yet observed by this copy) would wipe out whatever
-        a *different* worker already wrote to it -- but that can only happen
-        if we skip the ``is_dir()`` check, which we never do.
-
-        No baseline PID snapshot is captured here: unlike the container
-        backend (whose shared ``get_live_pids()`` needs one to exclude its
-        own init/runtime-helper processes), this backend's tracking is
-        PGID-only (see module docstring) and needs no startup snapshot at
-        all -- there is nothing else for this method to do once the
-        workspace exists.
-        """
+        """Create the workspace on first use (restoring from
+        `_checkpoint_image` if given); ground truth is the directory's
+        existence on disk, not a cached flag."""
         if not self._workspace.is_dir():
             self._materialize_workspace(self._checkpoint_image)
 
@@ -903,42 +795,11 @@ class _ChrootBackend(agsandbox_backend):
         self, env_export: str, cmd: str, workdir: str, timeout: int
     ) -> "tuple[str, int]":
         """Run *cmd* chrooted for filesystem containment. No before/after
-        /proc diff here -- unlike `agsandbox_backend._exec_with_pid_tracking()`'s
-        docker/podman version, this backend tracks background work purely
-        via the invocation's own process group (see module docstring), so
-        there is nothing for a diff to capture that PGID matching doesn't
-        already cover, including a child spawned well after this call
-        already returned (which a before/after diff limited to this one
-        call's own window could never see in the first place).
-
-        The chroot sub-invocation's own stdout/stderr is captured via a
-        temp FILE, not ``$(...)`` command substitution -- confirmed
-        empirically that command substitution reads a real OS pipe, whose
-        EOF (and therefore ``$(...)``'s own return) is held open until
-        EVERY process that inherited the write end closes it, including a
-        backgrounded descendant of the chrooted command. That made this
-        method block for the backgrounded job's ENTIRE runtime before ever
-        returning -- exactly the case this method exists to avoid waiting
-        on -- silently defeating background-process tracking for chroot in
-        a way distinct from (and found only after fixing) the
-        /proc-visibility bug this module's docstring describes. A file's
-        readers don't block on other processes' open write handles the way
-        a pipe's do, so `cat`-ing it after the foreground chroot invocation
-        returns picks up whatever was written by then and no more, which is
-        exactly the "don't wait on background work" behavior needed here.
-
-        The whole script runs via `_run_unshared()`, whose top-level
-        `unshare` process is its own new process group leader (see that
-        method's docstring) -- its pgid is recorded into
-        `_invocation_pgids`, letting `_live_pgid_matched_pids()` find this
-        call's own descendants later, at any point, not just within this
-        one call's own before/after window. A command that backgrounds a
-        process (``cmd &``) still detaches and survives past the `chroot`
-        sub-invocation's own exit exactly as it does today, since the
-        orphan is reparented on the shared host PID namespace regardless of
-        which process was its immediate parent -- but it keeps the same
-        pgid either way, which is all this mechanism needs.
-        """
+        /proc diff needed -- PGID tracking (see module docstring) already
+        covers everything a diff would, including children spawned after
+        this call returns. Output goes to a temp file, not `$(...)`, since
+        a pipe would block until every backgrounded descendant closes its
+        write end too."""
         self._ensure_started()
         root = str(self._root)
         setup = "{ " + "; ".join(self._setup_lines()) + "; } >/dev/null 2>&1"
@@ -967,11 +828,10 @@ class _ChrootBackend(agsandbox_backend):
     def commit(self, tag: "str | None" = None) -> bool:
         """Snapshot the current workspace to *tag* (default: this jail's own
         lifecycle tag) -- the chroot equivalent of a container `commit`.
-        Leaves the live workspace untouched (unlike the old commit-then-
-        discard stop()): the jail keeps running from it exactly as before,
-        no different from a container backend's commit() not removing the
-        container. Returns False if the jail was never started (nothing to
-        snapshot).
+        Leaves the live workspace untouched: the jail keeps running from
+        it, no different from a container backend's commit() not removing
+        the container. Returns False if the jail was never started
+        (nothing to snapshot).
 
         Checks the workspace directory's existence on disk directly so it
         remains correct when another backend view created the workspace.
@@ -993,32 +853,13 @@ class _ChrootBackend(agsandbox_backend):
         return True
 
     def stop(self) -> None:
-        """Hibernate the jail: kill tracked processes and release the GPU --
-        the chroot equivalent of releasing a container's resources. There
-        is no keyring/runtime slot to release here (chroot processes run
-        directly on the host, with no docker/podman container involved at
-        all -- see the module docstring), so this is simpler than the
-        container backend's stop(): unlike that one, releasing the GPU
-        here is safe, since chroot has no persistent container object with
-        GPU device flags baked in at creation -- visibility is granted
-        per-exec via env vars, so a later resume can safely be handed a
-        different physical GPU.
-
-        Deliberately leaves self._workspace untouched -- hibernating must
-        preserve state across calls the same way the container backend's
-        stop() does; use rm_container() to discard it, and commit() to
-        checkpoint it.
-        """
+        """Hibernate the jail: kill tracked processes and release the GPU.
+        No runtime slot to release (chroot has no container/keyring
+        involved). Leaves `self._workspace` untouched, so a later
+        `_ensure_started()` resumes from it; use `rm_container()` to
+        discard state instead."""
         gpu_ids_to_release = list(self._gpu_ids) if self._gpu_count_requested > 0 else []
-        # Kill first: wait_for_processes() already gave background work its
-        # fair chance to finish naturally before a skill's teardown ever
-        # reaches stop() (see _kill_all_sandbox_processes()'s docstring for
-        # why nothing does this implicitly here, unlike container removal).
-        # Release happens right after -- this kill attempt IS the
-        # confirmation the sandbox has exited; there is no separate
-        # "is it actually clear yet" wait (see release_gpus()'s docstring for
-        # why re-checking the same tracked state the kill just acted on
-        # would be redundant).
+        # Kill first: this IS the confirmation the sandbox has exited.
         self._kill_all_sandbox_processes()
         if gpu_ids_to_release and self._gpu_release_fn is not None:
             self._gpu_release_fn(gpu_ids_to_release)
@@ -1049,17 +890,12 @@ class _ChrootBackend(agsandbox_backend):
 
     def restore(self, tag: str) -> None:
         """Restore the jail's workspace from a previously committed snapshot."""
-        # Kill before overwriting the workspace underneath any still-running
-        # process from the state being replaced (see
-        # _kill_all_sandbox_processes()'s docstring).
+        # Kill before overwriting the workspace under any still-running process.
         self._kill_all_sandbox_processes()
         self._watched_pids = {}
         self._invocation_pgids = set()
         self._checkpoint_image = tag
-        # Materialize explicitly rather than calling _ensure_started() --
-        # that only restores when the workspace doesn't exist yet (see its
-        # docstring), which would make an explicit restore() onto an
-        # already-materialized workspace a silent no-op.
+        # Materialize explicitly: _ensure_started() no-ops once a workspace exists.
         self._materialize_workspace(tag)
 
     def destroy(self) -> None:
@@ -1129,7 +965,5 @@ class _ChrootBackend(agsandbox_backend):
 
     @staticmethod
     def relabel_owner_pid(tag: str, owner_pid: "int | None", timeout: int) -> None:
-        """No-op: a chroot snapshot is a plain directory copy with no
-        label/metadata concept at all (see _ContainerBackendBase's
-        version, which this mirrors for API parity so agent.py's
-        save()/load() can call it generically regardless of backend)."""
+        """No-op: a chroot snapshot has no label/metadata concept (mirrors
+        `_ContainerBackendBase`'s version for API parity)."""

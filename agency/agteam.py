@@ -147,10 +147,8 @@ class agteam:
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         """Replace this team's agconfig with a clone of the given one, and
-        push that same clone down to every agent this team has spawned so
-        far (via ``agent.change_config``). Agents created afterward pick up
-        the new ``self.agconfig`` automatically, the same way they do at
-        construction."""
+        push it to every agent already spawned (via ``agent.change_config``).
+        Agents created afterward pick it up automatically at construction."""
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         for a in self._agents:
             a.change_config(self.agconfig)

@@ -150,18 +150,9 @@ class _DockerBackend(_ContainerBackendBase):
 
     def _containerd_address(self) -> "str | None":
         """The containerd socket address this daemon itself is using, per
-        `docker info`'s `Containerd.Address` field. Rootless Docker runs
-        its own PRIVATE per-user containerd (e.g.
-        `/run/user/<uid>/docker/containerd/containerd.sock`, owned by the
-        invoking user) rather than the system-wide
-        `/run/containerd/containerd.sock` bare `ctr` dials by default --
-        confirmed empirically: on a rootless host, `docker info` reported
-        this private address while the system socket remained root-owned
-        and inaccessible without sudo. Reading the address straight from
-        the daemon means `ctr` always targets the SAME containerd this
-        Docker is actually using, rootless or not. None if `docker info`
-        doesn't expose it (older Docker, or a runtime with no such
-        field)."""
+        `docker info`'s `Containerd.Address` -- rootless Docker runs its
+        own private containerd, not the system-wide socket, so reading it
+        here means `ctr` always targets the right one. None if unexposed."""
         info = self._docker_info()
         if info is None:
             return None  # already warned in _docker_info()

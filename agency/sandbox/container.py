@@ -164,12 +164,8 @@ _AGENCY_OWNER_PID_LABEL = "agency.owner_pid"
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if *pid* refers to a currently-running process on this host.
-
-    Delegates to `agutil.pid_alive` so this reaper and the gateway-directory
-    reaper (`agutil._reap_orphaned_gateway_dirs`) share one definition of
-    "owner still alive" -- the test both rely on before deleting anything.
-    """
+    """Return True if *pid* is running on this host -- delegates to
+    `agutil.pid_alive` so every reaper shares one definition."""
     from ..utils.agutil import pid_alive
 
     return pid_alive(pid)
@@ -180,33 +176,10 @@ _reap_done = False
 
 
 def reap_orphaned_containers() -> None:
-    """Force-remove containers (and their lifecycle images) left behind by a
-    SIGKILL'd -- or otherwise uncleanly terminated -- previous process.
-    Also sweeps lifecycle IMAGES whose owning container is already gone
-    (see _reap_orphaned_lifecycle_images()) -- the container-based sweep
-    above only ever helps if the owning container still exists (carrying
-    its agency.owner_pid label) when this runs; once that container's
-    already been removed by anything other than this reaper (a crash's
-    container surviving to a later run, or e.g. external tooling deleting
-    containers directly without ever invoking Python), its lifecycle image
-    would otherwise be unreapable forever, since nothing else ever revisits it.
-
-    SIGKILL can never be caught (see agwebui.run()'s SIGTERM handler for what
-    *can* be done about a plain `kill`), so a SIGKILL'd process's containers
-    just keep running in the daemon forever: nothing in that process's own
-    lifecycle ever gets a chance to call destroy(), and -- per
-    _AGENCY_OWNER_PID_LABEL's docstring above -- a later run doesn't
-    naturally collide with (and thereby reclaim) their names either. This is
-    the other half of that gap: actively look for containers whose owning
-    PID is no longer alive and remove them.
-
-    Runs at most once per process (guarded by _reap_lock/_reap_done) --
-    called automatically the first time any _ContainerBackendBase is
-    constructed (see its __init__), so a real run reaps stale state near its
-    own start without every caller needing to remember to invoke this
-    directly. Best-effort throughout: any failure is logged and swallowed,
-    never allowed to block the actual work.
-    """
+    """Force-remove containers (and their lifecycle images) left by a
+    SIGKILL'd previous process, plus any lifecycle image whose owning
+    container is already gone. Runs at most once per process, triggered by
+    `_ContainerBackendBase.__init__`; best-effort throughout."""
     global _reap_done
     if _reap_done:
         return
@@ -469,46 +442,10 @@ def _amd_render_node_paths() -> "list[str]":
 
 def _gpu_flags(runtime: str) -> list[str]:
     """Return GPU passthrough flags for *runtime* ("docker" or "podman").
-
-    Attaches EVERY GPU on the host to EVERY container, regardless of
-    whether reserve_gpu() has been called on the owning sandbox --
-    `docker/podman run` is the only point these flags are ever set
-    (neither runtime supports hot-attaching a device to an
-    already-created container), so gating on `_gpu_virtual` at creation
-    time meant a container first created (e.g. via a bash/read_file/
-    write_file call) before reserve_gpu() ran was permanently stuck
-    without device access for its entire lifetime -- reserve_gpu() could
-    flip the sandbox's own flag, but nothing could retroactively attach
-    the device to the already-running container. Attaching unconditionally
-    removes that ordering dependency entirely: it no longer matters
-    whether reserve_gpu() is called before or after the first exec().
-
-    This is safe because CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES (set in
-    base.py's exec(), readonly-exported so a command can't hijack a
-    different GPU by reassigning the variable inline) is the ONLY access
-    control point by design -- a sandbox that hasn't called reserve_gpu()
-    gets "NoDevFiles" and sees no GPU regardless of what's attached at the
-    container level. Nothing stops code running inside a container from
-    opening another GPU's device node directly and ignoring the env var
-    entirely; this was already true for any sandbox that HAD reserved a
-    GPU even under the old gpu_reserved-gated design, so unconditional
-    attachment does not weaken isolation for the trusted-code case this
-    is meant for.
-
-    NVIDIA: Docker ``--gpus all``; Podman ``--device nvidia.com/gpu=all``
-      (CDI). Podman does not understand Docker's ``--gpus`` flag: it
-      accepts it silently (no error) but never mounts the NVIDIA
-      driver/devices, so a container started that way has zero GPU access
-      despite `podman run` appearing to succeed -- `nvidia-smi` inside
-      prints "WARNING: The NVIDIA Driver was not detected" and isn't even
-      on PATH. This mirrors the identical fix applied to images/build.sh's
-      own smoke tests.
-    AMD: ``--device /dev/kfd`` (shared control device) plus every
-      ``/dev/dri/renderD*`` node found -- there's no single "all" flag for
-      ROCm the way ``--gpus all``/CDI ``=all`` covers NVIDIA, so each
-      render node is attached explicitly.
-    CPU-only hosts get no flags at all (no GPUs to attach).
-    """
+    Attaches every GPU unconditionally (neither runtime supports attaching
+    a device after container creation); access is actually gated later,
+    in-container, via CUDA/HIP_VISIBLE_DEVICES. Podman needs CDI
+    (`--device nvidia.com/gpu=all`), not Docker's `--gpus all`."""
     kind = _gpu_kind(runtime)
     if kind == "none":
         return []
@@ -556,15 +493,9 @@ def keyring_quota() -> dict[str, int]:
 
 def _semaphore_held_count() -> str:
     """Return 'held/limit' for the container-concurrency semaphore, or
-    '?/limit' if unreadable.
-
-    Uses sem_getvalue() via the internal _semlock on POSIX (Linux).  The count
-    reflects this process's view only — other unrelated processes (including
-    a different runtime, or a container started outside this framework
-    entirely) are not tracked by our semaphore but do consume system keyring
-    slots, so comparing this number with keyring_quota()['used'] reveals how
-    many slots belong to external processes.
-    """
+    '?/limit' if unreadable. Reflects only this process's own containers --
+    compare against keyring_quota()['used'] to see external processes'
+    share."""
     limit = _keyring_container_limit()
     try:
         available = _container_semaphore._semlock._get_value()
@@ -630,24 +561,14 @@ class _ContainerBackendBase(agsandbox_backend):
             )
 
     def _is_quota_exhaustion_error(self, stderr: str) -> bool:
-        """Return True if *stderr* (from a failed run_cmd) indicates the
-        runtime hit the Linux session-keyring quota -- a concurrency quota
-        that waiting (for another container to exit and free its keyring)
-        can resolve. Matches both docker's and podman's (via runc) wording."""
+        """True if *stderr* indicates the runtime hit the Linux
+        session-keyring quota (matches both docker's and podman's/runc's wording)."""
         return "session key" in stderr or ("disk quota exceeded" in stderr and "keyring" in stderr)
 
     def _wait_for_quota_slot(self) -> None:
-        """Poll the actual keyring free count from /proc until a slot opens
-        up (or give up after keyring_wait_timeout_s).
-
-        The runtime-slot semaphore (_container_semaphore) prevents our own
-        containers from exceeding the limit, but external processes --
-        including the *other* container runtime, or anything else run as
-        this same host user -- can consume slots outside our accounting;
-        polling /proc catches that case too. Also called unconditionally
-        after a name-conflict is resolved in _run_with_conflict_retry(), in
-        case a quota was *also* exhausted (e.g. the container object got
-        created then hit the limit)."""
+        """Poll /proc's actual keyring free count until a slot opens (or
+        give up after keyring_wait_timeout_s) -- catches quota exhaustion
+        from processes outside our own semaphore's accounting."""
         deadline = time.monotonic() + self._agconfig.sandbox.keyring_wait_timeout_s
         while time.monotonic() < deadline:
             if keyring_quota().get("free", 0) > 0:
@@ -675,69 +596,29 @@ class _ContainerBackendBase(agsandbox_backend):
         agconfig: "agconfig_cls | None",
     ) -> None:
         reap_orphaned_containers()
-        # Captured here, at construction time, rather than read fresh from
-        # os.getpid() inside _ensure_started(). This preserves stable sandbox
-        # ownership even if a backend object is explicitly serialized or used
-        # from another process. Labeling
-        # the container with a fresh os.getpid() there would tag it with
-        # whichever worker happened to create it; once that worker exits
-        # (routine pool recycling, not a crash) while the container and its
-        # owning main process are both still very much alive, a concurrent
-        # reap_orphaned_containers() elsewhere would wrongly see a "dead"
-        # owner and delete a container still in active use. self._owner_pid
-        # is a plain instance attribute fixed here in whichever process
-        # actually constructs this backend (always the main process, never a
-        # worker), so it survives that same cloudpickling unchanged.
+        # Captured at construction (not lazily) so a serialized/forked copy
+        # still reports the real owning process.
         self._owner_pid = os.getpid()
         self._agname = agname
         self._gpu_ids: list[int] = []
-        self._gpu_count_requested: int = 0  # LLM has called reserve_resource(gpu=N)
-        self._gpu_acquire_fn = None  # pool.acquire_gpus, set by reserve_resource
-        self._gpu_release_fn = None  # pool.release_gpus, set by reserve_resource
+        self._gpu_count_requested: int = 0
+        self._gpu_acquire_fn = None
+        self._gpu_release_fn = None
         self._cpu_acquired: float = 0.0
         self._memory_acquired_mb: int = 0
         self._watched_pids: dict[int, float] = {}
-        # None means "not captured yet" -- distinct from a legitimately empty
-        # baseline. See _ensure_started()'s docstring for why this must be
-        # captured exactly once and never recomputed on a later call.
+        # None means "not yet captured", distinct from an empty baseline.
         self._baseline_pids: "set[int] | None" = None
         self._daemon_pids: set[int] = set()
-        self._ptrace_managed_pids: set[int] = set()  # see ingest_ptrace_pids() in base.py
+        self._ptrace_managed_pids: set[int] = set()
         self._started = False
         self._destroyed = False
         self._checkpoint_image: str | None = checkpoint_image
-        # Transient squash-time "diff since reference chain" tar, built
-        # lazily only when a squash is due (see
-        # `_build_accumulator_for_squash()`) by reading each new layer's
-        # on-disk overlay diff via `_locate_layer_diff_dir()`. Ordinary
-        # plain commits do NOT touch this -- under the hibernate model the
-        # lifecycle tag already keeps a single commit image, so eagerly
-        # copying that tip into TMPDIR every skill was pure duplicate
-        # disk. Cleared in a finally after the squash attempt (success or
-        # fallback). None/0 means "not built yet"; a failed build raises
-        # so commit() falls back to `_squash_commit()` export/import.
+        # Squash-time accumulator state (see _build_accumulator_for_squash()
+        # / _squash_commit()); cleared after each squash attempt.
         self._accumulated_diff_path: "Path | None" = None
         self._accumulated_layer_count: int = 0
         self._accumulator_dir: "Path | None" = None
-        # The reference chain _accumulator_squash_commit() validates and
-        # builds against -- None means "use self._base_image's own
-        # digests" (the ordinary case, and always true until this
-        # backend's own first successful squash). Set to the JUST-
-        # PRODUCED chain's digests after every successful squash (fast or
-        # fallback -- see _accumulator_squash_commit()/_squash_commit()),
-        # so a squash that fell back to export/import doesn't permanently
-        # lock this backend out of the fast path for the rest of its
-        # life: the fallback's own single-layer result becomes the new
-        # reference point for the NEXT squash instead of the original,
-        # now-unrelated base image. Referenced by DIGEST only (never the
-        # mutable lifecycle tag string, which gets overwritten by every
-        # subsequent commit) -- safe to hold onto indefinitely, since a
-        # layer that's an ancestor of the current chain can't be deleted
-        # out from under it (the runtime refuses "has dependent child
-        # images"). Purely in-memory: lost on process restart or fork
-        # (a fresh backend object starts back at None, falling back to
-        # self._base_image -- the same one-time-per-object gap as before,
-        # not a regression).
         self._squash_base_diff_ids: "list[str] | None" = None
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._validate_config(self._agconfig)
@@ -854,7 +735,7 @@ class _ContainerBackendBase(agsandbox_backend):
         A hibernating container is unambiguously our own: container names
         embed _RUN_ID (a fresh uuid4 per process), so no other process could
         have created one under this exact name -- there is no "leftover from
-        someone else" case to force-remove here the way there used to be.
+        someone else" case to force-remove here.
 
         Ground truth is always a real docker/podman inspect -- there is no
         self._started cache. Every call pays one lifecycle-state inspect via
@@ -1388,53 +1269,15 @@ class _ContainerBackendBase(agsandbox_backend):
     def _locate_layer_diff_dir(
         self, diff_id: str, *, diff_ids: "list[str] | None" = None
     ) -> "Path | None":
-        """Find the raw, on-disk diff directory backing *diff_id* directly
-        -- i.e. exactly the same data a `docker/podman commit` producing
-        this layer already read to build it, reused here essentially for
-        free instead of re-deriving it via `docker diff` (a generic scan
-        costing ~9s on a real ~24GB/many-file image regardless of how
-        much actually changed) or `docker save` (cost proportional to the
-        whole image). See `_build_accumulator_for_squash()`'s docstring
-        for how this feeds the fast squash path.
-
-        *diff_ids*, when provided, is the image's full RootFS.Layers list
-        (most-base-first) ending at *diff_id*. Some storage backends
-        (Docker's containerd overlayfs snapshotter) key layers by ChainID,
-        which is a function of that whole prefix -- not the tip DiffID
-        alone -- so the fold path always passes it; backends that only
-        need *diff_id* may ignore it.
-
-        None by default -- this means reaching into a runtime's own
-        undocumented internal storage layout, which is necessarily
-        runtime-specific (Docker's overlay2 / containerd-overlayfs layouts
-        and Podman's `containers/storage` layout are unrelated). Overridden
-        by `_DockerBackend` (`.docker`) and `_PodmanBackend` (`.podman`);
-        returning None here means "no fast lookup available for this
-        runtime," which `_build_accumulator_for_squash()` treats as
-        "accumulator unavailable," safely falling back to the slower
-        but always-correct `_squash_commit()` path -- never as an error.
-        """
+        """Find the on-disk diff directory backing *diff_id*, reused for
+        free instead of re-deriving it via `docker diff`/`docker save`.
+        None by default (runtime-specific; overridden by
+        `_DockerBackend`/`_PodmanBackend`) falls back to `_squash_commit()`."""
         return None
 
     def _host_to_container_id(self, uid: int, gid: int) -> "tuple[int, int]":
-        """Translate the HOST-side ownership `_locate_layer_diff_dir()`'s
-        files carry into the ownership the CONTAINER itself sees for
-        them. Identity by default -- correct for any runtime that
-        doesn't remap ownership between its own user namespace and the
-        container's (true of non-rootless Docker/Podman, where the
-        overlay2/overlay diff directory's on-disk ownership already IS
-        the container-visible ownership).
-
-        Overridden by `_DockerBackend` for rootless Docker and
-        `_PodmanBackend` for rootless Podman, where the runtime's user
-        namespace means a raw `os.lstat()` on the diff directory reports
-        HOST-remapped ownership instead (confirmed empirically: a
-        root-owned file inside the container showed up as owned by the
-        invoking host user via the raw overlay path, not uid 0) --
-        passed to `_layer_squash.overlay_diff_to_tar()`'s
-        `uid_gid_translate` parameter by `_fold_overlay_diff_into_accumulator()`
-        below.
-        """
+        """Identity by default -- host and container ownership match except
+        under rootless Docker/Podman, which override this."""
         return (uid, gid)
 
     def _reset_accumulator(self) -> None:
@@ -1631,54 +1474,12 @@ class _ContainerBackendBase(agsandbox_backend):
         self._squash_base_diff_ids = new_diff_ids
 
     def _squash_commit(self, tag: str) -> None:
-        """Flatten the container's current filesystem into a brand-new
-        single-layer image tagged *tag*, instead of committing a diff on
-        top of the existing chain.
-
-        `docker commit` always creates one more layer on top of whatever
-        the container was started from; since _ensure_started() always
-        restarts FROM the last checkpoint image, a long-running sandbox's
-        layer chain grows by exactly one every checkpoint cycle with
-        nothing to bound it, until it crosses the container runtime's hard
-        layer-depth cap ("max depth exceeded" on docker/moby, ~125 layers
-        observed empirically on this host). `export`+`import` serializes
-        the container's FULL filesystem into a new image with no parent
-        chain at all, resetting depth back to 1 -- this is the
-        always-correct fallback `stop()` uses when
-        `_accumulator_squash_commit()`'s faster, diff-only path raises
-        (its accumulator can't be trusted for this squash); materially
-        slower since it re-serializes the whole merged filesystem rather
-        than just the accumulated diff.
-
-        Safe to drop the image metadata `docker commit` would normally
-        preserve (env, embedded CMD/ENTRYPOINT): _ensure_started()'s
-        restart `run` command always passes an explicit `tail -f
-        /dev/null`, never relying on anything baked into the image itself.
-        The one label that IS explicitly re-applied via `--change` is
-        `_AGENCY_OWNER_PID_LABEL` -- `docker commit` propagates a
-        container's labels onto its image automatically, but `export`/
-        `import` doesn't preserve container config at all (confirmed
-        empirically: an export/import round-trip strips every label), so
-        without this the resulting image would carry no owner_pid at
-        all, making it permanently unreapable by
-        `reap_orphaned_containers()`'s image-scan (see that function's
-        docstring) even after its owning process dies.
-
-        Resets the diff accumulator on success (see
-        `_accumulator_squash_commit()`): export/import produces a
-        PARENTLESS image, disconnected from `self._base_image`'s own
-        lineage entirely -- meaning `_accumulator_squash_commit()`'s
-        base-is-a-prefix precondition can never hold again relative to
-        the ORIGINAL base image. This no longer means every future squash
-        is permanently stuck on this slower path, though: this method
-        re-baselines `self._squash_base_diff_ids` to the freshly-
-        flattened image's own (single-layer) chain right below, so the
-        NEXT squash attempt validates/builds against THAT instead --
-        recovering fast-path eligibility from here on, for as long as
-        this backend object lives (see `self._squash_base_diff_ids`'s
-        docstring in __init__ for why this is safe and why it doesn't
-        persist across a process restart or fork).
-        """
+        """Flatten the container's filesystem into a brand-new single-layer
+        image, resetting layer depth to 1 before the chain crosses the
+        runtime's hard layer-depth cap. Re-applies
+        `_AGENCY_OWNER_PID_LABEL` via `--change` since export/import drops
+        all container labels/config. Re-baselines `self._squash_base_diff_ids`
+        on success so the next squash can use the faster diff-only path."""
         export_result = self._run(
             [self._runtime, "export", self._container_name()],
             check=True,
@@ -1700,11 +1501,6 @@ class _ContainerBackendBase(agsandbox_backend):
         try:
             self._squash_base_diff_ids = self._image_diff_ids(tag)
         except Exception as _e:
-            # Best-effort: the flatten itself already succeeded above --
-            # this only means the NEXT squash won't benefit from the fast
-            # path re-baseline (falls back to self._base_image instead,
-            # which will fail its prefix check again and fall back once
-            # more, exactly like before this re-baselining existed).
             # DATACOLLECTOR: append, agname=self._agname -- best-effort failure, low priority.
             print(
                 f"[agsandbox_backend] WARNING: could not record post-squash chain "
@@ -1891,9 +1687,7 @@ class _ContainerBackendBase(agsandbox_backend):
         #    each containing the full cumulative diff -- never a growing
         #    chain). That means the previous commit's image is never a
         #    parent of this one, so once the tag moves off it, it's
-        #    immediately, safely deletable -- unlike the old teardown-every-
-        #    cycle design, where a plain commit's result was always a child
-        #    of what it replaced and could never free it. Best-effort: a
+        #    immediately, safely deletable. Best-effort: a
         #    failure to even look this up just means one image doesn't get
         #    cleaned up this cycle, not that the commit itself is at risk.
         previous_image_id: str | None = None
@@ -2157,9 +1951,9 @@ class _ContainerBackendBase(agsandbox_backend):
 
         # rm_container() already retries and only releases the runtime
         # slot/GPU once actually confirmed gone (see its docstring) --
-        # destroy() no longer needs its own copy of that logic (a prior
-        # copy here silently drifted out of sync with a fix made to
-        # rm_container() itself, which is exactly the risk of keeping two).
+        # destroy() reuses that logic rather than keeping its own copy,
+        # since two copies of this logic risk drifting out of sync when
+        # only one gets a fix.
         # rm_exc is raised at the end, after the image/accumulator cleanup
         # below has still been attempted -- an unconfirmed removal must
         # reach the caller, but shouldn't cut short cleanup that doesn't

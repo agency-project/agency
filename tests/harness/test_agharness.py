@@ -6,8 +6,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from agency.harness import agharness
-from agency.agdata import agdata
-from agency.agskill import agskill
 
 
 def test_mcp_config_preserves_host_entry_and_adds_separate_sandbox_endpoint():
@@ -47,10 +45,3 @@ def test_materialize_config_home_creates_isolated_directory():
 def test_cleanup_config_home_is_idempotent(tmp_path):
     d = tmp_path / "nonexistent"
     agharness.cleanup_config_home(d)  # must not raise
-
-
-def test_build_user_turn_prompt_delegates_to_skill():
-    skill = agskill(name="s", prompt="do the thing")
-    content = agharness.build_user_turn_prompt(skill, agdata(task="go"))
-    assert "go" in content if isinstance(content, str) else True
-    assert content == skill._build_user_content(agdata(task="go"))

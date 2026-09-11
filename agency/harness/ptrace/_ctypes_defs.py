@@ -191,14 +191,9 @@ def get_eventmsg(pid: int) -> int:
 
 
 def read_bytes(pid: int, addr: int, length: int) -> bytes:
-    """Read *length* bytes from the tracee's memory at *addr*.
-
-    Tries process_vm_readv (one syscall, no ptrace-stop overhead) first;
-    falls back to word-at-a-time PTRACE_PEEKDATA if that fails (e.g. denied
-    by a stricter LSM configuration than /proc/sys/kernel/yama/ptrace_scope
-    alone would suggest). Both paths are exercised directly in
-    tests/harness/test_agproxy_ptrace.py.
-    """
+    """Read *length* bytes from the tracee's memory at *addr*. Tries
+    process_vm_readv first (no ptrace-stop overhead); falls back to
+    word-at-a-time PTRACE_PEEKDATA if a stricter LSM denies it."""
     try:
         return _read_bytes_vm_readv(pid, addr, length)
     except OSError:

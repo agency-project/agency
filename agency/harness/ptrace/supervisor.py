@@ -191,15 +191,10 @@ def _sensitive_environment_values(envp: "dict[str, str]") -> "frozenset[str]":
 
 
 def _resolve_program_name(pid: int, sensitive_values: "frozenset[str]") -> "str | None":
-    """Best-effort executable currently loaded in *pid*, for syscall
-    admission logging -- same kernel-confirmed source and redaction as
-    _executable_display_name() (a credential-bearing path is never echoed),
-    just read live via /proc instead of cached from a PTRACE_EVENT_EXEC
-    callback: a traced pid can exec multiple times over its life, and this
-    always reflects whichever image is loaded at the moment of the syscall.
-    None on any failure (process already exited, unreadable /proc, ...) --
-    this is purely observational and must never affect the syscall itself.
-    """
+    """Best-effort executable currently loaded in *pid* for syscall
+    admission logging -- same redaction as `_executable_display_name()`,
+    but read live via /proc since a traced pid can exec multiple times.
+    None on any failure; purely observational."""
     try:
         exe = os.readlink(f"/proc/{pid}/exe")
     except OSError:
@@ -372,13 +367,8 @@ class agProxyPtraceHandle:
 
     def wait(self, timeout: "float | None" = None) -> "tuple[str, str, int]":
         """Block until the root process exits (or *timeout* elapses).
-        Returns `(stdout, stderr, returncode)` -- deliberately the same
-        shape family as `agSandbox.exec()`'s `(str, int)`, with stderr
-        broken out separately since, unlike a shell wrapper script, there
-        is no single combined-stream convention to lean on here. Output is
-        continuously drained by dedicated reader threads for the lifetime
-        of the launch (see `TracerLoop._drain_pipe`), so this only needs to
-        join and read back whatever has accumulated."""
+        Returns `(stdout, stderr, returncode)`, mirroring `agSandbox.exec()`'s
+        shape with stderr broken out separately."""
         returncode = self._loop.join(timeout=timeout)
         stdout, stderr = self._loop.read_output()
         return stdout, stderr, (returncode if returncode is not None else -1)
@@ -422,12 +412,8 @@ class agProxyPtraceHandle:
         self._loop.on_spawn(callback)
 
     def on_exec(self, callback: "Callable[[int, str | None], None]") -> None:
-        """Register a replay-safe successful-exec callback.
-
-        The path is staged from the exec syscall's pathname and delivered only
-        after ``PTRACE_EVENT_EXEC`` confirms success; ``/proc/<pid>/exe`` is a
-        fallback when no pathname was trapped. It is never taken from argv[0].
-        """
+        """Register a replay-safe successful-exec callback, delivered
+        only after ``PTRACE_EVENT_EXEC`` confirms success."""
         self._loop.on_exec(callback)
 
     def on_exit(

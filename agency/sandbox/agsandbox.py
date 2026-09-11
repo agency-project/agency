@@ -247,10 +247,8 @@ class agSandbox:
 
     def change_config(self, agconfig: "agconfig_cls | None") -> None:
         """Replace this sandbox's agconfig with a clone of the given one.
-
-        Only affects fields read live going forward -- the backend's image
-        and mounts were resolved once at construction and are not
-        re-resolved here."""
+        Only affects fields read live going forward -- image/mounts were
+        resolved once at construction."""
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         self._backend.change_config(self.agconfig)
 
@@ -349,16 +347,12 @@ class agSandbox:
         self._backend.remove_files(paths)
 
     def __del__(self) -> None:
-        # Python silently discards any exception raised out of __del__
-        # anyway (printed as "Exception ignored in..." with no way for a
-        # caller to observe it, since nothing is running a call stack that
-        # could catch it) -- so this print is the only way this failure is
-        # ever surfaced at all.
+        # __del__'s exceptions are silently swallowed by Python, so this
+        # print is the only way a destroy() failure here ever surfaces.
         try:
             self.destroy()
         except Exception as _e:
-            # DATACOLLECTOR: append, agname=self._agname -- exceptional, and __del__'s only
-            # surfacing mechanism (Python otherwise swallows the exception silently).
+            # DATACOLLECTOR: append, agname=self._agname -- exceptional, low priority.
             print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
@@ -370,40 +364,24 @@ class agSandbox:
             self._backend.destroy()
 
     def fork(self, new_name: str, agconfig: "agconfig_cls | None" = None) -> "agSandbox":
-        """Return a new agSandbox for *new_name* starting from this sandbox's
-        current checkpoint image.  If no checkpoint exists the fork starts fresh.
-
-        *new_name* doesn't need to already be unique -- like every
-        agSandbox construction, it's automatically deduplicated (see
-        __init__'s docstring below).
-
-        When *agconfig* is not given, the fork inherits this sandbox's own
-        agconfig unchanged (rather than silently re-reading whatever
-        base_image happens to be at fork time).
-
-        The caller owns the returned sandbox and is responsible for calling
-        destroy() on it when done.
-        """
+        """Return a new agSandbox for *new_name* starting from this
+        sandbox's checkpoint image (fresh if none exists; *new_name*
+        auto-deduplicated). Without *agconfig*, inherits this sandbox's
+        own config unchanged. Caller must destroy() the result."""
         with agprof.span("sandbox:fork"):
             cfg = agconfig if agconfig is not None else self.agconfig
             fork_sb = agSandbox(new_name, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image
             if checkpoint_image:
-                # type(self._backend), not the docker-only agSandbox.tag_image
-                # static forwarder -- a chroot-backed sandbox's checkpoint is a
-                # snapshot directory, not a docker/podman image tag, so it must
-                # be retagged by the same backend class that created it.
+                # Backend's own class, not the docker-only forwarder: a chroot checkpoint isn't a docker/podman tag.
                 type(self._backend).tag_image(checkpoint_image, fork_sb._backend._lifecycle_tag())
             fork_sb._backend._checkpoint_image = fork_sb._backend._lifecycle_tag()
         return fork_sb
 
     @property
     def image_kind(self) -> str:
-        """Identifies the checkpoint format this sandbox's backend uses
-        ("container" or "chroot") -- see agsandbox_backend.backend_for_image_kind().
-        agent.py's save() records this alongside a checkpoint so load() knows
-        which backend's tag_image/export_image/import_image/delete_image can
-        make sense of it."""
+        """Checkpoint format this backend uses ("container" or "chroot");
+        agent.py's save()/load() use it to pick the matching backend."""
         return type(self._backend).IMAGE_KIND
 
     # ------------------------------------------------------------------

@@ -87,12 +87,9 @@ def _is_thread_group_leader(pid: int) -> bool:
 
 
 def _kernel_executable_path(pid: int) -> "str | None":
-    """Read the executable image the kernel installed for stopped *pid*.
-
-    This is called only at ``PTRACE_EVENT_EXEC``. Unlike ``argv[0]``, the
-    procfs link identifies the actual image and cannot be changed by
-    ``exec -a``.
-    """
+    """Read the executable image the kernel installed for stopped *pid*
+    (only valid at ``PTRACE_EVENT_EXEC``). Unlike ``argv[0]``, this cannot
+    be changed by ``exec -a``."""
     try:
         return os.readlink(f"/proc/{pid}/exe")
     except OSError:
@@ -601,24 +598,15 @@ class TracerLoop:
         if cwd:
             os.chdir(cwd)
         pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)
-        # Synchronize with the parent: it must call PTRACE_SETOPTIONS(...,
-        # PTRACE_O_TRACESECCOMP) before the filter below is installed and we
-        # exec, or the filtered syscall fails with ENOSYS instead of
-        # trapping (see _seccomp_filter.py's docstring).
+        # Sync with parent: it must set PTRACE_O_TRACESECCOMP before we
+        # install the filter and exec, or the syscall traps ENOSYS instead.
         os.kill(os.getpid(), signal.SIGSTOP)
         _seccomp_filter.install_trace_filter(self._syscalls)
         try:
             os.execve(argv[0], argv, dict(envp))
         except BaseException as exc:
-            # Anything that reaches here means the traced target never ran
-            # at all -- write the reason directly to raw fd 2 (NOT via
-            # sys.stderr / print(): a test runner like pytest that captures
-            # output monkeypatches sys.stderr to a Python-level buffer
-            # object *before* fork(), and the forked child inherits that
-            # same monkeypatched object -- writing through it never reaches
-            # the real fd 2 this process's stderr was dup2'd onto, so the
-            # message would silently vanish under pytest's capture instead
-            # of ending up in read_output() as intended).
+            # Raw fd 2, not sys.stderr: a forked child under pytest inherits
+            # a monkeypatched stderr that never reaches the real fd.
             os.write(2, f"agproxy_ptrace: execve({argv[0]!r}) failed: {exc!r}\n".encode())
             os._exit(126)
 

@@ -44,14 +44,9 @@ _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
 
 
 def _known_anthropic_context_window(model: str) -> "int | None":
-    """Look up a known context window for an Anthropic model ID (either a
-    plain api.anthropic.com ID or a Bedrock one).
-
-    Strips the optional region prefix (us./eu./apac./global.) and the
-    "anthropic." prefix (a no-op if neither is present), then matches the
-    remainder against known model names — exact match, or a prefix match to
-    tolerate dated snapshot suffixes (e.g. "claude-opus-4-5-20251101-v1:0").
-    """
+    """Look up a known context window for an Anthropic model ID (plain or
+    Bedrock). Strips region/"anthropic." prefixes, then matches by exact
+    or prefix (to tolerate dated snapshot suffixes)."""
     bare = _ANTHROPIC_BEDROCK_MODEL_RE.sub("", model or "")
     for known_id, window in _ANTHROPIC_CONTEXT_WINDOWS.items():
         if bare == known_id or bare.startswith(known_id + "-"):
@@ -266,9 +261,7 @@ class _AnthropicBackend(agllm):
         return None
 
     def known_context_limit(self, model: str) -> "int | None":
-        # Fallback only — list_models() usually finds the real max_input_tokens
-        # first; this covers new models this table hasn't been updated for yet
-        # falling through, and any transient failure of the live lookup.
+        # Fallback only: list_models() usually finds the real value first.
         return _known_anthropic_context_window(model)
 
     @staticmethod

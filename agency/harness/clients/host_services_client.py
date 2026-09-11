@@ -93,11 +93,7 @@ class HostServicesClient:
     def context_limit(self, token: str) -> "int | None":
         """This agent's model's context window, for a caller that runs its
         own ReAct loop and needs to know when to compact (native_harness's
-        `compaction.py`, mirroring the old `_native_in_container_
-        entrypoint.py`'s `_fetch_context_limit`). Returns None on any
-        failure -- compaction just never triggers in that case, the same
-        graceful-when-unknown behavior `native_harness/compaction.py`'s
-        `maybe_compact()` already has."""
+        `compaction.py`)."""
         try:
             resp = self.client.get("/llm/context_limit", headers=self._attempt_headers(token))
             if resp.status_code != 200:

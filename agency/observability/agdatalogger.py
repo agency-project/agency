@@ -57,13 +57,8 @@ class agDataLogger:
         return self.agconfig.data_logger.db_path
 
     def _next_id_locked(self) -> str:
-        """Caller must already hold self._lock. The zero-padded sequence
-        prefix keeps ids sortable in local insertion order -- rows that share
-        one `timestamp` (e.g. record_final_transcript's loop, which computes it once
-        for every payload) still resolve correctly by `id` -- while the
-        uuid4 suffix keeps every id globally unique across independently
-        constructed instances (one per agent, plus the shared global one),
-        for a later merge into one physical table."""
+        """Caller must hold self._lock. A zero-padded sequence prefix plus
+        a uuid4 suffix keeps ids sortable and globally unique."""
         self._sequence += 1
         return f"{self._sequence:020d}{uuid.uuid4().hex}"
 

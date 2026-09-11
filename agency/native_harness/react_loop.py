@@ -3,9 +3,8 @@
 Ties together everything else in this package: dispatch (`llm_client.py`),
 compaction (`compaction.py`), built-in tools (`tools.py`), MCP tools
 (`mcp_client.py`), and the optional agency bridge (`bridge_client.py`) for
-per-tool policy checks. Same shape as the old
-`_native_in_container_entrypoint.py`'s `_run_react_loop_inner`, adapted to
-this package's own dependencies instead of a UDS connection to
+per-tool policy checks. Talks to this package's own in-process
+dependencies directly, not over a UDS connection to
 `agllm_terminus`/`agmcp_server`/`agharness_messenger`.
 
 This loop carries no invocation-lifecycle state of its own: cancellation

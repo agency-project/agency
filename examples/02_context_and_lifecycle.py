@@ -84,7 +84,7 @@ def main() -> None:
     print(f"cancelled result: {cancelled.to_dict()}")
 
     copied: agcontext = learner.context.copy()
-    assert copied.get_resolved_transcript() == learner.ctx.get_resolved_transcript()
+    assert copied.get_resolved_transcript() == learner.context.get_resolved_transcript()
     print(f"context messages: {len(learner.history.messages)}")
     print(f"artifacts: {run_dir}")
 

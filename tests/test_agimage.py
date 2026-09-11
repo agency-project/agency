@@ -160,14 +160,14 @@ def test_prompt_agimage_no_sandbox_warning():
 
 
 # ---------------------------------------------------------------------------
-# agskill._build_user_content — plain vs multimodal
+# agskill.build_user_content — plain vs multimodal
 # ---------------------------------------------------------------------------
 
 
 def test_build_user_content_no_images_returns_plain_string():
     sk = agskill("t", "", input_schema=agdata(question=str))
     inp = agdata(question="hello")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert isinstance(content, str)
     assert "hello" in content
 
@@ -175,14 +175,14 @@ def test_build_user_content_no_images_returns_plain_string():
 def test_build_user_content_no_schema_returns_plain_string():
     sk = agskill("t", "")
     inp = agdata(question="hello")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert isinstance(content, str)
 
 
 def test_build_user_content_single_image_returns_array():
     sk = agskill("t", "", input_schema=agdata(question=str, photo=agimage))
     inp = agdata(question="what is this?", photo="https://example.com/img.jpg")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert isinstance(content, list)
     types = [part["type"] for part in content]
     assert "text" in types
@@ -192,7 +192,7 @@ def test_build_user_content_single_image_returns_array():
 def test_build_user_content_image_url_correct():
     sk = agskill("t", "", input_schema=agdata(photo=agimage))
     inp = agdata(photo="https://example.com/img.jpg")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     image_parts = [p for p in content if p["type"] == "image_url"]
     assert len(image_parts) == 1
     assert image_parts[0]["image_url"]["url"] == "https://example.com/img.jpg"
@@ -201,7 +201,7 @@ def test_build_user_content_image_url_correct():
 def test_build_user_content_image_field_replaced_with_placeholder():
     sk = agskill("t", "", input_schema=agdata(question=str, photo=agimage))
     inp = agdata(question="what?", photo="data:image/jpeg;base64,AAAA")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
     parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert parsed["photo"] == "[image attached]"
@@ -212,7 +212,7 @@ def test_build_user_content_list_images_all_injected():
     sk = agskill("t", "", input_schema=agdata(frames=list[agimage]))
     urls = ["https://example.com/a.jpg", "https://example.com/b.jpg"]
     inp = agdata(frames=urls)
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     image_parts = [p for p in content if p["type"] == "image_url"]
     assert len(image_parts) == 2
     assert image_parts[0]["image_url"]["url"] == urls[0]
@@ -222,7 +222,7 @@ def test_build_user_content_list_images_all_injected():
 def test_build_user_content_list_images_placeholder_shows_count():
     sk = agskill("t", "", input_schema=agdata(frames=list[agimage]))
     inp = agdata(frames=["https://a.com/1.jpg", "https://a.com/2.jpg"])
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
     parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert "2" in parsed["frames"]
@@ -231,7 +231,7 @@ def test_build_user_content_list_images_placeholder_shows_count():
 def test_build_user_content_mixed_fields_non_image_preserved():
     sk = agskill("t", "", input_schema=agdata(label=str, photo=agimage))
     inp = agdata(label="cat", photo="https://example.com/cat.jpg")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     text_part = next(p for p in content if p["type"] == "text")
     parsed = json.loads(text_part["text"].split("\n", 1)[1])
     assert parsed["label"] == "cat"

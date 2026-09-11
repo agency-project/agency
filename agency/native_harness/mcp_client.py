@@ -12,9 +12,8 @@ choose).
 Uses the real `mcp` client library, the same one every harness's own
 native MCP client speaks -- no hand-rolled JSON-RPC client, no risk of
 diverging from the actual protocol. `httpx2` (not `httpx`) is used for the
-transport here, matching the old `_native_in_container_entrypoint.py`'s
-own MCP client code -- kept for consistency with that proven-working
-pattern rather than switched to plain `httpx` without a reason to."""
+transport here, a proven-working pattern kept for consistency rather than
+switched to plain `httpx` without a reason to."""
 
 from __future__ import annotations
 
@@ -63,9 +62,8 @@ def _decode_tool_result(result) -> dict:
 def _mcp_server_configs(mcp_config: "dict | None") -> "list[tuple[str, str, dict]]":
     """`(server_name, url, headers)` for every `type: "http"` server in an
     already-parsed `--mcp-config` blob. Non-HTTP server types (a local
-    stdio command, say) aren't supported here -- same scope the old
-    entrypoint's own MCP client had (only ever spoke to agmcp_server's own
-    HTTP-transport server)."""
+    stdio command, say) aren't supported here -- this client only ever
+    speaks to agmcp_server's own HTTP-transport server."""
     if not mcp_config:
         return []
     servers = mcp_config.get("mcpServers") or {}
@@ -120,11 +118,7 @@ class McpToolset:
     def __init__(self, mcp_config: "dict | None") -> None:
         self._servers = _mcp_server_configs(mcp_config)
         # tool_name -> (url, headers), last server registered for a given
-        # name wins on collision -- same precedence built-ins/MCP/custom
-        # tools already use elsewhere in this codebase (first-registered
-        # wins there; here there's no built-in-vs-MCP collision to begin
-        # with, since tools.py's names are reserved and never repeated in
-        # an MCP server's own tool set by convention).
+        # name wins on collision.
         self._tool_owner: "dict[str, tuple[str, dict]]" = {}
 
     def discover(self) -> "list[dict]":

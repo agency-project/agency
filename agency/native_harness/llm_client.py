@@ -13,21 +13,18 @@ and "fully standalone" the same code path with zero special-casing:
   provider directly.
 
 **Always dispatches with `stream=True` and reassembles client-side, never
-`stream=False`** -- ported from the old `_native_in_container_entrypoint.py`'s
-`_dispatch_via_terminus`, which discovered a real, confirmed gap: some
-backends' non-streaming code path (Anthropic/Bedrock's compatibility shim,
-reached when this loop is bridged through agency to one of those backends)
-doesn't reliably support tool calls at all. Streaming is the path every
-backend actually supports fully, so this loop takes it unconditionally
-rather than needing two code paths.
+`stream=False`**: some backends' non-streaming code path (Anthropic/
+Bedrock's compatibility shim, reached when this loop is bridged through
+agency to one of those backends) doesn't reliably support tool calls at
+all. Streaming is the path every backend actually supports fully, so this
+loop takes it unconditionally rather than needing two code paths.
 
 Retry policy: this loop owns its own bounded retry (503 / connection
 failure only, never after a chunk has already been reassembled -- retrying
-past that point would silently corrupt the conversation) -- same reasoning
-as the old entrypoint's identical retry, needed because there is no
-harness CLI underneath THIS loop the way there is for Claude Code/Codex
-(who have their own resilience); when bridged, `agmanager_host`'s own
-dispatch route deliberately makes exactly one attempt and classifies
+past that point would silently corrupt the conversation), needed because
+there is no harness CLI underneath THIS loop the way there is for Claude
+Code/Codex (who have their own resilience); when bridged, `agmanager_host`'s
+own dispatch route deliberately makes exactly one attempt and classifies
 failures for exactly this reason (see that module's docstring)."""
 
 from __future__ import annotations

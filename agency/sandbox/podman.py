@@ -40,12 +40,9 @@ from .container import _ContainerBackendBase
 
 
 def _translate_id(host_id: int, id_map: "list[tuple[int, int, int]]") -> int:
-    """Reverse-lookup a host-side uid/gid through a parsed id-mapping:
-    each entry is `(namespace_start, host_start, length)` -- the same
-    shape `/proc/<pid>/uid_map` uses and the shape Podman's
-    `host.idMappings` entries convert to. Returns the id unchanged if
-    it doesn't fall in any mapped range -- an id we don't understand is
-    safer left alone than guessed at."""
+    """Reverse-lookup a host-side uid/gid through a parsed id-mapping
+    (`(namespace_start, host_start, length)` entries, as in
+    `/proc/<pid>/uid_map`). Returns the id unchanged if unmapped."""
     for ns_start, host_start, length in id_map:
         if host_start <= host_id < host_start + length:
             return ns_start + (host_id - host_start)
@@ -58,12 +55,9 @@ class _PodmanBackend(_ContainerBackendBase):
     _runtime = "podman"
 
     def _resolve_image(self, name: str) -> str:
-        """Prefix bare image names with ``localhost/``.
-
-        Podman requires fully-qualified names when no unqualified-search
-        registries are configured in /etc/containers/registries.conf.
-        Docker accepts bare names fine, so this override is Podman-only.
-        """
+        """Prefix bare image names with ``localhost/``: Podman requires
+        fully-qualified names when no unqualified-search registries are
+        configured; Docker accepts bare names fine."""
         if "/" not in name:
             return f"localhost/{name}"
         return name

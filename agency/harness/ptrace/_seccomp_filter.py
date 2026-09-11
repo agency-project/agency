@@ -17,12 +17,10 @@ import pyseccomp as seccomp
 
 
 def install_trace_filter(syscalls: "list[str] | tuple[str, ...]") -> None:
-    """Install a seccomp filter in the CALLING process (must be the traced
-    child, after PTRACE_TRACEME and before execve -- see agProxyPtrace.launch()
-    for the exact ordering and why it matters: the tracer must already have
-    PTRACE_O_TRACESECCOMP set on this tracee by the time any filtered syscall
-    fires, or the kernel fails it with ENOSYS instead of generating a trace
-    stop. That's why launch() synchronizes via SIGSTOP before calling this."""
+    """Install a seccomp filter in the CALLING (traced) child, after
+    PTRACE_TRACEME and before execve. The tracer must already have
+    PTRACE_O_TRACESECCOMP set by then, or a filtered syscall fails with
+    ENOSYS instead of trapping -- see agProxyPtrace.launch()'s SIGSTOP sync."""
     filt = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     for name in syscalls:
         filt.add_rule(seccomp.TRACE(0), name)

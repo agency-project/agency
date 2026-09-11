@@ -2,11 +2,9 @@
 
 Split by concrete backend: `.base` (the abstract base class + config +
 selection logic), `.container` (shared docker/podman plumbing), `.docker`,
-`.podman`, `.chroot`. This package's own namespace re-exports the same public
-surface the single-file `agsandbox_backend.py` module used to, so
-`from agency.sandbox import X` (or `from agency import
-sandbox as m; m.X`) works exactly like the old
-`from agency.agsandbox_backend import X` did.
+`.podman`, `.chroot`. This package's own namespace re-exports its full
+public surface, so `from agency.sandbox import X` (or `from agency import
+sandbox as m; m.X`) both work.
 """
 
 from .base import (

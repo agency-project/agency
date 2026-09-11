@@ -167,9 +167,8 @@ class agsandbox_backend(AgSandboxBackendFields):
             )
 
     def _own_host_pids(self) -> "set[int]":
-        """Return the host PIDs of every process this sandbox currently has
-        running. Overridden per-backend; default is empty (no sandbox
-        process context)."""
+        """Host PIDs of every process this sandbox currently has running.
+        Overridden per-backend; default is empty."""
         return set()
 
     @staticmethod
@@ -281,16 +280,8 @@ class agsandbox_backend(AgSandboxBackendFields):
     # ------------------------------------------------------------------
 
     def _read_proc_table(self, script: str, timeout: int) -> "tuple[str, int]":
-        """Run a pure /proc-reading *script* (no filesystem access, no user
-        command involved) and return its ``(output, rc)``.
-
-        Default: delegate to ``_container_exec()`` -- a container's own exec
-        session runs inside its own procfs view, which IS the right process
-        table for `get_live_pids()` to read for docker and podman. Overridden
-        by `_ChrootBackend`, which has no isolated procfs
-        of its own to exec into (see its module docstring) and must instead
-        read the real host `/proc` directly, unchrooted.
-        """
+        """Run a pure /proc-reading script and return (output, rc);
+        overridden by `_ChrootBackend` for the host /proc."""
         return self._container_exec(script, timeout=timeout, shell="sh")
 
     def _exec_with_pid_tracking(
@@ -413,17 +404,8 @@ class agsandbox_backend(AgSandboxBackendFields):
         return clean_output, rc
 
     def exec_detached(self, cmd: str, workdir: str = "/workspace") -> None:
-        """Launch a long-lived process inside the container and return as
-        soon as it's registered, without waiting for it to finish or
-        tracking its output/exit code -- for a persistent in-container
-        process the caller will reach afterward over its own bridge (e.g.
-        agharness_backends/native.py's react-loop entrypoint, or a
-        container-relocated agproxy_llm), not via this call's return value.
-        No GPU/PID-tracking wiring here, unlike `exec()` -- a persistent
-        process manages its own environment for the lifetime of the
-        container, it isn't a single bounded command. Only implemented by
-        container-backed backends (docker/podman) so far -- see
-        `_container_exec_detached` in sandbox/container.py."""
+        """Launch a long-lived process, returning immediately without
+        tracking output/exit code (container-backed backends only)."""
         self._container_exec_detached(cmd, workdir=workdir)
 
     def read_file(self, path: str) -> str:
@@ -523,11 +505,9 @@ class agsandbox_backend(AgSandboxBackendFields):
             raise OSError(f"Failed to write {path} in container")
 
     def release_daemon(self, pid: int) -> None:
-        """Move *pid* out of the monitored set into the daemon set.
-
-        The process and all its future descendants will continue running in the
-        container but will never block the outer monitoring loop.
-        """
+        """Move *pid* out of the monitored set into the daemon set; it and
+        its descendants keep running but never block the outer monitoring
+        loop."""
         self._daemon_pids.add(pid)
         self._watched_pids.pop(pid, None)
 
@@ -542,29 +522,11 @@ class agsandbox_backend(AgSandboxBackendFields):
     def ingest_ptrace_pids(
         self, spawned: "set[int] | None" = None, exited: "set[int] | None" = None
     ) -> None:
-        """Alternate population path for `_watched_pids`, fed by
-        `agproxy_ptrace`'s fork/exit event stream (see
-        `agProxyPtraceHandle.on_spawn`/`.on_exit` in agproxy_ptrace.py) instead
-        of `exec()`'s `/proc`-diff + `__BGPIDS__` marker. `get_live_pids()`/
-        `pid_status_summary()`/`wait_for_processes()`/`release_daemon()`'s
-        external contracts are unchanged -- only the internal population
-        mechanism differs for harness-driven agents versus native ones.
-
-        Pids passed here are tracked in `_ptrace_managed_pids` in addition to
-        `_watched_pids`, so `get_live_pids()` trusts *this* method's `exited`
-        calls as the sole liveness signal for them rather than pruning them
-        the moment its own `/proc` scan doesn't happen to show them --
-        ptrace's fork/exit events are exact regardless of whether the traced
-        pids are visible in whatever PID namespace `_container_exec()`
-        queries, which they are NOT in general (a docker/podman container has
-        its own separate PID namespace from a ptrace supervisor forked on the
-        host; only a supervisor that itself runs inside the container's
-        namespace, e.g. via `docker exec`, or the chroot backend, which
-        shares the host namespace, would see them there too). Bridging that
-        gap for the docker/podman backends -- running the supervisor inside
-        the container plus an IPC channel back to the caller's `agpolicy` --
-        is an open item.
-        """
+        """Alternate population path for `_watched_pids`, fed by ptrace's
+        fork/exit stream instead of exec()'s /proc-diff. Also tracked in
+        `_ptrace_managed_pids`, so get_live_pids() trusts these `exited`
+        calls directly rather than a /proc scan that generally can't see
+        into a container's separate PID namespace."""
         now = time.monotonic()
         baseline_pids = self._baseline_pids or ()
         for pid in spawned or ():
@@ -585,12 +547,8 @@ class agsandbox_backend(AgSandboxBackendFields):
     _adopt_unwatched_live_pids: bool = True
 
     def _has_pending_background_work(self) -> bool:
-        """Refresh tracked work before deciding whether hibernation is safe.
-
-        CPU-only execs can retain exited runtime helpers in the watched set.
-        Use the existing liveness/descendant rules rather than treating a stale
-        dictionary entry as work. Chroot retains its own PGID-based override.
-        """
+        """Whether hibernation is safe, refreshed via the existing
+        liveness/descendant rules rather than stale state."""
         return bool(self.get_live_pids()) if self._watched_pids else False
 
     def get_live_pids(self) -> set[int]:
@@ -805,18 +763,10 @@ def _auto_detect_runtime() -> str:
 
 def backend_for_image_kind(kind: str) -> type:
     """Return the backend class whose tag_image/export_image/import_image/
-    delete_image understand a checkpoint of the given IMAGE_KIND.
-
-    Used by agent.py's load() to route a saved checkpoint's image bytes to
-    the same kind of backend that produced them in save() -- a chroot
-    snapshot directory and a docker/podman image tag are different formats
-    entirely, so this can't be assumed to always be the container backend.
-    Docker and podman checkpoints are both IMAGE_KIND="container" (tag_image/
-    export_image/import_image/delete_image are identical either way, both
-    just auto-detecting the live runtime via get_container_runtime()), so
-    both route to the same shared _ContainerBackendBase rather than needing
-    to know which of the two originally produced the checkpoint.
-    """
+    delete_image understand a checkpoint of the given IMAGE_KIND -- used
+    by agent.py's load() to route to the same kind of backend that
+    produced it in save(). Docker and podman checkpoints share
+    IMAGE_KIND="container" and both route to `_ContainerBackendBase`."""
     if kind == "container":
         from .container import _ContainerBackendBase
 

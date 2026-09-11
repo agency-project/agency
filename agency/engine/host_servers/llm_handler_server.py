@@ -46,18 +46,11 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
 
 
 def _payload_hash(payload: dict) -> str:
-    """Content identity for one {role, **block} transcript payload.
-
-    A tool_use/tool_result block is immutable once emitted -- its id/
-    tool_call_id never changes -- but the exact same call gets
-    re-serialized in a different (reduced) shape the moment it's replayed
-    back into a later request through a harness's own wire protocol (e.g.
-    native_harness's OpenAI-chatcompletions tool_calls array only carries
-    id/name/arguments, dropping fields the original backend-native block
-    carried like text/signature/data/citations/ts_start/ts_end, and often
-    renumbering `index`). Hashing the whole payload would treat that
-    reduced replay as new content and double-log every tool call/result,
-    so key on the block's own stable identity instead when it has one."""
+    """Content identity for one {role, **block} transcript payload. Keys on
+    the block's own stable id/tool_call_id when present, since the same
+    call gets re-serialized in a reduced shape when replayed back through
+    a harness's wire protocol -- hashing the whole payload would treat
+    that reduced replay as new content and double-log it."""
     role = payload.get("role")
     block_type = payload.get("type")
     if block_type == "tool_use" and payload.get("id"):
@@ -206,13 +199,9 @@ class _StreamHandle:
             self.cancel_and_join()
 
     def cancel(self) -> None:
-        # Wake either side of the bounded queue. A disconnected consumer may
-        # leave the producer waiting for capacity; a pre-first-item disconnect
-        # may leave the consumer waiting for data.
+        # Wakes both sides of the bounded queue; this lock is the
+        # linearization point after which no later item/field is admitted.
         with self._queue_condition:
-            # Publish and cancellation use this lock as their linearization
-            # point: once cancellation wins, no later item or transcript field
-            # can be admitted.
             self._cancel_event.set()
             self._queue_condition.notify_all()
         self._close_stream()

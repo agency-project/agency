@@ -195,28 +195,9 @@ class agResourcePool:
             self._gpu_cond.notify_all()
 
     def release_gpus(self, sandbox, gpu_ids: "list[int]") -> None:
-        """Release *gpu_ids* (held by *sandbox*) back to the pool, clearing
-        *sandbox*'s own `_gpu_ids`.
-
-        No separate "is this actually idle yet" wait: callers (backend
-        `stop()`/`destroy()`) already run their own teardown -- kill
-        watched processes, then remove the container / rmtree the chroot
-        jail -- synchronously, BEFORE calling this. That ordering is
-        already the confirmation that the sandbox has exited; a poll here
-        would just be re-checking, via the exact same tracked state the
-        teardown already acted on, something the sequencing already
-        guarantees.
-
-        Explicitly guards against a gpu_id not being one of this pool's
-        GPUs, and against double-releasing a gpu_id already in
-        `_free_gpus` -- neither is caught for free by a plain set. The
-        second check matters even though a set can't hold two copies of
-        the same id: without it, a double-release (or releasing a gpu_id
-        another sandbox still legitimately holds) would silently mark an
-        in-use GPU as free, letting two sandboxes acquire the same physical
-        GPU at once -- the actual hazard, not just a cosmetic duplicate
-        entry.
-        """
+        """Release *gpu_ids* (held by *sandbox*) back to the pool. No "is
+        it idle yet" wait: callers already tear down synchronously first.
+        Guards against an unknown gpu_id and a double-release."""
         if not gpu_ids:
             return
         with self._gpu_cond:

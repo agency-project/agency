@@ -25,11 +25,8 @@ _current_data_logger = threading.local()
 
 
 def bind_data_logger_for_current_thread(data_logger: "agDataLogger") -> None:
-    """Route this thread's `mcp.server.*` logging to *data_logger* instead of
-    the terminal. `HostServerManager` runs one agent's whole MCP server --
-    uvicorn, its asyncio loop, and every request the loop handles -- in one
-    dedicated thread, so a thread-local is enough to attribute log records
-    to the right agent without the mcp library knowing about agDataLogger."""
+    """Route this thread's `mcp.server.*` logging to *data_logger* -- one
+    dedicated thread per agent's MCP server makes a thread-local sufficient."""
     _current_data_logger.data_logger = data_logger
 
 

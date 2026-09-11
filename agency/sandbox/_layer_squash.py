@@ -1,13 +1,13 @@
 """Diff-only layer squashing: merge a run of Docker/OCI image layer diffs
 into a single layer, without touching whatever sits below them.
 
-`_ContainerBackendBase._squash_commit()` (container.py) used to flatten a
-checkpoint's ENTIRE filesystem via `docker export`/`docker import` -- fast to
-implement, but its cost is proportional to the whole merged filesystem
+Flattening a checkpoint's ENTIRE filesystem via `docker export`/`docker
+import` (`_ContainerBackendBase._squash_commit()` in container.py) is fast
+to implement, but its cost is proportional to the whole merged filesystem
 (base image + every accumulated diff), not just the diff. For a large base
-image (the real `agency-sandbox:latest` is ~24GB), that made every squash
+image (the real `agency-sandbox:latest` is ~24GB), that makes every squash
 take tens of seconds regardless of how small the actual workspace change
-was, confirmed live: forcing a squash at every skill exit pushed two
+is, confirmed live: forcing a squash at every skill exit pushed two
 concurrent agents' teardown past a 120s test timeout.
 
 This module operates one level lower, at the OCI layer-tar level instead of
@@ -323,35 +323,10 @@ def build_save_archive(
     tag: str,
 ) -> None:
     """Construct a `docker save`/`load`-compatible archive referencing the
-    base image's own layers BY DIGEST ONLY -- their real blob content is
-    deliberately never read or included. Both `docker load` and
-    `podman load` resolve those digests from their own local store
-    (confirmed empirically, including against a real ~24GB, 80-layer
-    base image: archive-build and load both completed in well under a
-    second, with zero bytes of base-layer content touched). This is what
-    makes squashing cheap regardless of base image size -- earlier
-    revisions of this function copied the base blobs' bytes into the
-    archive, which defeated the entire point.
-
-    Podman (unlike Docker) still requires every `manifest.json` Layers
-    path to exist as a member of the archive even when it will resolve
-    the content locally -- missing members fail with "Some layer
-    tarfiles are missing in the tarball". So each unique base-layer
-    digest gets a zero-byte placeholder blob written under
-    `blobs/sha256/<hex>` (empty, never the real layer bytes). Docker
-    tolerates the same placeholders. Duplicate digests (common for
-    empty image layers) share one placeholder member.
-
-    *base_layer_digests* are `sha256:<hex>`-prefixed strings (e.g. from
-    `docker inspect --format='{{json .RootFS.Layers}}'`), most-base-first,
-    matching the target image's OWN layer order exactly -- NOT file paths.
-
-    *tag* is qualified with an explicit `:latest` if it carries no tag
-    component of its own -- unlike `docker tag`/`docker commit`, `docker
-    load` does not default a bare repository name to `:latest`; it
-    rejects `manifest.json` RepoTags entries without one ("invalid tag"),
-    confirmed empirically during development.
-    """
+    base image's layers BY DIGEST ONLY, never reading their real blob
+    content -- both runtimes resolve digests from their local store,
+    which is what makes squashing cheap regardless of base image size.
+    Podman also requires a zero-byte placeholder per unique base-layer digest."""
     if ":" not in tag.rsplit("/", 1)[-1]:
         tag = f"{tag}:latest"
     base_blob_names = [f"blobs/sha256/{d.split(':', 1)[1]}" for d in base_layer_digests]
@@ -367,8 +342,6 @@ def build_save_archive(
     with tarfile.open(output_path, "w") as out:
         _add_bytes(out, "manifest.json", manifest_bytes)
         _add_bytes(out, f"blobs/sha256/{config_digest}", config_bytes)
-        # Zero-byte placeholders so Podman load accepts the archive; real
-        # base-layer content is never read -- see docstring.
         for blob_name in dict.fromkeys(base_blob_names):
             _add_bytes(out, blob_name, b"")
         _add_file(out, f"blobs/sha256/{merged_blob_digest}", merged_blob_path)

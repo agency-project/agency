@@ -1,13 +1,11 @@
 """On-disk session continuity for the standalone native harness.
 
-Native's old design never needed this: it was a long-lived process agency
-itself kept alive and RPC'd into, so the agent's `context.recent_transcript`
-(agency's own in-memory continuation, held on the host) was the only
-continuity that existed. A one-shot CLI in the Claude-Code mold has no such in-memory
-carry-over between invocations -- each `native_harness -p "..."` call is a
-fresh process -- so continuity has to live on disk instead, the same way
-Claude Code's own `--resume <session_id>` works against its own JSONL
-transcript file (see `claude_code.py`'s module docstring for that design).
+A one-shot CLI in the Claude-Code mold has no in-memory carry-over between
+invocations -- each `native_harness -p "..."` call is a fresh process, not
+a long-lived one agency stays connected to -- so continuity has to live on
+disk instead, the same way Claude Code's own `--resume <session_id>` works
+against its own JSONL transcript file (see `claude_code.py`'s module
+docstring for that design).
 
 Deliberately a single JSON snapshot, overwritten on save, not an
 append-only JSONL log the way Claude Code's real transcript is -- simpler,

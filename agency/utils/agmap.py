@@ -62,28 +62,9 @@ class agtask(agdata):
 
 def _spawn(fn: "Callable[[object], object]", arg: object, index: int = 0) -> agtask:
     """Run ``fn(arg)`` on a traced daemon thread; return a pending agtask
-    immediately.
-
-    The thread comes from ``agprof.spawn_traced()`` rather than a bare
-    ``threading.Thread`` so each task is a *child* of whatever ran the map,
-    which is the truthful parentage: the map call is what caused it. A bare
-    thread starts with empty ``contextvars``, which would make every mapped
-    task a disconnected trace root — and silently, since a disconnected root
-    is a valid trace, not an error. This is the highest-fan-out spawn site in
-    the framework (one thread per mapped item, deliberately unbounded), so it
-    is also where flat parentage would cost the most.
-
-    ``agmap:{fn}[{index}]`` is deliberately a *task* label, not a
-    ``run{N}:`` one: run-shaped labels are what ``run_metrics`` counts, and a
-    mapped function is not an agent run. Laying these spans out as flat lanes
-    in a timeline view stays a rendering concern (a synthetic ``tid`` per
-    span), never a parentage one, so ``thread_name()`` here is naming only.
-
-    Tasks of an ``is_asynchronous=True`` map may outlive the span that
-    enclosed the ``agmap()`` call. That is legal — ``parent_span_id`` is a
-    stored field, so the trace stays correct — and ``agsync`` is the natural
-    join point.
-    """
+    immediately. Uses ``agprof.spawn_traced()`` (not a bare Thread) so
+    each task is a true trace child of the map call. Labeled as a task
+    span, not a ``run{N}:`` one, since a mapped function isn't an agent run."""
     future: "Future[agdata]" = Future()
     label = f"agmap:{getattr(fn, '__name__', type(fn).__name__)}[{index}]"
 
@@ -100,9 +81,7 @@ def _spawn(fn: "Callable[[object], object]", arg: object, index: int = 0) -> agt
                 outcome="failure" if error else "success",
                 error_type="agmap_task_error" if error else None,
             )
-        # Resolved only after the span above fully exits (and is persisted),
-        # so a caller unblocked by this future can never race agprof.stop()
-        # into reading the profile store before this task's span lands in it.
+        # Resolved after the span exits, so callers can't race agprof.stop().
         future.set_result(result)
 
     agprof.spawn_traced(_run).start()

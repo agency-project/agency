@@ -68,28 +68,28 @@ def test_prompt_keeps_input_json_for_normal_input():
 
 
 # ---------------------------------------------------------------------------
-# _build_user_content — raw passthrough for agrawstring input
+# build_user_content — raw passthrough for agrawstring input
 # ---------------------------------------------------------------------------
 
 
 def test_build_user_content_raw_input_returns_plain_string():
     sk = agskill("t", "", input_schema=agdata(prompt=agrawstring))
     inp = agdata(prompt="Tell me a story about a robot.")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert content == "Tell me a story about a robot."
 
 
 def test_build_user_content_raw_input_no_json_wrapping():
     sk = agskill("t", "", input_schema=agdata(prompt=agrawstring))
     inp = agdata(prompt="Hello!")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert not content.startswith("{")
 
 
 def test_build_user_content_normal_input_still_json():
     sk = agskill("t", "", input_schema=agdata(text=str))
     inp = agdata(text="hello")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert isinstance(content, str)
     parsed = json.loads(content.split("\n", 1)[1])
     assert parsed["text"] == "hello"

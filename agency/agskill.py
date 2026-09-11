@@ -235,7 +235,10 @@ _DEFAULT_HOST_MCP_TOOLS: "list[agtool]" = [
 
 
 class agskill:
-    """A named skill with its own system prompt and a self-contained ReAct loop. # [REFACTOR] Not anymore...
+    """A named skill: Input prompt with an input/output schema contract,
+    executed by whichever harness (the native ReAct loop, or an external
+    CLI harness such as Claude Code/Codex) the owning agent is configured
+    with.
 
     input_schema / output_schema are agdata objects whose keys define required
     fields and whose values are Python types (``str``, ``int``, ``float``,
@@ -256,7 +259,7 @@ class agskill:
         add_sandbox_mcp_tools: "list[agtool] | None" = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
-        max_output_schema_retries: int = 10,  # [REFACTOR] Why here?
+        max_output_schema_retries: int = 10,
         policy: "agpolicy | None" = None,
     ):
         self.name = name
@@ -272,23 +275,23 @@ class agskill:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, extra: str | None = None) -> str:
-        parts = [self.prompt]  # [REFACTOR] Maybe rename into skill_prompt?
+    def _build_prompt(self) -> str:
+        parts = [self.prompt]
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
         # lines describing how the LLM should handle that field (e.g. file paths,
         # binary encoding).  Collect these for both input and output schemas.
         extra_lines: list[str] = []
         for key, hint in self.input_schema._data.items() if self.input_schema else []:
-            cls = agtype.from_hint(hint)  # [REFACTOR] We need better variable names here.
-            if cls is not None:
-                line = cls.extra_input_prompt(key)
+            schema_type = agtype.from_hint(hint)
+            if schema_type is not None:
+                line = schema_type.extra_input_prompt(key)
                 if line:
                     extra_lines.append(line)
         for key, hint in self.output_schema._data.items() if self.output_schema else []:
-            cls = agtype.from_hint(hint)  # [REFACTOR] Better names needed.
-            if cls is not None:
-                line = cls.extra_output_prompt(key, self.name)
+            schema_type = agtype.from_hint(hint)
+            if schema_type is not None:
+                line = schema_type.extra_output_prompt(key, self.name)
                 if line:
                     extra_lines.append(line)
 
@@ -299,16 +302,10 @@ class agskill:
                 "be automatically deleted after this task ends:\n" + "\n".join(extra_lines)
             )
 
-        # Caller-supplied extra prompt (e.g. compaction summary injection). # [REFACTOR] Check which method uses extras
-        if extra:
-            parts.append(extra)
-
         # Describe the input shape so the LLM knows what JSON keys to expect.
         # Skipped for agrawstring inputs (the value arrives as plain text, not JSON).
         if self.input_schema is not None and self.input_schema.raw_key() is None:
-            parts.append(
-                f"\nInput JSON format:\n{self.input_schema.to_json()}"
-            )  # [REFACTOR] Do we have to explain the input format?
+            parts.append(f"\nInput JSON format:\n{self.input_schema.to_json()}")
 
         if self.output_schema is not None:
             if self.output_schema.raw_key() is not None:
@@ -322,7 +319,7 @@ class agskill:
                 field_lines = "\n".join(
                     f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
-                parts.append(  # [REFACTOR] Better prompting
+                parts.append(
                     "\nTo return your results, you must call the Agency MCP server's "
                     "submit_output tool once for each required output field. Pass the field "
                     "name in `field` and its final value in `value`. Do not answer with the "
@@ -336,9 +333,7 @@ class agskill:
                 )
         return "\n".join(parts)
 
-    def _build_user_content(
-        self, skill_input: agdata
-    ) -> "str | list":  # [REFACTOR] Are we only providing the per-turn inputs here?
+    def build_user_content(self, skill_input: agdata) -> "str | list":
         """Build the content value for the user message.
 
         Returns a plain string for simple inputs, or a multimodal content array
@@ -353,29 +348,31 @@ class agskill:
 
         schema = self.input_schema
         text_data = dict(skill_input._data)
-        extra_blocks: list[dict] = []  # [REFACTOR] Better names - Why "extra"?
+        multimodal_blocks: list[dict] = []
 
         # Ask each agtype field for its contribution to the user message.
         # Fields with no agtype (e.g. plain str, int) are left as-is.
         if schema is not None:
             for key, hint in schema._data.items():
-                cls = agtype.from_hint(hint)
-                if cls is None:
+                schema_type = agtype.from_hint(hint)
+                if schema_type is None:
                     continue
-                placeholder, blocks = cls.build_content_prompt(key, skill_input._data.get(key))
+                placeholder, blocks = schema_type.build_content_prompt(
+                    key, skill_input._data.get(key)
+                )
                 if placeholder is not None:
                     text_data[key] = placeholder
-                extra_blocks.extend(blocks)
+                multimodal_blocks.extend(blocks)
 
-        # No extra blocks — return a plain JSON string (fast path). # [REFACTOR] what is skill input and what is extra_blocks - Maybe because of offloading? If so, need better names
-        if not extra_blocks:
+        # No multimodal blocks — return a plain JSON string (fast path).
+        if not multimodal_blocks:
             return f"[HARNESS SYSTEM] New Skill Input:\n{skill_input.to_json()}"
 
-        # Extra blocks present — build a multimodal content array: text first,
-        # then the type-contributed blocks in schema field order.
+        # Multimodal blocks present — build a multimodal content array: text
+        # first, then the type-contributed blocks in schema field order.
         text = json.dumps(text_data)
         content: list = [{"type": "text", "text": f"New Skill Input:\n{text}"}]
-        content.extend(extra_blocks)
+        content.extend(multimodal_blocks)
         return content
 
     # ------------------------------------------------------------------

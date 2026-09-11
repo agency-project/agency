@@ -62,7 +62,7 @@ class agtype:
         field_name.  Return an empty string to add nothing.  Default: ``""``.
 
     build_content_prompt(key, value) -> tuple[str | None, list[dict]]
-        Called by _build_user_content to let the type contribute to the user
+        Called by build_user_content to let the type contribute to the user
         message content array.  Returns (placeholder, content_blocks).
         placeholder: if not None, replaces the field value in the JSON text
         portion so the LLM doesn't see the raw value (e.g. a base64 blob).
@@ -137,13 +137,7 @@ class agtype:
     @classmethod
     def validate_input_value(cls, value: object) -> "str | None":
         """Validate a raw input value before the skill runs (called from
-        agschema.check()/check_field()).
-
-        Returns an error string, or None if valid. Default: every agtype's
-        generic wire representation is a plain string. Override in
-        subclasses that need a stricter contract (e.g. agpath requires the
-        string to actually look like a path).
-        """
+        agschema.check()/check_field())."""
         return None if isinstance(value, str) else f"must be a string, got {type(value).__name__}"
 
     @staticmethod

@@ -66,18 +66,8 @@ class agdata:
         return f is not None and not f.done()
 
     def wait(self, timeout: "float | None" = None) -> "agdata":
-        """Block until this agdata is resolved and return self.
-
-        Use as a barrier on a single result::
-
-            result = team.run()
-            # ... do other work ...
-            result.wait()   # block here until the team finishes
-            print(result.report_path)   # guaranteed resolved
-
-        *timeout*, if given, raises ``concurrent.futures.TimeoutError`` rather
-        than blocking forever.
-        """
+        """Block until this agdata is resolved and return self. *timeout*,
+        if given, raises ``TimeoutError`` rather than blocking forever."""
         if timeout is not None:
             f = object.__getattribute__(self, "_future")
             if f is not None:
@@ -177,10 +167,8 @@ class agdata:
 
     @classmethod
     def from_json(cls, s: str) -> "agdata":
-        """Parse a JSON object into an agdata, tolerating camelCase keys --
-        some LLMs emit tool-call arguments in camelCase even when a tool's
-        schema declares snake_case parameter names. Normalizes only
-        top-level keys; nested dict/list values are left untouched."""
+        """Parse a JSON object into an agdata, tolerating camelCase keys
+        (some LLMs emit tool-call args in camelCase)."""
         return cls(**{_camel_to_snake(k): v for k, v in json.loads(s).items()})
 
     # ------------------------------------------------------------------

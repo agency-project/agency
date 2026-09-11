@@ -776,13 +776,9 @@ def enabled() -> bool:
 
 
 def span(name: str, *, parent_context=None):
-    """A timed, named interval in the current execution context.
-
-    No-op (a shared ``nullcontext``) unless a session is active. Nesting in the
-    same synchronous or async context produces parent/child spans in the trace.
-    While active, each span also records its thread's CPU and run-queue time
-    (see module doc).
-    """
+    """A timed, named interval in the current execution context. No-op
+    unless a session is active; nesting produces parent/child spans, and
+    each active span also records its thread's CPU/run-queue time."""
     s = _session
     if s is None:
         return _NULL
@@ -852,13 +848,10 @@ def ingest_auto_samples(
 
 
 def current_span_context():
-    """Return a durable OTel context containing the active profiler span.
-
-    The returned context can be stored by a host-side correlation registry
-    and later supplied to :func:`span` from an unrelated request thread.  It
-    is ``None`` when profiling is off or the current execution context has no
-    active profiler span.
-    """
+    """Return a durable OTel context containing the active profiler span,
+    for a host-side correlation registry to store and later supply to
+    :func:`span` from an unrelated thread. None if profiling is off or
+    there's no active span."""
     if _session is None or not _span_stack.get():
         return None
     from opentelemetry import trace
@@ -901,14 +894,10 @@ def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
 
 
 def annotate(**metadata) -> None:
-    """Attach fields to the innermost active span in this execution context.
-
-    This is a no-op when profiling is disabled or the current context has no
-    open span. Context-local ownership prevents concurrent asyncio tasks on one
-    thread from cross-annotating. Framework call sites use it for outcomes,
-    token counts, TTFT, and other per-invocation metrics without adding work to
-    the off path.
-    """
+    """Attach fields to the innermost active span in this execution
+    context. No-op if profiling is disabled or there's no open span.
+    Context-local, so concurrent asyncio tasks on one thread never
+    cross-annotate."""
     if _session is None:
         return
     stack = _span_stack.get()
@@ -1389,13 +1378,9 @@ def _os_thread_name() -> str:
 
 
 def gpu_lease_begin(gpu_id: int) -> None:
-    """Record the start of an exclusive GPU lease (called by agresources).
-
-    Lease intervals are device-scope events joined to the trace at session
-    stop as a synthetic per-device lane — they are NOT thread spans, because a
-    lease can outlive the acquiring call (background processes hold the GPU
-    across turns). No-op when profiling is off.
-    """
+    """Record the start of an exclusive GPU lease. Joined to the trace at
+    session stop as a synthetic per-device lane, not a thread span, since
+    a lease can outlive the acquiring call. No-op when profiling is off."""
     if _session is None:
         return
     with _leases_lock:
@@ -3151,11 +3136,8 @@ def session(
 
 
 def profile_scope() -> str:
-    """Configured environment profiling scope.
-
-    Only ``process`` opts into process-lifetime profiling. Unset, empty, and
-    invalid values all select the deterministic ``workload`` default.
-    """
+    """Configured environment profiling scope: only ``process`` opts into
+    process-lifetime profiling, everything else selects ``workload``."""
     value = os.environ.get("AGENCY_PROFILE_SCOPE", "").strip().lower()
     return "process" if value == "process" else "workload"
 

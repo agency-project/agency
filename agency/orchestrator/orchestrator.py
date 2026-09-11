@@ -296,20 +296,10 @@ class GlobalAgentOrchestrator:
 
     def cancel_request(self, future: "Future") -> bool:
         """Mark whichever request produced *future* as cancelled. Returns
-        True iff that request was in "running" state at this instant --
-        agent.cancel() uses this as a best-effort gate for whether to also
-        try killing a live harness process; it is not a precise "a harness
-        is definitely running right now" signal (the worker dispatched for
-        a "running" request may not have reached the harness launch yet),
-        just a cheap way to skip that attempt when it's certain there's
-        nothing to reach (request still blocked/ready, never dispatched).
-
-        No scheduler scan and no wake-event: an already-running request is
-        only ever observed by the engine's own checkpoints, and a still-
-        blocked request will naturally reach one once its own predecessor
-        resolves via the normal flow -- nothing here needs to be faster than
-        that.
-        """
+        True iff that request was "running" at this instant -- a
+        best-effort gate for whether agent.cancel() should try killing a
+        live harness process. No scheduler scan needed: the engine's own
+        checkpoints observe it regardless."""
         with self._event_cond:
             request_id = self._future_producers.get(future)
             if request_id is None:

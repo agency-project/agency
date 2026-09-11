@@ -44,10 +44,10 @@ _VLLM_EXTRA_GEN_FIELDS = frozenset(
 
 # ---------------------------------------------------------------------------
 # agllm class -- one instance per agconfig, built via agllm.for_config().
-# Combines what used to be two classes: the per-provider backend (config
-# holding, client building, capability hooks) and a thin outer wrapper
-# around it. Reads every field (model, api_key, temperature, retry/timeout
-# policy, ...) straight off self.agconfig -- see agency/configs/agconfig.py.
+# The per-provider backend (config holding, client building, capability
+# hooks) and a thin outer wrapper around it, combined into one class. Reads
+# every field (model, api_key, temperature, retry/timeout policy, ...)
+# straight off self.agconfig -- see agency/configs/agconfig.py.
 # ---------------------------------------------------------------------------
 
 
@@ -153,9 +153,8 @@ class agllm:
         return None
 
     def known_context_limit(self, model: str) -> "int | None":
-        """Static fallback context window for models with no listing API to
-        query (e.g. Bedrock's native invoke_model). None if unknown — the
-        caller (fetch_context_limit) falls back to agconfig.default_context_limit."""
+        """Static fallback context window with no listing API to query.
+        None if unknown -- caller falls back to agconfig.default_context_limit."""
         return None
 
     def fetch_context_limit(self) -> int:

@@ -1,12 +1,10 @@
 """Built-in tools for the standalone native harness: bash, read, write,
 edit, glob, grep, webfetch, todowrite.
 
-Ported from the old `_native_in_container_entrypoint.py` (same
-implementation, same schemas). Plain `subprocess`/file I/O throughout: this
-process already runs inside whatever filesystem it's launched in (a
-sandbox container, or a user's own machine for a fully standalone run), so
-there is no `sandbox.exec()`/agtool bridge to reuse and no reason to invent
-one.
+Plain `subprocess`/file I/O throughout: this process already runs inside
+whatever filesystem it's launched in (a sandbox container, or a user's own
+machine for a fully standalone run), so there is no `sandbox.exec()`/agtool
+bridge to reuse and no reason to invent one.
 
 Per E.'s decision (see the conversation this package came out of): these
 built-ins ship with the harness itself, always available. Anything beyond

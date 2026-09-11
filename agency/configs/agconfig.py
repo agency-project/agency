@@ -1,49 +1,4 @@
-"""agconfig — one config object for the whole framework, one level deep.
-
-Replaces the old tiered descriptor system (`GlobalConfigParam`/
-`StaticConfigParam`/`DynamicConfigParam`, 14 owner-scoped `*Fields` classes,
-21 `*Config` view classes spread across the codebase). Every tunable value in
-the system lives on a plain, typed namespace dataclass (`llmconfig`,
-`sandboxconfig`, ...), and `agconfig` itself holds exactly one instance of
-each -- one level of nesting, no deeper, no descriptors, no owner strings.
-
-Passed as ``agconfig=`` to any framework class's constructor. A parent object
-forwards its own ``agconfig`` to every child object it creates (e.g. ``agent``
--> its ``agllm`` backend and ``agSandbox``), so one ``agconfig`` built at the
-top of a script flows to everything it spawns::
-
-    cfg = agconfig(
-        llmconfig(provider="bedrock", model="...", api_key="..."),
-        sandboxconfig(base_image="my-image:latest"),
-    )
-    ag = agent(agconfig=cfg)
-
-Construction takes zero or more namespace instances positionally (no keyword
-name needed -- each is recognized by its own type and dispatched to the
-matching field); any namespace not passed gets a fresh, all-defaults
-instance. Consumers read through the namespace (``self.agconfig.llm.model``),
-not a magically-inherited bare attribute -- ordinary composition, no
-descriptors involved.
-
-A handful of values that are genuinely process-wide (not meaningfully
-per-agent -- a docker call semaphore, one-time GPU/CPU/memory hardware
-detection, safety floors that must never be overridden per-agent) are
-module-level constants below, not fields on any namespace at all.
-
-What's deliberately dropped, not replaced, versus the old system:
-- The old tier-1 "locked after first read, can't be changed again this
-  process" guard, and each provider's ``_ALLOWED_FIELDS`` fail-fast
-  validation (every field now always exists on every instance; an
-  irrelevant field for a given provider/backend is just unused).
-  ``@dataclass(slots=True)`` keeps the one cheap, valuable safety property:
-  an unknown constructor kwarg or a typo'd attribute name still raises
-  immediately (``TypeError``/``AttributeError``) instead of silently doing
-  nothing.
-- Five fields confirmed dead (declared, never read anywhere in the
-  codebase) were dropped rather than carried forward: the old
-  ``agllm.call_max_concurrency``, ``agproxy_ptrace.attach_timeout_s``,
-  ``agent.ping_interval_s``/``poll_interval_s``/``max_outer_iters``.
-"""
+"""agconfig — one config class for the whole framework"""
 
 from __future__ import annotations
 
@@ -52,8 +7,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Callable, ClassVar
 
 # ---------------------------------------------------------------------------
-# Process-wide constants -- not per-agent config. Each one gates a real
-# shared resource or invariant (confirmed by tracing every reader):
+# Process-wide constants:
 #   - DOCKER_SEMAPHORE_LIMIT: a literal module-level threading.Semaphore in
 #     sandbox/container.py, throttling every docker/podman subprocess call
 #     process-wide regardless of agent.
@@ -86,16 +40,7 @@ def _is_json_safe(value: Any) -> bool:
 
 
 class confignamespace:
-    """Base class for every one-level namespace config dataclass (llmconfig,
-    sandboxconfig, ...) -- clone()/update()/safe_snapshot() live here once so
-    concrete namespaces only ever declare fields, never repeat this trio.
-
-    Not itself a dataclass (no fields of its own): `@dataclass(slots=True)`
-    on a concrete subclass still works fine inheriting from a plain class
-    like this one, and `dataclasses.fields()`/`__dataclass_fields__` are
-    found via the *subclass*, which is what these methods actually run
-    against through ``self``.
-    """
+    """Base class for every one-level namespace config dataclass"""
 
     __slots__: "ClassVar[tuple]" = ()
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset()
@@ -106,8 +51,7 @@ class confignamespace:
 
     def update(self, **values: Any):
         """Set several fields at once, e.g. from a partial webui-editor
-        payload. Raises on an unknown field name (same fail-fast intent the
-        old per-owner *Config views gave via _ALLOWED_FIELDS)."""
+        payload. Raises on an unknown field name."""
         known = {f.name for f in fields(self) if not f.name.startswith("_")}
         unknown = set(values) - known
         if unknown:
@@ -132,10 +76,7 @@ class confignamespace:
 
 @dataclass(slots=True)
 class llmconfig(confignamespace):
-    """LLM backend config -- merges the old "agllm" (process policy) and
-    "agllm_backend" (per-call params) owners, plus the mock/replay backend's
-    fields, since there's no structural reason to keep any of these apart
-    once they're all one namespace."""
+    """LLM backend config"""
 
     provider: "str | None" = None
     model: str = ""
@@ -261,9 +202,7 @@ class sandboxconfig(confignamespace):
 
 @dataclass(slots=True)
 class orchestratorconfig(confignamespace):
-    """The global orchestrator's own event/data logger (agency/orchestrator/
-    orchestrator.py) -- a different database, with different defaults, from
-    the per-agent data logger (see dataloggerconfig below)."""
+    """The global orchestrator (agency/orchestrator/orchestrator.py)"""
 
     max_concurrent_engines: "int | None" = None
     db_path: "str | None" = None
@@ -273,9 +212,7 @@ class orchestratorconfig(confignamespace):
 
 @dataclass(slots=True)
 class resourcesconfig(confignamespace):
-    """Resource pool (agency/orchestrator/agresources.py) -- per-agent
-    sandbox resource footprint. Detection timeouts and min_cpus/
-    min_memory_mb safety floors moved to the process-wide constants above."""
+    """Resource pool (agency/orchestrator/agresources.py)"""
 
     idle_cpus: "float | None" = 8.0
     idle_memory: "str | None" = None
@@ -283,13 +220,7 @@ class resourcesconfig(confignamespace):
 
 @dataclass(slots=True)
 class agentconfig(confignamespace):
-    """agency/agent.py. log_dir/output_dir used to be plain ClassVars on
-    `agent` (set once before creating agents, e.g. `agent.log_dir =
-    Path(...)`) resolved through a helper function specifically to avoid a
-    descriptor-on-a-class-attribute footgun -- that footgun doesn't exist
-    once there's no descriptor at all, so they're now ordinary fields here:
-    `agent.log_dir` stays a supported class-level default (checked first), a
-    set `agconfig.agent.log_dir` on a specific config overrides it."""
+    """agency/agent.py"""
 
     log_dir: "str | None" = None
     output_dir: "str | None" = None
@@ -346,10 +277,9 @@ class ptraceconfig(confignamespace):
 
 @dataclass(slots=True)
 class dataloggerconfig(confignamespace):
-    """Per-agent data logger (agency/observability/agdatalogger.py) --
-    replaces the old informal agDataLoggerConfigs escape-hatch dataclass.
-    db_path is computed once per agent (log_dir/<agname>_data.sqlite3) if
-    not already set, same as today."""
+    """Per-agent data logger (agency/observability/agdatalogger.py). db_path
+    is computed once per agent (log_dir/<agname>_data.sqlite3) if not
+    already set."""
 
     db_path: "str | None" = None
     flush_batch_size: int = 20
@@ -358,9 +288,8 @@ class dataloggerconfig(confignamespace):
 
 @dataclass(slots=True)
 class hostserverconfig(confignamespace):
-    """Host server manager (agency/engine/host_servers/host_server_manager.py)
-    -- replaces the old informal HostServerManagerConfigs escape-hatch
-    dataclass. uds_path is computed once per agent if not already set."""
+    """Host server manager (agency/engine/host_servers/host_server_manager.py).
+    uds_path is computed once per agent if not already set."""
 
     uds_path: "str | None" = None
     startup_timeout_s: float = 10.0
@@ -428,18 +357,11 @@ class agconfig:
             setattr(self, field_name, namespace)
 
     def clone(self) -> "agconfig":
-        """Independent copy -- mutating the clone never affects the
-        original (or vice versa). Used for agent.fork()/load()'s
-        independence guarantee and to layer a per-instance override onto a
-        shared/propagated config without touching what other in-flight
-        objects already consumed."""
+        """Independent copy"""
         return copy.deepcopy(self)
 
     def update(self, **namespace_updates: "dict[str, Any]") -> "agconfig":
-        """Merge partial field updates into one or more namespaces at once,
-        e.g. from a webui-editor payload shaped ``{"llm": {...}, "sandbox":
-        {...}}``. Raises on an unknown namespace name, and each namespace's
-        own update() raises on an unknown field name within it."""
+        """Merge partial field updates into one or more namespaces at once."""
         known = {f.name for f in fields(self)}
         unknown = set(namespace_updates) - known
         if unknown:
@@ -449,11 +371,6 @@ class agconfig:
         return self
 
     def safe_snapshot(self) -> "dict[str, dict[str, Any]]":
-        """JSON-safe, secret-redacted snapshot of every namespace -- what's
-        exposed to the webui's config editor and persisted into checkpoints/
-        event logs. Each namespace knows which of its own fields are secret;
-        every serialization path must go through this rather than
-        hand-rolling its own filter (a second, independent filter is exactly
-        how AWS credentials used to leak into checkpoints -- see the module
-        that replaced this file's predecessor)."""
+        """JSON-safe, secret-redacted snapshot of every namespace, for the
+        webui config editor and checkpoints/event logs."""
         return {f.name: getattr(self, f.name).safe_snapshot() for f in fields(self)}

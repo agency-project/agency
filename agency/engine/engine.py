@@ -373,9 +373,7 @@ class AgentEngine:
         *,
         retained_messages: "list[dict] | None" = None,
     ) -> PromptPayload:
-        from ..harness import agharness
-
-        user_content = agharness.build_user_turn_prompt(skill, skill_input)
+        user_content = skill.build_user_content(skill_input)
         if retained_messages:
             retained = self._render_retained_messages(retained_messages)
             if isinstance(user_content, str):

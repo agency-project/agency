@@ -88,10 +88,8 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
 
     # This agent's model's context window, for a caller (native_harness's
     # own compaction, see that package's `compaction.py`) that runs its own
-    # ReAct loop and needs to know when to compact -- mirrors the old
-    # `_native_in_container_entrypoint.py`'s `_fetch_context_limit`, just
-    # reached over this bridge instead of a direct UDS connection to the
-    # terminus.
+    # ReAct loop and needs to know when to compact -- reached over this
+    # bridge rather than a direct UDS connection to the terminus.
     @router.post("/internal/context_limit")
     async def context_limit(request: Request):
         body = await request.json()

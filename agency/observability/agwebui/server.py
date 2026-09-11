@@ -65,8 +65,8 @@ _agent_log_cursors: "dict[str, str]" = {}
 # each tick's rows from all sources are merged and sorted by timestamp
 # before broadcasting, so a scheduler event and an agent event that
 # happened close together in real time arrive at the client in that same
-# order. Two independently-timed poll loops (a fast global one, a slower
-# per-agent one) used to race here instead.
+# order (rather than each source polling and broadcasting independently,
+# which could reorder them at the client).
 TAIL_POLL_INTERVAL = 0.3
 AGENT_LOG_BACKLOG_PER_AGENT = 200
 
@@ -77,26 +77,17 @@ AGENT_LOG_BACKLOG_PER_AGENT = 200
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write *text* to *path* atomically.
-
-    Path.write_text() opens in truncate mode and then writes -- there is a
-    real window between the truncate and the write completing where a
-    concurrent reader (the execution process's _poll_commands() poll loop,
-    or a test polling the same directory) can glob the file and read back
-    an empty or partial string, raising JSONDecodeError. Writing to a
-    sibling temp file and then os.replace()-ing it into place means readers
-    only ever see the file fully absent or fully written, never in between
-    -- os.replace() is atomic on both POSIX and Windows.
-    """
+    """Write *text* to *path* atomically: write to a sibling temp file,
+    then `os.replace()` it into place, so a concurrent reader never sees
+    a truncated or partial file."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
 
 def _db_path() -> Path:
-    """The orchestrator's global agDataLogger writes here -- see
-    agdatalogger.resolve_global_db_path(), duplicated inline rather than
-    imported since this process stays free of agency package imports."""
+    """The orchestrator's global agDataLogger's db path, duplicated inline
+    (not imported) since this process stays free of agency package imports."""
     return _run_dir / "global_data.sqlite3"
 
 
@@ -125,8 +116,7 @@ def _list_profiler_files() -> dict:
 
 
 def _xterm256_hex(n: int) -> str:
-    """Ported from the old terminal-based agui's agterm.py (removed in
-    2705fa8) / agwebui_emitter.ansi_to_hex -- xterm-256 color index -> hex."""
+    """xterm-256 color index -> hex."""
     if n < 16:
         _ansi16 = [
             "#000000", "#aa0000", "#00aa00", "#aa8800",
@@ -147,12 +137,11 @@ def _xterm256_hex(n: int) -> str:
 
 
 def _make_color_palette() -> "list[str]":
-    """Ported from agterm.py's _make_color_palette(): sample the 6x6x6
-    xterm-256 cube at component levels {0,2,4,5} (values 0/135/215/255),
-    drop the cube-greys (r==g==b) and the near-black corner (brightest
-    component <= 135) -- 54 clearly visible, well-spread colors -- then
-    shuffle once per process, same as the old terminal-based agui did, so
-    colors stay varied and stable for the life of one webui server run."""
+    """Sample the 6x6x6 xterm-256 cube at component levels {0,2,4,5}
+    (values 0/135/215/255), drop the cube-greys (r==g==b) and the
+    near-black corner (brightest component <= 135) -- 54 clearly visible,
+    well-spread colors -- then shuffle once per process, so colors stay
+    varied and stable for the life of one webui server run."""
     levels = (0, 2, 4, 5)
     indices: "list[int]" = []
     for r in levels:
@@ -177,8 +166,8 @@ _agent_color_next = 0
 def _agent_color(agname: str) -> str:
     """Assign each agent the next unused palette color the first time its
     name is seen, then remember it -- round-robin in order of first
-    appearance, same assignment scheme as the old agterm.py (one counter,
-    incremented per agent, indexing into the shuffled palette)."""
+    appearance, via one counter incremented per agent, indexing into the
+    shuffled palette."""
     global _agent_color_next
     with _agent_color_lock:
         color = _agent_color_assignments.get(agname)
@@ -549,41 +538,15 @@ _TOKEN_TOTALS_SQL = (
 
 
 def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
-    """The full current transcript for one agent's own db, built entirely
-    from what llm_handler_server._finalize_success() persists via
-    record_final_transcript() (llm_block events) plus whatever exchange is
-    still actively streaming. Shared by the HTTP pull path
-    (_fetch_agent_detail) and the push path (_tail_and_broadcast's
-    messages_snapshot broadcast) so both compute it identically.
-
-    Deliberately does NOT read orchestrator.py's live_messages/skill_call
-    events -- those snapshot agcontext's own transcript, which carries no
-    per-message clock, so every message in one of those snapshots gets
-    stamped with a single blanket skill-finish timestamp. That made a
-    completed skill's own initial prompt render as if it happened *after*
-    the tool calls it triggered, once a later skill sharing the same
-    history finished. llm_block rows, by contrast, are each logged with a
-    real timestamp at the moment they actually happened, so they're the
-    canonical source for every message, not just the still-running tail.
-
-    Also deliberately does NOT read host_interaction_server's own
-    `tool_result` events here -- that's a *second*, independent record of
-    the same tool call (host_interaction_server._record_completion(),
-    logged the instant the tool finishes, versus llm_block's role='tool'
-    row, logged once the exchange that consumed it finalizes) -- reading
-    both produced two renderings of the same result, one double-JSON-
-    encoded (json.dumps() over an already-JSON result string) and one not.
-    The `tool_result` *events* still drive the immediate "Full Logs"
-    syslog line (recordSystemLog in app.js) for live feedback; they just
-    shouldn't also feed the canonical message transcript."""
+    """The full current transcript for one agent's db: llm_block events
+    plus whatever exchange is still streaming, shared by both HTTP pull
+    and push paths. Ignores orchestrator.py's live_messages snapshots (no
+    per-message clock) and host_interaction_server's tool_result events
+    (a duplicate record of what llm_block already covers)."""
     finalized = con.execute(
         "SELECT type, call_label, payload, timestamp FROM events "
         "WHERE type = 'llm_block' ORDER BY id"
     ).fetchall()
-    # record_final_transcript() atomically clears every stream_deltas row for a
-    # call_label the moment that exchange finishes (moving it to the
-    # permanent events rows read above) -- so whatever remains here is, by
-    # construction, exactly the exchange(s) still streaming right now.
     streaming_rows = con.execute(
         "SELECT call_label, payload, timestamp FROM stream_deltas "
         "WHERE type='llm_stream_delta' ORDER BY id"
@@ -644,32 +607,11 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
 
 
 def _reconstruct_in_progress_messages(rows: "list[tuple[str, str, str, float]]") -> "list[dict]":
-    """The canonical transcript builder for one agent's db, given every
-    llm_block row ever recorded (see _compute_agent_messages) -- not just an
-    in-flight skill's tail. llm_handler_server._finalize_success() persists
-    each new transcript block the moment its exchange finishes
-    (record_final_transcript()) -- one events row per {role, **block}
-    payload, content-diffed against everything already logged this
-    attempt (see _new_transcript_payloads()), so it's whatever's actually
-    new: the response, but also a changed system prompt, a tool result (role
-    'tool'), or a harness-injected mid-run message, whichever role it turns
-    out to carry. Reconstruct every message from those, in the same {role,
-    blocks} shape as a real transcript entry, each carrying the real
-    timestamp of the row that produced it -- so the interaction panel
-    keeps advancing during execution instead of only at completion, and a
-    completed skill's messages keep their true individual times instead of
-    all collapsing to one blanket finish timestamp.
-
-    Each row's payload is {"role": ..., **block} -- role is popped back off
-    to decide grouping and the message's own role; the rest of the payload
-    IS the block, metadata blocks included (they are not filtered here --
-    only at render time, gated behind the client's Full Logs toggle, same
-    as everything else this can't assume the shape of). Consecutive rows
-    sharing one (call_label, role) key group into a single message -- a
-    tool_result row (role='tool') typically shares its call_label with the
-    assistant turn that follows it (both get logged together once that next
-    exchange finalizes), but the differing role still splits them into
-    separate messages, mirroring how a real transcript alternates turns."""
+    """Rebuild one agent's transcript from every llm_block row on record
+    (see _compute_agent_messages), each keeping its own real timestamp so
+    the panel advances live instead of only at completion. Groups
+    consecutive rows sharing one (call_label, role) into a single
+    message, same as a real transcript alternating turns."""
     messages: "list[dict]" = []
     current_key: "object" = object()  # sentinel, never equals a real (call_label, role)
     current_blocks: "list[dict] | None" = None
@@ -759,9 +701,9 @@ async def _lifespan(app: FastAPI):
     global _lock, _last_event_id, _event_count, _first_ts, _last_ts
     _lock = asyncio.Lock()
     # Seed event-count/timestamp bookkeeping from an existing database (e.g.
-    # server restart mid-run). Registration/state recovery no longer needs
-    # seeding here -- _fetch_state_preamble() reads the durable state tables
-    # fresh on every connect regardless of server restarts.
+    # server restart mid-run). Registration/state recovery needs no seeding
+    # here -- _fetch_state_preamble() reads the durable state tables fresh
+    # on every connect regardless of server restarts.
     seed = await asyncio.to_thread(_seed_from_db, _db_path())
     _last_event_id, _event_count, _first_ts, _last_ts = seed
     task = asyncio.create_task(_tail_and_broadcast())
@@ -929,10 +871,9 @@ async def _tail_and_broadcast() -> None:
     since the global db by itself carries almost none of these).
 
     Each tick collects new rows from every source into one batch and sorts
-    that batch by timestamp before broadcasting -- two independently-timed
-    poll loops here previously (a fast global one, a slower per-agent one)
-    raced each other, so a scheduler event and an agent event that happened
-    close together in real time could arrive at the client out of order."""
+    that batch by timestamp before broadcasting, so a scheduler event and
+    an agent event that happened close together in real time always arrive
+    at the client in that same order."""
     global _last_event_id, _event_count, _first_ts, _last_ts
 
     while True:

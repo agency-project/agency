@@ -298,14 +298,12 @@ def test_change_config_forwards_to_host_server_manager_when_built(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
-    from agency.harness import agharness
-
-    monkeypatch.setattr(
-        agharness, "build_user_turn_prompt", lambda skill, skill_input: "the-prompt"
-    )
+def test_build_prompt_payload_uses_skill_methods():
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_prompt=lambda: "the-system")
+    skill = SimpleNamespace(
+        _build_prompt=lambda: "the-system",
+        build_user_content=lambda skill_input: "the-prompt",
+    )
     payload = engine._build_prompt_payload(skill, SimpleNamespace())
     assert payload == PromptPayload(
         system_instruction="the-system",
@@ -313,14 +311,12 @@ def test_build_prompt_payload_uses_agharness_helpers(monkeypatch):
     )
 
 
-def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
-    from agency.harness import agharness
-
-    monkeypatch.setattr(
-        agharness, "build_user_turn_prompt", lambda skill, skill_input: "current request"
-    )
+def test_build_prompt_payload_prefixes_typed_retained_context():
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_prompt=lambda: "system")
+    skill = SimpleNamespace(
+        _build_prompt=lambda: "system",
+        build_user_content=lambda skill_input: "current request",
+    )
 
     payload = engine._build_prompt_payload(
         skill,
@@ -337,13 +333,13 @@ def test_build_prompt_payload_prefixes_typed_retained_context(monkeypatch):
     assert payload.user_content.endswith("current request")
 
 
-def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content(monkeypatch):
-    from agency.harness import agharness
-
+def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content():
     current = [{"type": "text", "text": "current request"}]
-    monkeypatch.setattr(agharness, "build_user_turn_prompt", lambda *_args: current)
     engine = AgentEngine(_FakeAgent())
-    skill = SimpleNamespace(_build_prompt=lambda: "system")
+    skill = SimpleNamespace(
+        _build_prompt=lambda: "system",
+        build_user_content=lambda skill_input: current,
+    )
 
     payload = engine._build_prompt_payload(
         skill,

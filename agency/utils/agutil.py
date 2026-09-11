@@ -59,38 +59,11 @@ def format_exception(e: BaseException) -> str:
 
 @contextmanager
 def sigterm_as_exit(label: str = "agency") -> "Generator[threading.Event, None, None]":
-    """Install a SIGTERM handler for the duration of this ``with`` block that
-    converts a plain ``kill <pid>`` into a normal Python exit (``SystemExit``)
-    instead of the OS's default immediate termination.
-
-    Without this, SIGTERM bypasses every ``atexit`` cleanup hook the
-    framework relies on (live sandbox teardown in agsandbox.py, the tool
-    worker pool in agtool.py, a webui/graphui server subprocess, ...) exactly
-    like SIGKILL does -- the interpreter never regains control, so none of
-    that ever runs. Converting SIGTERM into ``SystemExit`` here lets whatever
-    code is running inside the ``with`` block unwind through its own
-    ``finally`` blocks and reach normal interpreter shutdown instead, where
-    those hooks fire exactly as they would on any other clean exit.
-
-    SIGKILL itself can never be caught by any process, so there's no
-    equivalent possible for it -- resuming cleanly after a SIGKILL relies on
-    the framework's own self-healing (e.g. ``sandbox.container``'s
-    startup orphan reaper reclaiming a dead run's containers), not on
-    anything a context manager can do.
-
-    Yields a ``threading.Event`` that's set if SIGTERM was actually received
-    during the block, so callers can distinguish a signal-triggered exit from
-    a normal one (e.g. to skip an otherwise-unconditional "wait for user
-    input" step -- the caller asked this process to exit, not to linger for a
-    second signal).
-
-    Only installs the handler when called from the main thread --
-    ``signal.signal()`` raises otherwise. From any other thread this is a
-    no-op: it yields an ``Event`` that's simply never set, since a background
-    thread already can't rely on Ctrl+C/KeyboardInterrupt working here either.
-    *label* is used only in the message printed when SIGTERM is caught (e.g.
-    ``"[agwebui] Received SIGTERM, shutting down..."``).
-    """
+    """Install a SIGTERM handler for this ``with`` block that converts a
+    plain kill into ``SystemExit``, so atexit/cleanup hooks run instead of
+    the OS's immediate termination. Main-thread only (a no-op elsewhere).
+    Yields an Event set if SIGTERM was actually received; *label* names the
+    process in the printed shutdown message."""
     received = threading.Event()
     if threading.current_thread() is not threading.main_thread():
         yield received
@@ -220,12 +193,8 @@ def _looks_like_path(s: str) -> bool:
 
 
 def _camel_to_snake(key: str) -> str:
-    """Normalize one dict key from camelCase/PascalCase to snake_case.
-
-    Idempotent on keys that are already snake_case or single-word (no
-    uppercase letters to act on). Used to tolerate LLMs that emit tool-call
-    arguments in camelCase even though our tool schemas declare snake_case.
-    """
+    """Normalize camelCase/PascalCase to snake_case; idempotent on inputs
+    already snake_case."""
     return _CAMEL_CASE_RE.sub("_", key).lower()
 
 
@@ -283,13 +252,9 @@ def pid_alive(pid: int) -> bool:
 
 
 def agency_run_id() -> str:
-    """Stable per-process id used to namespace every run-scoped path this
-    process owns -- this run's directory under `agency_tmp_dir()`
-    (gateways/scratch/sandboxes/config_homes) and under `agency_runs_dir()`
-    (logs/profiler), and (via `sandbox/container.py`'s own
-    `_RUN_ID = agency_run_id()`) every container/image name. A uuid rather
-    than a pid: pids are recycled, so a successive run could otherwise
-    inherit a dead run's name and adopt its leftovers."""
+    """Stable per-process id namespacing every run-scoped path (tmp dirs,
+    run dirs, container/image names). A uuid, not a pid, since pids are
+    recycled and could otherwise adopt a dead run's leftovers."""
     global _AGENCY_RUN_ID
     if _AGENCY_RUN_ID is None:
         import uuid
@@ -308,12 +273,11 @@ def agency_run_dir_name() -> str:
 
 
 def agency_tmp_dir():
-    """Root for local-filesystem-only run state (UDS sockets, squash
-    scratch, chroot state, config-homes). Hardcoded to `/tmp/agency-{uid}`
-    rather than `tempfile.gettempdir()`, which honours `$TMPDIR` -- fatal
-    for a live socket if something sweeps it. The `-{uid}` suffix is
-    per-user isolation (same as tmux's `/tmp/tmux-$UID`). Overridable via
-    `AGENCY_TMP_ROOT`. Short by design: see `UDS_SUN_PATH_MAX`."""
+    """Root for local-filesystem-only run state (sockets, squash scratch,
+    chroot state, config-homes). Hardcoded to `/tmp/agency-{uid}`, not
+    `tempfile.gettempdir()`, since a `$TMPDIR` sweep would kill a live
+    socket. Overridable via `AGENCY_TMP_ROOT`; kept short for
+    `UDS_SUN_PATH_MAX`."""
     root = Path(os.environ.get("AGENCY_TMP_ROOT", f"/tmp/agency-{os.getuid()}"))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     _ensure_owned_by_us(root)
@@ -349,10 +313,8 @@ def agency_runs_dir():
 
 
 def agency_cache_root():
-    """Root for cross-run state found without knowing which run created it
-    (when a caller needs a persistent cache). Under `~/.cache/agency` by default,
-    not run-scoped like the other two roots. Overridable via
-    `AGENCY_CACHE_ROOT`."""
+    """Root for cross-run cache state, under `~/.cache/agency` by default
+    (override via `AGENCY_CACHE_ROOT`)."""
     return Path(os.environ.get("AGENCY_CACHE_ROOT", str(Path.home() / ".cache" / "agency")))
 
 
@@ -384,46 +346,12 @@ def _agency_run_dir() -> Path:
 
 
 def agharness_llm_gateway_dir():
-    """Fixed, well-known host directory a docker/podman-backed harness
-    launch's Unix-domain-socket LLM gateway lives in -- `gw/` under
-    this run's own directory (see `_agency_run_dir`). Named `gw`, not
-    `gateways`, since it's the one subdirectory here spent from the
-    108-byte `sun_path` socket budget (see `new_uds_path`). Shared between
-    `agsandbox.py` (which bind-mounts this directory into every
-    container-backed sandbox unconditionally -- cheap and harmless for a
-    sandbox that never runs a harness, the same "attach unconditionally,
-    gate on use" pattern already used for GPU passthrough flags) and
-    `harness/agproxy_llm.py` (which places its UDS socket file
-    inside it once a container-backed harness actually launches). Kept
-    here, not in either of those two modules, specifically to avoid a
-    layering dependency in either direction -- `agsandbox` sits below
-    `agharness`/`agproxy_llm` in this codebase's intended import graph, so
-    neither should import from the other just for this constant. A bind
-    mount is a live view of the host directory, not a snapshot, so it's
-    safe for the socket file to not exist yet at container-creation time
-    and appear later once a harness actually launches.
-
-    Scoped to one subdirectory per run, for the same three reasons container
-    names are (`sandbox/container.py`'s `_RUN_ID`):
-
-    * **Lifecycle.** This root is deliberately outside `$TMPDIR` and so is
-      never externally cleaned; a flat directory shared by every run would
-      accumulate sockets with no owner and no disposal point. A per-run
-      directory makes cleanup a single atomic removal -- see
-      `_register_run_dir_cleanup`.
-    * **Isolation.** `agsandbox.py` bind-mounts this directory read-write
-      into *every* container, so a flat directory would let any container
-      read, connect to, and delete every concurrent run's sockets on the
-      host. Mounting only the current run's directory removes that entirely
-      while keeping the container-side path unchanged.
-    * **Attribution.** A socket's owning run is readable from its path
-      instead of having to be inferred from timestamps.
-
-    Safe to mount per-run because a container never outlives the run that
-    created it: container names embed their own per-process run id, and
-    reuse/resume only ever applies to containers this same process created
-    (see `_ContainerBackendBase._ensure_started`).
-    """
+    """Per-run `gw/` directory (under `_agency_run_dir`) holding this run's
+    harness LLM-gateway UDS socket. Bind-mounted into every container-backed
+    sandbox by agsandbox.py; the harness backend places its socket file
+    here once launched. Scoped per-run so cleanup, isolation between
+    concurrent runs, and attribution all fall out of the directory
+    boundary."""
     global _gateway_dir
     if _gateway_dir is not None:
         return _gateway_dir
@@ -540,18 +468,10 @@ def _reap_orphaned_run_dirs() -> None:
 
 
 def new_uds_path(prefix: str) -> str:
-    """A fresh socket path `<gateway dir>/<prefix>-<8 hex>.sock`, checked
-    against the `sun_path` budget before anything tries to bind it.
-
-    The id is 8 hex characters, not a full 32-character uuid4 hex: these
-    names only need to be unique within one directory on one host, and the
-    24 characters saved are the difference between fitting and not fitting
-    for any caller whose paths are deeper than the default (a `log_dir`
-    override, for instance). Validating here rather than at bind time turns
-    the kernel's bare `OSError: AF_UNIX path too long`, raised several
-    frames inside uvicorn with no mention of which path or what the limit
-    is, into an error naming both.
-    """
+    """Fresh socket path `<gateway dir>/<prefix>-<8 hex>.sock`,
+    length-checked against the `sun_path` budget before anything tries to
+    bind it, so a too-long path fails here with a clear message instead of
+    deep inside uvicorn as a bare, unlabeled `OSError`."""
     import uuid
 
     path = str(agharness_llm_gateway_dir() / f"{prefix}-{uuid.uuid4().hex[:8]}.sock")
@@ -567,15 +487,9 @@ def new_uds_path(prefix: str) -> str:
 
 def uds_listener_is_live(path: "str | None", thread) -> bool:
     """True only if *path* still exists on disk AND *thread* is still
-    serving it -- the two ways a UDS listener silently stops working while
-    its owner still believes it is up.
-
-    Either half failing leaves the same unrecoverable state, since the
-    cached path keeps being handed out: an external cleanup can delete the
-    socket file from under a live server (a Unix socket's mtime never
-    updates, so every age-based reaper sees a long-lived one as stale), and
-    a server thread that exits for any reason takes the socket file with it,
-    because uvicorn unlinks it on shutdown."""
+    alive -- either can fail independently while the cached path keeps
+    being handed out (external cleanup can delete the socket; the server
+    thread unlinks it on exit)."""
     import os
 
     if not path or not os.path.exists(path):
@@ -600,20 +514,10 @@ AGENCY_LOGS_CONTAINER_MOUNT = "/var/run/agency_logs"
 
 
 def agency_package_dir():
-    """Host directory containing the `agency` package currently running in
-    *this* process -- the parent of `agency/__init__.py`'s own directory,
-    i.e. what needs to be on `PYTHONPATH` for `import agency` to resolve.
-    Bind-mounted read-only into every container-backed sandbox at
-    `AGENCY_PACKAGE_CONTAINER_MOUNT`, same "attach unconditionally, gate on
-    use" pattern as `agharness_llm_gateway_dir`
-    above -- so an in-container entrypoint always runs the EXACT same code
-    the host process is running, not a second, potentially-stale copy
-    baked into the sandbox's base image.
-
-    Unlike those two, this is not a fixed scratch location -- it's resolved
-    dynamically from `agency.__file__`, since it has to be wherever *this*
-    process's own code actually lives (a dev checkout, an editable install,
-    a site-packages install are all valid; none should be hardcoded)."""
+    """Host directory containing the `agency` package this process is
+    running -- what must be on `PYTHONPATH` for `import agency` to
+    resolve. Bind-mounted read-only into every container so it runs the
+    exact same code, never a stale copy."""
     import agency as _agency_pkg
     from pathlib import Path
 
@@ -621,26 +525,10 @@ def agency_package_dir():
 
 
 def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 180) -> None:
-    """Ensure each of `packages` (import names, e.g. `"fastapi"`) is
-    importable inside `sandbox`'s container, installing any that are
-    missing via `pip3 install`. Confirmed real gap: `agency-sandbox:latest`
-    carries `httpx`/`pydantic` but not `fastapi`/`uvicorn`/`openai` --
-    needed by both a container-relocated `agproxy_llm` and a future
-    full react-loop entrypoint that imports `agency` itself.
-
-    Checks each package's actual importability first, not just its
-    presence in `pip list` (a package can be listed but broken, or absent
-    but shadowed by something else on the path) -- and only invokes pip for
-    the ones genuinely missing, so a container whose checkpoint image
-    already has everything installed (reused across skill calls, see
-    agskill.py's commit() boundary) pays this cost exactly once per fresh
-    container, not on every launch. Requires the container to have
-    outbound network access -- true today (see docs/Design_harness_
-    integration.md's network lockdown discussion, deferred).
-
-    Raises RuntimeError if pip itself fails (e.g. no network, a genuinely
-    broken package name) -- this is a real prerequisite-provisioning
-    failure, not something to silently swallow."""
+    """Ensure each of `packages` (import names) is importable inside
+    `sandbox`'s container, `pip3 install`-ing any missing after checking
+    real importability (not just `pip list` presence). Raises RuntimeError
+    if pip itself fails. Requires outbound network access."""
     import shlex
 
     missing = [
@@ -747,14 +635,9 @@ def _allocate_gpu_markers_rocm(gpu_ids: list[int], marker_bytes: int) -> None:
 
 
 def _allocate_gpu_markers(gpu_ids: list[int]) -> None:
-    """Allocate marker_mb of VRAM on each GPU directly in the calling process.
-
-    Tries the CUDA driver API first, falling back to ROCm/HIP — no torch
-    dependency required either way. Allocations live for the process
-    lifetime, which is fine: the memory is tiny (128 MB per GPU by default)
-    and there is no need to release it mid-run. Runs silently if neither
-    CUDA nor ROCm is available.
-    """
+    """Allocate marker_mb of VRAM per GPU in this process (CUDA first,
+    falling back to ROCm/HIP). Lives for the process lifetime; silent
+    no-op if neither driver is available."""
     marker_bytes = MARKER_MB * 1024 * 1024
     if _allocate_gpu_markers_cuda(gpu_ids, marker_bytes):
         return
@@ -838,13 +721,10 @@ _PCI_BUS_RE = re.compile(r"([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$")
 
 
 def _amd_render_node_pci_bus(name: str) -> "str | None":
-    """Resolve the real PCI bus address (e.g. "0000:75:00.0") backing a
-    /dev/dri render node by name (e.g. "renderD128"), by following
-    /sys/class/drm/<name>/device. Returns None for XCD/compute-partition
-    sibling nodes: MI300/MI350-class GPUs expose one render node per
-    accelerator-complex-die under a "amdgpu_xcp_N" platform device even
-    while the GPU itself is in unpartitioned (SPX) mode, and only the one
-    node with a real PCI parent maps 1:1 to a physical GPU."""
+    """Resolve the real PCI bus address backing a /dev/dri render node by
+    name, via /sys/class/drm/<name>/device. Returns None for XCD/compute-
+    partition sibling nodes (only the node with a real PCI parent maps 1:1
+    to a physical GPU)."""
     target = os.path.realpath(f"/sys/class/drm/{name}/device")
     match = _PCI_BUS_RE.search(target)
     return match.group(1).lower() if match else None
@@ -861,8 +741,8 @@ def amd_render_node_paths_by_pci_bus(candidates: "list[str]") -> "list[str] | No
     for 8 GPUs), and even the primary node's number doesn't sort in the same
     order as rocm-smi's GPU index -- e.g. GPU 3's real node was the
     numerically LOWEST of the 64 present, not the 4th. Naively picking
-    sorted-index N (the old behavior) scoped several GPU IDs to nodes
-    belonging to a different physical GPU entirely.
+    sorted-index N scopes several GPU IDs to nodes belonging to a
+    different physical GPU entirely.
 
     Returns None (caller should fall back to naive sorted order) if
     `rocm-smi --showbus` fails/is unavailable, or any GPU's bus can't be

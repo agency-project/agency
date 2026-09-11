@@ -17,12 +17,11 @@ _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 # Whitelisted LLM fields that round-trip through checkpoints/creation-event
 # logging -- NOT the whole agconfig (sandbox/orchestrator/etc. namespaces
-# were never meant to be part of a checkpoint). Built on
-# agconfig.llm.safe_snapshot() so this is the same one canonical redaction
-# path the webui's config editor uses, rather than a second,
-# independently-hand-maintained secret filter -- that's exactly how AWS
-# credentials used to leak into checkpoints while only api_key was stripped
-# by hand here.
+# are never part of a checkpoint). Built on agconfig.llm.safe_snapshot() so
+# this is the same canonical redaction path the webui's config editor uses,
+# rather than a second, independently-hand-maintained secret filter -- a
+# hand-rolled filter that misses a newly added sensitive field silently
+# leaks credentials into checkpoints.
 _LLM_CHECKPOINT_FIELDS = (
     "provider", "model", "base_url", "region", "context_limit",
     "temperature", "reasoning_effort", "max_completion_tokens", "max_tokens",
@@ -48,7 +47,7 @@ from .sandbox.agsandbox import agSandbox
 from .llm.usage_tracker import LlmUsageTracker
 from .configs.agconfig import agconfig as agconfig_cls
 
-from .agname import agname as _agname  # [REFACTOR] Why underscore?
+from .agname import agname as _agname
 from .observability.profiler import agprof
 
 if TYPE_CHECKING:
@@ -83,11 +82,6 @@ class agent:
     Class-level configuration (set once before creating agents)::
 
         agent.log_dir        = Path("runs/logs")
-
-    The GPU/CPU/memory pool is no longer a class-level override on ``agent``
-    -- it's owned by the process-wide orchestrator, constructed eagerly at
-    import time. Override it via ``get_orchestrator().agresource_pool = ...``
-    instead.
     """
 
     log_dir: ClassVar[Path | None] = None
@@ -118,11 +112,8 @@ class agent:
         harness: "str | None",
     ) -> None:
         def _has_llm_config(cfg: "agconfig_cls | None") -> bool:
-            # cfg.llm always has every field present (with its default), so
-            # "has the caller configured an LLM backend at all" can no
-            # longer mean "was any agllm_backend field ever .set()" --
-            # model/provider being non-default is the pragmatic stand-in:
-            # either one identifies a real backend selection.
+            # cfg.llm always has every field present, so treat a non-default
+            # model/provider as "an LLM backend was configured".
             return cfg is not None and bool(cfg.llm.model or cfg.llm.provider)
 
         _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
@@ -152,9 +143,7 @@ class agent:
         self.agconfig: "agconfig_cls" = _src_agconfig.clone()
 
         self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
-        self._parent_agent_id: "str | None" = (
-            None  # [REFACTOR]  Why do we need to keep reference of parent agent id?
-        )
+        self._parent_agent_id: "str | None" = None
 
         self.harness: str = harness if harness is not None else self.agconfig.agent.harness
         self.context: agcontext = agcontext()
@@ -276,17 +265,8 @@ class agent:
         return self.agconfig.clone()
 
     # ------------------------------------------------------------------
-    # Properties # [REFACTOR] Why as properties?
+    # Properties
     # ------------------------------------------------------------------
-
-    @property
-    def ctx(self) -> agcontext:
-        """Compatibility alias for the one authoritative ``context`` chain."""
-        return self.context
-
-    @ctx.setter
-    def ctx(self, value: agcontext) -> None:
-        self.context = value
 
     @property
     def output_path(self) -> Path | None:
@@ -448,20 +428,10 @@ class agent:
         self.queue_message(message)
 
     def cancel(self, handle: agdata) -> None:
-        """Cancel whichever run() produced *handle*.
-
-        Purely a lookup key: nothing is marked on *handle* itself. A
-        not-yet-launched run naturally reaches the engine's own pre-checkpoint
-        once its predecessor resolves; an already-running one is caught by
-        the post-checkpoint once the harness returns (cooperative-only,
-        by itself -- does not interrupt an in-flight harness). If *handle*'s
-        request is the one actually running right now, this also kills its
-        harness process at the OS level, via the same daemon pause()/
-        resume() reaches. A race where the harness hasn't launched yet even
-        though the request is "running" is harmless: cancel_harness() would
-        just find nothing registered, and the cooperative checkpoints above
-        still guarantee agcanceled() regardless of timing.
-        """
+        """Cancel whichever run() produced *handle*. Cooperative: an
+        already-running harness is caught at the post-checkpoint once it
+        returns, and also killed at the OS level via the same daemon
+        pause()/resume() path if its request is the one currently running."""
         future = object.__getattribute__(handle, "_future")
         was_running = self._orchestrator.cancel_request(future)
         if was_running:
@@ -781,12 +751,6 @@ class agent:
         ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agconfig_cls()
-        # cfg.llm always has every field present, so "was this field
-        # explicitly set by the caller" can no longer mean "present in
-        # .data" -- a field still at its class default is treated as
-        # unset, so the checkpoint's own value fills it in; anything the
-        # caller already changed (e.g. cfg.llm.api_key = ..., restoring the
-        # secret save() stripped) wins over the checkpoint.
         _defaults = agconfig_cls()
         for k, v in state.get("llm_config", {}).items():
             if getattr(ag.agconfig.llm, k) == getattr(_defaults.llm, k):
