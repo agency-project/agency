@@ -455,7 +455,7 @@ class TestDanglingImageEagerCleanup:
         try:
             sb.exec("echo one")
             before = _dangling_ids()
-            with patch.object(sb._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
+            with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
                 sb.commit()
             after = _dangling_ids()
 
@@ -1094,7 +1094,7 @@ class TestCheckpointAccumulator:
         sb.exec("mkdir -p /workspace/proj/sub && echo three > /workspace/proj/sub/f3")
 
         t0 = time.time()
-        with patch.object(sb._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
+        with patch.object(sb._backend._agconfig.sandbox, "checkpoint_squash_max_depth", 1):
             sb.commit()  # this cycle commits AND squashes
         elapsed = time.time() - t0
 
