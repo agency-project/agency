@@ -1037,7 +1037,8 @@ def test_environment_cgroup_adopts_current_dir_after_user_scope_landing(tmp_path
     (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
     (tmp_path / "memory.current").write_text("0")
     (tmp_path / "cgroup.procs").write_text(f"{__import__('os').getpid()}\n")
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    # Record an undo entry even when this variable was initially absent.
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP", "")
     monkeypatch.setenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", "1")
     monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: tmp_path)
     monkeypatch.setattr(
@@ -1506,3 +1507,31 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     agwebui_module.agwebui.run(fn, run_dir=tmp_path, port=17860, linger=False)
 
     assert events[:3] == ["profile-start", "workload", "profile-stop"]
+
+
+@pytest.mark.parametrize("failure", ["cgroup", "thread_start"])
+def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("sampler startup failed")
+
+    if failure == "cgroup":
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", fail)
+    else:
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", lambda: tmp_path)
+        monkeypatch.setattr(agprof._Sampler, "start", fail)
+    try:
+        with pytest.raises(RuntimeError, match="sampler startup failed"):
+            agprof.start(tmp_path / "failed", sample_hz=10, sample_gpu=False)
+        assert not agprof.enabled()
+        assert agprof._profile_data_logger is None
+        with agprof.session(tmp_path / "retry", sample_hz=0, sample_gpu=False):
+            with agprof.span("retry_succeeded"):
+                pass
+        assert any(row[1] == "retry_succeeded" for row in agprof.profile_records())
+    finally:
+        # The regression must not poison other tests when run against old code.
+        if agprof._sampler is not None and not agprof._sampler.is_alive():
+            agprof._sampler = None
+        agprof.stop()
