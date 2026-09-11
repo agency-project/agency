@@ -242,11 +242,18 @@ class PtyDriver:
                 self._last_prompt = prompt
                 self._last_turn_id = turn
             elif kind == "Stop" and (self.name != "grok" or payload.get("reason") == "end_turn"):
+                text = payload.get(
+                    "last_assistant_message", payload.get("lastAssistantMessage", "")
+                )
+                # Codex reports JSON null when a turn ends immediately after a
+                # successful MCP submission. The protocol represents that as
+                # an empty final string so the engine can consume the output
+                # collected by submit_output.
+                if self.name == "codex" and text is None:
+                    text = ""
                 event.update(
                     kind="stop",
-                    text=payload.get(
-                        "last_assistant_message", payload.get("lastAssistantMessage", "")
-                    ),
+                    text=text,
                 )
             elif kind == "StopCancelled":
                 if payload.get("reason") == "user_interrupt":

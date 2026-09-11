@@ -281,20 +281,21 @@ class agskill:
                     "\nRespond with plain text only — no JSON wrapping, no markdown code fences."
                 )
             else:
-                # Structured output — model must call one return_<field> tool per output field.
-                field_tools = ", ".join(f"return_{f}" for f in self.output_schema._data)
+                # Structured output is collected one field at a time through
+                # the host MCP server's submit_output tool.
                 field_lines = "\n".join(
                     f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
                 parts.append(  # [REFACTOR] Better prompting
-                    f"\nTo return your results, call the appropriate return_<field> tool "
-                    f"once for each required output field ({field_tools}). "
-                    f"Required fields:\n"
+                    "\nTo return your results, you must call the Agency MCP server's "
+                    "submit_output tool once for each required output field. Pass the field "
+                    "name in `field` and its final value in `value`. Do not answer with the "
+                    "values in assistant text; text does not submit structured output. "
+                    "Required fields:\n"
                     f"{field_lines}\n\n"
-                    "- Call each return_<field> tool separately — one field per call.\n"
-                    "- Only call a return_<field> tool when you have the final value ready — "
-                    "return the output itself as the tool argument. "
-                    "Never call a return_<field> tool with empty or missing arguments.\n"
+                    "- Call submit_output separately for each field — one field per call.\n"
+                    "- Only call submit_output when you have the final value ready. "
+                    "Never call it with an empty or missing `field` or `value`.\n"
                     "- You may continue using other tools after registering outputs if needed."
                 )
         return "\n".join(parts)

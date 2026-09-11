@@ -274,7 +274,10 @@ def test_schemas_appended_to_system_prompt():
     assert "Be helpful." in prompt
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
-    assert "return_summary" in prompt
+    assert "submit_output" in prompt
+    assert "return_summary" not in prompt
+    assert "`field`" in prompt and "`value`" in prompt
+    assert "Do not answer" in prompt
     assert "summary" in prompt
     assert "string" in prompt  # per-field description for str output
 

@@ -362,6 +362,7 @@ def test_build_retry_prompt_mentions_missing_fields():
     assert payload.system_instruction == "the-system"
     assert "a" in payload.user_content and "b" in payload.user_content
     assert "submit_output" in payload.user_content
+    assert "Do not answer with text" in payload.user_content
     assert payload.output_instruction is None
 
 

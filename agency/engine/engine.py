@@ -416,8 +416,8 @@ class AgentEngine:
             system_instruction=system_instruction,
             user_content=(
                 "[HARNESS SYSTEM] You have not yet provided all required output "
-                f"fields. Still missing: {missing}. Call the submit_output tool "
-                "once for each of them."
+                f"fields. Still missing: {missing}. Do not answer with text. You must "
+                "call the Agency MCP server's submit_output tool once for each missing field."
             ),
             output_instruction=None,
         )

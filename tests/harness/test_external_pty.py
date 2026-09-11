@@ -136,6 +136,37 @@ def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
     assert driver.events() == []
 
 
+def test_codex_accepts_empty_completion_after_mcp_submission(runtime, tmp_path):
+    driver = PtyDriver(
+        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
+    )
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn"},
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "events/stop.json").write_text(
+        json.dumps(
+            {
+                "session_id": "session",
+                "transcript_path": str(transcript),
+                "hook_event_name": "Stop",
+                "turn_id": "turn",
+                "last_assistant_message": None,
+            }
+        )
+    )
+
+    event = driver.events()[0]
+    assert event == {"turn_id": "turn", "kind": "stop", "text": ""}
+    assert driver.completed(event)
+
+
 @pytest.fixture
 def execution(runtime, tmp_path):
     driver = FakeDriver(tmp_path)
