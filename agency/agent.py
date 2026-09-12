@@ -18,11 +18,12 @@ _live_agents: "weakref.WeakSet[agent]" = weakref.WeakSet()
 
 # Whitelisted LLM fields that round-trip through checkpoints/creation-event
 # logging -- NOT the whole agconfig (sandbox/orchestrator/etc. namespaces
-# are never part of a checkpoint). Built on agconfig.llm.safe_snapshot() so
-# this is the same canonical redaction path the webui's config editor uses,
-# rather than a second, independently-hand-maintained secret filter -- a
-# hand-rolled filter that misses a newly added sensitive field silently
-# leaks credentials into checkpoints.
+# were never meant to be part of a checkpoint). Built on
+# agconfig.llm.safe_snapshot() so this is the same one canonical redaction
+# path the webui's config editor uses, rather than a second,
+# independently-hand-maintained secret filter -- that's exactly how AWS
+# credentials used to leak into checkpoints while only api_key was stripped
+# by hand here.
 _LLM_CHECKPOINT_FIELDS = (
     "provider", "model", "base_url", "region", "context_limit",
     "temperature", "reasoning_effort", "max_completion_tokens", "max_tokens",
@@ -55,8 +56,8 @@ if TYPE_CHECKING:
     from .engine import AgentEngine
 
 
-def _resolve_agent_default(agconfig: "agconfig_cls | None", field: str, classvar_default):
-    """Resolve one of agent's own knobs (log_dir, output_dir): a set
+def _resolve_agent_directory(agconfig: "agconfig_cls | None", field: str, classvar_default):
+    """Resolve an agent directory setting (log_dir or output_dir): a set
     agconfig.agent.<field> wins; otherwise the plain ClassVar default
     (``agent.log_dir = Path(...)``, set once before creating agents)."""
     if agconfig is None:
@@ -84,10 +85,10 @@ class agent:
 
         agent.log_dir        = Path("runs/logs")
 
-    The GPU/CPU/memory pool is owned by the process-wide orchestrator,
-    created lazily when the orchestrator is first requested, not a
-    class-level override on ``agent``. Override it via
-    ``get_orchestrator().agresource_pool = ...``.
+    The GPU/CPU/memory pool is no longer a class-level override on ``agent``
+    -- it's owned by the process-wide orchestrator, created lazily when the
+    orchestrator is first requested. Override it via ``get_orchestrator().agresource_pool = ...``
+    instead.
     """
 
     log_dir: ClassVar[Path | None] = None
@@ -99,6 +100,10 @@ class agent:
     # agconfig= kwarg) still pick up a run-wide agconfig.
     default_agconfig: "ClassVar[agconfig_cls | None]" = None
 
+    # ------------------------------------------------------------------
+    # Agent Initialization
+    # ------------------------------------------------------------------
+
     def __init__(
         self,
         name: str | None = None,
@@ -108,79 +113,69 @@ class agent:
         harness: "str | None" = None,
     ):
         with agprof.span("agent:create"):
-            self._initialize(name, sandbox, agconfig, harness)
+            # Resolve agconfig
+            def _has_configured_llm(cfg: "agconfig_cls | None") -> bool:
+                """Whether a config selects an LLM provider or model."""
+                return cfg is not None and bool(cfg.llm.provider or cfg.llm.model)
 
-    def _initialize(
-        self,
-        name: "str | None",
-        sandbox: "agSandbox | None",
-        agconfig: "agconfig_cls | None",
-        harness: "str | None",
-    ) -> None:
-        def _has_llm_config(cfg: "agconfig_cls | None") -> bool:
-            # cfg.llm always has every field present, so treat a non-default
-            # model/provider as "an LLM backend was configured".
-            return cfg is not None and bool(cfg.llm.model or cfg.llm.provider)
+            # An explicit config takes precedence over the process-wide default.
+            source_config = agconfig if agconfig is not None else agent.default_agconfig
 
-        _src_agconfig = agconfig if agconfig is not None else agent.default_agconfig
+            if not _has_configured_llm(source_config):
+                from .agteam import _active_team as _at
 
-        if not _has_llm_config(_src_agconfig):
-            from .agteam import _active_team as _at
+                active_team = _at.get(None)
+                if active_team is not None and _has_configured_llm(active_team.agconfig):
+                    # A team supplies all of its configuration, not only its
+                    # LLM settings, so its agents share the same runtime setup.
+                    source_config = active_team.agconfig
+                else:
+                    raise TypeError(
+                        "agent() requires an agconfig with LLM fields set "
+                        "(e.g. agconfig(llmconfig(model=..., provider=...))) when called "
+                        "outside an agteam context"
+                    )
 
-            _t = _at.get(None)
-            if _t is not None and _has_llm_config(_t.agconfig):
-                # Adopt the team's agconfig outright (not just for the LLM
-                # fields) -- log_dir/output_dir/sandbox settings etc. should
-                # also come from it, matching "agents inherit the team's
-                # agconfig automatically" (see agteam's docstring).
-                _src_agconfig = _t.agconfig
-            else:
-                raise TypeError(
-                    "agent() requires an agconfig with LLM fields set "
-                    "(e.g. agconfig(llmconfig(model=..., provider=...))) when called "
-                    "outside an agteam context"
-                )
+            # Cloned so this agent's own agconfig is independent of whatever
+            # source it was built from (an explicit agconfig=, agent.default_agconfig,
+            # or the active agteam's agconfig) -- mutating that source afterward
+            # must not silently change an already-constructed agent. Use
+            # ag.change_config(new_cfg) to change it live -- see that method.
+            self.agconfig: "agconfig_cls" = source_config.clone()
 
-        # Cloned so this agent's own agconfig is independent of whatever
-        # source it was built from (an explicit agconfig=, agent.default_agconfig,
-        # or the active agteam's agconfig) -- mutating that source afterward
-        # must not silently change an already-constructed agent. Use
-        # ag.change_config(new_cfg) to change it live -- see that method.
-        self.agconfig: "agconfig_cls" = _src_agconfig.clone()
+            # Init moving parts of an Agent
+            self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
+            self._parent_agent_id: "str | None" = None
 
-        self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
-        self._parent_agent_id: "str | None" = None
+            self.harness: str = harness if harness is not None else self.agconfig.agent.harness
+            self.context: agcontext = agcontext()
+            # Sandbox is created lazily on first skill run; container provisioning
+            # is expensive and agents may be constructed without ever running a skill.
+            self.sandbox: "agSandbox | None" = sandbox
+            self.engine: "AgentEngine | None" = None
 
-        self.harness: str = harness if harness is not None else self.agconfig.agent.harness
-        self.context: agcontext = agcontext()
-        # Sandbox is created lazily on first skill run; container provisioning
-        # is expensive and agents may be constructed without ever running a skill.
-        self.sandbox: "agSandbox | None" = sandbox
-        self.engine: "AgentEngine | None" = None
+            from .agteam import _active_team
 
-        from .agteam import _active_team
+            _team = _active_team.get(None)
+            if _team is not None:
+                _team._agents.add(self)
 
-        _team = _active_team.get(None)
-        if _team is not None:
-            _team._agents.add(self)
+            team_name = _team.name if _team is not None else None
 
-        team_name = _team.name if _team is not None else None
-
-        _llm_config = _llm_config_snapshot(self.agconfig)
-        team_tag = f"  team={team_name}" if team_name else ""
-        self._finish_construction(
-            event_type="agent_created",
-            event_payload={
-                "agname": self.agname,
-                "team": team_name,
-                "llm_config": _llm_config,
-            },
-            term_message=(
-                f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}"
-                f"  harness={self.harness}{team_tag}"
-            ),
-            reuse_data_logger_configs=True,
-        )
+            _llm_config = _llm_config_snapshot(self.agconfig)
+            team_tag = f"  team={team_name}" if team_name else ""
+            self._finish_construction(
+                event_type="agent_created",
+                event_payload={
+                    "agname": self.agname,
+                    "team": team_name,
+                    "llm_config": _llm_config,
+                },
+                term_message=(
+                    f"[{self.agname}] CREATED  model={_llm_config.get('model') or '?'}{team_tag}"
+                ),
+                reuse_data_logger_configs=True,
+            )
 
     def _finish_construction(
         self,
@@ -190,15 +185,18 @@ class agent:
         term_message: str,
         reuse_data_logger_configs: bool = False,
     ) -> None:
-        """Shared tail of _initialize()/fork()/load(): data logger setup,
+        """Shared tail of __init__()/fork()/load(): data logger setup,
         initial runtime state, live registry, and the construction-event log
         -- everything that only needs agname/agconfig already resolved,
         regardless of how they were resolved."""
-        _log_dir_val = _resolve_agent_default(self.agconfig, "log_dir", agent.log_dir)
+
+        # Start Data Logger
+        _log_dir_val = _resolve_agent_directory(self.agconfig, "log_dir", agent.log_dir)
         log_dir = Path(_log_dir_val) if _log_dir_val is not None else _DEFAULT_LOG_DIR
 
         if not (reuse_data_logger_configs and self.agconfig.data_logger.db_path):
             self.agconfig.data_logger.db_path = str(log_dir / f"{self.agname}_data.sqlite3")
+
         self.data_logger = agDataLogger(
             self.agconfig, default_name=str(self.agname), default_object="agent"
         )
@@ -210,9 +208,11 @@ class agent:
             self.agconfig,
             default_db_path=resolve_global_db_path(log_dir),
         )
+
+        # Concurrency + Context setup
         self._submission_lock = threading.RLock()
         self._control_lock = threading.RLock()
-        self._sequence = max(
+        self._message_sequence = max(
             (
                 int(entry.get("sequence", 0))
                 for entry in self.context.retained_messages
@@ -224,15 +224,22 @@ class agent:
         self._current_state = "agent_idle"
         _live_agents.add(self)
 
+        # Record agent creation
         self.data_logger.record_event(
             type=event_type, payload=event_payload, term_message=term_message
         )
-        self._register_global_catalog(event_payload.get("team"))
+        self._register_private_db_with_global_catalog(event_payload.get("team"))
         self.record_state("agent_idle")
         self.change_config(self.agconfig)
 
-    def _register_global_catalog(self, team_name: "str | None") -> None:
-        """Publish only agent identity and its detailed database location globally."""
+    def _register_private_db_with_global_catalog(self, team_name: "str | None") -> None:
+        """Record agname -> this agent's own db_path as an 'agent_registered'
+        row in the *global* logger's latest_values table (not this agent's
+        own db). This agent's detailed events live only in its own private
+        sqlite file, so an out-of-process reader with no access to this
+        agent's Python object (e.g. agwebui, reading db files off disk) has
+        no way to find that file -- unless every agent publishes its own
+        agname -> db_path pointer to one shared, well-known global db first."""
         try:
             agent_db_path = Path(self.data_logger.db_path)
             self._orchestrator.data_logger.record_event(
@@ -247,14 +254,24 @@ class agent:
 
     def _next_sequence(self) -> int:
         with self._submission_lock:
-            self._sequence += 1
-            return self._sequence
+            self._message_sequence += 1
+            return self._message_sequence
 
     def _ensure_sequence_at_least(self, value: int) -> None:
         with self._submission_lock:
-            self._sequence = max(self._sequence, int(value))
+            self._message_sequence = max(self._message_sequence, int(value))
 
+    # ------------------------------------------------------------------
+    # Misc Public APIs
+    # ------------------------------------------------------------------
     def change_config(self, agconfig: "agconfig_cls") -> None:
+        """Reconfigure this agent live -- e.g. switch LLM provider/model --
+        without recreating it. Takes full effect immediately: this agent and
+        all of its already-created parts (data logger, sandbox, engine) run
+        under the new config from this call onward, and the change is
+        visible externally (e.g. in agwebui) as this agent's current config.
+        The caller's `agconfig` object is not retained -- mutating it after
+        this call has no further effect on this agent."""
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         self.data_logger.change_config(self.agconfig)
         if self.sandbox is not None:
@@ -268,8 +285,24 @@ class agent:
         )
 
     def get_config_copy(self) -> "agconfig_cls":
-        """Return a clone of this agent's agconfig."""
+        """Return an independent clone of this agent's current agconfig --
+        safe to inspect or mutate without affecting the agent; to actually
+        apply changes back, pass the (mutated) result to change_config()."""
         return self.agconfig.clone()
+
+    def record_state(
+        self, state: str, skill: "str | None" = None, tool: "str | None" = None
+    ) -> None:
+        """Mark what this agent is doing right now (e.g. idle, running a
+        skill, calling a tool), immediately visible both in-process and to
+        outside readers like agwebui."""
+        self._current_state = state
+        self.data_logger.record_event(
+            type="agent_state",
+            payload={"state": state, "skill": skill, "tool": tool},
+            update_latest_snapshot=True,
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -277,17 +310,17 @@ class agent:
 
     @property
     def output_path(self) -> Path | None:
-        out_dir = _resolve_agent_default(self.agconfig, "output_dir", agent.output_dir)
+        out_dir = _resolve_agent_directory(self.agconfig, "output_dir", agent.output_dir)
         if out_dir is None:
             return None
         return Path(out_dir) / self.agname
 
     @property
     def container_output_path(self) -> str | None:
-        out_dir = _resolve_agent_default(self.agconfig, "output_dir", agent.output_dir)
+        out_dir = _resolve_agent_directory(self.agconfig, "output_dir", agent.output_dir)
         if out_dir is None:
             return None
-        return f"/agent_output/{self.agname}"
+        return "/agent_output"
 
     @property
     def history(self) -> agdata:
@@ -308,19 +341,8 @@ class agent:
                         current.set_transcript(messages)
                         return
 
-    def record_state(
-        self, state: str, skill: "str | None" = None, tool: "str | None" = None
-    ) -> None:
-        self._current_state = state
-        self.data_logger.record_event(
-            type="agent_state",
-            payload={"state": state, "skill": skill, "tool": tool},
-            update_latest_snapshot=True,
-            flush=True,
-        )
-
     # ------------------------------------------------------------------
-    # Pause / resume
+    # Pause / Resume
     # ------------------------------------------------------------------
 
     def _record_context_notice(self, context: agcontext) -> int:
@@ -437,10 +459,20 @@ class agent:
         self.queue_message(message)
 
     def cancel(self, handle: agdata) -> None:
-        """Cancel whichever run() produced *handle*. Cooperative: an
-        already-running harness is caught at the post-checkpoint once it
-        returns, and also killed at the OS level via the same daemon
-        pause()/resume() path if its request is the one currently running."""
+        """Cancel whichever run() produced *handle*.
+
+        Purely a lookup key: nothing is marked on *handle* itself. A
+        not-yet-launched run naturally reaches the engine's own pre-checkpoint
+        once its predecessor resolves; an already-running one is caught by
+        the post-checkpoint once the harness returns (cooperative-only,
+        by itself -- does not interrupt an in-flight harness). If *handle*'s
+        request is the one actually running right now, this also kills its
+        harness process at the OS level, via the same daemon pause()/
+        resume() reaches. A race where the harness hasn't launched yet even
+        though the request is "running" is harmless: cancel_harness() would
+        just find nothing registered, and the cooperative checkpoints above
+        still guarantee agcanceled() regardless of timing.
+        """
         future = object.__getattribute__(handle, "_future")
         engine = self._orchestrator.cancel_request(self, future)
         if engine is not None:
@@ -560,7 +592,7 @@ class agent:
         ag.engine = None
         with src._resolved_snapshot() as (source_context, source_sandbox):
             ag.context = source_context
-            _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
+            _out_dir = _resolve_agent_directory(ag.agconfig, "output_dir", cls.output_dir)
             _out = Path(_out_dir) / ag.agname if _out_dir else None
             sb_cfg = ag.agconfig.clone()
             sb_cfg.agent.harness = ag.harness
@@ -764,6 +796,12 @@ class agent:
         ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agconfig_cls()
+        # cfg.llm always has every field present, so "was this field
+        # explicitly set by the caller" can no longer mean "present in
+        # .data" -- a field still at its class default is treated as
+        # unset, so the checkpoint's own value fills it in; anything the
+        # caller already changed (e.g. cfg.llm.api_key = ..., restoring the
+        # secret save() stripped) wins over the checkpoint.
         _defaults = agconfig_cls()
         for k, v in state.get("llm_config", {}).items():
             if getattr(ag.agconfig.llm, k) == getattr(_defaults.llm, k):
@@ -777,7 +815,7 @@ class agent:
             retained_messages=state.get("retained_messages", []),
             harness_message_cursors=state.get("harness_message_cursors", {}),
         )
-        _out_dir = _resolve_agent_default(ag.agconfig, "output_dir", cls.output_dir)
+        _out_dir = _resolve_agent_directory(ag.agconfig, "output_dir", cls.output_dir)
         _out = Path(_out_dir) / ag.agname if _out_dir else None
         sb_cfg = ag.agconfig.clone()
         sb_cfg.agent.harness = ag.harness
