@@ -534,7 +534,9 @@ def _json_object(value: str) -> dict:
 # renders raw events anyway (only messages/state/config/tokens are).
 _TOKEN_TOTALS_SQL = (
     "SELECT SUM(json_extract(payload, '$.new_prompt_tokens')), "
-    "SUM(json_extract(payload, '$.usage.completion_tokens')) "
+    "SUM(json_extract(payload, '$.usage.completion_tokens')), "
+    "SUM(json_extract(payload, '$.usage.cache_read_tokens')), "
+    "SUM(json_extract(payload, '$.usage.cache_write_tokens')) "
     "FROM events WHERE type = 'llm_block' AND json_extract(payload, '$.type') = 'metadata'"
 )
 
@@ -598,13 +600,20 @@ def _fetch_agent_detail(global_path: Path, agname: str) -> dict:
         if con is not None:
             con.close()
 
-    input_tokens, output_tokens = token_row if token_row is not None else (None, None)
+    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens = (
+        token_row if token_row is not None else (None, None, None, None)
+    )
     return {
         "agname": agname,
         "messages": messages,
         "state": latest.get("agent_state", {}),
         "config": latest.get("agent_config", {}),
-        "tokens": {"input": input_tokens or 0, "output": output_tokens or 0},
+        "tokens": {
+            "input": input_tokens or 0,
+            "output": output_tokens or 0,
+            "cache_read": cache_read_tokens or 0,
+            "cache_write": cache_write_tokens or 0,
+        },
     }
 
 

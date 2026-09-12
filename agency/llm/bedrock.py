@@ -520,6 +520,8 @@ class _BedrockConverseBackend(agllm):
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": usage.get("totalTokens") or (input_tokens + output_tokens),
+            "cache_read_tokens": usage.get("cacheReadInputTokens", 0) or 0,
+            "cache_write_tokens": usage.get("cacheWriteInputTokens", 0) or 0,
         }
         stop_reason = raw_result.get("stopReason")
         blocks.append(
@@ -549,6 +551,8 @@ class _BedrockConverseBackend(agllm):
     def _format_stream_to_agency(self, raw_stream):
         input_tokens = 0
         output_tokens = 0
+        cache_read_tokens = 0
+        cache_write_tokens = 0
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
@@ -647,6 +651,8 @@ class _BedrockConverseBackend(agllm):
                 usage = event["metadata"].get("usage") or {}
                 input_tokens = usage.get("inputTokens", 0) or input_tokens
                 output_tokens = usage.get("outputTokens", 0) or output_tokens
+                cache_read_tokens = usage.get("cacheReadInputTokens", 0) or cache_read_tokens
+                cache_write_tokens = usage.get("cacheWriteInputTokens", 0) or cache_write_tokens
 
         # If the stream ended (e.g. stopReason="max_tokens") while a tool_use
         # block was still open, contentBlockStop never fires for it -- flush
@@ -682,6 +688,8 @@ class _BedrockConverseBackend(agllm):
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
         }
         yield {
             "type": "block_delta",

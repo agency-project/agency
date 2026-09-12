@@ -794,7 +794,7 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
         },
     ]
     assert detail["state"] == {}
-    assert detail["tokens"] == {"input": 15, "output": 5}
+    assert detail["tokens"] == {"input": 15, "output": 5, "cache_read": 0, "cache_write": 0}
 
 
 def test_agent_detail_endpoint_sums_tokens_across_multiple_exchanges(server):
@@ -822,7 +822,7 @@ def test_agent_detail_endpoint_sums_tokens_across_multiple_exchanges(server):
     global_logger.stop()
 
     detail = client.get("/api/agents/Multi").json()
-    assert detail["tokens"] == {"input": 13, "output": 6}
+    assert detail["tokens"] == {"input": 13, "output": 6, "cache_read": 0, "cache_write": 0}
 
 
 def test_agent_detail_endpoint_ignores_orchestrator_skill_call_and_live_messages_events(server):

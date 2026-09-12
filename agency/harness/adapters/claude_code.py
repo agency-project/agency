@@ -746,6 +746,7 @@ class _ClaudePtyExecution:
         self._submission_offset = 0
         self._attempt_offset = 0
         self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
+        self._last_activity_generation = None
 
     @property
     def _transcript_path(self):
@@ -961,6 +962,11 @@ class _ClaudePtyExecution:
                     now = time.monotonic()
                     if self.handle.is_paused():
                         self._deadline += now - last_poll
+                    else:
+                        generation = self.handle.terminal_screen()[3]
+                        if generation != self._last_activity_generation:
+                            self._last_activity_generation = generation
+                            self._deadline = now + _DEFAULT_TIMEOUT_S
                     last_poll = now
                     self._poll()
                     self._check_alive()

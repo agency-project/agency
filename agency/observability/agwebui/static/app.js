@@ -13,7 +13,7 @@ const state = {
   // the transcript at render time by real timestamp (see buildHistoryHtml()).
   systemLogs:  new Map(),
   fullLogsEnabled: false,
-  tokenUsage:  new Map(),  // agname -> { inp, out, history: [{ts,inp,out}] }
+  tokenUsage:  new Map(),  // agname -> { inp, out, cacheRead, cacheWrite, history: [{ts,inp,out}] }
   resources: { gpus_acquired: 0, gpus_total: 0, cpus_acquired: 0, cpus_total: 0, memory_acquired_mb: 0, memory_total_mb: 0 },
   agentOrder: [],          // [agname] ordered for display / Tab cycling
   pinnedAgents: [],        // [agname] dropped onto the interaction pane as side panels
@@ -320,13 +320,16 @@ function updateResourceBadge() {
 }
 
 
-function fmtTokens(inp, out, history) {
+function fmtTokens(inp, out, history, cacheRead, cacheWrite) {
   function compact(n) {
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
     if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
     return String(n);
   }
   let s = `↑${compact(inp)} ↓${compact(out)}`;
+  if (cacheRead || cacheWrite) {
+    s += `  cache ↑${compact(cacheWrite)} ↓${compact(cacheRead)}`;
+  }
   if (history && history.length >= 2) {
     const oldest  = history[0];
     const newest  = history[history.length - 1];
@@ -338,6 +341,14 @@ function fmtTokens(inp, out, history) {
     }
   }
   return s;
+}
+
+// "model · harness" for an agent's title row, once its config is known.
+function agentMetaText(ag) {
+  const cfg = (ag && ag.config) || {};
+  const model = cfg.llm && cfg.llm.model;
+  const harness = cfg.agent && cfg.agent.harness;
+  return [model, harness].filter(Boolean).join(' · ');
 }
 
 function updateInteractionTitle() {
@@ -352,12 +363,16 @@ function updateInteractionTitle() {
     return;
   }
 
+  const ag      = state.agents.get(agname) || { color: '#d4d4d4' };
   const usage   = state.tokenUsage.get(agname);
+  const metaTxt = agentMetaText(ag);
+  const metaHtml = metaTxt ? `<span class="meta-badge">${esc(metaTxt)}</span>` : '';
   const tokHtml = usage
-    ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history)}</span>`
+    ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite)}</span>`
     : '';
   $interactionTitle.innerHTML =
-    `${esc(agname)}  [${idx + 1}/${n}]  ← →${tokHtml}`;
+    `<span style="color:${ag.color || '#d4d4d4'}">${esc(agname)}</span>  [${idx + 1}/${n}]  ← →` +
+    `<span class="badge-group">${metaHtml}${tokHtml}</span>`;
   $navLabel.textContent = `${idx + 1} / ${n}`;
 }
 
@@ -877,8 +892,6 @@ function renderSidePanels() {
   for (const agname of state.pinnedAgents) {
     let els = panelElements.get(agname);
     if (!els) {
-      const ag = state.agents.get(agname) || { color: '#d4d4d4' };
-
       const resizer = document.createElement('div');
       resizer.className = 'panel-resizer';
       attachPanelResizer(resizer, agname);
@@ -888,8 +901,12 @@ function renderSidePanels() {
       panel.dataset.agname = agname;
       panel.innerHTML =
         `<div class="panel-title side-panel-title">` +
-          `<span style="color:${ag.color || '#d4d4d4'}">${esc(agname)}</span>` +
-          `<button class="side-panel-close" title="Unpin">&times;</button>` +
+          `<span class="side-panel-agname"></span>` +
+          `<span class="side-panel-right">` +
+            `<span class="meta-badge"></span>` +
+            `<span class="token-badge"></span>` +
+            `<button class="side-panel-close" title="Unpin">&times;</button>` +
+          `</span>` +
         `</div>` +
         `<div class="side-panel-history"></div>`;
       panel.querySelector('.side-panel-close').addEventListener('click', () => unpinAgent(agname));
@@ -899,7 +916,12 @@ function renderSidePanels() {
         panelAutoScroll.set(agname, historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight < 40);
       });
 
-      els = { resizer, panel, historyEl };
+      els = {
+        resizer, panel, historyEl,
+        agnameEl: panel.querySelector('.side-panel-agname'),
+        metaEl:   panel.querySelector('.meta-badge'),
+        tokenEl:  panel.querySelector('.token-badge'),
+      };
       panelElements.set(agname, els);
     }
     // Re-appending an already-attached node moves it -- this keeps DOM
@@ -910,6 +932,13 @@ function renderSidePanels() {
     const width = state.panelWidths.get(agname) || DEFAULT_PANEL_WIDTH;
     els.panel.style.flex = `0 0 ${width}px`;
     els.panel.style.width = `${width}px`;
+
+    const ag = state.agents.get(agname) || { color: '#d4d4d4' };
+    els.agnameEl.textContent = agname;
+    els.agnameEl.style.color = ag.color || '#d4d4d4';
+    els.metaEl.textContent = agentMetaText(ag);
+    const usage = state.tokenUsage.get(agname);
+    els.tokenEl.textContent = usage ? fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite) : '';
 
     els.historyEl.innerHTML = buildHistoryHtml(agname);
     if (panelAutoScroll.get(agname) !== false) els.historyEl.scrollTop = els.historyEl.scrollHeight;
@@ -1177,6 +1206,8 @@ async function loadAgentDetail(agname) {
       state.tokenUsage.set(agname, {
         inp: tokenPayload.agent_input || tokenPayload.input || 0,
         out: tokenPayload.agent_output || tokenPayload.output || 0,
+        cacheRead: tokenPayload.cache_read || 0,
+        cacheWrite: tokenPayload.cache_write || 0,
         history: [],
       });
     }

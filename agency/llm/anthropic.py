@@ -357,10 +357,14 @@ class _AnthropicBackend(agllm):
         usage = getattr(raw_result, "usage", None)
         input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
         output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        cache_read_tokens = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
+        cache_write_tokens = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
         usage_dict = {
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
         }
         stop_reason = getattr(raw_result, "stop_reason", None)
         blocks.append(
@@ -394,6 +398,8 @@ class _AnthropicBackend(agllm):
         individually surviving whatever consumes this generator."""
         input_tokens = 0
         output_tokens = 0
+        cache_read_tokens = 0
+        cache_write_tokens = 0
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
@@ -405,6 +411,8 @@ class _AnthropicBackend(agllm):
                 usage = getattr(event.message, "usage", None)
                 if usage is not None:
                     input_tokens = getattr(usage, "input_tokens", 0) or 0
+                    cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+                    cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
                     metadata_events.append(
                         {"event": "message_start", "usage": _serialize_sdk_object(usage)}
                     )
@@ -524,6 +532,8 @@ class _AnthropicBackend(agllm):
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
         }
         # The metadata block is a plain block_delta -- like any other unknown
         # native block, it flows through the host server's generic block

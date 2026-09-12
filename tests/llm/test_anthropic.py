@@ -29,7 +29,16 @@ def _ev(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
-def _metadata_block(raw, *, index, stop_reason, prompt_tokens=0, completion_tokens=0):
+def _metadata_block(
+    raw,
+    *,
+    index,
+    stop_reason,
+    prompt_tokens=0,
+    completion_tokens=0,
+    cache_read_tokens=0,
+    cache_write_tokens=0,
+):
     return {
         "type": "metadata",
         "index": index,
@@ -37,6 +46,8 @@ def _metadata_block(raw, *, index, stop_reason, prompt_tokens=0, completion_toke
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
         },
         "stop_reason": stop_reason,
         "data": raw,
@@ -874,7 +885,13 @@ class TestFormatContextBackendToAgency:
     def test_usage_and_stop_reason_extracted(self):
         raw = _ev(content=[], usage=_ev(input_tokens=10, output_tokens=5), stop_reason="end_turn")
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        assert result["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
         assert result["stop_reason"] == "end_turn"
 
     def test_unrecognized_content_block_preserved_as_unknown(self):
@@ -930,6 +947,8 @@ class TestFormatStreamToAgency:
             "prompt_tokens": 10,
             "completion_tokens": 5,
             "total_tokens": 15,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
         }
         assert usage_item["stop_reason"] == "end_turn"
 
@@ -1182,7 +1201,13 @@ class TestFormatStreamToAgency:
         assert [i["type"] for i in items] == ["block_delta", "usage"]
         assert items[0]["block_type"] == "metadata"
         assert items[-1]["type"] == "usage"
-        assert items[-1]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        assert items[-1]["usage"] == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
 
     def test_missing_usage_on_message_start_defaults_to_zero(self):
         stream = [_ev(type="message_start", message=_ev(usage=None))]

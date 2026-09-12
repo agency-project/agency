@@ -57,9 +57,7 @@ if TYPE_CHECKING:
 
 
 def _resolve_agent_directory(agconfig: "agconfig_cls | None", field: str, classvar_default):
-    """Resolve an agent directory setting (log_dir or output_dir): a set
-    agconfig.agent.<field> wins; otherwise the plain ClassVar default
-    (``agent.log_dir = Path(...)``, set once before creating agents)."""
+    """Resolve an agent directory setting (log_dir or output_dir):"""
     if agconfig is None:
         return classvar_default
     value = getattr(agconfig.agent, field)
@@ -148,6 +146,7 @@ class agent:
             self._parent_agent_id: "str | None" = None
 
             self.harness: str = harness if harness is not None else self.agconfig.agent.harness
+            self.agconfig.agent.harness = self.harness  # keep config snapshot consistent
             self.context: agcontext = agcontext()
             # Sandbox is created lazily on first skill run; container provisioning
             # is expensive and agents may be constructed without ever running a skill.
@@ -185,10 +184,7 @@ class agent:
         term_message: str,
         reuse_data_logger_configs: bool = False,
     ) -> None:
-        """Shared tail of __init__()/fork()/load(): data logger setup,
-        initial runtime state, live registry, and the construction-event log
-        -- everything that only needs agname/agconfig already resolved,
-        regardless of how they were resolved."""
+        """Shared tail of __init__()/fork()/load()"""
 
         # Start Data Logger
         _log_dir_val = _resolve_agent_directory(self.agconfig, "log_dir", agent.log_dir)
@@ -234,12 +230,7 @@ class agent:
 
     def _register_private_db_with_global_catalog(self, team_name: "str | None") -> None:
         """Record agname -> this agent's own db_path as an 'agent_registered'
-        row in the *global* logger's latest_values table (not this agent's
-        own db). This agent's detailed events live only in its own private
-        sqlite file, so an out-of-process reader with no access to this
-        agent's Python object (e.g. agwebui, reading db files off disk) has
-        no way to find that file -- unless every agent publishes its own
-        agname -> db_path pointer to one shared, well-known global db first."""
+        row in the *global* logger's latest_values table"""
         try:
             agent_db_path = Path(self.data_logger.db_path)
             self._orchestrator.data_logger.record_event(
@@ -265,13 +256,7 @@ class agent:
     # Misc Public APIs
     # ------------------------------------------------------------------
     def change_config(self, agconfig: "agconfig_cls") -> None:
-        """Reconfigure this agent live -- e.g. switch LLM provider/model --
-        without recreating it. Takes full effect immediately: this agent and
-        all of its already-created parts (data logger, sandbox, engine) run
-        under the new config from this call onward, and the change is
-        visible externally (e.g. in agwebui) as this agent's current config.
-        The caller's `agconfig` object is not retained -- mutating it after
-        this call has no further effect on this agent."""
+        """Reconfigure this agent live"""
         self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         self.data_logger.change_config(self.agconfig)
         if self.sandbox is not None:
@@ -285,17 +270,13 @@ class agent:
         )
 
     def get_config_copy(self) -> "agconfig_cls":
-        """Return an independent clone of this agent's current agconfig --
-        safe to inspect or mutate without affecting the agent; to actually
-        apply changes back, pass the (mutated) result to change_config()."""
+        """Return an independent clone of this agent's current agconfig"""
         return self.agconfig.clone()
 
     def record_state(
         self, state: str, skill: "str | None" = None, tool: "str | None" = None
     ) -> None:
-        """Mark what this agent is doing right now (e.g. idle, running a
-        skill, calling a tool), immediately visible both in-process and to
-        outside readers like agwebui."""
+        """Mark what this agent is doing right now."""
         self._current_state = state
         self.data_logger.record_event(
             type="agent_state",
@@ -371,10 +352,7 @@ class agent:
         return sequence
 
     def _daemon_handle(self):
-        """This agent's already-persistent daemon handle, if one exists --
-        the same cache ensure_harness_daemon() populates, keyed by
-        engine_name (str(agent.agname), see engine.py's _execute_harness()).
-        None when this agent has no active, reachable harness services."""
+        """This agent's already-persistent daemon handle, if one exists"""
         engine = self.engine
         if engine is None or getattr(engine, "_services_closed", True):
             return None
@@ -394,12 +372,7 @@ class agent:
         return handle if _is_ready(handle) else None
 
     def pause(self) -> None:
-        """Pause this agent's harness at the OS-process level: if one is
-        currently running, freeze it now; either way, the daemon remembers
-        this so the next harness it launches starts paused too, until
-        resume() (see HarnessManager._agent_paused). No orchestrator/
-        scheduler involvement -- purely agent.py + the sandbox's daemon.
-        """
+        """Pause this agent's harness at the OS-process level"""
         with self._control_lock:
             self._paused = True
             handle = self._daemon_handle()
@@ -459,20 +432,7 @@ class agent:
         self.queue_message(message)
 
     def cancel(self, handle: agdata) -> None:
-        """Cancel whichever run() produced *handle*.
-
-        Purely a lookup key: nothing is marked on *handle* itself. A
-        not-yet-launched run naturally reaches the engine's own pre-checkpoint
-        once its predecessor resolves; an already-running one is caught by
-        the post-checkpoint once the harness returns (cooperative-only,
-        by itself -- does not interrupt an in-flight harness). If *handle*'s
-        request is the one actually running right now, this also kills its
-        harness process at the OS level, via the same daemon pause()/
-        resume() reaches. A race where the harness hasn't launched yet even
-        though the request is "running" is harmless: cancel_harness() would
-        just find nothing registered, and the cooperative checkpoints above
-        still guarantee agcanceled() regardless of timing.
-        """
+        """Cancel whichever run() produced *handle*."""
         future = object.__getattribute__(handle, "_future")
         engine = self._orchestrator.cancel_request(self, future)
         if engine is not None:
@@ -500,11 +460,7 @@ class agent:
         return self.sandbox
 
     def queue_message(self, message: str) -> None:
-        """Append one ordered retained message without starting infrastructure.
-
-        A plain enqueue -- ordering into the context chain is guaranteed
-        synchronously before this returns, so there is nothing to hand back.
-        """
+        """Append one ordered retained message without starting infrastructure"""
         if not isinstance(message, str):
             raise TypeError("message must be a string")
         if not message.strip():
@@ -756,14 +712,7 @@ class agent:
         path: "Path | str",
         agconfig: "agconfig_cls | None" = None,
     ) -> "agent":
-        """Restore an agent from a checkpoint file created by agent.save().
-
-        The checkpointed LLM config (everything except the secret fields
-        ``save()`` strips) is applied to ``agconfig`` -- a field already
-        explicitly set on ``agconfig`` (e.g. ``cfg.api_key = ...``, to
-        restore the secret ``save()`` dropped) wins over the checkpointed
-        value; a field left at its default is filled in from the checkpoint.
-        """
+        """Restore an agent from a checkpoint file created by agent.save()."""
         path = Path(path)
         image_tag = f"agency/ckpt-restore-{_uuid_mod.uuid4().hex[:8]}"
 
@@ -796,18 +745,14 @@ class agent:
         ag._parent_agent_id = state.get("parent_agent_id")
         _base_agconfig = agconfig if agconfig is not None else agent.default_agconfig
         ag.agconfig = _base_agconfig.clone() if _base_agconfig is not None else agconfig_cls()
-        # cfg.llm always has every field present, so "was this field
-        # explicitly set by the caller" can no longer mean "present in
-        # .data" -- a field still at its class default is treated as
-        # unset, so the checkpoint's own value fills it in; anything the
-        # caller already changed (e.g. cfg.llm.api_key = ..., restoring the
-        # secret save() stripped) wins over the checkpoint.
+
         _defaults = agconfig_cls()
         for k, v in state.get("llm_config", {}).items():
             if getattr(ag.agconfig.llm, k) == getattr(_defaults.llm, k):
                 setattr(ag.agconfig.llm, k, v)
         # Accept the old checkpoint key so existing snapshots remain loadable.
         ag.harness = state.get("harness", state.get("engine", "native"))
+        ag.agconfig.agent.harness = ag.harness  # keep config snapshot consistent
         ag.engine = None
         ag.context = agcontext(
             recent_transcript=list(state.get("history", [])),
