@@ -379,12 +379,15 @@ def test_host_syscall_policy_short_circuits_unhooked_syscalls_by_default():
     policy = _HostSyscallPolicy(
         host_services, "attempt-token", hooked_syscalls=frozenset({"openat"})
     )
-    event = SimpleNamespace(syscall="execve")
+    # Not "execve"/"execveat" -- those are always forced onto the
+    # synchronous path (see _HostSyscallPolicy._ALWAYS_SYNCHRONOUS), so
+    # they'd defeat the point of this short-circuit test.
+    event = SimpleNamespace(syscall="open")
 
     decision = policy.check(None, event)
     # check() already returned even though the background RPC is still
     # blocked (or hasn't even started) -- proves it never waited on it.
-    assert decision == (True, None, None)
+    assert decision == (True, None, None, None)
 
     release_rpc.set()
     assert entered_rpc.wait(timeout=5)
@@ -406,9 +409,9 @@ def test_host_syscall_policy_short_circuits_to_deny_when_default_to_deny_set():
             pass
 
     policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token", default_to_deny=True)
-    event = SimpleNamespace(syscall="execve")
+    event = SimpleNamespace(syscall="open")
 
-    assert policy.check(None, event) == (False, None, None)
+    assert policy.check(None, event) == (False, None, None, None)
 
 
 def test_host_syscall_policy_logging_failure_never_raises():
@@ -425,7 +428,7 @@ def test_host_syscall_policy_logging_failure_never_raises():
             raise RuntimeError("host unreachable")
 
     policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token")
-    event = SimpleNamespace(syscall="execve")
+    event = SimpleNamespace(syscall="open")
 
-    assert policy.check(None, event) == (True, None, None)
+    assert policy.check(None, event) == (True, None, None, None)
     assert attempted.wait(timeout=5)

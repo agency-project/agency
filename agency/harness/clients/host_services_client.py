@@ -112,10 +112,17 @@ class HostServicesClient:
         )
 
     def check_tool_policy(self, token: str, tool_name: str, tool_input: dict) -> dict:
+        # A GPU-gated tool call can legitimately block on the host for as
+        # long as another agent holds the GPU it reserved -- unbounded by
+        # design (see agResourcePool.acquire_gpus), so this one call, unlike
+        # the rest of this client's (should-be-fast) calls, must not race a
+        # generic client timeout. Same reasoning as engine.py's
+        # `handle.client(timeout_s=None)` for run_harness_attempt.
         resp = self.client.post(
             "/interaction/check_tool",
             json={"tool_name": tool_name, "tool_input": tool_input},
             headers=self._attempt_headers(token),
+            timeout=None,
         )
         resp.raise_for_status()
         result = resp.json()
@@ -149,15 +156,24 @@ class HostServicesClient:
 
     def check_syscall_policy(
         self, token: str, syscall: "agsyscallevent"
-    ) -> "tuple[bool, str | None, str | None]":
+    ) -> "tuple[bool, str | None, str | None, dict[str, str] | None]":
+        # See check_tool_policy's comment above -- execve/execveat are
+        # exactly the syscalls a GPU reservation gates, so this call can
+        # also legitimately block on the host for an unbounded time.
         response = self.client.post(
             "/interaction/check_syscall",
             json=asdict(syscall),
             headers=self._attempt_headers(token),
+            timeout=None,
         )
         response.raise_for_status()
         result = response.json()
-        return bool(result.get("allowed")), result.get("reason"), result.get("call_id")
+        return (
+            bool(result.get("allowed")),
+            result.get("reason"),
+            result.get("call_id"),
+            result.get("env_overrides"),
+        )
 
     def complete_syscall_policy(
         self,

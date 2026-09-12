@@ -74,10 +74,33 @@ def _make_skill(policy=None):
     return SimpleNamespace(policy=policy if policy is not None else agpolicy())
 
 
-def _make_server(policy=None, data_logger=None, is_cancelled=None, agname="agent-1"):
+def _make_server(policy=None, data_logger=None, is_cancelled=None, agname="agent-1", sandbox=None):
     skill = _make_skill(policy)
     data_logger = data_logger if data_logger is not None else _FakeDataLogger()
-    return HostInteractionServer(skill, data_logger, agname, is_cancelled=is_cancelled)
+    return HostInteractionServer(
+        skill, data_logger, agname, sandbox=sandbox, is_cancelled=is_cancelled
+    )
+
+
+class _FakeSandbox:
+    """Mimics agSandbox's GPU surface (no real daemon handle here, so
+    ensure_gpu_acquired() is a direct passthrough, no pause/resume)."""
+
+    def __init__(self, gpu_count_requested=0, gpu_ids=None):
+        self._gpu_count_requested = gpu_count_requested
+        self._gpu_ids = list(gpu_ids or [])
+        self.acquire_calls = []
+
+    def current_gpu_ids(self):
+        if self._gpu_count_requested <= 0:
+            return None
+        return list(self._gpu_ids)
+
+    def ensure_gpu_acquired(self, agname, *, is_cancelled=None):
+        if self._gpu_count_requested <= 0 or self._gpu_ids:
+            return
+        self.acquire_calls.append(self._gpu_count_requested)
+        self._gpu_ids = [0]
 
 
 def _make_syscall(
@@ -182,12 +205,12 @@ def test_check_tool_empty_hooks_dict_falls_back_to_default():
 
 def test_check_syscall_allows_by_default_when_no_hooks_and_not_default_to_deny():
     server = _make_server(policy=agpolicy())
-    assert server.check_syscall(_make_syscall()) == (True, None)
+    assert server.check_syscall(_make_syscall()) == (True, None, None)
 
 
 def test_check_syscall_denies_by_default_when_default_to_deny_set():
     server = _make_server(policy=agpolicy(default_to_deny=True))
-    assert server.check_syscall(_make_syscall()) == (False, None)
+    assert server.check_syscall(_make_syscall()) == (False, None, None)
 
 
 def test_check_syscall_uses_bool_returning_hook():
@@ -195,9 +218,14 @@ def test_check_syscall_uses_bool_returning_hook():
         return syscall.path != "/etc/passwd"
 
     server = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
-    assert server.check_syscall(_make_syscall(syscall="openat", path="/tmp/x")) == (True, None)
+    assert server.check_syscall(_make_syscall(syscall="openat", path="/tmp/x")) == (
+        True,
+        None,
+        None,
+    )
     assert server.check_syscall(_make_syscall(syscall="openat", path="/etc/passwd")) == (
         False,
+        None,
         None,
     )
 
@@ -208,7 +236,7 @@ def test_check_syscall_uses_tuple_returning_hook():
 
     server = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
     result = server.check_syscall(_make_syscall(syscall="openat", path="/etc/passwd"))
-    assert result == (False, "sensitive path")
+    assert result == (False, "sensitive path", None)
 
 
 def test_check_syscall_denies_with_reason_when_hook_raises():
@@ -216,7 +244,7 @@ def test_check_syscall_denies_with_reason_when_hook_raises():
         raise ValueError("boom")
 
     server = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}))
-    allowed, reason = server.check_syscall(_make_syscall(syscall="openat"))
+    allowed, reason, _env_overrides = server.check_syscall(_make_syscall(syscall="openat"))
     assert allowed is False
     assert "boom" in reason
 
@@ -239,7 +267,7 @@ def test_check_syscall_falls_back_to_default_for_unregistered_syscall_name():
         return False
 
     server = _make_server(policy=agpolicy(syscall_hooks={"openat": hook}, default_to_deny=False))
-    assert server.check_syscall(_make_syscall(syscall="execve")) == (True, None)
+    assert server.check_syscall(_make_syscall(syscall="execve")) == (True, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +493,13 @@ def test_admit_tool_call_records_call_event_and_returns_call_id():
     assert logger.events == [
         (
             "tool_call",
-            {"tool": "bash", "arguments": {"cmd": "ls"}, "call_id": call_id, "allowed": True},
+            {
+                "tool": "bash",
+                "arguments": {"cmd": "ls"},
+                "gpu_ids": None,
+                "call_id": call_id,
+                "allowed": True,
+            },
             None,
             False,
             None,
@@ -634,3 +668,122 @@ def test_cached_routes_do_not_retain_server_after_app_is_released():
     gc.collect()
     assert reference() is None, "cached endpoints must not retain completed requests"
     assert cached_endpoints
+
+
+# ---------------------------------------------------------------------------
+# GPU gating -- admit_tool_call() physically acquires, check_tool() and
+# check_syscall() never do
+# ---------------------------------------------------------------------------
+
+
+def test_check_tool_never_physically_acquires_a_gpu():
+    """check_tool() is the pure-policy check; only admit_tool_call() (its one
+    real caller) performs the blocking acquire, so a policy-only check never
+    blocks."""
+    sandbox = _FakeSandbox(gpu_count_requested=1)
+    server = _make_server(sandbox=sandbox)
+    assert server.check_tool("bash", {"cmd": "ls"}) == (True, None)
+    assert sandbox.acquire_calls == []
+    assert sandbox._gpu_ids == []
+
+
+def test_admit_tool_call_acquires_gpu_when_reserved_but_not_yet_held():
+    sandbox = _FakeSandbox(gpu_count_requested=1)
+    server = _make_server(sandbox=sandbox)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert (result["allowed"], result["reason"]) == (True, None)
+    assert sandbox.acquire_calls == [1]
+    assert sandbox._gpu_ids == [0]
+
+
+def test_admit_tool_call_does_not_reacquire_once_gpu_already_held():
+    sandbox = _FakeSandbox(gpu_count_requested=1, gpu_ids=[3])
+    server = _make_server(sandbox=sandbox)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert (result["allowed"], result["reason"]) == (True, None)
+    assert sandbox.acquire_calls == []
+    assert sandbox._gpu_ids == [3]
+
+
+def test_admit_tool_call_is_a_noop_when_sandbox_never_reserved_a_gpu():
+    sandbox = _FakeSandbox(gpu_count_requested=0)
+    server = _make_server(sandbox=sandbox)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert (result["allowed"], result["reason"]) == (True, None)
+    assert sandbox.acquire_calls == []
+
+
+def test_admit_tool_call_is_a_noop_when_no_sandbox_is_wired_up():
+    server = _make_server(sandbox=None)
+    result = server.admit_tool_call("bash", {"cmd": "ls"})
+    assert (result["allowed"], result["reason"]) == (True, None)
+
+
+def test_admit_tool_call_records_gpu_ids_in_its_term_message_and_event():
+    sandbox = _FakeSandbox(gpu_count_requested=1, gpu_ids=[2])
+    data_logger = _FakeDataLogger()
+    server = _make_server(sandbox=sandbox, data_logger=data_logger)
+    server.admit_tool_call("bash", {"cmd": "ls"})
+    call_events = [e for e in data_logger.events if e[0] == "tool_call"]
+    assert call_events[0][1]["gpu_ids"] == [2]
+    term_messages = [e[4] for e in data_logger.events if e[4] and "TOOL" in e[4]]
+    assert any("gpu=[2]" in m for m in term_messages)
+
+
+def test_check_syscall_never_triggers_physical_gpu_acquisition():
+    """Regression test: gating the blocking GPU acquire at the execve/execveat
+    syscall layer wedged every agent forever, because a harness's own internal
+    hook subprocesses and diagnostic probes (nvidia-smi, hostname, sed, ...)
+    execve constantly and are indistinguishable from the agent's own workload
+    at the syscall level -- so the very first such exec after reserve_resource
+    blocked forever, long before the agent's real tool call ever ran. Physical
+    acquisition must happen only in admit_tool_call(), never in
+    check_syscall()."""
+    sandbox = _FakeSandbox(gpu_count_requested=1)
+    server = _make_server(sandbox=sandbox)
+    for syscall_name in ("execve", "execveat"):
+        allowed, reason, env_overrides = server.check_syscall(_make_syscall(syscall=syscall_name))
+        assert (allowed, reason) == (True, None)
+        assert sandbox.acquire_calls == []
+        assert env_overrides == {
+            "CUDA_VISIBLE_DEVICES": "NoDevFiles",
+            "HIP_VISIBLE_DEVICES": "NoDevFiles",
+        }
+
+
+def test_admit_syscall_records_env_overrides_in_its_term_message_and_event():
+    sandbox = _FakeSandbox(gpu_count_requested=1, gpu_ids=[2])
+    data_logger = _FakeDataLogger()
+    server = _make_server(sandbox=sandbox, data_logger=data_logger)
+    server.admit_syscall(_make_syscall(syscall="execve"))
+    call_events = [e for e in data_logger.events if e[0] == "syscall_call"]
+    assert call_events[0][1]["env_overrides"] == {
+        "CUDA_VISIBLE_DEVICES": "2",
+        "HIP_VISIBLE_DEVICES": "2",
+    }
+    term_messages = [e[4] for e in data_logger.events if e[4] and "SYSCALL" in e[4]]
+    assert any("env_overrides=" in m and "CUDA_VISIBLE_DEVICES" in m for m in term_messages)
+
+
+def test_check_syscall_reflects_already_acquired_gpu_ids_as_env_overrides():
+    sandbox = _FakeSandbox(gpu_count_requested=1, gpu_ids=[2])
+    server = _make_server(sandbox=sandbox)
+    allowed, reason, env_overrides = server.check_syscall(_make_syscall(syscall="execve"))
+    assert (allowed, reason) == (True, None)
+    assert env_overrides == {"CUDA_VISIBLE_DEVICES": "2", "HIP_VISIBLE_DEVICES": "2"}
+
+
+def test_check_syscall_has_no_env_overrides_for_non_gated_syscalls():
+    sandbox = _FakeSandbox(gpu_count_requested=1, gpu_ids=[2])
+    server = _make_server(sandbox=sandbox)
+    allowed, reason, env_overrides = server.check_syscall(_make_syscall(syscall="openat"))
+    assert (allowed, reason) == (True, None)
+    assert env_overrides is None
+
+
+def test_check_syscall_has_no_env_overrides_when_sandbox_never_reserved_a_gpu():
+    sandbox = _FakeSandbox(gpu_count_requested=0)
+    server = _make_server(sandbox=sandbox)
+    allowed, reason, env_overrides = server.check_syscall(_make_syscall(syscall="execve"))
+    assert (allowed, reason) == (True, None)
+    assert env_overrides is None

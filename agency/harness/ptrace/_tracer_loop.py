@@ -58,6 +58,13 @@ class SeccompStop:
 class StopDecision:
     kind: str  # "allow" | "deny" | "rewrite"
     new_args: "list[str] | None" = None
+    # Complete replacement environment for an exec-family "rewrite" --
+    # independent of new_args (either, both, or neither may be set on the
+    # same decision). The full dict, already merged with whatever the
+    # process would otherwise have seen -- this module injects it verbatim,
+    # it does not merge (see supervisor.py's syscall_hook, which builds
+    # this from the original envp plus overrides).
+    new_envp: "dict[str, str] | None" = None
     # Correlates this admission with its later completion report (see
     # syscall_exit_hook below) -- opaque to this module, just threaded
     # through from whatever syscall_hook's own policy.check() returned.
@@ -780,27 +787,34 @@ class TracerLoop:
             regs2 = pt.get_regs(pid)
             regs2.rax = ctypes.c_ulonglong((-_EPERM) & 0xFFFFFFFFFFFFFFFF).value
             pt.set_regs(pid, regs2)
-        elif decision.kind == "rewrite" and decision.new_args:
+        elif decision.kind == "rewrite" and (decision.new_args or decision.new_envp):
             if nr not in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"]):
-                # `rewrite` only injects a new path+argv into the exec-family
-                # argument registers. Path
-                # redirection for openat/open is deliberately NOT done this
-                # way (see the design doc: raw pointer rewriting for file
-                # paths is fragile and agsandbox's mount mechanism already
-                # solves "this path resolves somewhere else" properly) --
+                # `rewrite` only injects a new path+argv/envp into the
+                # exec-family argument registers. Path redirection for
+                # openat/open is deliberately NOT done this way (see the
+                # design doc: raw pointer rewriting for file paths is
+                # fragile and agsandbox's mount mechanism already solves
+                # "this path resolves somewhere else" properly) --
                 # silently falls through to allow rather than corrupting
                 # unrelated registers.
                 pass
             else:
-                path_addr, argv_addr = pt.inject_argv(
-                    pid, regs.rsp, decision.new_args[0], decision.new_args
-                )
-                if nr == pt.SYSCALL_NUMBERS["execve"]:
-                    regs.rdi = path_addr
-                    regs.rsi = argv_addr
-                else:
-                    regs.rsi = path_addr
-                    regs.rdx = argv_addr
+                if decision.new_args:
+                    path_addr, argv_addr = pt.inject_argv(
+                        pid, regs.rsp, decision.new_args[0], decision.new_args
+                    )
+                    if nr == pt.SYSCALL_NUMBERS["execve"]:
+                        regs.rdi = path_addr
+                        regs.rsi = argv_addr
+                    else:
+                        regs.rsi = path_addr
+                        regs.rdx = argv_addr
+                if decision.new_envp:
+                    envp_addr = pt.inject_envp(pid, regs.rsp, decision.new_envp)
+                    if nr == pt.SYSCALL_NUMBERS["execve"]:
+                        regs.rdx = envp_addr
+                    else:
+                        regs.r10 = envp_addr
                 pt.set_regs(pid, regs)
         if is_exec:
             # The syscall entry is only a candidate: exec can still fail

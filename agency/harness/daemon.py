@@ -46,19 +46,29 @@ _SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
 class _HostSyscallPolicy:
     """Ptrace policy adapter backed by the host interaction service.
 
-    Only syscalls this attempt's policy actually hooks need the synchronous
-    host round-trip -- every other syscall has a decision that is fully
-    known before the harness even launches (``not default_to_deny``), so it
-    never sits on the traced process's critical path. The same
-    ``/interaction/check_syscall`` call still fires for those, just in the
-    background and with its result discarded, purely so the admission still
-    gets logged (tool_call/agent_state events, the "SYSCALL" line) exactly
-    like a hooked call's does. Its returned ``call_id`` (the host stashes it
-    as a pending call awaiting completion) is immediately closed out with an
-    "unknown" outcome, since nothing here ever observes the syscall's real
-    return value for an admission that was never actually gated on that
-    host round-trip.
+    Only syscalls this attempt's policy actually hooks (plus exec-family
+    ones, see below) need the synchronous host round-trip -- every other
+    syscall has a decision that is fully known before the harness even
+    launches (``not default_to_deny``), so it never sits on the traced
+    process's critical path. The same ``/interaction/check_syscall`` call
+    still fires for those, just in the background and with its result
+    discarded, purely so the admission still gets logged (tool_call/
+    agent_state events, the "SYSCALL" line) exactly like a hooked call's
+    does. Its returned ``call_id`` (the host stashes it as a pending call
+    awaiting completion) is immediately closed out with an "unknown"
+    outcome, since nothing here ever observes the syscall's real return
+    value for an admission that was never actually gated on that host
+    round-trip.
+
+    ``execve``/``execveat`` are always forced onto the real synchronous
+    path regardless of ``hooked_syscalls`` -- the host uses exactly this
+    admission to gate a pending GPU reservation (blocking until one is
+    actually free) and to scope CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES
+    onto the process about to run, neither of which the short-circuit's
+    "decision known before launch" premise holds for.
     """
+
+    _ALWAYS_SYNCHRONOUS = frozenset({"execve", "execveat"})
 
     def __init__(
         self,
@@ -74,10 +84,10 @@ class _HostSyscallPolicy:
         self._hooked_syscalls = hooked_syscalls or frozenset()
 
     def check(self, _agent, syscall):
-        if syscall.syscall in self._hooked_syscalls:
+        if syscall.syscall in self._hooked_syscalls or syscall.syscall in self._ALWAYS_SYNCHRONOUS:
             return self._host_services.check_syscall_policy(self._attempt_token, syscall)
         _SYSCALL_LOG_POOL.submit(self._log_admission_best_effort, syscall)
-        return (not self._default_to_deny, None, None)
+        return (not self._default_to_deny, None, None, None)
 
     def _log_admission_best_effort(self, syscall) -> None:
         try:

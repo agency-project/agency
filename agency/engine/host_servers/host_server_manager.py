@@ -88,6 +88,7 @@ class HostServerManager:
             skill,
             self._data_logger,
             agent.agname,
+            sandbox=sandbox,
             is_cancelled=is_cancelled,
             parent_context=agprof.current_span_context(),
             profile_attributes={

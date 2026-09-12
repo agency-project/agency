@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from ...harness._syscall_event import agsyscallevent
 from ...observability.profiler import agprof
+from ...orchestrator.agresources import GpuWaitCancelled
 
 # Slack absorbed by translating a reporter's wall-clock timestamp into this
 # host's own perf_counter_ns domain (see _wall_clock_to_perf_ns) -- generous
@@ -22,6 +23,13 @@ _CLOCK_SLACK_NS = 5_000_000
 if TYPE_CHECKING:
     from ...observability.agdatalogger import agDataLogger
     from ...agskill import agskill
+    from ...sandbox.agsandbox import agSandbox
+
+# execve/execveat are the only syscalls a pending GPU reservation needs to
+# gate on (see _HostSyscallPolicy._ALWAYS_SYNCHRONOUS in harness/daemon.py,
+# which forces exactly these two past the short-circuit so this class's
+# check_syscall() is actually consulted synchronously for them).
+_GPU_GATED_SYSCALLS = frozenset({"execve", "execveat"})
 
 
 class HostInteractionServer:
@@ -31,6 +39,7 @@ class HostInteractionServer:
         data_logger: "agDataLogger",
         agname: str,
         *,
+        sandbox: "agSandbox | None" = None,
         is_cancelled: "Callable[[], bool] | None" = None,
         parent_context=None,
         profile_attributes: dict | None = None,
@@ -40,6 +49,7 @@ class HostInteractionServer:
         self._policy = skill.policy
         self._data_logger = data_logger
         self._agname = agname  # for _record_admission's term_message tag
+        self._sandbox = sandbox
         # Bound by HostServerManager to the exact orchestrator request.  The
         # sandbox never supplies an invocation id and therefore cannot target
         # another request's cancellation state.
@@ -60,26 +70,39 @@ class HostInteractionServer:
         self._profile_pid = -2 - agprof.next_index("remote-profile")
 
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
+        """Pure policy check -- does not acquire a reserved GPU."""
         if self._is_cancelled():
             return False, "agent invocation stopped"
         hook = (self._policy.tool_hooks or {}).get(tool_name)
         if hook is None:
-            return (not self._policy.default_to_deny, None)
+            return not self._policy.default_to_deny, None
         try:
             result = hook(tool_input)
         except Exception as exc:
-            return (False, f"hook raised: {exc}")
+            return False, f"hook raised: {exc}"
         return result if isinstance(result, tuple) else (result, None)
 
-    def check_syscall(self, syscall: "agsyscallevent") -> "tuple[bool, str | None]":
+    def check_syscall(
+        self, syscall: "agsyscallevent"
+    ) -> "tuple[bool, str | None, dict[str, str] | None]":
+        if self._is_cancelled():
+            return False, "agent invocation stopped", None
         hook = (self._policy.syscall_hooks or {}).get(syscall.syscall)
         if hook is None:
-            return (not self._policy.default_to_deny, None)
-        try:
-            result = hook(syscall)
-        except Exception as exc:
-            return (False, f"hook raised: {exc}")
-        return result if isinstance(result, tuple) else (result, None)
+            allowed, reason = not self._policy.default_to_deny, None
+        else:
+            try:
+                result = hook(syscall)
+            except Exception as exc:
+                result = (False, f"hook raised: {exc}")
+            allowed, reason = result if isinstance(result, tuple) else (result, None)
+        env_overrides = None
+        sandbox = self._sandbox
+        gpu_ids = sandbox.current_gpu_ids() if sandbox is not None else None
+        if allowed and syscall.syscall in _GPU_GATED_SYSCALLS and gpu_ids is not None:
+            gpu_id_str = ",".join(str(g) for g in gpu_ids) if gpu_ids else "NoDevFiles"
+            env_overrides = {"CUDA_VISIBLE_DEVICES": gpu_id_str, "HIP_VISIBLE_DEVICES": gpu_id_str}
+        return allowed, reason, env_overrides
 
     _ADMISSION_LABEL = {"tool": "TOOL   ", "syscall": "SYSCALL"}
 
@@ -94,12 +117,16 @@ class HostInteractionServer:
         label = self._ADMISSION_LABEL[kind]
         if kind == "tool":
             args_text = repr(attributes["arguments"])
+            if attributes.get("gpu_ids"):
+                args_text = f"{args_text}  gpu={attributes['gpu_ids']}"
         elif attributes.get("address") is not None:
             args_text = f"{attributes['address']}:{attributes.get('port')}"
         else:
             args_text = repr(attributes["argv"] or attributes["path"])
         if attributes.get("program"):
             args_text = f"{args_text}  program={attributes['program']}"
+        if attributes.get("env_overrides"):
+            args_text = f"{args_text}  env_overrides={attributes['env_overrides']}"
         args_suffix = f"  args={args_text}"
         if allowed:
             term_message = f"[{self._agname}] {label} ▶  {name}{args_suffix}"
@@ -287,10 +314,21 @@ class HostInteractionServer:
         return {"ok": rejected == 0, "rejected": rejected}
 
     def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
-        """Admission + telemetry entry point for a tool call"""
+        """Admission + telemetry entry point for a tool call."""
         allowed, reason = self.check_tool(tool_name, tool_input)
+        sandbox = self._sandbox
+        if allowed and sandbox is not None:
+            try:
+                sandbox.ensure_gpu_acquired(self._agname, is_cancelled=self._is_cancelled)
+            except GpuWaitCancelled:
+                allowed, reason = False, "agent invocation cancelled"
+        gpu_ids = sandbox.current_gpu_ids() if sandbox is not None else None
         call_id = self._record_admission(
-            "tool", tool_name, {"tool": tool_name, "arguments": tool_input}, allowed, reason
+            "tool",
+            tool_name,
+            {"tool": tool_name, "arguments": tool_input, "gpu_ids": gpu_ids},
+            allowed,
+            reason,
         )
         return {"allowed": allowed, "reason": reason, "call_id": call_id}
 
@@ -315,7 +353,7 @@ class HostInteractionServer:
 
     def admit_syscall(self, syscall: "agsyscallevent") -> dict:
         """Admission + telemetry entry point for a syscall"""
-        allowed, reason = self.check_syscall(syscall)
+        allowed, reason, env_overrides = self.check_syscall(syscall)
         call_id = self._record_admission(
             "syscall",
             syscall.syscall,
@@ -327,11 +365,17 @@ class HostInteractionServer:
                 "program": syscall.program,
                 "address": syscall.address,
                 "port": syscall.port,
+                "env_overrides": env_overrides,
             },
             allowed,
             reason,
         )
-        return {"allowed": allowed, "reason": reason, "call_id": call_id}
+        return {
+            "allowed": allowed,
+            "reason": reason,
+            "call_id": call_id,
+            "env_overrides": env_overrides,
+        }
 
     def complete_syscall(
         self, call_id: str, return_value: "int | None" = None, error: "str | None" = None

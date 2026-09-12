@@ -330,3 +330,30 @@ def inject_argv(pid: int, rsp: int, path: str, argv: list[str]) -> tuple[int, in
     write_bytes(pid, scratch, bytes(blob))
     write_bytes(pid, ptrarr_addr, ptrs)
     return path_addr, ptrarr_addr
+
+
+# A separate scratch region further below rsp than inject_argv's own, so an
+# envp rewrite and an argv rewrite never overlap even if a single decision
+# ever needed both at once (today nothing does -- GPU env scoping is the
+# only rewrite user, and it never also rewrites argv).
+ENVP_REWRITE_SCRATCH_SIZE = 8192
+
+
+def inject_envp(pid: int, rsp: int, envp: "dict[str, str]") -> int:
+    """Write *envp* into its own scratch stack memory and return the new
+    envp array address -- the tracee's rdx (execve) / r10 (execveat) value
+    to make the pending exec see this environment instead."""
+    scratch = (rsp - REWRITE_SCRATCH_SIZE - ENVP_REWRITE_SCRATCH_SIZE) & ~0xF
+    blob = bytearray()
+    str_addrs = []
+    for key, value in envp.items():
+        str_addrs.append(scratch + len(blob))
+        blob += f"{key}={value}".encode() + b"\x00"
+    ptrarr_addr = scratch + len(blob)
+    ptrarr_addr = (ptrarr_addr + 7) & ~0x7  # 8-byte align the pointer array
+    if ptrarr_addr - scratch + (len(envp) + 1) * 8 > ENVP_REWRITE_SCRATCH_SIZE:
+        raise ValueError("rewritten envp too large for scratch space")
+    ptrs = b"".join(struct.pack("<Q", a) for a in str_addrs) + struct.pack("<Q", 0)
+    write_bytes(pid, scratch, bytes(blob))
+    write_bytes(pid, ptrarr_addr, ptrs)
+    return ptrarr_addr

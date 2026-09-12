@@ -13,6 +13,7 @@ from .base import agsandbox_backend, backend_for_image_kind
 from .container import _RUN_ID
 
 if TYPE_CHECKING:
+    from ..engine.clients import HarnessInteractionClient
     from ..orchestrator.agresources import agResourcePool
 
 
@@ -206,6 +207,42 @@ class agSandbox:
     @_gpu_release_fn.setter
     def _gpu_release_fn(self, value) -> None:
         self._backend._gpu_release_fn = value
+
+    def current_gpu_ids(self) -> "list[int] | None":
+        """Currently-held GPU ids, or None if nothing was ever reserved."""
+        if self._gpu_count_requested <= 0:
+            return None
+        return list(self._gpu_ids)
+
+    def ensure_gpu_acquired(
+        self, agname: str, *, is_cancelled: "Callable[[], bool] | None" = None
+    ) -> None:
+        """Physically acquire the reserved GPU(s), if not already held.
+        Pauses agname's harness for the duration (best-effort)."""
+        if self._gpu_count_requested <= 0 or self._gpu_ids or self._gpu_acquire_fn is None:
+            return
+        count = self._gpu_count_requested
+        client = self._harness_daemon_client(agname)
+        if client is None:
+            self._gpu_ids = self._gpu_acquire_fn(count, is_cancelled=is_cancelled)
+            return
+        with client:
+            try:
+                client.pause_harness()
+            except Exception as exc:
+                print(f"[agsandbox] WARNING: pause_harness() failed for {agname}: {exc}")
+            try:
+                self._gpu_ids = self._gpu_acquire_fn(count, is_cancelled=is_cancelled)
+            finally:
+                try:
+                    client.resume_harness()
+                except Exception as exc:
+                    print(f"[agsandbox] WARNING: resume_harness() failed for {agname}: {exc}")
+
+    def _harness_daemon_client(self, agname: str) -> "HarnessInteractionClient | None":
+        handles = getattr(self, "_agency_harness_daemon_handles", None)
+        handle = handles.get(agname) if handles else None
+        return handle.client(timeout_s=10) if handle is not None else None
 
     def _own_host_pids(self) -> "set[int]":
         return self._backend._own_host_pids()

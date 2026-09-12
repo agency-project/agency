@@ -56,6 +56,12 @@ TracerLoop = _load_tracer_loop
 @dataclass
 class _TraceDecision:
     kind: str
+    # Duck-typed against _tracer_loop.py's StopDecision -- that module reads
+    # .new_args/.new_envp off whatever syscall_hook returns, so both must
+    # exist here even though this class only ever populates new_envp today
+    # (GPU env scoping never also rewrites argv).
+    new_args: "list[str] | None" = None
+    new_envp: "dict[str, str] | None" = None
     call_id: "str | None" = None
 
 
@@ -528,6 +534,19 @@ class agProxyPtrace:
             decision = policy.check(ag, event)
             allowed = decision[0] if isinstance(decision, tuple) else decision
             call_id = decision[2] if isinstance(decision, tuple) and len(decision) > 2 else None
+            env_overrides = (
+                decision[3] if isinstance(decision, tuple) and len(decision) > 3 else None
+            )
+            if allowed and env_overrides:
+                # A GPU-scoping (or similar) env override only ever adds to
+                # the environment the process would otherwise have seen --
+                # merge onto the envp already captured at this trap, rather
+                # than replacing it outright.
+                return _TraceDecision(
+                    kind="rewrite",
+                    call_id=call_id,
+                    new_envp={**(stop.envp or {}), **env_overrides},
+                )
             return _TraceDecision(kind="allow" if allowed else "deny", call_id=call_id)
 
         check_completion = getattr(policy, "check_completion", None)

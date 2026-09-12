@@ -107,7 +107,7 @@ def test_bridge_uses_stable_host_service_routes_and_request_shapes():
             path="/bin/true",
             timestamp=1.0,
         )
-        assert bridge.check_syscall_policy("token", syscall) == (True, None, None)
+        assert bridge.check_syscall_policy("token", syscall) == (True, None, None, None)
         assert bridge.record_profiler_span(
             "token", {"name": "turn0", "span_id": "s1", "attributes": {}}
         ) == {"ok": True}

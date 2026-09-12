@@ -4,7 +4,7 @@ import heapq
 import itertools
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..utils.agutil import (
     _allocate_gpu_markers,
@@ -17,6 +17,12 @@ from ..configs.agconfig import MIN_CPUS, MIN_MEMORY_MB, agconfig as agconfig_cls
 
 if TYPE_CHECKING:
     from ..observability.agdatalogger import agDataLogger
+
+
+class GpuWaitCancelled(RuntimeError):
+    """Raised by acquire_gpus() when its caller's is_cancelled() went true
+    while still queued -- distinct from TimeoutError so a caller can tell
+    "gave up, no GPU ever came" apart from "the request itself died"."""
 
 
 def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
@@ -129,7 +135,14 @@ class agResourcePool:
         """Return a clone of this pool's agconfig."""
         return self.agconfig.clone()
 
-    def acquire_gpus(self, sandbox, count: int, timeout: "float | None" = None) -> "list[int]":
+    def acquire_gpus(
+        self,
+        sandbox,
+        count: int,
+        timeout: "float | None" = None,
+        is_cancelled: "Callable[[], bool] | None" = None,
+        poll_interval: float = 0.5,
+    ) -> "list[int]":
         """Block until *count* GPUs are free; grant them to *sandbox* (setting
         its `_gpu_ids`) and return their ids.
 
@@ -142,6 +155,17 @@ class agResourcePool:
 
         Raises ValueError immediately if `count` exceeds the pool's total
         size -- that's never satisfiable, so there's no reason to queue it.
+
+        *is_cancelled*, if given, is polled every *poll_interval* seconds
+        while queued (never once for the whole wait -- an external caller
+        that's cancelled mid-wait must be noticed promptly, not just once at
+        entry). On a positive check this request is dequeued and
+        GpuWaitCancelled is raised -- otherwise a cancelled caller's queue
+        entry lives on and can still be granted a real GPU nobody will ever
+        release, since the caller that would have released it is already
+        gone. A plain wall-clock *timeout* is a separate, orthogonal
+        concern (give up waiting after a bounded time regardless of
+        cancellation) and still raises TimeoutError as before.
         """
         if count <= 0:
             return []
@@ -156,17 +180,19 @@ class agResourcePool:
             heapq.heappush(self._gpu_queue, (count, seq, request))
             self._dispatch_gpu_queue_locked()
             while request.granted_ids is None:
+                if is_cancelled is not None and is_cancelled():
+                    self._dequeue_gpu_request_locked(request)
+                    raise GpuWaitCancelled(
+                        f"cancelled while waiting for {count} GPU(s) (pool: {self.gpus})"
+                    )
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     self._dequeue_gpu_request_locked(request)
                     raise TimeoutError(
                         f"No {count} GPU(s) available within {timeout}s (pool: {self.gpus})"
                     )
-                if not self._gpu_cond.wait(timeout=remaining):
-                    self._dequeue_gpu_request_locked(request)
-                    raise TimeoutError(
-                        f"No {count} GPU(s) available within {timeout}s (pool: {self.gpus})"
-                    )
+                slice_s = poll_interval if remaining is None else min(poll_interval, remaining)
+                self._gpu_cond.wait(timeout=slice_s)
         for gpu_id in request.granted_ids:
             agprof.gpu_lease_begin(gpu_id)
         sandbox._gpu_ids = request.granted_ids
