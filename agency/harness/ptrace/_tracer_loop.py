@@ -26,6 +26,7 @@ package's only job "run the ptrace mechanics correctly."
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import struct
 import termios
@@ -72,6 +73,21 @@ class StopDecision:
 
 
 _EPERM = 1
+
+
+def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0) -> None:
+    """A fire-and-forget ptrace() restart/setoptions call: *pid* may have
+    already exited and been reaped between being observed and acted on here
+    -- an ordinary race in a multi-process tree, not a bug, so it's
+    swallowed here instead of killing the whole tracer thread (our own
+    ptrace() wrapper raises PtraceError, not ProcessLookupError, for this)."""
+    try:
+        pt.ptrace(request, pid, addr, data)
+    except ProcessLookupError:
+        pass
+    except pt.PtraceError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
 
 
 def _is_thread_group_leader(pid: int) -> bool:
@@ -633,10 +649,7 @@ class TracerLoop:
             # resume() only queues the pids here; this loop is what actually
             # restarts them, on its very next iteration.
             for pid in to_resume:
-                try:
-                    pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
-                except ProcessLookupError:
-                    pass
+                _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
             # A kill can overtake a clone notification. Its auto-attached child
             # still needs its exit-stop resumed, even though it never entered
             # _known_pids. Waiting only on known PIDs strands that child and
@@ -679,10 +692,10 @@ class TracerLoop:
             # auto-attached fork/vfork/clone child) or, defensively, any
             # other pid we somehow see before applying options to it.
             self._classify_pending_clone(pid)
-            pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+            _ptrace_ignoring_esrch(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
             with self._lock:
                 self._options_applied.add(pid)
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
             return
 
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_SECCOMP:
@@ -704,16 +717,16 @@ class TracerLoop:
                 new_pid,
                 is_process=None if event == pt.PTRACE_EVENT_CLONE else True,
             )
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
             return
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXEC:
             self._commit_exec(pid)
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
             return
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXIT:
             # Process disappearance itself is handled via WIFEXITED or
             # WIFSIGNALED above; the pre-exit notification just resumes.
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
             return
         # A real signal being delivered to the tracee -- forward it
         # untouched, except don't forward a bare SIGTRAP (which shouldn't
@@ -730,7 +743,7 @@ class TracerLoop:
                 if pid in self._held_pids:
                     self._parked_pids.add(pid)
                     return
-        pt.ptrace(pt.PTRACE_CONT, pid, 0, forward)
+        _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, forward)
 
     def pause(self) -> None:
         """Stop every currently-known pid in the traced tree. Unlike
@@ -839,9 +852,9 @@ class TracerLoop:
             # like any other syscall's exit.
             with self._lock:
                 self._pending_syscall_exit[pid] = (stop, decision.call_id)
-            pt.ptrace(pt.PTRACE_SYSCALL, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_SYSCALL, pid, 0, 0)
         else:
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
 
     def _handle_syscall_exit_stop(self, pid: int, pending: tuple) -> None:
         stop, call_id = pending
@@ -854,7 +867,7 @@ class TracerLoop:
             # rather than crash the whole tracer loop over one lost value.
             return_value = None
         finally:
-            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
         if self._syscall_exit_hook is not None and return_value is not None:
             self._syscall_exit_hook(stop, call_id, return_value)
 

@@ -954,3 +954,21 @@ def test_deny_openat_blocks_file_read():
     stdout, stderr, rc = handle.wait(timeout=10)
     assert rc != 0
     assert stdout == ""
+
+
+def test_ptrace_ignoring_esrch_swallows_resume_of_an_already_dead_pid():
+    """Regression test: resuming a pid that already exited (and was reaped)
+    between being queued and being acted on used to kill the whole tracer
+    thread -- our ptrace() wrapper raises PtraceError, not
+    ProcessLookupError, for that case, so the old `except ProcessLookupError`
+    guard never actually caught it."""
+    import os
+
+    from agency.harness.ptrace import _ctypes_defs as pt
+    from agency.harness.ptrace._tracer_loop import _ptrace_ignoring_esrch
+
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)  # reaped -- pid is now guaranteed gone
+    _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)  # must not raise
