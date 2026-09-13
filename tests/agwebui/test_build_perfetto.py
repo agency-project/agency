@@ -74,6 +74,16 @@ def test_failed_build_can_be_retried(cache):
     assert builder.viewer_is_current()
 
 
+def test_presentation_source_invalidates_cache(cache, monkeypatch, tmp_path):
+    build, complete = cache
+    complete()
+    source = tmp_path / "presentation.ts"
+    source.write_text("new plugin")
+    monkeypatch.setattr(builder, "PRESENTATION", source)
+    builder.ensure_viewer()
+    build.assert_called_once()
+
+
 def test_concurrent_starts_share_one_build(cache):
     build, complete = cache
     entered, release = threading.Event(), threading.Event()

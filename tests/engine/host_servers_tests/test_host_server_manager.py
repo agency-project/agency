@@ -41,7 +41,10 @@ def _make_manager(tmp_path, policy=None, is_cancelled=None, harness="claude_code
         data_logger=agDataLogger(cfg),
         llm_usage_tracker=LlmUsageTracker(),
     )
-    sandbox = SimpleNamespace()
+    sandbox = SimpleNamespace(
+        ensure_gpu_acquired=lambda _agname, *, is_cancelled: None,
+        current_gpu_ids=lambda: None,
+    )
     skill = SimpleNamespace(
         name="test-skill",
         policy=policy if policy is not None else agpolicy(),
@@ -242,9 +245,9 @@ def test_failed_start_clears_dead_worker_state_and_can_retry(tmp_path, monkeypat
             return None
 
     class DeadThread:
-        def __init__(self, *, target, daemon, name):
+        def __init__(self, *, target, daemon, name=None, args=(), kwargs=None):
             del daemon, name
-            self._target = target
+            self._target = lambda: target(*args, **(kwargs or {}))
             self._alive = False
 
         def start(self):
@@ -274,8 +277,8 @@ def test_thread_start_failure_clears_server_refs_and_remains_stoppable(tmp_path,
     manager, _, _ = _make_manager(tmp_path)
 
     class StartFailureThread:
-        def __init__(self, *, target, daemon, name):
-            del target, daemon, name
+        def __init__(self, *, target, daemon, name=None, args=(), kwargs=None):
+            del target, daemon, name, args, kwargs
 
         @staticmethod
         def start():
@@ -394,7 +397,10 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
         data_logger=agDataLogger(cfg),
         llm_usage_tracker=LlmUsageTracker(),
     )
-    sandbox = SimpleNamespace()
+    sandbox = SimpleNamespace(
+        ensure_gpu_acquired=lambda _agname, *, is_cancelled: None,
+        current_gpu_ids=lambda: None,
+    )
     skill = agskill(name="s", prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()
     manager = HostServerManager(agent, sandbox, skill, resource_pool)

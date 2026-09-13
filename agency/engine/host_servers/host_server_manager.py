@@ -14,6 +14,7 @@ from starlette.datastructures import Headers
 
 from ...harness.protocol import ATTEMPT_TOKEN_HEADER
 from ...utils.agutil import new_uds_path
+from ...observability.profiler import agprof
 from .host_interaction_server import HostInteractionServer
 from .host_mcp_server import HostMcpServer, bind_data_logger_for_current_thread
 from .llm_handler_server import LlmHandlerServer
@@ -53,7 +54,14 @@ class _AttemptFenceMiddleware:
             return
 
         try:
-            await self._app(scope, receive, send)
+            with agprof.execution_context(
+                {
+                    **self._manager.interaction_server._profile_attributes,
+                    "agency.execution_side": "host",
+                },
+                parent_context=self._manager.interaction_server.current_open_context(),
+            ):
+                await self._app(scope, receive, send)
         finally:
             self._manager._release_attempt_lease(token)
 
@@ -94,6 +102,8 @@ class HostServerManager:
             profile_attributes={
                 **agprof.current_span_attributes(),
                 "harness": getattr(agent, "harness", "unknown"),
+                "agency.agent_id": str(agent.agname),
+                "agency.sandbox_id": agprof.sandbox_identity(sandbox),
             },
         )
         self._llm_handler_server._profile_context_provider = (
@@ -273,7 +283,12 @@ class HostServerManager:
                 bind_data_logger_for_current_thread(data_logger)
                 server.run()
 
-            thread = threading.Thread(target=_run_server, daemon=True, name="host-server-manager")
+            with agprof.execution_context(
+                {**self._interaction_server._profile_attributes, "agency.execution_side": "host"},
+                parent_context=self._interaction_server._profile_context,
+            ):
+                thread = agprof.spawn_traced(_run_server, daemon=True)
+            thread.name = "host-server-manager"
             self._server = server
             self._server_thread = thread
             try:

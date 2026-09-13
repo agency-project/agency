@@ -890,8 +890,8 @@ class TestProfilerContainerRegistration:
             agconfig=None,
         )
 
-    def test_profiler_label_unwraps_sandbox_name_and_dedup_suffix(self):
-        assert self._sb()._prof_container_label() == "research_agent"
+    def test_profiler_label_preserves_unique_sandbox_identity(self):
+        assert self._sb()._prof_container_label() == "sandbox_research_agent_a1b2"
         assert self._sb("plain_agent")._prof_container_label() == "plain_agent"
 
     def test_registration_is_a_noop_without_an_active_profiler(self):
@@ -926,7 +926,7 @@ class TestProfilerContainerRegistration:
             sb._name,
         ]
         started.assert_called_once_with(
-            "research_agent",
+            "sandbox_research_agent_a1b2",
             f"/sys/fs/cgroup/user.slice/libpod-{self._CONTAINER_ID}.scope{payload_suffix}",
             conmon,
             "conmon",
@@ -980,7 +980,7 @@ class TestProfilerContainerRegistration:
                 with patch.object(sb, "_release_runtime_slot"):
                     with patch.object(_container.agprof, "container_stopped") as stopped:
                         sb.stop()
-        stopped.assert_called_once_with("research_agent")
+        stopped.assert_called_once_with("sandbox_research_agent_a1b2")
 
     def test_failed_stop_keeps_running_container_registered(self):
         sb = self._sb()
@@ -999,7 +999,7 @@ class TestProfilerContainerRegistration:
                     with patch.object(sb, "_release_runtime_slot"):
                         with patch.object(_container.agprof, "container_stopped") as stopped:
                             sb.rm_container()
-        stopped.assert_called_once_with("research_agent")
+        stopped.assert_called_once_with("sandbox_research_agent_a1b2")
 
     def test_failed_rm_keeps_a_still_running_container_registered(self):
         sb = self._sb()

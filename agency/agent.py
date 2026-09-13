@@ -143,6 +143,7 @@ class agent:
 
             # Init moving parts of an Agent
             self.agname: _agname = _agname.allocate_agname(name, prefix="agent")
+            agprof.annotate(**{"agency.agent_id": str(self.agname)})
             self._parent_agent_id: "str | None" = None
 
             self.harness: str = harness if harness is not None else self.agconfig.agent.harness

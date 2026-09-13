@@ -113,10 +113,46 @@ def _iter_trace_events(
     trace_pid,
     origin_ns,
 ):
-    """Yield harness-only Chrome events without retaining the full event array.
+    from .presentation import present_events
 
-    Helper-process counters remain available to summary generation, but do
-    not create separate process groups in the application timeline.
+    def events():
+        return _raw_trace_events(
+            records,
+            leases,
+            process_info,
+            interrupted_spans,
+            observations,
+            automatic_records,
+            thread_labels,
+            profile_root_pid,
+            trace_pid,
+            origin_ns,
+        )
+
+    yield from present_events(
+        events,
+        records,
+        trace_pid if profile_root_pid is None else profile_root_pid,
+        process_info=process_info,
+    )
+
+
+def _raw_trace_events(
+    records,
+    leases,
+    process_info,
+    interrupted_spans,
+    observations,
+    automatic_records,
+    thread_labels,
+    profile_root_pid,
+    trace_pid,
+    origin_ns,
+):
+    """Yield application Chrome events without retaining the full event array.
+
+    Include explicitly owned sandbox work; unrelated runtime helper-process
+    counters remain available only to summary generation.
     """
 
     def to_us(timestamp_ns: int) -> float:
@@ -148,6 +184,11 @@ def _iter_trace_events(
         event["args"]["trace_span_id"] = f"slice:{len(slices)}"
         # Keep only relationship fields; streamed transcripts/results may be large.
         node = {key: event[key] for key in ("tid", "ts", "dur")}
+        node["source"] = (
+            event["args"].get("agency.source_pid", root_pid),
+            event["tid"],
+            event["args"].get("agency.reporter_id"),
+        )
         node["args"] = {
             key: event["args"][key]
             for key in ("trace_span_id", "span_id", "parent_span_id")
@@ -236,8 +277,12 @@ def _iter_trace_events(
     automatic_by_thread = {}
     for record in automatic_records:
         process_pid, tid, _name, _file, _line, started_ns, _duration, _outcome = record[:8]
-        if process_pid != root_pid:
+        ownership = record[9] if len(record) > 9 else {}
+        if process_pid != root_pid and not ownership.get("agency.sandbox_id"):
             continue
+        physical_tid = tid
+        if process_pid != root_pid:
+            tid = f"remote:{process_pid}:{tid}"
         lane_pid = trace_pid
         automatic_by_thread.setdefault((lane_pid, tid), []).append(record)
         runtime_name = record[8] if len(record) > 8 else "Python thread"
@@ -253,6 +298,9 @@ def _iter_trace_events(
                 "name": record[2],
                 "cat": "python.auto",
                 "args": {
+                    **ownership,
+                    "agency.source_pid": process_pid,
+                    "agency.source_tid": physical_tid,
                     "file": record[3],
                     "line": record[4],
                     "outcome": record[7],
@@ -266,7 +314,7 @@ def _iter_trace_events(
     enclosing = {}
     stacks = {}
     for event in sorted(slices, key=lambda e: (e["ts"], -e["dur"])):
-        stack = stacks.setdefault(event["tid"], [])
+        stack = stacks.setdefault(event["source"], [])
         end = event["ts"] + event["dur"]
         while stack and (
             stack[-1]["ts"] + stack[-1]["dur"] < end
@@ -327,7 +375,11 @@ def _iter_trace_events(
 
     root_trace_pid = root_info.get("trace_pid", trace_pid) if root_info else trace_pid
     for observation in observations:
-        if observation.get("trace_pid", trace_pid) not in {trace_pid, root_trace_pid}:
+        process = process_info.get(observation.get("process_identity"), {})
+        if observation.get("trace_pid", trace_pid) not in {
+            trace_pid,
+            root_trace_pid,
+        } and not process.get("sandbox"):
             continue
         yield {
             "ph": "C",
@@ -337,6 +389,10 @@ def _iter_trace_events(
             "name": observation["trace_name"],
             "cat": "resource",
             "args": {"value": round(observation["value"], 2)},
+            "agency_resource": {
+                "name": observation.get("name", observation["trace_name"]),
+                "process": process,
+            },
         }
 
     lease_tids = set()

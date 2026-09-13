@@ -81,6 +81,13 @@ _engine_coverage: dict[str, dict] = {}
 
 _tls = threading.local()  # per-thread schedstat file cache only
 _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stack", default=())
+_execution_context: ContextVar[dict] = ContextVar("agprof_execution_context", default={})
+_OWNERSHIP_KEYS = (
+    "agency.agent_id",
+    "agency.sandbox_id",
+    "agency.component",
+    "agency.execution_side",
+)
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
@@ -496,7 +503,10 @@ class _TimedSpan:
         self._parent_context = parent_context
         self._span = None
         self._scope = None
-        self._metadata: dict = {}
+        self._metadata: dict = {
+            k: v for k, v in _capture_execution_context().items() if k in _OWNERSHIP_KEYS
+        }
+        self._metadata["agency.execution_side"] = "host"
         self._interrupted = False
         self._stack_token = None
         self._profile_session_id = _profile_session_id
@@ -814,7 +824,11 @@ def telemetry_error(kind: str, count: int = 1) -> None:
 
 
 def ingest_auto_samples(
-    pid: int, samples: "list[dict]", *, thread_label: str = "Remote thread"
+    pid: int,
+    samples: "list[dict]",
+    *,
+    thread_label: str = "Remote thread",
+    metadata: "dict | None" = None,
 ) -> int:
     """Accept a batch of already-measured function-call samples from an
     external reporter (a harness profiling its own call stack, outside this
@@ -849,12 +863,39 @@ def ingest_auto_samples(
                     duration,
                     str(sample.get("outcome", "unknown"))[:32],
                     thread_label,
+                    {
+                        **_reported_process_identity(sample.get("process_identity", {})),
+                        **dict(metadata or {}),
+                    },
                 )
             )
         except (KeyError, ValueError, TypeError, OverflowError):
             rejected += 1
             telemetry_error("remote_events_rejected")
     return rejected
+
+
+def _reported_process_identity(attributes: dict) -> dict:
+    """Accept only a complete Linux identity tuple; the host verifies it later."""
+    if not isinstance(attributes, dict):
+        return {}
+    pid = attributes.get("agency.namespace_pid")
+    ticks = attributes.get("agency.process_start_ticks")
+    namespace = attributes.get("agency.pid_namespace")
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(ticks) is not int
+        or ticks < 0
+        or not isinstance(namespace, str)
+        or re.fullmatch(r"pid:\[\d+\]", namespace) is None
+    ):
+        return {}
+    return {
+        "agency.namespace_pid": pid,
+        "agency.process_start_ticks": ticks,
+        "agency.pid_namespace": namespace,
+    }
 
 
 def current_span_context():
@@ -877,6 +918,49 @@ def current_span_attributes() -> dict:
     return dict(_span_stack.get()[-1]._metadata)
 
 
+def sandbox_identity(sandbox) -> "str | None":
+    """Return an explicit sandbox name, or no identity for custom adapters."""
+    identity = getattr(sandbox, "_agname", None)
+    return identity if isinstance(identity, str) else None
+
+
+def _capture_execution_context() -> dict:
+    """Copy ownership without transferring mutable span handles to a worker."""
+    metadata = dict(_execution_context.get())
+    for span_handle in _span_stack.get():
+        metadata.update({k: v for k, v in span_handle._metadata.items() if k in _OWNERSHIP_KEYS})
+    stack = _span_stack.get()
+    if stack:
+        metadata["agency.context_span_id"] = stack[-1]._span.get_span_context().span_id
+    if not metadata and threading.get_native_id() == _profile_root_pid:
+        metadata["agency.component"] = "workflow"
+    return metadata
+
+
+@contextmanager
+def execution_context(metadata: dict, *, parent_context=None):
+    """Attribute one task/request without entering or sharing a timed span."""
+    if _session is None:
+        yield
+        return
+    snapshot = {**_capture_execution_context(), **metadata}
+    token = _execution_context.set(snapshot)
+    from opentelemetry import context as otel_context, trace
+
+    otel_token = None
+    if parent_context is not None:
+        parent_id = trace.get_current_span(parent_context).get_span_context().span_id
+        if parent_id:
+            snapshot["agency.context_span_id"] = parent_id
+        otel_token = otel_context.attach(parent_context)
+    try:
+        yield
+    finally:
+        if otel_token is not None:
+            otel_context.detach(otel_token)
+        _execution_context.reset(token)
+
+
 def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
     """Create a thread that inherits the caller's active OTel context.
 
@@ -892,15 +976,29 @@ def spawn_traced(fn, *args, daemon: bool = True, **kwargs) -> threading.Thread:
     from opentelemetry import context as otel_context
 
     context = otel_context.get_current()
+    ownership = _capture_execution_context()
 
     def run() -> None:
         token = otel_context.attach(context)
+        owner_token = _execution_context.set(ownership)
         try:
             fn(*args, **kwargs)
         finally:
+            _execution_context.reset(owner_token)
             otel_context.detach(token)
 
     return threading.Thread(target=run, daemon=daemon)
+
+
+def bind_execution(fn, metadata: dict, *, parent_context=None):
+    """Bind explicit ownership before a pool starts tracing the callback."""
+    snapshot = dict(metadata)
+
+    def run(*args, **kwargs):
+        with execution_context(snapshot, parent_context=parent_context):
+            return fn(*args, **kwargs)
+
+    return run
 
 
 def annotate(**metadata) -> None:
@@ -1211,7 +1309,7 @@ def _thread_label(pid: int, tid: int) -> str:
 
 def _record_auto_call(entry: tuple, ended_ns: int, outcome: str, *, identity=None) -> None:
     global _auto_dropped
-    _code, started_ns, label, filename, lineno = entry
+    _code, started_ns, label, filename, lineno = entry[:5]
     if started_ns is None:
         _auto_filtered["depth"] += 1
         return
@@ -1237,6 +1335,7 @@ def _record_auto_call(entry: tuple, ended_ns: int, outcome: str, *, identity=Non
             duration_ns,
             outcome,
             _thread_label(pid, tid),
+            entry[5] if len(entry) > 5 else {},
         )
     )
 
@@ -1252,7 +1351,8 @@ def _auto_py_start(code, _instruction_offset) -> None:
     if settings is None:
         return
     started_ns = time.perf_counter_ns() if len(stack) < settings["max_depth"] else None
-    stack.append((code, started_ns, *resolved))
+    metadata = _capture_execution_context()
+    stack.append((code, started_ns, *resolved, metadata))
 
 
 def _auto_py_end(code, _instruction_offset, _value, *, outcome: str) -> None:
@@ -1489,8 +1589,13 @@ class _Sampler(threading.Thread):
         treat every subsequent /proc read as best-effort.
         """
         pids: "dict[int, str]" = {}
-        try:
-            for root, _dirs, files in os.walk(self._process_cgroup):
+        # Rootless runtimes can put payloads in sibling systemd scopes rather
+        # than below the host workflow. Include only explicitly registered
+        # sandbox scopes, not every process owned by the runtime or user.
+        with _cg_lock:
+            roots = {str(self._process_cgroup), *_cg_registry.values()}
+        for scope in sorted(roots):
+            for root, _dirs, files in os.walk(scope):
                 if "cgroup.procs" not in files:
                     continue
                 try:
@@ -1499,8 +1604,6 @@ class _Sampler(threading.Thread):
                             pids[int(raw_pid)] = root
                 except (OSError, ValueError):
                     continue
-        except OSError:
-            return {}
         return pids
 
     def _process_scope(self, cgroup_dir: str) -> "str | None":
@@ -1559,6 +1662,15 @@ class _Sampler(threading.Thread):
                 "first_seen_ns": t,
                 "last_seen_ns": t,
             }
+            try:
+                info["pid_namespace"] = os.readlink(process_dir / "ns/pid")
+                status = (process_dir / "status").read_text()
+                nspid = next(line for line in status.splitlines() if line.startswith("NSpid:"))
+                info["namespace_pid"] = int(nspid.split()[-1])
+            except (OSError, ValueError, StopIteration):
+                # Keep resource samples when namespace identity is unavailable.
+                info["pid_namespace"] = None
+                info["namespace_pid"] = None
             _process_info[identity] = info
         else:
             info["last_seen_ns"] = t
@@ -2661,6 +2773,9 @@ def _build_run_summary(
                 "cmdline": info.get("cmdline", ""),
                 "sandbox": info.get("sandbox"),
                 "cgroup": info.get("cgroup"),
+                "start_ticks": info.get("start_ticks"),
+                "namespace_pid": info.get("namespace_pid"),
+                "pid_namespace": info.get("pid_namespace"),
                 "cpu_average_percent": cpu["mean"] if cpu else None,
                 "cpu_peak_percent": cpu["max"] if cpu else None,
                 "cpu_time_seconds": cpu.get("total") if cpu else None,

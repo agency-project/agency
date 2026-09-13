@@ -12,7 +12,9 @@ clock readings, not a negotiated offset.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -29,11 +31,17 @@ class NativeProfiler:
         self.collector = None
         self.failed = False
         self.stack: "list[str]" = []
+        self.process_identity: dict = {}
 
     def _report_span(self, payload: dict) -> None:
         if self.failed:
             return
         try:
+            payload["attributes"] = {
+                **payload.get("attributes", {}),
+                **self.process_identity,
+                "agency.namespace_tid": threading.get_native_id(),
+            }
             result = self.bridge.record_profiler_span(payload)
             if not result.get("ok", True):
                 raise RuntimeError(result.get("error", "span report rejected"))
@@ -57,6 +65,17 @@ class NativeProfiler:
             if not self.enabled:
                 return self
             self.bridge._profiler = self
+            try:
+                stat = Path("/proc/self/stat").read_text()
+                self.process_identity = {
+                    "agency.namespace_pid": os.getpid(),
+                    "agency.process_start_ticks": int(stat[stat.rfind(") ") + 2 :].split()[19]),
+                    "agency.pid_namespace": os.readlink("/proc/self/ns/pid"),
+                }
+            except (OSError, ValueError, IndexError):
+                # A restricted /proc may prevent mapping. Spans still report
+                # under the attempt identity; never guess an OS process.
+                self.process_identity = {}
             self.automatic_settings = settings.get("automatic")
             if self.automatic_settings:
                 # Reuse the host's own collector while avoiding agency.__init__
@@ -99,6 +118,7 @@ class NativeProfiler:
                             "duration_ns": r[6],
                             "tid": r[1],
                             "outcome": r[7],
+                            "process_identity": self.process_identity,
                         }
                         for r in records[start : start + 128]
                     ]
