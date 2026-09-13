@@ -518,11 +518,23 @@ def agency_package_dir():
     return Path(_agency_pkg.__file__).resolve().parent.parent
 
 
+def _container_can_reach_pypi(sandbox, timeout_s: int = 30) -> bool:
+    """Whether the container has outbound network to a package index."""
+    probe = (
+        'python3 -c "import socket; socket.setdefaulttimeout(5); '
+        "socket.create_connection(('pypi.org', 443))\""
+    )
+    try:
+        return sandbox.exec(probe, timeout=timeout_s)[1] == 0
+    except Exception:
+        return False
+
+
 def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 180) -> None:
     """Ensure each of `packages` (import names) is importable inside
     `sandbox`'s container, `pip3 install`-ing any missing after checking
     real importability (not just `pip list` presence). Raises RuntimeError
-    if pip itself fails. Requires outbound network access."""
+    if pip itself fails."""
     import shlex
 
     missing = [
@@ -530,6 +542,15 @@ def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 1
     ]
     if not missing:
         return
+
+    if not _container_can_reach_pypi(sandbox):
+        raise RuntimeError(
+            f"cannot install {missing} inside the container: no outbound network "
+            "(probed pypi.org:443). Either give the sandbox network access, or bake "
+            "these packages into the base image. A sandbox started with "
+            "sandboxconfig.flags=['--network', 'none'] is the usual cause; a private "
+            "package index on an isolated network would also probe as unreachable."
+        )
 
     install_cmd = "pip3 install --quiet " + " ".join(shlex.quote(p) for p in missing)
     out, rc = sandbox.exec(install_cmd, timeout=timeout_s)

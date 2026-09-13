@@ -1705,20 +1705,28 @@ class TestEnsurePythonPackagesInContainer:
 
     @docker
     def test_noop_when_already_present(self):
-        """A package already importable (httpx, confirmed present in the
-        base image) must not trigger any pip install at all -- verified by
-        making pip3 itself unusable and confirming that doesn't matter."""
+        """An already-importable package must not trigger any pip install at
+        all -- verified by making pip3 unusable and confirming that doesn't
+        matter.
+
+        Uses a stdlib module rather than a third-party one. This test used to
+        assert httpx was "confirmed present in the base image", which was true
+        only of the old purpose-built sandbox image; against a stock Python
+        base it fails on its own premise rather than on the behaviour it is
+        supposed to be testing. A stdlib import is present in every image, so
+        the test now depends on nothing but the contract.
+        """
         from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
-            _, rc = sb.exec('python3 -c "import httpx"')
-            assert rc == 0, "httpx must already be present -- test assumes this baseline"
+            _, rc = sb.exec('python3 -c "import json"')
+            assert rc == 0, "stdlib import must work -- test assumes this baseline"
 
             # Break pip3 so any real install attempt would fail loudly.
             sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
 
-            ensure_python_packages_in_container(sb, ["httpx"], timeout_s=30)  # must not raise
+            ensure_python_packages_in_container(sb, ["json"], timeout_s=30)  # must not raise
         finally:
             sb.destroy()
 
@@ -1734,6 +1742,73 @@ class TestEnsurePythonPackagesInContainer:
                 )
         finally:
             sb.destroy()
+
+    @docker
+    def test_raises_before_pip_when_network_unreachable(self):
+        """A missing package plus no network must raise a diagnosable error.
+
+        Without the probe, pip's own failure is "Could not find a version
+        that satisfies the requirement X (from versions: none)", which reads
+        like a bad package name rather than a deliberately isolated sandbox.
+        The harness calls this on every launch, so that message would surface
+        as every agent failing to start for no visible reason.
+        """
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.utils.agutil import ensure_python_packages_in_container
+
+        cfg = agconfig_cls()
+        cfg.sandbox.flags = ["--network", "none"]
+        sb = _make_sandbox(agconfig=cfg)
+        try:
+            with pytest.raises(RuntimeError, match="no outbound network"):
+                ensure_python_packages_in_container(sb, ["fastapi"], timeout_s=60)
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_no_network_needed_when_nothing_is_missing(self):
+        """The no-network path must stay usable when the image already carries
+        everything -- this is what makes a --network none sandbox workable at
+        all, rather than the probe simply moving the failure earlier.
+
+        pip3 is broken here too, so reaching either the probe or the install
+        would fail rather than silently pass.
+        """
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.utils.agutil import ensure_python_packages_in_container
+
+        cfg = agconfig_cls()
+        cfg.sandbox.flags = ["--network", "none"]
+        sb = _make_sandbox(agconfig=cfg)
+        try:
+            sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
+            ensure_python_packages_in_container(sb, ["json", "os"], timeout_s=30)
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_probe_reports_reachable_with_network(self):
+        """The probe must not be a blanket "always unreachable" -- otherwise
+        the raise above would fire on every ordinary networked sandbox."""
+        from agency.utils.agutil import _container_can_reach_pypi
+
+        sb = _make_sandbox()
+        try:
+            assert _container_can_reach_pypi(sb) is True
+        finally:
+            sb.destroy()
+
+    def test_probe_is_false_when_exec_raises(self):
+        """A backend that raises rather than returning a non-zero code must
+        read as unreachable, not propagate -- the caller turns this into its
+        own error message."""
+        from agency.utils.agutil import _container_can_reach_pypi
+
+        class _Exploding:
+            def exec(self, *args, **kwargs):
+                raise OSError("daemon gone")
+
+        assert _container_can_reach_pypi(_Exploding()) is False
 
     @docker
     def test_installs_only_the_missing_subset(self):
