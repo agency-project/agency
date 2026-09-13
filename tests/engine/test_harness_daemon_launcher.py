@@ -153,6 +153,7 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
         "harness_adapter": {"binary_path": "/bin/claude"},
         "ptrace": {
             "syscalls": list(agconfig().ptrace.syscalls),
+            "file_access": False,
             "profiler": None,
             "disable_harness_native_sandbox": True,
         },
