@@ -195,7 +195,7 @@ def test_public_agent_redirect_and_late_queue_in_docker(monkeypatch, tmp_path):
     config = agconfig(
         agentconfig(log_dir=str(tmp_path / "logs")),
         llmconfig(model=backend.model, api_key="unused"),
-        sandboxconfig(backend="docker", base_image="agency-sandbox:latest"),
+        sandboxconfig(backend="docker", base_image="docker.io/library/python:3.12-slim"),
     )
     owner = agent(harness="claude_code", agconfig=config)
     skill = agskill("public-redirect", "Respond to the user.")

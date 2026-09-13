@@ -1603,12 +1603,9 @@ class TestAgSandboxExecDetached:
         actual property a persistent in-container entrypoint depends on.
 
         Scans /proc with shell builtins rather than calling `pgrep`/`ps`:
-        procps is absent from the CPU image (python:3.12-slim + ripgrep,
-        what `GPU_TYPE=cpu ./images/build.sh` builds in CI) but present in
-        the CUDA/ROCm ones, whose full Ubuntu bases ship it -- so a
-        pgrep-based check passes on every GPU-built image and fails only on
-        CPU. Nothing in agency/ needs procps; this was the repo's only
-        caller. Matching the *start* of each cmdline is what keeps the
+        procps is absent from the sandbox base image, so a pgrep-based
+        check would fail outright. Nothing in agency/ needs procps; this
+        was the repo's only caller. Matching the *start* of each cmdline is what keeps the
         scanning shell (argv[0] "bash") and its own children from matching
         the pattern they are searching for.
 
@@ -1684,8 +1681,8 @@ class TestAgSandboxAgencyPackageMount:
 # ---------------------------------------------------------------------------
 # agutil.ensure_python_packages_in_container -- resolves the dependency gap
 # a container-relocated agproxy_llm / full react-loop entrypoint (Phase 2b /
-# 3b) hits: agency-sandbox:latest carries httpx/pydantic but not
-# fastapi/uvicorn/openai.
+# 3b) hits: the sandbox base image is a bare Python image and carries none
+# of httpx/pydantic/fastapi/uvicorn/openai.
 # ---------------------------------------------------------------------------
 
 

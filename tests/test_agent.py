@@ -77,10 +77,13 @@ def _noop(arg: agdata) -> agdata:
 def _llm_agconfig(d: dict) -> agconfig_cls:
     # Force the docker sandbox backend for any test that ends up constructing
     # a real sandbox -- sandbox' "auto" selection now prefers
-    # podman over docker when both are usable, but CI's images/build.sh only
-    # builds/tags agency-sandbox:latest for docker, so podman has no local
-    # image and would try (and fail) to pull one from a registry. This has
-    # no effect on the many tests here that never touch ag.sandbox at all.
+    # podman over docker when both are usable, and pinning one runtime keeps
+    # these tests deterministic. The sandbox base is now a fully-qualified
+    # registry image, so either runtime can pull it -- the name MUST stay
+    # qualified, because podman's _resolve_image() prefixes bare names with
+    # `localhost/` and would then try to pull from a registry literally
+    # named localhost. This has no effect on the many tests here that never
+    # touch ag.sandbox at all.
     #
     # Default provider="mock" so agent()'s _has_llm_config() check (model or
     # provider truthy) passes even for the many tests here that intentionally

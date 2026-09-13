@@ -103,7 +103,9 @@ def tutorial_config(
             log_dir=str(run_dir / "logs"),
             output_dir=str(run_dir / "agent_output"),
         ),
-        sandboxconfig(base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "agency-sandbox:latest")),
+        sandboxconfig(
+            base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "docker.io/library/python:3.12-slim")
+        ),
         orchestratorconfig(
             max_concurrent_engines=max_concurrent_engines,
             db_path=str(run_dir / "agency.sqlite3"),

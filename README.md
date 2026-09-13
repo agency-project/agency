@@ -17,10 +17,6 @@ Agents are non-blocking by default. `agent.run()` returns a pending `agdata` imm
 git clone https://github.com/agency-project/agency
 cd agency
 
-# Build the sandbox base image (once).
-# Auto-detects the host GPU (NVIDIA / AMD / CPU-only):
-./images/build.sh
-
 uv venv --python 3.12 --seed --managed-python
 source .venv/bin/activate
 

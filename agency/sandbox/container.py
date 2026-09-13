@@ -711,48 +711,20 @@ class _ContainerBackendBase(agsandbox_backend):
         )
         return (running_str == "true", status)
 
+    def _ensure_workspace_dir(self) -> None:
+        """Guarantee /workspace exists in a container that is about to be used."""
+        self._run(
+            [self._runtime, "exec", self._name, "mkdir", "-p", "/workspace"],
+            check=True,
+        )
+
     def _ensure_started(self) -> None:
         with agprof.span("sandbox:start"):
             self._ensure_started_profiled()
         self._register_prof_container()
 
     def _ensure_started_profiled(self) -> None:
-        """Start the Docker/Podman container on first use.
-
-        Called lazily by _container_exec() so containers are only created when
-        an agent actually needs sandboxed execution (bash, file I/O, etc.).
-        Tasks that complete using only host-side tools (webfetch, todowrite,
-        find_papers, …) never start a container at all.
-
-        Invariant: after rm_container() the container does not exist; after
-        stop() (hibernate) it still does, just not running -- see that
-        method's docstring. The three states handled here are therefore:
-          - running     → reuse (worker-reuse path, does NOT acquire the runtime slot)
-          - hibernating  → docker/podman start (resume in place, acquires the
-                           runtime slot; the GPU is re-acquired lazily on the
-                           next exec() -- see base.py's exec())
-          - absent       → docker/podman run (acquires the runtime slot and GPU)
-        A hibernating container is unambiguously our own: container names
-        embed _RUN_ID (a fresh uuid4 per process), so no other process could
-        have created one under this exact name -- there is no "leftover from
-        someone else" case to force-remove here.
-
-        Ground truth is always a real docker/podman inspect -- there is no
-        self._started cache. Every call pays one lifecycle-state inspect via
-        _inspect_container_state(); an active profiler adds an ID/PID inspect
-        on first registration to resolve and validate the kernel cgroup. That's the price of never
-        trusting a per-instance flag that another backend view could have made stale.
-
-        _baseline_pids is captured exactly once (None means "not yet") and
-        never refreshed after that, even though this method itself now runs
-        on every single call (the "reuse" branch below fires on every call
-        once the container exists). Recomputing it every time would make it
-        track "whatever's running right now" instead of "what was already
-        running before this sandbox's own tracked work started" -- silently
-        reclassifying a still-running tracked background process as baseline
-        noise the moment any later call (e.g. get_live_pids() itself) happens
-        to re-enter here.
-        """
+        """Start the Docker/Podman container on first use."""
         name = self._name
         running, status = self._inspect_container_state()
         if running:
@@ -772,6 +744,7 @@ class _ContainerBackendBase(agsandbox_backend):
             except Exception:
                 self._release_runtime_slot()
                 raise
+            self._ensure_workspace_dir()
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
             return
@@ -816,9 +789,11 @@ class _ContainerBackendBase(agsandbox_backend):
                     + cgroup_flags
                     + gpu_flags
                     + self._vol_flags
+                    + list(self._agconfig.sandbox.flags)
                     + [image, "tail", "-f", "/dev/null"]
                 )
                 self._run_with_conflict_retry(run_cmd, name)
+                self._ensure_workspace_dir()
                 # Keep _checkpoint_image — not a one-shot restore, needed for future restarts.
             else:
                 image = self._resolve_image(self._base_image)
@@ -829,13 +804,11 @@ class _ContainerBackendBase(agsandbox_backend):
                     + cgroup_flags
                     + gpu_flags
                     + self._vol_flags
+                    + list(self._agconfig.sandbox.flags)
                     + [image, "tail", "-f", "/dev/null"]
                 )
                 self._run_with_conflict_retry(run_cmd, name)
-                self._run(
-                    [self._runtime, "exec", name, "mkdir", "-p", "/workspace"],
-                    check=True,
-                )
+                self._ensure_workspace_dir()
         except _ContainerAlreadyRunning:
             # Another process started the container while we were retrying;
             # that process owns the slot — release ours.
@@ -1375,8 +1348,7 @@ class _ContainerBackendBase(agsandbox_backend):
         digest only -- see `_layer_squash.build_save_archive()`, never
         touched) to produce the new squashed HEAD image. Confirmed
         empirically to complete in well under a second regardless of base
-        image size (verified against the real ~24GB, 80-layer
-        `agency-sandbox:latest`).
+        image size.
 
         The accumulator must already have been built by
         `_build_accumulator_for_squash()` for this same *tag*. The

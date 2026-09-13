@@ -426,7 +426,9 @@ class TestQuotaHooksSharedAcrossRuntimes:
 
     def test_unrelated_stderr_does_not_match(self):
         sb = self._sb()
-        assert not sb._is_quota_exhaustion_error("no such image: agency-sandbox:latest")
+        assert not sb._is_quota_exhaustion_error(
+            "no such image: docker.io/library/python:3.12-slim"
+        )
 
     def test_wait_for_quota_slot_polls_until_a_slot_frees_up(self):
         sb = self._sb()
@@ -609,7 +611,7 @@ class TestRunWithConflictRetryHooks:
 
     def test_non_conflict_non_quota_failure_raises_immediately_without_retry(self):
         sb = self._sb()
-        result = self._FakeResult(1, b"no such image: agency-sandbox:latest")
+        result = self._FakeResult(1, b"no such image: docker.io/library/python:3.12-slim")
         run_mock = MagicMock(return_value=result)
         with patch.object(sb, "_run", run_mock):
             with pytest.raises(RuntimeError, match="no such image"):
@@ -1397,12 +1399,12 @@ class TestPodmanGpuPassthroughIntegration:
     only that -- a container with zero real GPU access still passes those).
 
     Requires a real podman binary/daemon and a real NVIDIA GPU -- skipped
-    automatically otherwise. Uses the same `agency-sandbox:latest` image the
-    rest of the suite's @docker-marked real-daemon tests use, built via
-    `images/build.sh`.
+    automatically otherwise. Uses the same `docker.io/library/python:3.12-slim`
+    image the rest of the suite's @docker-marked real-daemon tests use,
+    pulled from the registry rather than built locally.
     """
 
-    IMAGE = "agency-sandbox:latest"
+    IMAGE = "docker.io/library/python:3.12-slim"
 
     @podman_gpu
     def test_nvidia_smi_inside_a_real_podman_container_sees_the_gpus(self):
@@ -1609,9 +1611,11 @@ class TestOwnHostPidsRealPodmanContainerIntegration:
 
 docker_gpu = pytest.mark.skipif(
     not (
-        _docker_available() and _host_gpu_available() and _docker_has_image("agency-sandbox:latest")
+        _docker_available()
+        and _host_gpu_available()
+        and _docker_has_image("docker.io/library/python:3.12-slim")
     ),
-    reason="Docker daemon, NVIDIA GPU, or local agency-sandbox:latest docker image not available",
+    reason="Docker daemon, NVIDIA GPU, or local docker.io/library/python:3.12-slim docker image not available",
 )
 
 
@@ -1628,7 +1632,7 @@ class TestDockerGpuPassthroughIntegration:
     TestGpuFlagsPerRuntime alone.
 
     Requires a real docker binary/daemon, a real NVIDIA GPU, AND a locally
-    built `agency-sandbox:latest` docker image -- skipped automatically
+    built `docker.io/library/python:3.12-slim` docker image -- skipped automatically
     otherwise. Unlike the rest of this suite's plain @docker-marked tests
     (which only check daemon reachability, and can therefore fail outright
     with "pull access denied" on a host where the image was only ever built
@@ -1637,7 +1641,7 @@ class TestDockerGpuPassthroughIntegration:
     instead of a false-positive failure on such a host.
     """
 
-    IMAGE = "agency-sandbox:latest"
+    IMAGE = "docker.io/library/python:3.12-slim"
 
     @docker_gpu
     def test_nvidia_smi_inside_a_real_docker_container_sees_the_gpus(self):
@@ -1674,7 +1678,7 @@ class TestCvdOverrideProtectionIntegration:
     (``readonly CUDA_VISIBLE_DEVICES HIP_VISIBLE_DEVICES`` in base.py's
     exec()) lives in exactly that command-wrapping logic. Requires a real
     docker/podman daemon, a real NVIDIA GPU, and the local
-    agency-sandbox:latest image -- skipped otherwise (see the docker_gpu/
+    docker.io/library/python:3.12-slim image -- skipped otherwise (see the docker_gpu/
     podman_gpu markers above).
     """
 

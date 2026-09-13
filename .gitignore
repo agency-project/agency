@@ -4,7 +4,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .DS_Store
-runs/
 agency_runs/
 AGENT_INSTRUCTIONS/
 artifacts/

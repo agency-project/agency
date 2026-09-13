@@ -5,7 +5,7 @@ Flattening a checkpoint's ENTIRE filesystem via `docker export`/`docker
 import` (`_ContainerBackendBase._squash_commit()` in container.py) is fast
 to implement, but its cost is proportional to the whole merged filesystem
 (base image + every accumulated diff), not just the diff. For a large base
-image (the real `agency-sandbox:latest` is ~24GB), that makes every squash
+image, that makes every squash
 take tens of seconds regardless of how small the actual workspace change
 is, confirmed live: forcing a squash at every skill exit pushed two
 concurrent agents' teardown past a 120s test timeout.

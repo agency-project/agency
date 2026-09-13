@@ -146,17 +146,16 @@ class llmconfig(confignamespace):
 class sandboxconfig(confignamespace):
     """Sandbox facade (agency/sandbox/agsandbox.py) and backend mechanics
     (agency/sandbox/base.py) -- docker/podman daemon-call timeouts and retry
-    policy. docker_semaphore_limit moved to the process-wide
-    DOCKER_SEMAPHORE_LIMIT constant above (it gates an actual shared
-    semaphore, not a per-agent tunable)."""
+    policy, plus `flags` for arbitrary extra `run` arguments."""
 
-    base_image: str = "agency-sandbox:latest"
+    base_image: str = "docker.io/library/python:3.12-slim"
     persistent: bool = False
     hibernation_diagnostics: bool = False
     # Host-side metadata only; never collect file contents. Docker/Podman only.
     checkpoint_diagnostics: bool = False
     checkpoint_diagnostics_extended: bool = False
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
+    flags: "list[str]" = field(default_factory=list)
 
     backend: str = "auto"  # podman | docker | chroot | auto
     # Container creation constraints, retained across hibernation and rollback.

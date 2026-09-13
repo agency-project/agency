@@ -49,7 +49,9 @@ def test_real_installed_cli_launches_from_read_only_installation(harness, binary
         harnessadapterconfig(binary_path=host_binary if explicit_path else None),
         sandboxconfig(
             backend="docker",
-            base_image=os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "agency-sandbox:latest"),
+            base_image=os.environ.get(
+                "AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim"
+            ),
         ),
     )
     sandbox = agSandbox(f"external-{harness}", agconfig=config)
@@ -109,7 +111,7 @@ raise SystemExit(rc)
 def test_real_codex_reports_missing_image_node_runtime():
     config = agconfig(
         agentconfig(harness="codex"),
-        sandboxconfig(backend="docker", base_image="agency-sandbox:latest"),
+        sandboxconfig(backend="docker", base_image="docker.io/library/python:3.12-slim"),
     )
     sandbox = agSandbox("external-missing-node", agconfig=config)
     try:
@@ -130,7 +132,9 @@ def test_real_agent_harness_override_prepares_installation(harness):
         llmconfig(provider="openai", model="unused-startup-test", api_key="unused"),
         sandboxconfig(
             backend="docker",
-            base_image=os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "agency-sandbox:latest"),
+            base_image=os.environ.get(
+                "AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim"
+            ),
         ),
     )
     # This intentionally leaves config.agent.harness at its native default.

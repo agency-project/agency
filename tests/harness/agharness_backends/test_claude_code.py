@@ -92,7 +92,9 @@ def real_agent():
     config = agconfig(
         sandboxconfig(
             backend="docker",
-            base_image=os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "agency-sandbox:latest"),
+            base_image=os.environ.get(
+                "AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim"
+            ),
         ),
         llmconfig(**kwargs),
     )

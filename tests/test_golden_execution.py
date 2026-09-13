@@ -2,8 +2,11 @@
 
 CI runs this with normal pytest. On a Linux development host:
 
-    GPU_TYPE=cpu ./images/build.sh
     pytest tests/test_golden_execution.py -k "native or claude_code" -v
+
+No image build step is needed: the sandbox base is a fully-qualified registry
+image (docker.io/library/python:3.12-slim) that both docker and podman pull
+directly.
 
 Alternatively, install the external CLIs on the host and supply an image with
 their system runtimes through AGENCY_TEST_HARNESS_IMAGE.
@@ -56,7 +59,7 @@ ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "artifacts" / "golden-exec
 
 @pytest.fixture(scope="module")
 def golden_image():
-    image = os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "agency-sandbox:latest")
+    image = os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim")
     problem = None
     if not sys.platform.startswith("linux"):
         problem = "golden profiling and real external harnesses require Linux"

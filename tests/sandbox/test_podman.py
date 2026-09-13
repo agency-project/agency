@@ -83,7 +83,7 @@ def _make_backend(**kwargs):
         agname=name,
         name=name,
         checkpoint_image=None,
-        base_image="agency-sandbox:latest",
+        base_image="docker.io/library/python:3.12-slim",
         mounts={},
         agconfig=None,
     )
@@ -377,16 +377,14 @@ class TestDanglingImageEagerCleanup:
         wasn't reachable there), but the underlying mechanism is shared,
         runtime-agnostic code on `_ContainerBackendBase`.
 
-        Uses agency-sandbox:latest, not a bare `alpine:latest` -- Podman's
-        `_resolve_image()` prefixes bare names with `localhost/` (see its
-        docstring), and a `localhost/alpine:latest` that was never actually
-        pulled/tagged locally makes Podman attempt a real network pull
-        against a registry literally named `localhost`, which fails outright
-        on any host without that exact local tag already present. The
-        already-locally-built `agency-sandbox:latest` used by the rest of
-        this file's real-daemon tests doesn't have that problem."""
+        Uses docker.io/library/python:3.12-slim, not a bare `alpine:latest` --
+        Podman's `_resolve_image()` prefixes bare names with `localhost/`
+        (see its docstring), so a bare name makes Podman attempt a real
+        network pull against a registry literally named `localhost`, which
+        always fails. The sandbox base is fully qualified precisely so that
+        prefixing does not apply."""
         sb = _make_sandbox()
-        sb._backend._base_image = "agency-sandbox:latest"
+        sb._backend._base_image = "docker.io/library/python:3.12-slim"
         try:
             sb.exec("echo one")
             sb.commit()  # checkpoint 1 (plain commit)
@@ -424,14 +422,14 @@ class TestDanglingImageEagerCleanup:
         accumulated chain"). Unverified against a real podman daemon in the
         environment this was written in (podman wasn't reachable there).
 
-        Uses agency-sandbox:latest, not a bare `alpine:latest` -- see
+        Uses docker.io/library/python:3.12-slim, not a bare `alpine:latest` -- see
         test_real_plain_commit_cycle_cleans_up_previous_sibling's docstring
         for why a bare name that resolves to `localhost/alpine:latest` via
         Podman's `_resolve_image()` fails outright unless that exact tag was
         already pulled locally."""
 
         sb = _make_sandbox()
-        sb._backend._base_image = "agency-sandbox:latest"
+        sb._backend._base_image = "docker.io/library/python:3.12-slim"
 
         def _dangling_ids():
             r = subprocess.run(
@@ -446,7 +444,7 @@ class TestDanglingImageEagerCleanup:
                 "podman",
                 "inspect",
                 "--format={{json .RootFS.Layers}}",
-                "localhost/agency-sandbox:latest",
+                "docker.io/library/python:3.12-slim",
             ],
             capture_output=True,
             text=True,
@@ -501,7 +499,7 @@ class TestDanglingImageEagerCleanup:
                 "-d",
                 "--name",
                 name,
-                "agency-sandbox:latest",
+                "docker.io/library/python:3.12-slim",
                 "tail",
                 "-f",
                 "/dev/null",
@@ -693,8 +691,8 @@ class TestCheckpointSquash:
     @podman
     @pytest.mark.timeout(180)
     def test_squash_flattens_real_layer_depth(self):
-        """Uses the tiny local `alpine` image rather than the real
-        (multi-GB) agency-sandbox image -- this only needs to exercise the
+        """Uses the tiny local `alpine` image rather than the sandbox
+        base image -- this only needs to exercise the
         export/import mechanism itself. Mirrors test_docker.py's version;
         unverified in the environment this was written in (podman wasn't
         reachable there)."""
@@ -1056,7 +1054,7 @@ class TestCheckpointAccumulator:
     @podman
     @pytest.mark.timeout(180)
     def test_real_end_to_end_fast_squash_against_base_image(self):
-        """Several plain-commit cycles against localhost/agency-sandbox:latest,
+        """Several plain-commit cycles against docker.io/library/python:3.12-slim,
         each folding via the real containers/storage lookup (no mocking),
         then a real squash -- must complete quickly, produce correct
         content, and leave the base image's own layers untouched.
@@ -1078,7 +1076,7 @@ class TestCheckpointAccumulator:
 
         sb = _make_sandbox()
 
-        base_ref = "localhost/agency-sandbox:latest"
+        base_ref = "docker.io/library/python:3.12-slim"
         base_layers_before = subprocess.run(
             ["podman", "inspect", "--format={{json .RootFS.Layers}}", base_ref],
             capture_output=True,

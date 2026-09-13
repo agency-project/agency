@@ -495,7 +495,7 @@ class TestDanglingImageEagerCleanup:
                 "-d",
                 "--name",
                 name,
-                "agency-sandbox:latest",
+                "docker.io/library/python:3.12-slim",
                 "tail",
                 "-f",
                 "/dev/null",
@@ -901,7 +901,7 @@ class TestCheckpointSquash:
         """A real docker export|import must reset RootFS.Layers to 1,
         confirming the flatten genuinely resets depth rather than just
         re-tagging the same growing chain. Uses the tiny local `alpine`
-        image rather than the real (multi-GB) agency-sandbox image --
+        image rather than the sandbox base image --
         this only needs to exercise the export/import mechanism itself,
         and a large image makes the round-trip genuinely slow."""
 
@@ -1616,7 +1616,7 @@ class TestCheckpointAccumulator:
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
                 # ...the real gap is 2 layers, not 0.
-                if args[-1] == "agency-sandbox:latest":
+                if args[-1] == "docker.io/library/python:3.12-slim":
                     return _FakeCompleted(stdout=b'["sha256:base1"]')
                 return _FakeCompleted(stdout=b'["sha256:base1", "sha256:c1", "sha256:c2"]')
             return _FakeCompleted()
@@ -1635,7 +1635,7 @@ class TestCheckpointAccumulator:
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
-                if args[-1] == "agency-sandbox:latest":
+                if args[-1] == "docker.io/library/python:3.12-slim":
                     return _FakeCompleted(stdout=b'["sha256:base1"]')
                 # Current chain does NOT start with the base's own layer.
                 return _FakeCompleted(stdout=b'["sha256:different", "sha256:c1"]')
@@ -1712,7 +1712,7 @@ class TestCheckpointAccumulator:
 
         def fake_run(self_inner, args, *, check=False, input=None, timeout=120):
             if "--format={{json .RootFS.Layers}}" in args:
-                if args[-1] == "agency-sandbox:latest":
+                if args[-1] == "docker.io/library/python:3.12-slim":
                     return _FakeCompleted(stdout=b'["sha256:base1"]')
                 return _FakeCompleted(stdout=b'["sha256:base1", "sha256:c1"]')
             if args[1] == "inspect":
@@ -1736,7 +1736,7 @@ class TestCheckpointAccumulator:
     @pytest.mark.timeout(180)
     def test_real_end_to_end_fast_squash_against_large_base_image(self):
         """The full, real thing: several plain-commit cycles against the
-        actual multi-GB agency-sandbox:latest image, each folding into
+        actual sandbox base image, each folding into
         the accumulator via the real overlay2 lookup (no mocking at all),
         then a real squash -- must complete in well under the ~77-180s
         the slower paths took (measured during development), produce
@@ -1786,7 +1786,12 @@ class TestCheckpointAccumulator:
                     )
 
         base_layers_before = subprocess.run(
-            ["docker", "inspect", "--format={{json .RootFS.Layers}}", "agency-sandbox:latest"],
+            [
+                "docker",
+                "inspect",
+                "--format={{json .RootFS.Layers}}",
+                "docker.io/library/python:3.12-slim",
+            ],
             capture_output=True,
             text=True,
         ).stdout
@@ -1812,7 +1817,12 @@ class TestCheckpointAccumulator:
             assert elapsed < 45, f"fast squash took {elapsed:.1f}s -- expected well under 45s"
 
             base_layers_after = subprocess.run(
-                ["docker", "inspect", "--format={{json .RootFS.Layers}}", "agency-sandbox:latest"],
+                [
+                    "docker",
+                    "inspect",
+                    "--format={{json .RootFS.Layers}}",
+                    "docker.io/library/python:3.12-slim",
+                ],
                 capture_output=True,
                 text=True,
             ).stdout
