@@ -123,4 +123,16 @@ def prepare_harness_executable(sandbox, harness, config) -> str | None:
             f"(exit {rc}). Its complete installation must be mounted and the image "
             f"must provide its system interpreter and shared libraries. Output: {out[-2000:]}"
         )
+    if harness == "codex" and "0.147.0" not in out:
+        # 0.154.0 hangs waiting for native prompt acknowledgment on large
+        # (>1000 char) bracketed pastes -- the PTY driver's normal submission
+        # path -- because codex routes those through a placeholder/expand-on-
+        # submit pipeline that was heavily refactored between the two
+        # versions. Only 0.147.0 is verified working; fail closed instead of
+        # a confusing mid-run submit timeout.
+        raise RuntimeError(
+            f"codex executable {resolved!r} reports version {out.strip()!r}, expected "
+            "0.147.0. Untested/newer codex builds have hung waiting for native prompt "
+            "acknowledgment on real (large) task prompts -- install/pin 0.147.0."
+        )
     return resolved

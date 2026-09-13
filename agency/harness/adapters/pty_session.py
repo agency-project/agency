@@ -114,7 +114,7 @@ async def stream_response(router, token, context, model, formatter):
 
 
 class PtyExecution:
-    INPUT_TIMEOUT = 20.0
+    INPUT_TIMEOUT = 60.0
     START_TIMEOUT = 45.0
     ATTEMPT_TIMEOUT = 600.0
 

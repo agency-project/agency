@@ -10,6 +10,8 @@ from pathlib import Path
 from ..executable import HARNESS_PATH
 from .pty_session import MAX_SESSION_BYTES, PtyExecution, restore_session, snapshot_session
 
+_PROFILER_BRIDGE_TIMEOUT_S = 10.0
+
 
 def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_session_blob, max_steps):
     from ..agharness import cleanup_config_home, materialize_config_home
@@ -24,7 +26,9 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
         raise
     # Reuse the existing span bridge, without enabling native Python's
     # automatic function sampler inside the external-harness daemon.
-    bridge = BridgeClient(runtime.harness_base_url, runtime.token, timeout_s=1)
+    bridge = BridgeClient(
+        runtime.harness_base_url, runtime.token, timeout_s=_PROFILER_BRIDGE_TIMEOUT_S
+    )
     profiler = NativeProfiler(bridge)
     try:
         try:

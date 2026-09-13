@@ -272,7 +272,7 @@ class harnessadapterconfig(confignamespace):
 class ptraceconfig(confignamespace):
     """ptrace harness supervisor (agency/harness/ptrace/supervisor.py)."""
 
-    syscalls: "tuple[str, ...]" = ("execve", "execveat")
+    syscalls: "tuple[str, ...]" = ("execve", "execveat", "connect", "bind", "sendto")
     # Independent opt-in: metadata-only successful opens/reads in traced trees.
     file_access: bool = False
     profiler: "str | None" = None  # reserved for a future heavyweight profiler (e.g. perf)

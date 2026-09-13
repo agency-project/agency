@@ -639,3 +639,21 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
 
     driver.clear_input(handle, wait_until)
     handle.write_terminal.assert_called_once_with(b"\x03")
+
+
+# ---------------------------------------------------------------------------
+# run_pty_attempt's profiler-status bridge timeout
+# ---------------------------------------------------------------------------
+
+
+def test_profiler_bridge_timeout_is_not_too_tight_for_container_startup():
+    """Was 1s: tight enough that ordinary container-startup load made every
+    failure of this status check silent (run_pty_attempt's blanket except
+    around bridge.profiler_settings()) -- profiler.enabled would come back
+    False with no error, and every harness:launch/startup_ready/submit/
+    await_cli phase span for the whole attempt would silently become a
+    no-op. Guarded directly since the failure mode has no visible symptom
+    to catch it with otherwise."""
+    from agency.harness.adapters.pty_drivers import _PROFILER_BRIDGE_TIMEOUT_S
+
+    assert _PROFILER_BRIDGE_TIMEOUT_S >= 5.0

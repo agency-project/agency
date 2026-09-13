@@ -19,6 +19,7 @@ from agency.configs.agconfig import (
     agentconfig,
     confignamespace,
     llmconfig,
+    ptraceconfig,
     sandboxconfig,
 )
 
@@ -384,3 +385,18 @@ def test_module_level_constants_are_not_fields_on_agconfig_or_any_namespace():
         assert not hasattr(cfg, name)
         assert not hasattr(cfg.sandbox, name)
         assert not hasattr(cfg.llm, name)
+
+
+# ---------------------------------------------------------------------------
+# ptraceconfig.syscalls default
+# ---------------------------------------------------------------------------
+
+
+def test_ptraceconfig_default_syscalls_include_network_destinations():
+    """connect/bind/sendto are decoded with real address/port by the tracer
+    (agency/harness/ptrace/_tracer_loop.py's _resolve_syscall_args) -- on by
+    default so a caller gets network-destination visibility without having
+    to know that decode table exists. execve/execveat stay too: process
+    launches are the original, still-needed default."""
+    cfg = ptraceconfig()
+    assert set(cfg.syscalls) == {"execve", "execveat", "connect", "bind", "sendto"}
