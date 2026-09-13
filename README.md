@@ -161,7 +161,7 @@ For Claude via AWS's direct Anthropic-on-AWS API, use `provider="anthropicAWS"`.
 
 **Amazon Bedrock**
 
-Credentials are picked up automatically from the environment (IAM role, `~/.aws/credentials`, SSO, etc.). `aws_bedrock_token_generator` (included in dependencies) exchanges them for a bearer token on each request.
+Requires an explicit bearer-token API key`.
 
 ```python
 from agency.configs.agconfig import agconfig, llmconfig
@@ -171,13 +171,14 @@ cfg = agconfig(
         provider="bedrock",
         region="us-east-1",
         model="nvidia.nemotron-super-3-120b",
+        api_key=os.environ["BEDROCK_API_KEY"],
     )
 )
 
 ag = agent(agconfig=cfg)
 ```
 
-Pass `api_key="bedrock-api-key-..."` to `llmconfig(provider="bedrock", ...)` to use a static Bedrock API key instead of IAM credentials. For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
+For Claude models on Bedrock, stick to the fields listed under **Anthropic** above — other generation params aren't supported there.
 
 ## Usage Examples
 

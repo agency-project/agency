@@ -3,9 +3,6 @@ backend (provider='anthropicAWS'/'anthropic_aws') -- grouped here as the two
 AWS-hosted flavors of Anthropic access, distinct from Bedrock's actual other
 models.
 
-Claude models on Amazon Bedrock are NOT served through the OpenAI-compatible
-Mantle gateway used by every other Bedrock model — Mantle's `/v1/models`
-never lists an `anthropic.*` model, and every Claude model ID 404s there.
 Claude models on Bedrock are only reachable through Bedrock's native
 invoke_model API, in the Anthropic Messages API shape (the `anthropic` SDK's
 `AnthropicBedrock` client), and only via an inference-profile ID (e.g.
@@ -46,13 +43,12 @@ def _is_anthropic_bedrock_model(model: str) -> bool:
     return bool(_ANTHROPIC_BEDROCK_MODEL_RE.match(model or ""))
 
 
-# openai.gpt-5.x on Bedrock 400s on Mantle's OpenAI-compatible gateway
-# ("isn't supported on this route") and, like Anthropic models, only works
-# through the native Converse API with an inference-profile-prefixed ID
-# (e.g. "us.openai.gpt-5.6-terra") -- confirmed directly against Bedrock for
-# gpt-5.4/5.5/5.6-luna/5.6-sol/5.6-terra, while openai.gpt-oss-* and
-# minimax.* work fine on Mantle. Update if more Bedrock models are confirmed
-# to need this route too.
+# openai.gpt-5.x on Bedrock 400s on the OpenAI-compatible gateway ("isn't
+# supported on this route" on bedrock-mantle) and, like Anthropic models,
+# only works through the native Converse API with an inference-profile-
+# prefixed ID (e.g. "us.openai.gpt-5.6-terra") -- confirmed directly against
+# Bedrock for gpt-5.4/5.5/5.6-luna/5.6-sol/5.6-terra. Update if more Bedrock
+# models are confirmed to need this route too.
 _BEDROCK_CONVERSE_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?openai\.gpt-5(?:[.\-]|$)")
 
 
@@ -60,107 +56,36 @@ def _needs_bedrock_converse(model: str) -> bool:
     return bool(_BEDROCK_CONVERSE_MODEL_RE.match(model or ""))
 
 
-def _is_bedrock_bearer_token(api_key: "str | None") -> bool:
-    """A Bedrock API key is one opaque bearer token; AWS SigV4 pairs
-    always contain a colon ("ACCESS:SECRET[:SESSION]")."""
-    return bool(api_key) and ":" not in api_key
-
-
-def _split_aws_key_pair(api_key: str) -> "tuple[str, str, str | None]":
-    parts = api_key.split(":", 2)
-    if len(parts) < 2:
+def _require_bedrock_bearer_token(llm_config) -> str:
+    """Amazon Bedrock's one supported auth mechanism: an explicit
+    bearer-token api_key (what Bedrock itself calls a "Bedrock API key"),
+    from either the llm config or AWS_BEARER_TOKEN_BEDROCK."""
+    api_key = llm_config.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+    if not api_key:
+        raise RuntimeError(
+            "Amazon Bedrock requires a bearer-token api_key: set it in the "
+            "llm_config's api_key field, or export AWS_BEARER_TOKEN_BEDROCK. "
+            "SigV4 key pairs and the AWS default credential chain are not "
+            "supported for provider='bedrock'."
+        )
+    if ":" in api_key:
         raise ValueError(
-            "Bedrock api_key must be 'ACCESS_KEY_ID:SECRET_ACCESS_KEY' "
-            "or 'ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN'."
+            "Amazon Bedrock only accepts a bearer-token api_key now, not a "
+            "SigV4 'ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]' pair."
         )
-    return parts[0], parts[1], parts[2] if len(parts) == 3 else None
-
-
-# ---------------------------------------------------------------------------
-# AWS Bedrock SigV4 auth
-# ---------------------------------------------------------------------------
-
-
-class _BedrockSigV4Auth(httpx.Auth):
-    """httpx auth handler that signs requests with AWS SigV4 for Amazon Bedrock."""
-
-    def __init__(self, region: str, api_key: str | None = None) -> None:
-        import boto3
-        from botocore.credentials import Credentials
-
-        self._region = region
-        if api_key:
-            parts = api_key.split(":", 2)
-            if len(parts) < 2:
-                raise ValueError(
-                    "Bedrock api_key must be 'ACCESS_KEY_ID:SECRET_ACCESS_KEY' "
-                    "or 'ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN'."
-                )
-            self._creds = Credentials(
-                access_key=parts[0],
-                secret_key=parts[1],
-                token=parts[2] if len(parts) == 3 else None,
-            )
-        else:
-            creds = boto3.Session(region_name=region).get_credentials()
-            if creds is None:
-                raise RuntimeError(
-                    "No AWS credentials found for Amazon Bedrock. "
-                    "Set api_key='ACCESS_KEY_ID:SECRET_ACCESS_KEY' in the llm_config, "
-                    "or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars, "
-                    "or run: aws configure"
-                )
-            self._creds = creds
-
-    def auth_flow(self, request: httpx.Request):
-        import botocore.auth
-        import botocore.awsrequest
-
-        aws_req = botocore.awsrequest.AWSRequest(
-            method=request.method,
-            url=str(request.url),
-            data=request.content or b"",
-            headers={
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in ("host", "content-length")
-            },
-        )
-        botocore.auth.SigV4Auth(
-            self._creds.get_frozen_credentials(), "bedrock", self._region
-        ).add_auth(aws_req)
-        for k, v in aws_req.headers.items():
-            request.headers[k] = v
-        yield request
+    return api_key
 
 
 class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
-    """Bedrock models reachable through the OpenAI-compatible Mantle gateway —
-    every Bedrock model except Anthropic's own (see module docstring above)."""
+    """Bedrock models reached through bedrock-runtime's own OpenAI-compatible
+    endpoint (its /openai/v1 path) — every Bedrock model except Anthropic's
+    own and openai.gpt-5.x (see module docstring above)."""
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
         region = self.agconfig.llm.region or "us-east-1"
-        api_key = self.agconfig.llm.api_key or os.environ.get("AWS_BEARER_TOKEN_BEDROCK") or None
-        mantle_url = f"https://bedrock-mantle.{region}.api.aws/v1"
-        runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com"
-        if _is_bedrock_bearer_token(api_key):
-            return openai.OpenAI(api_key=api_key, base_url=mantle_url, timeout=timeout)
-        if not api_key:
-            try:
-                from aws_bedrock_token_generator import provide_token as _provide_token
-
-                os.environ.setdefault("AWS_DEFAULT_REGION", region)
-                token = _provide_token(region=region)
-                return openai.OpenAI(api_key=token, base_url=mantle_url, timeout=timeout)
-            except ImportError:
-                pass
-        return openai.OpenAI(
-            api_key="bedrock",
-            base_url=runtime_url,
-            http_client=httpx.Client(
-                auth=_BedrockSigV4Auth(region, api_key=api_key), timeout=timeout
-            ),
-        )
+        api_key = _require_bedrock_bearer_token(self.agconfig.llm)
+        runtime_url = f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+        return openai.OpenAI(api_key=api_key, base_url=runtime_url, timeout=timeout)
 
     def tokenize_url(self) -> "str | None":
         return None  # Bedrock has no vLLM-style /tokenize endpoint
@@ -176,21 +101,8 @@ class _AnthropicBedrockBackend(_AnthropicBackend):
                 "Anthropic models on Bedrock require the 'anthropic' package: pip install anthropic"
             )
         region = self.agconfig.llm.region or "us-east-1"
-        kwargs: dict = dict(aws_region=region, timeout=timeout)
-        api_key = self.agconfig.llm.api_key
-        if api_key:
-            # AnthropicBedrock natively accepts either shape directly (no env
-            # var/boto3 plumbing needed): a bearer-token Bedrock api_key, or
-            # a SigV4 access/secret[/session] key pair.
-            if _is_bedrock_bearer_token(api_key):
-                kwargs["api_key"] = api_key
-            else:
-                access_key, secret_key, session_token = _split_aws_key_pair(api_key)
-                kwargs["aws_access_key"] = access_key
-                kwargs["aws_secret_key"] = secret_key
-                if session_token:
-                    kwargs["aws_session_token"] = session_token
-        return _anthropic_sdk.AnthropicBedrock(**kwargs)
+        api_key = _require_bedrock_bearer_token(self.agconfig.llm)
+        return _anthropic_sdk.AnthropicBedrock(aws_region=region, api_key=api_key, timeout=timeout)
 
     def list_models(self) -> list:
         return []  # Bedrock's native invoke_model API has no OpenAI-style /v1/models
@@ -396,28 +308,17 @@ class _BedrockConverseBackend(agllm):
         from botocore.config import Config as _BotoConfig
 
         region = self.agconfig.llm.region or "us-east-1"
-        boto_kwargs: dict = {}
-        api_key = self.agconfig.llm.api_key
-        if api_key:
-            if _is_bedrock_bearer_token(api_key):
-                # boto3 has no per-client passthrough for a Bedrock API key
-                # bearer token -- it's only ever resolved via this env var,
-                # read fresh on every signed request (AWS's own documented
-                # mechanism for Bedrock API keys). Last write wins if
-                # different Bedrock bearer tokens are used concurrently in
-                # one process.
-                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = api_key
-            else:
-                access_key, secret_key, session_token = _split_aws_key_pair(api_key)
-                boto_kwargs["aws_access_key_id"] = access_key
-                boto_kwargs["aws_secret_access_key"] = secret_key
-                if session_token:
-                    boto_kwargs["aws_session_token"] = session_token
+        api_key = _require_bedrock_bearer_token(self.agconfig.llm)
+        # boto3 has no per-client passthrough for a Bedrock API key bearer
+        # token -- it's only ever resolved via this env var, read fresh on
+        # every signed request (AWS's own documented mechanism for Bedrock
+        # API keys). Last write wins if different Bedrock bearer tokens are
+        # used concurrently in one process.
+        os.environ["AWS_BEARER_TOKEN_BEDROCK"] = api_key
         return boto3.client(
             "bedrock-runtime",
             region_name=region,
             config=_BotoConfig(connect_timeout=timeout.connect, read_timeout=timeout.read),
-            **boto_kwargs,
         )
 
     def list_models(self) -> list:
