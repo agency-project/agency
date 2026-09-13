@@ -516,6 +516,48 @@ def test_shared_log_relays_new_per_agent_term_messages(server):
     assert relayed["agname"] == "Reporter"
 
 
+def test_shared_log_relays_agent_state_events_without_a_term_message(server):
+    """agent.record_state() never sets a term_message (every queued/
+    running_skill/running_harness/agent_idle transition would otherwise
+    flood the shared log), so these rows used to be silently dropped by
+    the term_message filter in the per-agent relay -- meaning the display
+    only ever received the coarser scheduler-level request_completed
+    ("finished") and never the agent_idle that immediately follows it,
+    leaving a client's displayed state stuck on "finished" forever. They
+    must still reach the client (to correct that), but without a
+    term_message field, so they don't also show up in the shared log."""
+    client, run_dir, srv = server
+
+    agent_path = run_dir / "Reporter_data.sqlite3"
+    agent_logger = _make_data_logger(agent_path)
+    global_logger = _make_data_logger(run_dir / "global_data.sqlite3")
+    global_logger.record_event(
+        "agent_registered",
+        {"db_path": str(agent_path), "team": None},
+        name="Reporter",
+        object="agent",
+        update_latest_snapshot=True,
+    )
+    global_logger.stop()
+
+    with client.websocket_connect("/ws") as ws:
+        agent_logger.record_event(
+            "agent_state",
+            {"state": "running_harness", "skill": "run", "tool": None},
+            name="Reporter",
+            update_latest_snapshot=True,
+        )
+        agent_logger.stop()
+
+        received = _recv_skipping_sync(ws, 5)
+
+    relayed = next((e for e in received if e.get("type") == "agent_state"), None)
+    assert relayed is not None, f"no relayed agent_state event received; got {received}"
+    assert relayed["state"] == "running_harness"
+    assert relayed["agname"] == "Reporter"
+    assert "term_message" not in relayed
+
+
 def test_websocket_connect_replays_per_agent_log_backlog(server):
     """A client connecting after per-agent activity already happened still
     sees it -- not just future updates."""

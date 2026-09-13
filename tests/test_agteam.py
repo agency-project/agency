@@ -507,6 +507,52 @@ def test_team_get_config_copy_reflects_current_values():
     assert team.get_config_copy().llm.model == "m"
 
 
+# ---------------------------------------------------------------------------
+# team_registered snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_team_registered_is_refreshed_after_run_builds_its_agents(tmp_path):
+    """__init__'s team_registered snapshot is taken right after setup(),
+    before run() ever executes -- a team with no setup() override (agents
+    built directly in run(), the common ad-hoc pattern -- see main.py-style
+    scripts) always has an empty _agents set at that point. The wrapped
+    run() must log team_registered again once run() completes so the
+    snapshot reflects the agents run() actually created."""
+    import json
+    import sqlite3
+
+    from agency.agent import agent
+    from agency.utils.agsync import agsync
+
+    class RunBuiltTeam(agteam):
+        agconfig = _llm_agconfig(_ECHO_LLM)
+
+        def run(self):
+            self.worker = agent(name="run_built_worker")
+            return agdata(done=True)
+
+    agent.log_dir = tmp_path
+    team = RunBuiltTeam()
+    team.run()
+    agsync(team)
+    team.data_logger.flush()
+
+    con = sqlite3.connect(team.data_logger.db_path)
+    try:
+        rows = con.execute(
+            "SELECT payload FROM events WHERE object='agteam' AND name=? "
+            "AND type='team_registered' ORDER BY id",
+            (team.name,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    payloads = [json.loads(row[0]) for row in rows]
+    assert payloads[0]["agents"] == []
+    assert payloads[-1]["agents"] == [team.worker.agname]
+
+
 def test_mutating_team_get_config_copy_does_not_affect_team():
     team = _EchoTeam()
     copy = team.get_config_copy()

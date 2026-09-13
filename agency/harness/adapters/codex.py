@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import hashlib
 import shutil
 import uuid
 from functools import partial
@@ -83,12 +82,21 @@ def _responses_content_to_text(content) -> str:
     return "".join(b["text"] for b in _responses_content_to_blocks(content))
 
 
+_TOOL_WIRE_NAME_MAX_LEN = 64  # Chat Completions' tool-name cap; no namespace field.
+
+
 def _tool_wire_name(kind: str, name: str, namespace: "str | None" = None) -> str:
     if kind == "function" and not namespace:
         return name
-    # Chat Completions names have a 64-character limit and no namespace field.
-    identity = json.dumps([kind, namespace, name]).encode()
-    return "agency_" + hashlib.sha256(identity).hexdigest()[:48]
+    segments = ["mcp", *(namespace or "").split("."), name]
+    if kind != "function":
+        segments.append(kind)
+    wire_name = "__".join(s for s in segments if s)
+    if len(wire_name) > _TOOL_WIRE_NAME_MAX_LEN:
+        # Truncate from the front: the tool name (and innermost namespace
+        # segment) at the tail is the readable part worth keeping intact.
+        wire_name = wire_name[-_TOOL_WIRE_NAME_MAX_LEN:]
+    return wire_name
 
 
 def _responses_tool_routes(request: dict) -> dict:
