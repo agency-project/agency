@@ -21,6 +21,7 @@ equivalent.
 from __future__ import annotations
 
 import os
+import logging
 import platform
 import re
 import threading
@@ -496,6 +497,12 @@ class agProxyPtrace:
             if self._agconfig is not None
             else agconfig_cls().ptrace.syscalls
         )
+        original_syscalls = tuple(syscalls)
+        track_access = self._agconfig is not None and self._agconfig.ptrace.file_access
+        if track_access:
+            from .file_access import ACCESS_SYSCALLS, access_result
+
+            syscalls = tuple(dict.fromkeys((*syscalls, *ACCESS_SYSCALLS)))
         process_profiler = _ProcessLifecycleProfiler.for_active_session(
             ag,
             envp,
@@ -506,6 +513,9 @@ class agProxyPtrace:
 
         def syscall_hook(stop) -> _TraceDecision:
             nonlocal initial_exec_pending
+            # Observer-only traps must not introduce new policy decisions.
+            if track_access and stop.syscall not in original_syscalls:
+                return _TraceDecision(kind="allow")
             # Agency selected this exact root executable and argv.  Consume a
             # one-shot authorization for that launch without granting the
             # harness or its descendants a general exec-policy bypass.
@@ -550,16 +560,35 @@ class agProxyPtrace:
             return _TraceDecision(kind="allow" if allowed else "deny", call_id=call_id)
 
         check_completion = getattr(policy, "check_completion", None)
+        access_failures = 0
 
         def syscall_exit_hook(stop, call_id, return_value) -> None:
-            del stop  # the admission-time event already carried the syscall's shape
+            nonlocal access_failures
+            if track_access and stop.syscall in ACCESS_SYSCALLS:
+                payload = access_result(stop, return_value)
+                reporter = getattr(policy, "record_file_access", None)
+                if payload is not None and reporter is not None:
+                    try:
+                        reporter(payload)
+                    except Exception as exc:
+                        # Missing telemetry is never evidence of no reuse.
+                        # Consumers always report this observer as partial.
+                        access_failures += 1
+                        if access_failures == 1:
+                            logging.getLogger(__name__).warning(
+                                "File access observations dropped: %s; coverage is partial",
+                                type(exc).__name__,
+                            )
             if check_completion is None or call_id is None:
                 return
             check_completion(ag, call_id, return_value)
 
-        loop = TracerLoop(
+        loop_args = dict(
             syscalls=syscalls, syscall_hook=syscall_hook, syscall_exit_hook=syscall_exit_hook
         )
+        if track_access:
+            loop_args["file_access"] = True
+        loop = TracerLoop(**loop_args)
         handle = agProxyPtraceHandle(loop, process_profiler)
         if process_profiler is not None:
             handle.on_spawn(_isolated_profiler_callback(process_profiler.on_spawn))

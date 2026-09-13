@@ -63,6 +63,7 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
         "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),
+            "file_access": agconfig.ptrace.file_access,
             "profiler": agconfig.ptrace.profiler,
             "disable_harness_native_sandbox": agconfig.ptrace.disable_harness_native_sandbox,
         },

@@ -96,6 +96,9 @@ ALL_TRACE_OPTIONS = (
 # _tracer_loop.py) to add more -- do not guess a number, verify against
 # /usr/include/x86_64-linux-gnu/asm/unistd_64.h or the kernel's syscall table.
 SYSCALL_NUMBERS: dict[str, int] = {
+    "read": 0,
+    "pread64": 17,
+    "readv": 19,
     "execve": 59,
     "execveat": 322,
     "open": 2,

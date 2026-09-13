@@ -153,6 +153,9 @@ class sandboxconfig(confignamespace):
     base_image: str = "agency-sandbox:latest"
     persistent: bool = False
     hibernation_diagnostics: bool = False
+    # Host-side metadata only; never collect file contents. Docker/Podman only.
+    checkpoint_diagnostics: bool = False
+    checkpoint_diagnostics_extended: bool = False
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
 
     backend: str = "auto"  # podman | docker | chroot | auto
@@ -271,6 +274,8 @@ class ptraceconfig(confignamespace):
     """ptrace harness supervisor (agency/harness/ptrace/supervisor.py)."""
 
     syscalls: "tuple[str, ...]" = ("execve", "execveat")
+    # Independent opt-in: metadata-only successful opens/reads in traced trees.
+    file_access: bool = False
     profiler: "str | None" = None  # reserved for a future heavyweight profiler (e.g. perf)
     disable_harness_native_sandbox: bool = True
 

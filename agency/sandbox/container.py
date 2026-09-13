@@ -1718,6 +1718,12 @@ class _ContainerBackendBase(agsandbox_backend):
         #    due, never a replacement for it, so an ordinary commit's cost
         #    never regresses.
         commit_exc: Exception | None = None
+        diagnostic = None
+        if self._agconfig.sandbox.checkpoint_diagnostics:
+            from .checkpoint_diagnostics import collect_before, write_after
+
+            diagnostic = collect_before(self)
+        commit_started = time.perf_counter() if diagnostic is not None else None
         for _attempt in range(self._agconfig.sandbox.commit_retry_attempts):
             try:
                 self._run(
@@ -1732,6 +1738,9 @@ class _ContainerBackendBase(agsandbox_backend):
                 commit_exc = _e
                 if _attempt != self._agconfig.sandbox.commit_retry_attempts - 1:
                     time.sleep(self._agconfig.sandbox.commit_retry_backoff_s)
+        if diagnostic is not None:
+            commit_seconds = time.perf_counter() - commit_started
+            write_after(self, diagnostic, tag, commit_seconds, commit_exc)
         if commit_exc is not None:
             raise commit_exc
 

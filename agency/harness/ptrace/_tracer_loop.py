@@ -53,6 +53,7 @@ class SeccompStop:
     timestamp: float
     address: "str | None" = None
     port: "int | None" = None
+    file_access: "dict | None" = None
 
 
 @dataclass
@@ -174,6 +175,7 @@ class TracerLoop:
         syscall_hook: "Callable[[SeccompStop], StopDecision]",
         poll_interval_s: float = 0.002,
         syscall_exit_hook: "Callable[[SeccompStop, str | None, int], None] | None" = None,
+        file_access: bool = False,
     ) -> None:
         self._syscalls = tuple(syscalls)
         self._syscall_hook = syscall_hook
@@ -183,6 +185,7 @@ class TracerLoop:
         # entirely, resuming every admitted syscall with PTRACE_CONT exactly
         # as before this existed.
         self._syscall_exit_hook = syscall_exit_hook
+        self._file_access = file_access
 
         self.root_pid: "int | None" = None
         self.stdout_r: "int | None" = None
@@ -787,6 +790,10 @@ class TracerLoop:
             address=address,
             port=port,
         )
+        if self._file_access and name in ("read", "pread64", "readv"):
+            from .file_access import fd_metadata
+
+            stop.file_access = fd_metadata(pid, regs.rdi)
         decision = self._syscall_hook(stop)
         is_exec = nr in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"])
         if decision.kind == "deny":

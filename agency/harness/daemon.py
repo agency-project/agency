@@ -83,6 +83,9 @@ class _HostSyscallPolicy:
         self._default_to_deny = default_to_deny
         self._hooked_syscalls = hooked_syscalls or frozenset()
 
+    def record_file_access(self, payload):
+        self._host_services.record_file_access(self._attempt_token, payload)
+
     def check(self, _agent, syscall):
         if syscall.syscall in self._hooked_syscalls or syscall.syscall in self._ALWAYS_SYNCHRONOUS:
             return self._host_services.check_syscall_policy(self._attempt_token, syscall)

@@ -111,6 +111,15 @@ class HostServicesClient:
             headers=self._attempt_headers(token),
         )
 
+    def record_file_access(self, token: str, payload: dict) -> None:
+        response = self.client.post(
+            "/interaction/record_event",
+            json={"type": "checkpoint_file_access", "payload": payload},
+            headers=self._attempt_headers(token),
+            timeout=2,
+        )
+        response.raise_for_status()
+
     def check_tool_policy(self, token: str, tool_name: str, tool_input: dict) -> dict:
         # A GPU-gated tool call can legitimately block on the host for as
         # long as another agent holds the GPU it reserved -- unbounded by
