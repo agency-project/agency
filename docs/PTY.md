@@ -13,8 +13,10 @@ and starts `PtyExecution`. That runner owns a fresh PTY process for one attempt.
 It never shares a live CLI between attempts or agents.
 
 The shared runner handles bracketed-paste input, native acknowledgment deadlines,
-pause-aware timeouts, redirects, completion, and process retirement. `PtyDriver`
-contains the three CLI dialects. Hooks and the OpenCode plugin only observe
+pause-aware timeouts, redirects, completion, and process retirement. It contains
+no per-harness branches. `PtyDriver` is the dialect contract, with one subclass
+per harness selected by `driver_for()`; `_HookPtyDriver` carries what the
+hook-and-rollout CLIs (Codex, Grok) share. Hooks and the OpenCode plugin only observe
 lifecycle events and enforce tool policy; prompts and interrupts travel through
 the PTY, not an alternate headless server or prompt-injection HTTP endpoint.
 

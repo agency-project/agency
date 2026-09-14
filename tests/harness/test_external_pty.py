@@ -9,7 +9,7 @@ import pytest
 
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.pty_drivers import PtyDriver
+from agency.harness.adapters.pty_drivers import OpencodeDriver, driver_for
 from agency.harness.adapters.pty_session import PtyExecution, restore_session, snapshot_session
 
 
@@ -29,7 +29,7 @@ def runtime():
 
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
 def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     assert driver.argv[0] == name
@@ -65,7 +65,7 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
 
 def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
     runtime = replace(runtime, has_sandbox_mcp_tools=True)
-    PtyDriver(
+    driver_for(
         agharness_backend.for_config("codex", runtime.agconfig),
         runtime,
         tmp_path,
@@ -100,6 +100,9 @@ class FakeDriver:
     def ready(self, handle):
         return self.is_ready
 
+    def prompt_matches(self, prompt, expected):
+        return prompt == expected
+
     def clear_input(self, handle, wait_until):
         handle.write_terminal(b"\x15")
 
@@ -115,7 +118,7 @@ class FakeDriver:
 
 
 def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     driver.transcript_path = tmp_path / "transcript.jsonl"
@@ -137,7 +140,7 @@ def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
 
 
 def test_codex_accepts_empty_completion_after_mcp_submission(runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     transcript = tmp_path / "transcript.jsonl"
@@ -405,7 +408,7 @@ def test_restore_rejects_symlinked_parent(tmp_path):
 def test_sqlite_snapshot_includes_wal_without_mutating_live_database(runtime, tmp_path):
     import sqlite3
 
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("opencode", runtime.agconfig),
         runtime,
         tmp_path,
@@ -464,7 +467,7 @@ def test_terminal_confirmation_is_required_before_second_escape(execution):
 
 @pytest.mark.parametrize("name", ["codex", "grok"])
 def test_driver_fences_native_turns_and_rejects_child_events(name, runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
     )
     if name == "codex":
@@ -493,7 +496,7 @@ def test_driver_fences_native_turns_and_rejects_child_events(name, runtime, tmp_
 def test_driver_requires_matching_complete_native_record_and_ignores_partial_tail(
     name, runtime, tmp_path
 ):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
     )
     path = tmp_path / "transcript.jsonl"
@@ -513,7 +516,7 @@ def test_driver_requires_matching_complete_native_record_and_ignores_partial_tai
 
 
 def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver.transcript_path = tmp_path / "transcript.jsonl"
@@ -590,7 +593,7 @@ def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch
 
 
 def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "[Agency run test]\nprevious prompt"
@@ -610,6 +613,7 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
 @pytest.mark.parametrize("suffix", ["\n", " \n"])
 def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
     execution.driver.name = "opencode"
+    execution.driver.prompt_matches = OpencodeDriver.prompt_matches.__get__(execution.driver)
     execution._expected_prompt = "[Agency run test]\ncurrent instruction"
     execution._turn_id = None
     execution.driver.pending = [
@@ -624,7 +628,7 @@ def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
 
 
 def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
-    driver = PtyDriver(
+    driver = driver_for(
         agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "\n".join(["[Agency run test]"] + ["previous line"] * 10)
