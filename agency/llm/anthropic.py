@@ -13,6 +13,24 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+try:
+    import httpx2 as _httpx2
+except ImportError:
+    _httpx2 = None
+
+
+def _anthropic_sdk_timeout(timeout: httpx.Timeout):
+    """The installed anthropic SDK validates its `timeout` kwarg against its
+    own httpx2 package (a separate, newer PyPI package, not a re-export of
+    httpx), rejecting a real httpx.Timeout with a TypeError. Every Anthropic-
+    family backend's client construction must convert at this boundary."""
+    if _httpx2 is None:
+        return timeout
+    return _httpx2.Timeout(
+        connect=timeout.connect, read=timeout.read, write=timeout.write, pool=timeout.pool
+    )
+
+
 # Matches the region + "anthropic." prefix Bedrock model IDs carry (e.g.
 # "us.anthropic.claude-sonnet-5-...") -- a no-op substitution on plain
 # api.anthropic.com model IDs ("claude-sonnet-5"), which carry no such
@@ -234,7 +252,7 @@ class _AnthropicBackend(agllm):
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
         kwargs: dict = dict(
             api_key=self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_API_KEY"),
-            timeout=timeout,
+            timeout=_anthropic_sdk_timeout(timeout),
         )
         workspace_id = self.agconfig.llm.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
