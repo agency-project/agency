@@ -31,6 +31,10 @@ def _discard_control_handle(_handle: object) -> None:
     return None
 
 
+def _run_one_pty_execution(_key: object, factory: Callable[[], object], prompt: str):
+    return factory().run(prompt)
+
+
 @dataclass
 class AttemptResult:
     """Normalized result of one harness CLI invocation."""
@@ -80,6 +84,11 @@ class AdapterRuntime:
     # Register an attempt-local delivery function. False means the caller must
     # queue the message; True requires native prompt acceptance, not a buffer write.
     register_redirect: "Callable[[Callable[[str], bool]], None]" = _discard_control_handle
+    # The daemon supplies a retaining runner only for optional CRIU fast
+    # resume.  Direct callers and the default lifecycle stay invocation scoped.
+    run_pty_execution: "Callable[[object, Callable[[], object], str], AttemptResult]" = (
+        _run_one_pty_execution
+    )
 
 
 class agharness_backend:

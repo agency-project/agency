@@ -45,25 +45,36 @@ class HostServicesClient:
         )
         self._attempt_token_lock = threading.Lock()
         self._active_attempt_token: "str | None" = None
+        self._upstream_attempt_token: "str | None" = None
 
-    def register_attempt_token(self, token: str) -> None:
-        """Activate exactly one credential for the current daemon attempt."""
+    def register_attempt_token(self, token: str, *, local_token: "str | None" = None) -> None:
+        """Map one process-local credential to the current host attempt.
+
+        A CRIU-restored CLI cannot change its environment, so it keeps the
+        credential created with the process.  The host credential remains
+        attempt scoped and is replaced on every dispatch.
+        """
         if not isinstance(token, str) or not token:
             raise ValueError("attempt token must be a non-empty string")
+        accepted = local_token if local_token is not None else token
+        if not isinstance(accepted, str) or not accepted:
+            raise ValueError("local attempt token must be a non-empty string")
         with self._attempt_token_lock:
             if self._active_attempt_token is not None:
                 raise RuntimeError("another harness attempt token is already active")
-            self._active_attempt_token = token
+            self._active_attempt_token = accepted
+            self._upstream_attempt_token = token
 
     def clear_attempt_token(self, token: str) -> bool:
         """Revoke only the matching credential, making stale cleanup harmless."""
         if not isinstance(token, str) or not token:
             return False
         with self._attempt_token_lock:
-            active = self._active_attempt_token
-            if active is None or not self._attempt_tokens_match(active, token):
+            upstream = self._upstream_attempt_token
+            if upstream is None or not self._attempt_tokens_match(upstream, token):
                 return False
             self._active_attempt_token = None
+            self._upstream_attempt_token = None
             return True
 
     def validate_token(self, token: str) -> bool:
@@ -83,7 +94,20 @@ class HostServicesClient:
     def _attempt_headers(self, token: str) -> dict[str, str]:
         if not self.validate_token(token):
             raise RuntimeError("unknown or missing bearer token")
-        return {ATTEMPT_TOKEN_HEADER: token}
+        with self._attempt_token_lock:
+            upstream = self._upstream_attempt_token
+        if upstream is None:
+            raise RuntimeError("no active upstream attempt token")
+        return {ATTEMPT_TOKEN_HEADER: upstream}
+
+    def quiesce_connections(self) -> None:
+        """Remove host-external sockets before a container-level CRIU dump."""
+        self.client.close()
+        self.client = httpx.Client(
+            transport=httpx.HTTPTransport(uds=self._uds_path),
+            base_url="http://agmanager-host",
+            timeout=self._timeout_s,
+        )
 
     def resolve_model(self, token: str) -> str:
         resp = self.client.get("/llm/resolve_model", headers=self._attempt_headers(token))
@@ -342,6 +366,7 @@ class HostServicesClient:
     def close(self) -> None:
         with self._attempt_token_lock:
             self._active_attempt_token = None
+            self._upstream_attempt_token = None
         self.client.close()
 
 

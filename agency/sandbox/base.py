@@ -165,6 +165,8 @@ class agsandbox_backend(AgSandboxBackendFields):
             raise ValueError(
                 "cow_zfs requires sandbox.checkpoint_zfs_parent (an existing ZFS dataset)"
             )
+        if agconfig.sandbox.checkpoint_fast_resume and checkpoint != "cow_zfs":
+            raise ValueError("checkpoint_fast_resume requires checkpoint_backend='cow_zfs'")
         if backend == "chroot" and (
             checkpoint != "image_commit" or agconfig.sandbox.checkpoint_zfs_parent
         ):

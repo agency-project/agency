@@ -31,6 +31,7 @@ import json
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -648,6 +649,8 @@ class _ContainerBackendBase(agsandbox_backend):
         if (
             updated.sandbox.checkpoint_backend != self._agconfig.sandbox.checkpoint_backend
             or updated.sandbox.checkpoint_zfs_parent != self._agconfig.sandbox.checkpoint_zfs_parent
+            or updated.sandbox.checkpoint_fast_resume
+            != self._agconfig.sandbox.checkpoint_fast_resume
         ):
             raise ValueError("Checkpoint backend/storage is fixed at sandbox construction")
         self._validate_config(updated)
@@ -793,6 +796,19 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
         gpu_flags = _gpu_flags(self._runtime)
+        storage = getattr(self, "_checkpoint_storage", None)
+        if (
+            storage is not None
+            and self._runtime == "podman"
+            and self._agconfig.sandbox.checkpoint_fast_resume
+            and storage.criu_ready
+        ):
+            gpu_flags += [
+                "--cap-add=SYS_PTRACE",
+                f"--init-path={storage.init_path}",
+                "--annotation",
+                f"org.criu.config={storage.criu_config}",
+            ]
         cgroup_flags = []
         cgroup_parent = agprof.container_cgroup_parent()
         if cgroup_parent is not None and self._runtime == "docker":
@@ -1233,6 +1249,21 @@ class _ContainerBackendBase(agsandbox_backend):
         offers no such feedback once the process is handed off.
         """
         self._ensure_started()
+        if self._agconfig.sandbox.checkpoint_fast_resume:
+            # The short exec parent exits and container init adopts the
+            # daemon. CRIU then sees no live Podman exec session or host pipe.
+            args = [
+                self._runtime,
+                "exec",
+                "-w",
+                workdir,
+                self._container_name(),
+                shell,
+                "-c",
+                f"nohup {shell} -c {shlex.quote(sh_cmd)} </dev/null >/dev/null 2>&1 &",
+            ]
+            self._run(args, check=True, timeout=self._agconfig.sandbox.exec_quick_timeout_s)
+            return
         args = [
             self._runtime,
             "exec",
@@ -1595,6 +1626,24 @@ class _ContainerBackendBase(agsandbox_backend):
         if stop_exc is not None:
             raise stop_exc
 
+    def _mark_runtime_checkpoint_stopped(self) -> None:
+        """Release host bookkeeping after CRIU stopped the container."""
+        from .checkpoint import CheckpointCapabilityError
+
+        if self._container_running():
+            raise CheckpointCapabilityError("CRIU checkpoint left the container running")
+        gpu_ids_to_release = list(self._gpu_ids) if self._gpu_count_requested > 0 else []
+        self._watched_pids = {}
+        self._baseline_pids = None
+        self._ptrace_managed_pids = set()
+        self._daemon_pids = set()
+        self._infrastructure_pids = {}
+        agprof.container_stopped(self._prof_container_label())
+        self._release_runtime_slot()
+        if gpu_ids_to_release and self._gpu_release_fn is not None:
+            self._gpu_release_fn(gpu_ids_to_release)
+            self._gpu_ids = []
+
     def rm_container(self) -> None:
         """Force-remove the container outright, discarding all of its
         current state and releasing both the runtime slot and the GPU (see
@@ -1614,6 +1663,21 @@ class _ContainerBackendBase(agsandbox_backend):
         already removed) -- a no-op in that case, aside from a GPU release
         if one was still held.
         """
+        from .checkpoint import CowZfsCheckpoint
+
+        checkpointer = getattr(self, "_checkpointer", None)
+        if (
+            isinstance(checkpointer, CowZfsCheckpoint)
+            and checkpointer.latest is not None
+            and not getattr(self, "_checkpoint_destroying", False)
+        ):
+            # For local COW storage, discard means roll back on next use.
+            # Keep the runtime object because its metadata is part of the
+            # same private dataset as the writable filesystem and CRIU cache.
+            if self._container_running():
+                self._stop_image()
+            checkpointer.hibernated = True
+            return
         gpu_ids_to_release = list(self._gpu_ids) if self._gpu_count_requested > 0 else []
         if not self._container_status():
             agprof.container_stopped(self._prof_container_label())

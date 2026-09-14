@@ -104,6 +104,7 @@ class HostServerManager:
             skill,
             resource_pool,
             self._data_logger,
+            live_session=agent.agconfig.sandbox.checkpoint_fast_resume,
             # Native tools have already passed the loop's admission fence.
             is_cancelled=is_cancelled if getattr(agent, "harness", None) != "native" else None,
         )

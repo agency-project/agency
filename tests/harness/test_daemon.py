@@ -91,6 +91,8 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     manager._control_lock = threading.Lock()
     manager._current_control_handle = None
     manager._agent_paused = False
+    manager._persistent = False
+    manager._live_control_handle = None
     policy = object()
 
     class HarnessApi:
@@ -159,6 +161,8 @@ def test_daemon_rejects_missing_attempt_token_without_registering():
     manager._control_lock = threading.Lock()
     manager._current_control_handle = None
     manager._agent_paused = False
+    manager._persistent = False
+    manager._live_control_handle = None
     manager._harness_api = type(
         "HarnessApi",
         (),
@@ -185,6 +189,8 @@ def test_daemon_revokes_attempt_token_when_handler_raises():
     manager._control_lock = threading.Lock()
     manager._current_control_handle = None
     manager._agent_paused = False
+    manager._persistent = False
+    manager._live_control_handle = None
     manager._harness_api = type(
         "HarnessApi",
         (),

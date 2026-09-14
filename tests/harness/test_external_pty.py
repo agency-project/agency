@@ -639,3 +639,55 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
 
     driver.clear_input(handle, wait_until)
     handle.write_terminal.assert_called_once_with(b"\x03")
+
+
+def test_cow_success_closes_pty_at_invocation_boundary(runtime, tmp_path, monkeypatch):
+    runtime.agconfig.sandbox.checkpoint_backend = "cow_zfs"
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    handle = Mock(returncode=None)
+    handle.is_paused.return_value = False
+    launch = Mock(return_value=handle)
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+
+    def write(data):
+        if data == b"\r":
+            execution.driver.pending += [
+                {"kind": "submit", "turn_id": "turn", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "turn", "text": "done"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    assert execution.run("first").ok
+    assert not tmp_path.exists()
+    handle.close.assert_called_once()
+    launch.assert_called_once()
+
+
+def test_codex_reports_failed_task_complete_without_waiting_for_stop_hook(runtime, tmp_path):
+    driver = PtyDriver(
+        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    path = tmp_path / "transcript.jsonl"
+    driver.transcript_path = path
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "failed-turn",
+                    "last_agent_message": None,
+                    "error": {"message": "model configuration rejected"},
+                },
+            }
+        )
+        + "\n"
+    )
+    events = driver.events()
+    assert events == [
+        {
+            "kind": "error",
+            "turn_id": "failed-turn",
+            "error": "Codex terminal error: {'message': 'model configuration rejected'}",
+        }
+    ]

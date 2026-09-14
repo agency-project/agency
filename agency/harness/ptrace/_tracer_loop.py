@@ -176,6 +176,7 @@ class TracerLoop:
         poll_interval_s: float = 0.002,
         syscall_exit_hook: "Callable[[SeccompStop, str | None, int], None] | None" = None,
         file_access: bool = False,
+        checkpointable: bool = False,
     ) -> None:
         self._syscalls = tuple(syscalls)
         self._syscall_hook = syscall_hook
@@ -186,6 +187,14 @@ class TracerLoop:
         # as before this existed.
         self._syscall_exit_hook = syscall_exit_hook
         self._file_access = file_access
+        self._seize_mode = checkpointable
+        self._checkpoint_detached = False
+        self._checkpoint_seized = False
+        self._checkpoint_group_stopped = False
+        self._checkpoint_request = None
+        self._checkpoint_request_lock = threading.Lock()
+        self._checkpoint_done = threading.Event()
+        self._checkpoint_error = None
 
         self.root_pid: "int | None" = None
         self.stdout_r: "int | None" = None
@@ -395,9 +404,9 @@ class TracerLoop:
         self._stderr_reader.start()
 
         try:
-            _, status = os.waitpid(pid, 0)
+            _, status = os.waitpid(pid, os.WUNTRACED if self._seize_mode else 0)
             assert os.WIFSTOPPED(status), f"expected initial stop, got status={status:#x}"
-            pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+            self._attach_initial(pid)
             with self._lock:
                 self._options_applied.add(pid)
             pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
@@ -447,12 +456,12 @@ class TracerLoop:
         os.close(slave)
         self.root_pid = pid
         self._remember_spawn(pid)
-        _, status = os.waitpid(pid, 0)
+        _, status = os.waitpid(pid, os.WUNTRACED if self._seize_mode else 0)
         if not os.WIFSTOPPED(status):
             os.close(master)
             self.pty_master = None
             raise RuntimeError("PTY child failed before trace setup")
-        pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+        self._attach_initial(pid)
         with self._lock:
             self._options_applied.add(pid)
         # Keep the master alive for writes; the reader owns a duplicate.
@@ -623,7 +632,8 @@ class TracerLoop:
     def _exec_traced(self, argv, envp, cwd) -> None:
         if cwd:
             os.chdir(cwd)
-        pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)
+        if not self._seize_mode:
+            pt.ptrace(pt.PTRACE_TRACEME, 0, 0, 0)
         # Sync with parent: it must set PTRACE_O_TRACESECCOMP before we
         # install the filter and exec, or the syscall traps ENOSYS instead.
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -642,6 +652,21 @@ class TracerLoop:
         PTRACE_SETOPTIONS by the time this is called -- see `start()`)."""
         assert self.root_pid is not None
         while True:
+            if self._checkpoint_request is not None:
+                from . import _checkpoint_handoff
+
+                operation, timeout = self._checkpoint_request
+                try:
+                    getattr(_checkpoint_handoff, operation)(self, timeout)
+                except BaseException as exc:
+                    self._checkpoint_error = exc
+                finally:
+                    self._checkpoint_request = None
+                    self._checkpoint_done.set()
+                continue
+            if self._checkpoint_detached:
+                time.sleep(self._poll_interval_s)
+                continue
             with self._lock:
                 pending = list(self._known_pids)
                 to_resume = list(self._resume_requests)
@@ -651,8 +676,13 @@ class TracerLoop:
             # call from resume()'s own (arbitrary) caller thread would fail.
             # resume() only queues the pids here; this loop is what actually
             # restarts them, on its very next iteration.
+            if to_resume and self._checkpoint_group_stopped:
+                from ._checkpoint_handoff import resume_groups
+
+                resume_groups(self)
             for pid in to_resume:
-                _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+                request = pt.PTRACE_SYSCALL if pid in self._pending_syscall_exit else pt.PTRACE_CONT
+                _ptrace_ignoring_esrch(request, pid, 0, 0)
             # A kill can overtake a clone notification. Its auto-attached child
             # still needs its exit-stop resumed, even though it never entered
             # _known_pids. Waiting only on known PIDs strands that child and
@@ -685,6 +715,18 @@ class TracerLoop:
         assert os.WIFSTOPPED(status), (pid, status)
         sig = os.WSTOPSIG(status)
         event = (status >> 16) & 0xFF
+
+        if event == pt.PTRACE_EVENT_STOP:
+            if pid not in self._options_applied:
+                self._classify_pending_clone(pid)
+                pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+                self._options_applied.add(pid)
+            with self._lock:
+                if pid in self._held_pids:
+                    self._parked_pids.add(pid)
+                    return
+            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            return
 
         with self._lock:
             needs_options = pid not in self._options_applied
@@ -761,6 +803,33 @@ class TracerLoop:
                 os.kill(pid, signal.SIGSTOP)
             except ProcessLookupError:
                 pass
+
+    def _attach_initial(self, pid):
+        if not self._seize_mode:
+            pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
+            return
+        pt.ptrace(pt.PTRACE_SEIZE, pid, 0, pt.ALL_TRACE_OPTIONS)
+        pt.ptrace(pt.PTRACE_INTERRUPT, pid, 0, 0)
+        _, status = os.waitpid(pid, pt.WAIT_ALL)
+        if not os.WIFSTOPPED(status):
+            raise RuntimeError("Initial SEIZE attachment did not stop the child")
+        os.kill(pid, signal.SIGCONT)
+
+    def checkpoint_handoff(self, operation, timeout=20):
+        if operation not in {"detach", "reattach", "seize_frozen"}:
+            raise ValueError("Unknown checkpoint handoff")
+        with self._checkpoint_request_lock:
+            if self._finished.is_set():
+                raise RuntimeError("CLI process tree has exited")
+            self._checkpoint_error = None
+            self._checkpoint_done.clear()
+            self._checkpoint_request = (operation, timeout)
+            if not self._checkpoint_done.wait(timeout + 2):
+                raise TimeoutError(
+                    "Tracer did not finish checkpoint handoff; tree must remain stopped"
+                )
+            if self._checkpoint_error is not None:
+                raise self._checkpoint_error
 
     def resume(self) -> None:
         """Queue the deferred PTRACE_CONT for every pid pause() withheld --
@@ -985,6 +1054,8 @@ class TracerLoop:
         return self._returncode
 
     def kill(self) -> None:
+        if self._checkpoint_detached:
+            self.checkpoint_handoff("reattach")
         with self._lock:
             pids = list(self._known_pids)
         for pid in pids:

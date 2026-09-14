@@ -159,10 +159,17 @@ class sandboxconfig(confignamespace):
 
     backend: str = "auto"  # podman | docker | chroot | auto
     checkpoint_backend: str = "image_commit"  # image_commit | cow_zfs
+    # Keep the idle harness process tree as a best-effort CRIU acceleration
+    # layer.  The ZFS snapshot remains authoritative and is always captured;
+    # any dump or restore failure falls back to a fresh process tree.
+    checkpoint_fast_resume: bool = False
     # Existing host-managed ZFS parent dataset. Provisioning is outside
     # checkpoint spans; sandbox processes never receive ZFS privileges.
     checkpoint_zfs_parent: "str | None" = None
     checkpoint_setup_timeout_s: float = 900
+    # Host paths CRIU may scan when resolving in-memory file handles during
+    # the optional local restore. They never affect the durable ZFS snapshot.
+    checkpoint_irmap_paths: tuple[str, ...] = ("/tmp/agency-0", "/workspace", "/testbed")
     # Container creation constraints, retained across hibernation and rollback.
     # Changing these on an existing container requires recreating that container.
     cpuset_cpus: "str | None" = None

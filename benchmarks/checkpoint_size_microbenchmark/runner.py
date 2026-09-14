@@ -201,6 +201,7 @@ def prepare(
     checkpoint_backend: str = "image_commit",
     runtime: str = "docker",
     checkpoint_zfs_parent: str | None = None,
+    checkpoint_fast_resume: bool = False,
 ) -> None:
     if root.exists():
         raise RuntimeError(f"Experiment directory already exists: {root}")
@@ -272,6 +273,7 @@ def prepare(
         "sample_gpu": False,
         "backend": runtime,
         "checkpoint_backend": checkpoint_backend,
+        "checkpoint_fast_resume": checkpoint_fast_resume,
         "checkpoint_zfs_parent": checkpoint_zfs_parent,
         "sandbox_cpus": 4,
         "sandbox_memory": "8g",
@@ -411,6 +413,7 @@ def configure(root: Path, key_file: Path):
     cfg.agent.harness = config["harness"]
     cfg.sandbox.backend = config["backend"]
     cfg.sandbox.checkpoint_backend = config.get("checkpoint_backend", "image_commit")
+    cfg.sandbox.checkpoint_fast_resume = config.get("checkpoint_fast_resume", False)
     cfg.sandbox.checkpoint_zfs_parent = config.get("checkpoint_zfs_parent")
     cfg.sandbox.base_image = manifest["control"]["runtime_creation_image_id"]
     cfg.sandbox.checkpoint_diagnostics = True
@@ -431,6 +434,8 @@ def validate_checkpoint_comparison(config: dict) -> None:
         raise ValueError(f"Unknown checkpoint_backend {backend!r}")
     if backend == "cow_zfs" and not config.get("checkpoint_zfs_parent"):
         raise CheckpointCapabilityError("COW comparison requires checkpoint_zfs_parent")
+    if config.get("checkpoint_fast_resume") and backend != "cow_zfs":
+        raise CheckpointCapabilityError("CRIU fast resume requires cow_zfs")
 
 
 def extract_payload_result(database: Path, summary: str = "") -> dict | None:
@@ -863,6 +868,7 @@ def main() -> None:
     )
     prepare_parser.add_argument("--runtime", choices=("docker", "podman"), default="docker")
     prepare_parser.add_argument("--checkpoint-zfs-parent")
+    prepare_parser.add_argument("--checkpoint-fast-resume", action="store_true")
     cohort_parser = subparsers.add_parser("cohort")
     cohort_parser.add_argument("--root", type=Path, required=True)
     cohort_parser.add_argument("--key-file", type=Path, required=True)
@@ -883,6 +889,7 @@ def main() -> None:
             checkpoint_backend=args.checkpoint_backend,
             runtime=args.runtime,
             checkpoint_zfs_parent=args.checkpoint_zfs_parent,
+            checkpoint_fast_resume=args.checkpoint_fast_resume,
         )
     elif args.mode == "cohort":
         run_cohort(args.root, args.key_file)

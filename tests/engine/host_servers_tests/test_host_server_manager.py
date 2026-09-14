@@ -41,7 +41,10 @@ def _make_manager(tmp_path, policy=None, is_cancelled=None, harness="claude_code
         data_logger=agDataLogger(cfg),
         llm_usage_tracker=LlmUsageTracker(),
     )
-    sandbox = SimpleNamespace()
+    sandbox = SimpleNamespace(
+        ensure_gpu_acquired=lambda *_args, **_kwargs: None,
+        current_gpu_ids=lambda: None,
+    )
     skill = SimpleNamespace(
         name="test-skill",
         policy=policy if policy is not None else agpolicy(),
@@ -394,7 +397,10 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
         data_logger=agDataLogger(cfg),
         llm_usage_tracker=LlmUsageTracker(),
     )
-    sandbox = SimpleNamespace()
+    sandbox = SimpleNamespace(
+        ensure_gpu_acquired=lambda *_args, **_kwargs: None,
+        current_gpu_ids=lambda: None,
+    )
     skill = agskill(name="s", prompt="p", policy=agpolicy())
     resource_pool = SimpleNamespace()
     manager = HostServerManager(agent, sandbox, skill, resource_pool)

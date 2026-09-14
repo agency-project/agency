@@ -223,13 +223,18 @@ class _ClaudeCodeBackend(agharness_backend):
         prior_session_blob: bytes | None,
         max_steps: int | None,
     ) -> AttemptResult:
-        return _ClaudePtyExecution(
-            self,
-            runtime,
-            resume_session_id=resume_session_id,
-            prior_session_blob=prior_session_blob,
-            max_steps=max_steps,
-        ).run(prompt)
+        key = ("pty", "claude", runtime.model, max_steps, runtime.has_sandbox_mcp_tools)
+        return runtime.run_pty_execution(
+            key,
+            lambda: _ClaudePtyExecution(
+                self,
+                runtime,
+                resume_session_id=resume_session_id,
+                prior_session_blob=prior_session_blob,
+                max_steps=max_steps,
+            ),
+            prompt,
+        )
 
     def prepare_pty(self, runtime, *, resume_session_id=None, prior_session_blob=None):
         """Prepare isolated native configuration; one process belongs to one attempt."""
@@ -746,6 +751,8 @@ class _ClaudePtyExecution:
         self._attempt_offset = 0
         self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
         self._last_activity_generation = None
+        self._closed = False
+        self._launched = False
 
     @property
     def _transcript_path(self):
@@ -929,19 +936,52 @@ class _ClaudePtyExecution:
                 self.handle.kill()
                 return False
 
-    def run(self, prompt):
-        from ..ptrace.supervisor import agProxyPtrace
+    def close(self):
         from ..agharness import cleanup_config_home
 
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._active = False
+            try:
+                if self.handle is not None:
+                    self.handle.close()
+            finally:
+                cleanup_config_home(self.config_home)
+
+    def prepare_fast_checkpoint(self):
+        with self._lock:
+            if self._active:
+                raise RuntimeError("cannot checkpoint an active PTY attempt")
+            if self.handle is not None:
+                self.handle.checkpoint_detach()
+
+    def seize_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_seize_frozen()
+
+    def complete_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_reattach()
+
+    def run(self, prompt, *, keep_alive=False):
+        from ..ptrace.supervisor import agProxyPtrace
+
+        completed = False
         try:
-            self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
-                self.argv,
-                self.env,
-                cwd=str(self.config_home),
-                pty_size=(120, 36),
-                policy=self.runtime.syscall_policy,
-                ag=None,
-            )
+            if not self._launched:
+                self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
+                    self.argv,
+                    self.env,
+                    cwd=str(self.config_home),
+                    pty_size=(120, 36),
+                    policy=self.runtime.syscall_policy,
+                    ag=None,
+                )
+                self._launched = True
             self.runtime.register_control_handle(self.handle)
             self.runtime.register_redirect(self.redirect)
             # Startup does not hold the delivery lock: early redirects return
@@ -976,6 +1016,7 @@ class _ClaudePtyExecution:
                         for row in self._rows(snapshot[self._attempt_offset :]):
                             for key in usage:
                                 usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
+                        completed = True
                         return AttemptResult(
                             ok=True,
                             final_text=self._stop,
@@ -989,9 +1030,8 @@ class _ClaudePtyExecution:
         finally:
             with self._lock:
                 self._active = False
-                if self.handle is not None:
-                    self.handle.close()
-            cleanup_config_home(self.config_home)
+            if not (keep_alive and completed):
+                self.close()
 
 
 __all__ = ["_ClaudeCodeBackend", "claude_code_available"]
