@@ -1,7 +1,7 @@
 # External harness PTYs
 
-Claude Code, Codex, Grok Build, and OpenCode all run their interactive terminal
-interfaces under the daemon's existing ptrace supervisor, through one runner.
+Claude Code, Codex, Grok Build, Kimi Code, and OpenCode all run their interactive
+terminal interfaces under the daemon's existing ptrace supervisor, through one runner.
 Native uses its standalone process, pipe transport, model loop, and session
 format; it never enters the PTY runner.
 
@@ -27,9 +27,10 @@ Two axes vary enough to be explicit driver hooks. **Turn identity**: most CLIs
 assign it and report it on submission, so the runner learns it from the
 acknowledgment; Claude assigns none, so `begin_turn()` commits one to
 `agency-turn.json` for its lifecycle hook to stamp events with. **Completion
-evidence**: a stop event is sufficient for OpenCode, while Codex, Grok, and
+evidence**: a stop event is sufficient for OpenCode, while Codex, Grok, Kimi, and
 Claude must also reconcile it against the persisted transcript before the turn
-counts as finished.
+counts as finished. Kimi is the extreme case -- its `Stop` names no turn at all,
+so the transcript is the only thing that can attribute a completion.
 
 The terminal screen establishes whether the composer is ready. It is not the
 source of final answers. Submissions include an Agency marker, and native
@@ -44,16 +45,24 @@ stale by definition and is discarded.
 | Harness | Submission and completion | Interrupt | Persisted state |
 | --- | --- | --- | --- |
 | Claude Code | Agency-assigned turn ID in `agency-turn.json`; `UserPromptSubmit`/`Stop` hooks, then a transcript showing the prompt and the final assistant message (or a `turn_duration` marker when the turn ends after tool output) | Escape; a `[Request interrupted by user]` transcript row confirms, or a restored draft is cleared with a second Escape pair | Native session transcript JSONL |
+| Kimi Code | `TurnStarted` carries the turn ID and prompt; `Stop` carries neither and is stamped with the turn last started, then only counts once `wire.jsonl` records a matching `turn.ended` with reason `completed`; the answer and usage come from that turn's `content.part`/`step.end` events | Escape, confirmed by the `Interrupt` hook, which does report its turn | `session_index.jsonl` plus the session directory's JSON/JSONL |
 | Codex | `UserPromptSubmit`/`Stop` hooks, then matching rollout `task_complete` | Escape, confirmed by rollout `turn_aborted` | Native session rollout files |
 | Grok Build | `UserPromptSubmit`/`Stop` hooks, then matching `turn_completed` record; full answer and usage come from native updates | Ctrl+C, confirmed by native cancellation; restored drafts are cleared before submission | Native session JSON/JSONL files |
 | OpenCode | `chat.message` identifies the user message; its persisted text part acknowledges acceptance; `session.idle` reads committed assistant messages with that parent ID | Escape, wait for confirmation prompt, Escape; native `MessageAbortedError` confirms | Consistent SQLite backup, including committed WAL pages |
 
-The tested CLI versions are Codex 0.147.0, Grok Build 1.0.0, and OpenCode 1.18.15.
+The tested CLI versions are Codex 0.147.0, Grok Build 1.0.0, Kimi Code 0.42.0, and
+OpenCode 1.18.15.
 These are version-sensitive integrations: readiness or lifecycle changes must
 pass the live tests before claiming support. Unknown or unacknowledged behavior
 fails the attempt; it is never converted from arbitrary terminal text into a
-successful answer. Grok/OpenCode retain their native step-limit settings. Codex
-has no equivalent CLI step-limit flag, as with its previous adapter.
+successful answer. Grok/OpenCode retain their native step-limit settings, and
+Kimi's goes in `loop_control.max_steps_per_turn`. Codex has no equivalent CLI
+step-limit flag, as with its previous adapter.
+
+Kimi Code also gates startup behind a "Trust this folder?" prompt, which its
+driver accepts the same way Codex's is, and emits `CSI ? 996 n` at startup --
+a private-mode query pyte 0.8.2 cannot dispatch, so the tracer's screen ignores
+the private form rather than letting a `TypeError` kill the reader thread.
 
 ## Sessions, policy, and cancellation
 

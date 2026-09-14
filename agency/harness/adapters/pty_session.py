@@ -64,6 +64,11 @@ def session_file_allowed(harness, path):
         return False
     if harness in {"codex", "grok"}:
         return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
+    if harness == "kimi":
+        # The index names each session directory; both are needed to resume.
+        if str(path) == "session_index.jsonl":
+            return True
+        return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
     return harness == "opencode" and str(path) == "data/opencode/opencode.db"
 
 
