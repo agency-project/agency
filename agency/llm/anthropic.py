@@ -13,20 +13,19 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
-try:
-    import httpx2 as _httpx2
-except ImportError:
-    _httpx2 = None
-
 
 def _anthropic_sdk_timeout(timeout: httpx.Timeout):
     """The installed anthropic SDK validates its `timeout` kwarg against its
-    own httpx2 package (a separate, newer PyPI package, not a re-export of
-    httpx), rejecting a real httpx.Timeout with a TypeError. Every Anthropic-
-    family backend's client construction must convert at this boundary."""
-    if _httpx2 is None:
+    own Timeout type -- httpx.Timeout in older SDK releases, the separate
+    httpx2 package's Timeout in newer ones -- and rejects the other one with
+    a TypeError (older releases fail worse: they accept it, then break deep
+    in socket setup). `anthropic.Timeout` is the SDK's own stable alias for
+    whichever one this installed version actually needs (confirmed via
+    identity check against both), so construct through it directly instead
+    of guessing which package is installed."""
+    if _anthropic_sdk is None:
         return timeout
-    return _httpx2.Timeout(
+    return _anthropic_sdk.Timeout(
         connect=timeout.connect, read=timeout.read, write=timeout.write, pool=timeout.pool
     )
 
