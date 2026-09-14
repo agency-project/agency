@@ -215,9 +215,28 @@ class PtyExecution:
                     if self._stop is not None:
                         return False
                     self.handle.write_terminal(self.driver.interrupt_key)
-                self._wait_until(
-                    lambda: self._interrupted or self._stop is not None, "native interruption"
-                )
+                if self.driver.name == "grok":
+                    # Grok's hooks never report a transcript_path, so there is
+                    # no rollout file to confirm a StopCancelled/turn_completed
+                    # event against -- Ctrl+C instead just disconnects the
+                    # in-flight model request and silently restores the
+                    # interrupted prompt as a composer draft, with no hook or
+                    # transcript event marking the cancellation. That
+                    # restoration is Grok's only observable signal here.
+                    self._wait_until(
+                        lambda: (
+                            self._interrupted
+                            or self._stop is not None
+                            or self.driver.grok_draft_restored(self.handle)
+                        ),
+                        "native interruption",
+                    )
+                    if self._stop is None:
+                        self._interrupted = True
+                else:
+                    self._wait_until(
+                        lambda: self._interrupted or self._stop is not None, "native interruption"
+                    )
                 if self._stop is not None:
                     return False
                 self.driver.clear_input(self.handle, self._wait_until)

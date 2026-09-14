@@ -57,6 +57,9 @@ WAIT_SECONDS = 90
 ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "artifacts" / "golden-execution"
 
 
+CONTAINER_BACKEND = os.environ.get("AGENCY_TEST_CONTAINER_BACKEND", "docker")
+
+
 @pytest.fixture(scope="module")
 def golden_image():
     image = os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim")
@@ -65,15 +68,17 @@ def golden_image():
         problem = "golden profiling and real external harnesses require Linux"
     else:
         try:
-            subprocess.run(["docker", "info"], capture_output=True, check=True, timeout=15)
+            subprocess.run([CONTAINER_BACKEND, "info"], capture_output=True, check=True, timeout=15)
             subprocess.run(
-                ["docker", "image", "inspect", image],
+                [CONTAINER_BACKEND, "image", "inspect", image],
                 capture_output=True,
                 check=True,
                 timeout=15,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            problem = f"golden execution requires Docker and the local image {image}: {exc}"
+            problem = (
+                f"golden execution requires {CONTAINER_BACKEND} and the local image {image}: {exc}"
+            )
     if problem:
         if os.environ.get("CI") or os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") == "1":
             pytest.fail(problem)
@@ -190,7 +195,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
     _write_replay(replay)
     config = agconfig(
         agentconfig(harness=harness, log_dir=str(directory / "logs")),
-        sandboxconfig(backend="docker", base_image=golden_image),
+        sandboxconfig(backend=CONTAINER_BACKEND, base_image=golden_image),
         resourcesconfig(idle_cpus=1, idle_memory="2g"),
         llmconfig(
             provider="mock",

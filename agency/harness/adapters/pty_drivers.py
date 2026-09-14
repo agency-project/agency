@@ -169,9 +169,29 @@ class PtyDriver:
             return (
                 current.startswith("│ ❯") and not current.removeprefix("│ ❯").rstrip("│ ").strip()
             )
-        empty_composer = current == "┃" or current.startswith("┃  Ask anything...")
+        empty_composer = current == "┃" or current.startswith("┃  Ask anything…")
         return empty_composer and any(
             "Build" in line and "Agency Proxy" in line for line in lines[max(0, y - 1) : y + 4]
+        )
+
+    def grok_draft_restored(self, handle):
+        """True once Grok has visibly restored an interrupted prompt as a
+        composer draft -- see `clear_input`. Grok's hooks never report a
+        `transcript_path`, so unlike codex there is no rollout file to
+        confirm a cancellation against; this on-screen restoration is the
+        only observable signal Grok gives that a turn was interrupted
+        pre-response, and `redirect()` relies on it directly for that."""
+        if self._last_prompt is None:
+            return False
+        marker = self._last_prompt.split("\n", 1)[0]
+        pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
+        lines, _x, y, _generation = handle.terminal_screen()
+        # Grok collapses a restored multiline paste into a token. The prompt
+        # marker then appears only in the old transcript.
+        return (
+            self.ready(handle)
+            or any("│ ❯ " + marker in line for line in lines)
+            or pasted in lines[y]
         )
 
     def clear_input(self, handle, wait_until):
@@ -182,30 +202,9 @@ class PtyDriver:
         elif self._last_prompt is not None:
             # Grok restores a pre-response cancellation as a draft. Its idle
             # Ctrl+C clears that draft; Ctrl+U would trigger self-update.
-            committed = False
-            for row in self._rows():
-                params = row.get("params", {})
-                if params.get("_meta", {}).get("promptId") == self._last_turn_id and params.get(
-                    "update", {}
-                ).get("sessionUpdate") in {"agent_message_chunk", "tool_call"}:
-                    committed = True
-            if not committed:
-                marker = self._last_prompt.split("\n", 1)[0]
-                pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
-
-                def restored_input():
-                    lines, _x, y, _generation = handle.terminal_screen()
-                    # Grok collapses a restored multiline paste into a token.
-                    # The prompt marker then appears only in the old transcript.
-                    return (
-                        self.ready(handle)
-                        or any("│ ❯ " + marker in line for line in lines)
-                        or pasted in lines[y]
-                    )
-
-                wait_until(restored_input, "restored Grok input")
-                if not self.ready(handle):
-                    handle.write_terminal(b"\x03")
+            wait_until(lambda: self.grok_draft_restored(handle), "restored Grok input")
+            if not self.ready(handle):
+                handle.write_terminal(b"\x03")
 
     def interrupt_pending(self, handle):
         return any("esc again to interrupt" in line for line in handle.terminal_screen()[0])
