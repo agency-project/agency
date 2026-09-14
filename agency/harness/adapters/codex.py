@@ -12,7 +12,7 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
-from .pty_drivers import run_pty_attempt
+from .pty_drivers import CodexDriver, run_pty_attempt
 from .pty_session import stream_response
 
 
@@ -194,6 +194,7 @@ def _sse(event_type: str, data: dict) -> str:
 
 class _CodexBackend(agharness_backend):
     _DEFAULT_BINARY = "codex"
+    _PTY_DRIVER = CodexDriver
     _PROVIDER_NAME = "agency-proxy"
     _ENV_KEY_NAME = "AGENCY_PROXY_API_KEY"
 

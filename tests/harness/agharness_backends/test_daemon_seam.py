@@ -81,15 +81,16 @@ def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, 
     )
     session = Path(_session_path(str(config_home), "session-one"))
 
-    argv, _env, home = _ClaudeCodeBackend(config).prepare_pty(
+    argv, _env = _ClaudeCodeBackend(config).prepare_pty(
         replace(_runtime(sandbox=sandbox), agconfig=config),
+        config_home,
         resume_session_id="session-one",
         prior_session_blob=b"prior transcript",
     )
     assert argv[0] == str(binary)
     assert argv[-2:] == ["--resume", "session-one"]
     assert session.read_bytes() == b"prior transcript"
-    assert (home / "agpolicy_hook.py").is_file()
+    assert (config_home / "agpolicy_hook.py").is_file()
     assert "-p" not in argv
 
 
@@ -235,9 +236,10 @@ def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, 
     )
     runtime = replace(_runtime(sandbox=sandbox), has_sandbox_mcp_tools=has_sandbox_tools)
     if backend_cls is _ClaudeCodeBackend:
-        from agency.harness.agharness import cleanup_config_home
+        from agency.harness.agharness import cleanup_config_home, materialize_config_home
 
-        argv, _, config_home = backend_cls(agconfig()).prepare_pty(runtime)
+        config_home = materialize_config_home(runtime.engine_name)
+        argv, _ = backend_cls(agconfig()).prepare_pty(runtime, config_home)
         cleanup_config_home(config_home)
     else:
         result = backend_cls(agconfig()).run_daemon_attempt(

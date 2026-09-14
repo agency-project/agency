@@ -9,7 +9,7 @@ import pytest
 
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.pty_drivers import OpencodeDriver, driver_for
+from agency.harness.adapters.pty_drivers import OpencodeDriver, PtyDriver, driver_for
 from agency.harness.adapters.pty_session import PtyExecution, restore_session, snapshot_session
 
 
@@ -82,13 +82,13 @@ def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
     }
 
 
-class FakeDriver:
+class FakeDriver(PtyDriver):
+    """Subclasses the real contract so new driver hooks reach this double too."""
+
     name = "fake"
     cwd = "/workspace"
     argv = ["interactive-cli"]
     env = {"TERM": "xterm-256color"}
-    interrupt_key = b"\x1b"
-    confirm_interrupt = False
     session_id = "native-session"
 
     def __init__(self, root):
@@ -99,9 +99,6 @@ class FakeDriver:
 
     def ready(self, handle):
         return self.is_ready
-
-    def prompt_matches(self, prompt, expected):
-        return prompt == expected
 
     def clear_input(self, handle, wait_until):
         handle.write_terminal(b"\x15")
@@ -213,6 +210,24 @@ def test_delayed_stop_and_wrong_prompt_do_not_acknowledge_current_turn(execution
     execution._poll()
     assert execution._turn_id is None
     assert execution._stop is None
+
+
+def test_startup_failure_is_reported_before_any_turn_exists(execution):
+    execution._turn_id = None
+    execution._turn_started = False
+    execution.driver.pending = [{"kind": "error", "turn_id": None, "error": "bad credential"}]
+    execution._poll()
+    assert execution._failure == "bad credential"
+
+
+def test_turnless_error_cannot_fail_a_replacement_turn(execution):
+    # A delayed error from a retired turn must not kill the redirect that
+    # replaced it, which is still waiting to learn its own turn identity.
+    execution._turn_id = None
+    execution._turn_started = True
+    execution.driver.pending = [{"kind": "error", "turn_id": None, "error": "stale failure"}]
+    execution._poll()
+    assert execution._failure is None
 
 
 def test_redirect_interrupts_then_requires_exact_native_ack(execution):

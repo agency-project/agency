@@ -11,6 +11,7 @@ import base64
 import json
 import shlex
 import sqlite3
+import uuid
 from pathlib import Path
 
 from ..executable import HARNESS_PATH
@@ -20,11 +21,9 @@ _PROFILER_BRIDGE_TIMEOUT_S = 10.0
 
 
 def driver_for(adapter, runtime, root, session_id, blob, max_steps):
-    name = adapter._DEFAULT_BINARY
-    try:
-        driver_class = _DRIVERS[name]
-    except KeyError:
-        raise ValueError(f"no PTY driver for harness: {name}") from None
+    driver_class = getattr(adapter, "_PTY_DRIVER", None)
+    if driver_class is None:
+        raise ValueError(f"no PTY driver for harness: {adapter._DEFAULT_BINARY}")
     return driver_class(adapter, runtime, root, session_id, blob, max_steps)
 
 
@@ -64,14 +63,18 @@ class PtyDriver:
     name = ""
     interrupt_key = b"\x1b"
     confirm_interrupt = False
+    INPUT_TIMEOUT = 60.0
+    START_TIMEOUT = 45.0
+    ATTEMPT_TIMEOUT = 600.0
+    # Whether terminal output alone should extend the attempt deadline.
+    activity_extends_deadline = False
 
     def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
         self.root = root
         self.session_id = session_id
         self.cwd = "/workspace"
         self.transcript_path = None
-        restore_session(root, self.name, session_id, blob)
-        (root / "events").mkdir()
+        self._restore(session_id, blob)
         self.env = {
             "PATH": HARNESS_PATH,
             "TERM": "xterm-256color",
@@ -89,6 +92,10 @@ class PtyDriver:
         self.argv = [adapter.agconfig.harness_adapter.binary_path or self.name]
         self._configure(adapter, runtime, max_steps)
 
+    def _restore(self, session_id, blob):
+        restore_session(self.root, self.name, session_id, blob)
+        (self.root / "events").mkdir()
+
     def _configure(self, adapter, runtime, max_steps):
         raise NotImplementedError
 
@@ -98,6 +105,15 @@ class PtyDriver:
     def prompt_matches(self, prompt, expected):
         return prompt == expected
 
+    def submission_marker(self, label):
+        # Unique content also fences two submissions with identical user text,
+        # which is what a CLI-assigned turn identity is matched against.
+        return f"[Agency {label} {uuid.uuid4().hex}]"
+
+    def begin_turn(self, prompt):
+        """Return a turn identity this driver commits itself, else None."""
+        return None
+
     def clear_input(self, handle, wait_until):
         # These CLIs clear the interrupted prompt. Ctrl+U clears any restored
         # editable draft without submitting it or sending a second interrupt.
@@ -105,6 +121,16 @@ class PtyDriver:
 
     def interrupt_pending(self, handle):
         return False
+
+    def begin_interrupt(self, handle):
+        """Record whatever an interrupt will later be recognized against."""
+
+    def interrupted(self, handle):
+        """Evidence of interruption that arrives outside the event stream."""
+        return False
+
+    def reap(self, handle):
+        handle.close()
 
     def events(self):
         pending = []
@@ -524,6 +550,3 @@ class OpencodeDriver(PtyDriver):
             return bundle
         finally:
             temporary.unlink()
-
-
-_DRIVERS = {driver.name: driver for driver in (CodexDriver, GrokDriver, OpencodeDriver)}

@@ -11,7 +11,7 @@ from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
-from .pty_drivers import run_pty_attempt
+from .pty_drivers import GrokDriver, run_pty_attempt
 from .pty_session import stream_response
 
 
@@ -70,6 +70,7 @@ def _toml_string(value: str) -> str:
 
 class _GrokBackend(agharness_backend):
     _DEFAULT_BINARY = "grok"
+    _PTY_DRIVER = GrokDriver
     _MODEL_NAME = "agency-proxy"
 
     def run_daemon_attempt(
