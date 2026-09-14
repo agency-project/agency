@@ -1,0 +1,655 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  color-scheme: dark; /* always dark -- native form controls/scrollbars otherwise
+                          default to the OS/browser light theme regardless of the
+                          page's own (already dark-only) CSS variables below. */
+  --bg:               #1a1a1a;
+  --bg2:              #222;
+  --bg3:              #2a2a2a;
+  --border:           #3a3a3a;
+  --border-log:       #4a9eff;
+  --border-interact:  #e87d0d;
+  --text:             #d4d4d4;
+  --dim:              rgba(212,212,212,0.45);
+  --cyan:             #5fd7ff;
+  --yellow:           #ffaf00;
+  --green:            #5fd75f;
+  --red:              #ff5555;
+  /* Message-body brightness scale (white ratio against --text's grey,
+     212,212,212) -- user/assistant read at full brightness (plain --text,
+     no class needed); system/tool/syscall step down from there so a
+     glance at shade alone says how far a line is from the model's own
+     words. */
+  --body-system:      rgba(212,212,212,0.9);
+  --body-tool:        rgba(212,212,212,0.8);
+  --body-syscall:     rgba(212,212,212,0.7);
+  --font: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
+  --fs:               12.5px;
+}
+
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
+
+#app {
+  display: flex;
+  height: calc(100vh - 38px);
+  font-family: var(--font);
+  font-size: var(--fs);
+  line-height: 1.45;
+}
+
+/* ------------------------------------------------------------------ Left */
+
+#left {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Shared log — upper 5 parts */
+#shared-log-container {
+  flex: 5;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-log);
+  overflow: hidden;
+}
+
+#shared-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#shared-log a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+#shared-log a:hover { text-decoration: underline; }
+
+/* Interaction pane — lower 7 parts. Row layout: the main (nav-driven) panel
+   plus zero or more agents pinned as side panels, for side-by-side
+   comparison -- see #side-panels and .side-panel below. */
+#interaction {
+  position: relative;
+  flex: 7;
+  display: flex;
+  flex-direction: row;
+  border: 1px solid var(--border-interact);
+  border-top: none;
+  overflow: hidden;
+}
+
+/* VS Code-style drop indicator -- hidden until an agent is actually being
+   dragged over the pane (#interaction's drag-over class, toggled by its
+   drag handlers below), never a persistent hint. */
+#drop-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  background: rgba(74,158,255,0.15);
+  border: 2px solid var(--border-log);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: bold;
+  pointer-events: none;
+  z-index: 10;
+}
+#interaction.drag-over #drop-overlay { display: flex; }
+
+#panel-main {
+  flex: 1;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#agent-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Pinned agents, dropped from the list on the right (see .agent-entry's
+   draggable + #interaction's drop handler) -- each panel's width is set
+   inline by app.js (state.panelWidths), dragged via the .panel-resizer
+   immediately to its left; the strip scrolls horizontally past however
+   many fit. */
+#side-panels {
+  display: flex;
+  flex-direction: row;
+  flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.side-panel {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+/* Draggable divider between #panel-main and the first side panel, and
+   between every consecutive pair -- a wide invisible hit-area (easy to
+   grab) with a thin visible line at rest, widening on hover/drag. */
+.panel-resizer {
+  flex: 0 0 5px;
+  width: 5px;
+  cursor: col-resize;
+  position: relative;
+}
+.panel-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+}
+.panel-resizer:hover::after,
+.panel-resizer.resizing::after {
+  left: 0;
+  width: 5px;
+  background: var(--border-log);
+}
+
+body.resizing-panels {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.side-panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.side-panel-agname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-panel-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.meta-badge {
+  font-size: 10px;
+  font-weight: normal;
+  letter-spacing: 0;
+  opacity: 0.65;
+  white-space: nowrap;
+}
+
+.side-panel-close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+.side-panel-close:hover { color: var(--red); }
+
+.side-panel-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+#nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#full-logs-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+#full-logs-toggle:hover { color: var(--text); }
+#full-logs-toggle input { cursor: pointer; accent-color: var(--border-log); }
+
+#nav-bar button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 1px 7px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#nav-bar button:hover { border-color: var(--border-log); color: var(--cyan); }
+
+#nav-label { color: var(--dim); font-size: 11px; margin-left: auto; }
+
+#agent-input {
+  background: var(--bg2);
+  border: none;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs);
+  padding: 5px 10px;
+  outline: none;
+  flex-shrink: 0;
+}
+#agent-input::placeholder { color: var(--dim); }
+#agent-input:focus { border-top-color: var(--border-interact); }
+
+/* ----------------------------------------------------------------- Right */
+
+#right {
+  width: 270px;
+  min-width: 180px;
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#agent-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 6px;
+}
+
+#agent-actions {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#agent-actions button {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 3px 6px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#agent-actions button:hover:not(:disabled) { border-color: var(--border-log); color: var(--cyan); }
+#agent-actions button:disabled { color: var(--dim); cursor: default; opacity: 0.5; }
+
+#btn-pause-toggle.active { border-color: var(--red); color: var(--red); }
+#btn-pause-toggle.active:hover { border-color: var(--red); color: var(--red); }
+
+/* --------------------------------------------------------- Panel titles */
+
+.panel-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--border-log);
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  flex-shrink: 0;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.token-badge {
+  font-size: 10px;
+  font-weight: normal;
+  letter-spacing: 0;
+  opacity: 0.65;
+  white-space: nowrap;
+}
+
+.badge-group {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.resource-badge {
+  font-size: 10px;
+  font-weight: normal;
+  letter-spacing: 0;
+  color: var(--yellow);
+  white-space: nowrap;
+}
+
+.right-title { color: var(--text); border-bottom-color: var(--border); }
+
+/* ---------------------------------------------------------- Shared log */
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.log-line + .log-line { }
+
+.log-ts {
+  color: var(--dim);
+}
+
+.done-banner {
+  color: var(--green);
+  font-weight: bold;
+  padding: 4px 0;
+}
+
+.error-line { color: var(--red); }
+
+/* ---------------------------------------------------------- Agent list */
+
+.team-header {
+  font-weight: bold;
+  color: var(--text);
+  margin-top: 8px;
+  margin-bottom: 1px;
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+}
+
+.agent-entry {
+  padding: 3px 4px 3px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-bottom: 1px;
+}
+.agent-entry:hover   { background: var(--bg3); }
+.agent-entry.focused { background: rgba(74,158,255,0.12); border-left: 2px solid var(--border-log); padding-left: 2px; }
+
+.agent-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent-status {
+  font-size: 11px;
+  padding-left: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+
+.dot-inactive  { color: var(--dim); }
+.dot-finished  { color: var(--green); opacity: 0.6; }
+.dot-paused    { color: var(--red); }
+.status-llm    { color: var(--cyan); }
+.status-tool   { color: var(--yellow); }
+.status-human  { color: var(--yellow); }
+.status-finished { color: var(--green); opacity: 0.6; }
+.status-paused { color: var(--red); }
+
+/* ------------------------------------------------------------ Tabs */
+
+#agent-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg2);
+}
+
+.tab-btn {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 10.5px;
+  padding: 4px 2px;
+  white-space: nowrap;
+  transition: color 0.1s;
+}
+.tab-btn:hover  { color: var(--text); }
+.tab-btn.active { color: var(--border-log); border-bottom-color: var(--border-log); }
+
+.tab-count {
+  font-size: 9.5px;
+  opacity: 0.7;
+  margin-left: 2px;
+}
+
+#agent-search-bar {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+#agent-search {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 3px 6px;
+  outline: none;
+}
+
+#agent-search:focus {
+  border-color: var(--border-log);
+}
+
+/* ------------------------------------------------------- History pane */
+
+.msg-system     { margin: 3px 0; }
+.msg-user       { margin: 3px 0; }
+.msg-thinking   { color: var(--dim); font-style: italic; margin: 3px 0; border-left: 2px solid var(--border); padding-left: 6px; }
+.msg-tool-call  { margin: 3px 0; }
+.msg-assistant  { margin: 3px 0; }
+.msg-tool-result{ margin: 2px 0; }
+.msg-syslog     { margin: 3px 0; }
+.msg-metadata   { margin: 3px 0; }
+.msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
+.msg-paused     { color: var(--red); }
+
+.role-user      { color: var(--cyan);   font-weight: bold; }
+.role-tool-call { color: var(--yellow); font-weight: bold; }
+.role-assistant { color: var(--green);  font-weight: bold; }
+.dim            { opacity: 0.5; }
+
+/* Message-body brightness tiers -- see --body-* above. */
+.body-system    { color: var(--body-system); }
+.body-tool      { color: var(--body-tool); }
+.body-syscall   { color: var(--body-syscall); }
+
+/* ----------------------------------------------------------- Timeline */
+
+#timeline-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+#timeline-slider {
+  flex: 1;
+  height: 4px;
+  cursor: pointer;
+  accent-color: var(--border-log);
+  min-width: 0;
+}
+#timeline-slider:disabled { opacity: 0.3; cursor: default; }
+
+#timeline-from, #timeline-to {
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+#timeline-live-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: var(--font);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#timeline-live-btn.active {
+  border-color: var(--green);
+  color: var(--green);
+}
+#timeline-live-btn:hover { border-color: var(--text); color: var(--text); }
+
+/* --------------------------------------------------------- Scrollbars */
+
+::-webkit-scrollbar              { width: 5px; height: 5px; }
+::-webkit-scrollbar-track        { background: var(--bg); }
+::-webkit-scrollbar-thumb        { background: #444; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover  { background: #666; }
+
+/* --------------------------------------------------------- Config modal */
+
+.hidden { display: none !important; }
+
+#config-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+#config-modal {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#config-modal-title {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+#config-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.config-owner {
+  color: var(--cyan);
+  font-weight: bold;
+  font-size: 11px;
+  text-transform: uppercase;
+  margin: 10px 0 4px;
+}
+.config-owner:first-child { margin-top: 0; }
+
+.config-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.config-field label {
+  flex: 1;
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-field input[type="text"],
+.config-field input[type="number"],
+.config-field textarea {
+  flex: 1.4;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--fs);
+  padding: 2px 5px;
+  border-radius: 2px;
+}
+.config-field textarea { resize: vertical; }
+.config-field input[type="text"]:focus,
+.config-field input[type="number"]:focus,
+.config-field textarea:focus { border-color: var(--border-interact); outline: none; }
+
+#config-modal-actions {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+#config-modal-actions button {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 6px;
+  font-family: var(--font);
+  font-size: var(--fs);
+  border-radius: 2px;
+}
+#config-modal-actions button:hover { border-color: var(--border-log); color: var(--cyan); }
+#config-update, #config-update-all { border-color: var(--green); color: var(--green); }
+#config-update:hover, #config-update-all:hover { border-color: var(--green); color: var(--green); }
+
+/* The embedded viewer shares the dashboard server and keeps its own state. */
+#view-tabs { height: 38px; display: flex; gap: 6px; padding: 4px 10px; border-bottom: 1px solid var(--border); }
+#view-tabs button, #profiler-toolbar button { padding: 4px 12px; background: var(--bg2); color: var(--text); border: 1px solid var(--border); cursor: pointer; }
+#view-tabs button.active { border-color: var(--cyan); color: var(--cyan); }
+#app[hidden], #profiler-view[hidden], #profiler-frame[hidden] { display: none; }
+#profiler-view { height: calc(100vh - 38px); display: flex; flex-direction: column; }
+#profiler-toolbar { display: flex; gap: 12px; align-items: center; padding: 8px 12px; font: 12px var(--font); }
+#profiler-status { flex: 1; }
+#profiler-frame { width: 100%; flex: 1; border: 0; background: var(--bg); }

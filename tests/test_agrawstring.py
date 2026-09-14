@@ -37,58 +37,59 @@ def test_agrawstring_recover_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# _build_system_prompt — JSON blocks omitted for agrawstring
+# _build_prompt — JSON blocks omitted for agrawstring
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_no_input_json_when_raw_input():
+def test_prompt_no_input_json_when_raw_input():
     sk = agskill("t", "Write a story.", input_schema=agdata(prompt=agrawstring))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Input JSON format" not in prompt
 
 
-def test_system_prompt_no_output_json_when_raw_output():
+def test_prompt_no_output_json_when_raw_output():
     sk = agskill("t", "Write a story.", output_schema=agdata(story=agrawstring))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Output JSON format" not in prompt
     assert "plain text" in prompt.lower()
 
 
-def test_system_prompt_keeps_json_for_normal_output():
+def test_prompt_keeps_json_for_normal_output():
     sk = agskill("t", "Summarise.", output_schema=agdata(summary=str))
-    prompt = sk._build_system_prompt()
-    assert "return_summary" in prompt
+    prompt = sk._build_prompt()
+    assert "submit_output" in prompt
+    assert "summary" in prompt
 
 
-def test_system_prompt_keeps_input_json_for_normal_input():
+def test_prompt_keeps_input_json_for_normal_input():
     sk = agskill("t", "Summarise.", input_schema=agdata(text=str))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "Input JSON format" in prompt
 
 
 # ---------------------------------------------------------------------------
-# _build_user_content — raw passthrough for agrawstring input
+# build_user_content — raw passthrough for agrawstring input
 # ---------------------------------------------------------------------------
 
 
 def test_build_user_content_raw_input_returns_plain_string():
     sk = agskill("t", "", input_schema=agdata(prompt=agrawstring))
     inp = agdata(prompt="Tell me a story about a robot.")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert content == "Tell me a story about a robot."
 
 
 def test_build_user_content_raw_input_no_json_wrapping():
     sk = agskill("t", "", input_schema=agdata(prompt=agrawstring))
     inp = agdata(prompt="Hello!")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert not content.startswith("{")
 
 
 def test_build_user_content_normal_input_still_json():
     sk = agskill("t", "", input_schema=agdata(text=str))
     inp = agdata(text="hello")
-    content = sk._build_user_content(inp)
+    content = sk.build_user_content(inp)
     assert isinstance(content, str)
     parsed = json.loads(content.split("\n", 1)[1])
     assert parsed["text"] == "hello"
@@ -107,7 +108,7 @@ def test_build_user_content_normal_input_still_json():
 # the identical raw_key()-passthrough logic (`agdata(**{out_key: final_text})`)
 # one level above the entrypoint's own react loop -- fast, no-Docker
 # coverage of the entrypoint's own final_text plumbing (which this logic
-# wraps) lives in tests/agharness_internal/agharness_backends/
+# wraps) lives in tests/harness/agharness_backends/
 # test_native_loop_fast.py; the agdata-wrapping step itself is Docker-only
 # coverage today (test_native.py's TestNativeBackendRealEndToEnd), same
 # tier gap noted for the return_output-family tests elsewhere in this

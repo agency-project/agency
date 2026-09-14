@@ -11,8 +11,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .agsandbox import agSandbox
-    from .agconfig import agConfig
+    from .sandbox.agsandbox import agSandbox
 
 from .agdata import agdata, agerror
 from .agtype import (
@@ -22,47 +21,17 @@ from .agtype import (
     validate_value_against_type_hint,
     output_field_desc,
 )
-from .agconfig import DynamicConfigParam, _AgConfigViewBase
-
-
-# Exists only to register agschema's config fields (via __set_name__ at
-# import time). Reads use a throwaway instance -- _AgSchemaFields(agconfig)
-# -- since agschema instances don't hold their own agconfig, so there's no
-# self to hang a descriptor on.
-class _AgSchemaFields:
-    # Maximum length of a string field that will be auto-offloaded to a
-    # sandbox file. Other code needing this same value (e.g. tests) reads
-    # the descriptor's frozen default directly: _AgSchemaFields.input_offload_chars.default
-    input_offload_chars = DynamicConfigParam("agschema", default=40_000)
-    # Cap the per-field offload threshold at a fraction of the context window
-    # (converted from tokens to chars) so a single oversized field can't eat
-    # the whole context on small-context models. Shared with agskill.py's
-    # tool-output offload sizing -- this class is the source of truth for both.
-    offload_context_fraction = DynamicConfigParam("agschema", default=0.1)
-    chars_per_token = DynamicConfigParam("agschema", default=4)
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agSchemaConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agschema tunables in one call::
-
-        cfg = agConfig(agSchemaConfig(input_offload_chars=2000))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agschema"
+from .configs.agconfig import agconfig as agconfig_cls
 
 
 def _lenient_json_object(raw_text: str) -> dict:
     """Parse *raw_text* as a JSON object, tolerating a harness's model
-    wrapping its final answer in prose and/or a markdown code fence
-    despite being asked for raw JSON only
-    (`agharness.build_output_format_instruction`'s instruction is not
-    always followed strictly -- confirmed against a real response from a
-    real Claude model: 'Perfect! All tasks have been completed
+    wrapping its final answer in prose and/or a markdown code fence even
+    though it was never asked to reply in JSON at all -- structured output
+    is normally submitted via MCP tool calls (return_<field>/submit_output),
+    so this is a lenient, unprompted fallback recovery for whenever a model
+    states its answer as JSON anyway (confirmed against a real response
+    from a real Claude model: 'Perfect! All tasks have been completed
     successfully. Let me provide the final status:\\n\\n```json\\n{...}\\n```').
 
     Tries, in order: the raw text as-is; the contents of a ```...```
@@ -166,10 +135,8 @@ class agschema:
         return errors
 
     def check_field(self, field_name: str, value) -> "str | None":
-        """Validate a single (field_name, value) pair against the schema type hint.
-
-        Returns an error string, or None if valid.
-        """
+        """Validate a single (field_name, value) pair; returns an error
+        string, or None if valid."""
         return validate_value_against_type_hint(self._data[field_name], value)
 
     # ------------------------------------------------------------------
@@ -194,7 +161,7 @@ class agschema:
         skill_name: str,
         suffix: str = "",
         context_limit: "int | None" = None,
-        agconfig: "agConfig | None" = None,
+        agconfig: "agconfig_cls | None" = None,
     ) -> "tuple[list[str], list[str]]":
         """Prepare all input fields that require sandbox access, in one pass.
 
@@ -211,15 +178,15 @@ class agschema:
         the names of fields that were size-offloaded (used for the system prompt
         warning telling the LLM to read those files).
         """
-        _schema_fields = _AgSchemaFields(agconfig)
-        _input_offload_chars = _schema_fields.input_offload_chars
+        _cfg = agconfig if agconfig is not None else agconfig_cls()
+        _input_offload_chars = _cfg.schema.input_offload_chars
         _threshold = (
             min(
                 _input_offload_chars,
                 int(
                     context_limit
-                    * _schema_fields.offload_context_fraction
-                    * _schema_fields.chars_per_token
+                    * _cfg.schema.offload_context_fraction
+                    * _cfg.schema.chars_per_token
                 ),
             )
             if context_limit
@@ -312,25 +279,39 @@ class agschema:
             paths.extend(written)
         return paths
 
+    def validate_outputs(
+        self,
+        data: agdata,
+        sandbox: "agSandbox",
+        exec_timeout: float = 5,
+    ) -> list[str]:
+        """Validate sandbox-backed output values before recovering them."""
+        errors: list[str] = []
+        for key, hint in self._data.items():
+
+            def on_leaf(h, value, _key=key):
+                error = h.validate_output(_key, value, sandbox, exec_timeout)
+                if error is not None:
+                    errors.append(error)
+                return value, []
+
+            agtype.walk(hint, data._data.get(key), on_leaf)
+        return errors
+
     def validate_and_recover(
         self,
         raw_text: str,
         sandbox: "agSandbox",
+        exec_timeout: float = 5,
     ) -> "tuple[agdata | agerror, list[str]]":
         """Validate and recover a harness's single raw final-answer text
         against this schema, in one call.
 
-        The native ReAct loop collects structured output incrementally,
-        one field at a time, through per-field `return_<field>` tool calls
-        (`make_return_output_agtool`/`make_field_handler` above) --
-        `agskill.execute_harness()`'s harness path instead gets one raw
-        text blob back and needs the whole-schema equivalent of that
-        validation + recovery in a single step, which didn't exist as a
-        single entry point before this method: this is pure composition of
+        Harness adapters return one raw text blob, so this provides the
+        whole-schema validation and recovery step as a pure composition of
         `check()` (whole-schema field presence/type validation, already
         used for input validation despite the name) and `recover_outputs()`
-        (per-agtype-field `.recover()`, already used by `execute_react()`'s
-        own success path) -- no new validation logic.
+        (per-agtype-field `.recover()`) -- no new validation logic.
 
         Returns `(data, paths)` on success (`paths` are the sandbox paths
         `recover_outputs()` produced, for parity with `execute_react()`'s
@@ -349,6 +330,10 @@ class agschema:
 
         data = agdata(**parsed)
         errors = self.check(data)
+        if errors:
+            return agerror(f"output schema error: {errors}"), []
+
+        errors = self.validate_outputs(data, sandbox, exec_timeout)
         if errors:
             return agerror(f"output schema error: {errors}"), []
 

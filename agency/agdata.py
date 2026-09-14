@@ -1,14 +1,15 @@
 from __future__ import annotations
+import asyncio
 import json
+from dataclasses import fields, is_dataclass, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
-from . import agpause
-from .profiler import agprof
+from .observability.profiler import agprof
 from .agtype import agtype
-from .agutil import _camel_to_snake
+from .utils.agutil import _camel_to_snake
 
 
 class AgError(RuntimeError):
@@ -38,12 +39,16 @@ class agdata:
         f = object.__getattribute__(self, "_future")
         if f is None:
             return
-        with agpause.note_blocked_on(agpause.producer_of(f)):
-            if f.done():
+        if f.done():
+            resolved = f.result()
+        else:
+            with agprof.span("sync:result_wait"):
                 resolved = f.result()
-            else:
-                with agprof.span("sync:result_wait"):
-                    resolved = f.result()
+        if not isinstance(resolved, agdata):
+            raise TypeError(
+                "pending agdata future resolved to an incompatible value: "
+                f"{type(resolved).__name__}"
+            )
         resolved._resolve()  # chain: future may resolve to another pending agdata
         object.__setattr__(self, "_data", object.__getattribute__(resolved, "_data"))
         object.__setattr__(self, "_future", None)
@@ -53,21 +58,30 @@ class agdata:
         f = object.__getattribute__(self, "_future")
         return f is not None and not f.done()
 
-    def wait(self) -> "agdata":
-        """Block until this agdata is resolved and return self.
+    def wait(self, timeout: "float | None" = None) -> "agdata":
+        """Block until this agdata is resolved and return self. *timeout*,
+        if given, raises ``TimeoutError`` rather than blocking forever."""
+        if timeout is not None:
+            f = object.__getattribute__(self, "_future")
+            if f is not None:
+                f.result(timeout=timeout)
+        self._resolve()
+        return self
 
-        Use as a barrier on a single result::
+    def __await__(self):
+        return self._await_self().__await__()
 
-            result = team.run()
-            # ... do other work ...
-            result.wait()   # block here until the team finishes
-            print(result.report_path)   # guaranteed resolved
-        """
+    async def _await_self(self) -> "agdata":
+        # Shielded so cancelling one waiter's task never cancels the shared
+        # underlying future for any other concurrent awaiter.
+        f = object.__getattribute__(self, "_future")
+        if f is not None:
+            await asyncio.shield(asyncio.wrap_future(f))
         self._resolve()
         return self
 
     @staticmethod
-    def wait_all(pending: "list[agdata]") -> "list[agdata]":
+    def wait_all(pending: "list") -> "list":
         """Block until every agdata in *pending* is resolved.
 
         Use as a barrier over a fan-out::
@@ -80,7 +94,14 @@ class agdata:
                 print(r.report_path)   # all resolved, no further blocking
         """
         for p in pending:
-            p._resolve()
+            resolver = getattr(p, "_resolve", None)
+            if callable(resolver):
+                resolver()
+                continue
+            waiter = getattr(p, "wait", None)
+            if not callable(waiter):
+                raise TypeError(f"object is not waitable: {type(p).__name__}")
+            waiter()
         return pending
 
     # ------------------------------------------------------------------
@@ -110,6 +131,16 @@ class agdata:
             return {k: agdata._to_serializable(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [agdata._to_serializable(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [agdata._to_serializable(v) for v in obj]
+        if is_dataclass(obj) and not isinstance(obj, type):
+            return {
+                field.name: agdata._to_serializable(getattr(obj, field.name))
+                for field in fields(obj)
+            }
+        model_dump = getattr(obj, "model_dump", None)
+        if callable(model_dump):
+            return agdata._to_serializable(model_dump())
         return obj
 
     def to_dict(self) -> dict:
@@ -125,10 +156,8 @@ class agdata:
 
     @classmethod
     def from_json(cls, s: str) -> "agdata":
-        """Parse a JSON object into an agdata, tolerating camelCase keys --
-        some LLMs emit tool-call arguments in camelCase even when a tool's
-        schema declares snake_case parameter names. Normalizes only
-        top-level keys; nested dict/list values are left untouched."""
+        """Parse a JSON object into an agdata, tolerating camelCase keys
+        (some LLMs emit tool-call args in camelCase)."""
         return cls(**{_camel_to_snake(k): v for k, v in json.loads(s).items()})
 
     # ------------------------------------------------------------------
@@ -160,16 +189,50 @@ class agdata:
             return self._data == other._data
         return NotImplemented
 
+    @staticmethod
+    def _resolve_dependency(value):
+        if isinstance(value, agdata):
+            value._resolve()
+            return value
+        if isinstance(value, list):
+            return [agdata._resolve_dependency(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(agdata._resolve_dependency(item) for item in value)
+        if isinstance(value, dict):
+            return {key: agdata._resolve_dependency(item) for key, item in value.items()}
+        if is_dataclass(value) and not isinstance(value, type):
+            return replace(
+                value,
+                **{
+                    field.name: agdata._resolve_dependency(getattr(value, field.name))
+                    for field in fields(value)
+                },
+            )
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if not isinstance(dumped, dict):
+                raise TypeError(f"{type(value).__name__}.model_dump() must return a dictionary")
+            updates = {key: agdata._resolve_dependency(item) for key, item in dumped.items()}
+            model_copy = getattr(value, "model_copy", None)
+            if callable(model_copy):
+                return model_copy(update=updates)
+            try:
+                for key, item in updates.items():
+                    setattr(value, key, item)
+            except (AttributeError, TypeError):
+                # Generic immutable model-like values have no standard copy
+                # protocol.  Preserve their resolved data rather than leaving
+                # hidden pending handles behind.
+                return updates
+            return value
+        return value
+
     def resolve_input_dependencies(self) -> None:
-        """Resolve any pending agdata values nested inside self, in-place."""
+        """Resolve pending data/result handles nested inside self, in-place."""
         self._resolve()
-        for val in self._data.values():
-            if isinstance(val, agdata):
-                val._resolve()
-            elif isinstance(val, list):
-                for item in val:
-                    if isinstance(item, agdata):
-                        item._resolve()
+        for key, value in tuple(self._data.items()):
+            self._data[key] = self._resolve_dependency(value)
 
 
 class agerror(agdata):
@@ -188,11 +251,6 @@ class agerror(agdata):
             raise TypeError(f"agerror message must be a str, got {type(message).__name__}")
         object.__setattr__(self, "_future", None)
         object.__setattr__(self, "_data", {"error": message})
-        from .agterm import agterm as _agterm_cls
-
-        if not hasattr(agerror, "_term"):
-            agerror._term = _agterm_cls("agerror")
-        agerror._term.log("ERROR ✗  ", message, depth=2)
 
     def __getattr__(self, name: str):
         if name == "error":
@@ -201,3 +259,14 @@ class agerror(agdata):
 
     def __repr__(self) -> str:
         return f"agerror({self._data.get('error')!r})"
+
+
+class agcanceled(agerror):
+    """Returned when an invocation was cancelled via ``agent.cancel(handle)``.
+
+    A typed subclass of ``agerror`` so callers can ``isinstance(result, agcanceled)``
+    instead of string-matching ``.error``.
+    """
+
+    def __init__(self, message: str = "agent invocation cancelled"):
+        super().__init__(message)

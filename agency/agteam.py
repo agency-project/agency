@@ -1,15 +1,20 @@
 from __future__ import annotations
 import functools
+import threading
 import weakref
 from concurrent.futures import Future
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from ._context import _active_team
-from .agconfig import agConfig
-from .profiler import agprof
+from .configs.agconfig import agconfig as agconfig_cls
+from .observability.profiler import agprof
 
 if TYPE_CHECKING:
     from .agent import agent as _Agent
+
+# Set to the active agteam instance while its run() method is executing.
+# Used by agent.__init__ to auto-register fork agents with the enclosing team.
+_active_team: ContextVar = ContextVar("_active_team", default=None)
 
 
 class agteam:
@@ -24,10 +29,15 @@ class agteam:
     thread and returns a pending :class:`agdata` immediately.  Field access
     on the returned value blocks until the workflow finishes::
 
-        cfg = agConfig()
-        cfg.agllm_backend.model = "claude-sonnet-5"
-        cfg.agllm_backend.provider = "anthropic"
-        cfg.agllm_backend.api_key = os.environ["ANTHROPIC_API_KEY"]
+        from agency.configs.agconfig import agconfig, llmconfig
+
+        cfg = agconfig(
+            llmconfig(
+                model="claude-sonnet-5",
+                provider="anthropic",
+                api_key=os.environ["ANTHROPIC_API_KEY"],
+            )
+        )
 
         class PaperCrawlerTeam(agteam):
             agconfig = cfg
@@ -55,14 +65,14 @@ class agteam:
 
     Class attributes
     ----------------
-    agconfig : agConfig | None
+    agconfig : agconfig_cls | None
         Default LLM configuration (and any other agconfig-based settings)
         shared by all instances unless overridden at construction time.
         Agents created with no explicit ``agconfig=`` inside ``setup()``/
         ``run()`` inherit this automatically.
     """
 
-    agconfig: "agConfig | None" = None
+    agconfig: "agconfig_cls | None" = None
 
     # Global weak registry of all live agteam instances.
     _live_teams: "weakref.WeakSet[agteam]" = weakref.WeakSet()
@@ -72,13 +82,13 @@ class agteam:
         if "run" in cls.__dict__:
             _wrap_run(cls)
 
-    def __init__(self, agconfig: "agConfig | None" = None, **config) -> None:
+    def __init__(self, agconfig: "agconfig_cls | None" = None, **config) -> None:
         # Instance-level agconfig: explicit arg > class attribute. Cloned so
         # this team's own agconfig is independent of whatever source it was
         # built from -- mutating that source afterward must not silently
         # change an already-constructed team (or the agents it already spawned).
         _src_agconfig = agconfig if agconfig is not None else type(self).agconfig
-        self.agconfig: "agConfig | None" = (
+        self.agconfig: "agconfig_cls | None" = (
             _src_agconfig.clone() if _src_agconfig is not None else None
         )
         # Expose every config kwarg as a plain attribute
@@ -86,33 +96,28 @@ class agteam:
             setattr(self, k, v)
         self._agents: weakref.WeakSet = weakref.WeakSet()
         self._run_future: Future | None = None
+        self._run_lock = threading.Lock()
+        self._active_run_futures: set[Future] = set()
         agteam._live_teams.add(self)
 
         parent = _active_team.get(None)
         self._parent_team: "agteam | None" = parent
 
-        # Log team creation to both terminal and file
-        from .agent import agent as _Agent
+        from .orchestrator import get_orchestrator
         from .agname import agname as _agname
-        from .aglog import aglog as _aglog
-        import sys
 
         _base = config.get("name") or f"{type(self).__name__}"
-        self.team_name: str = _agname.allocate_agname(_base)
-        parent_team_name = parent.team_name if parent is not None else None
-        log_dir = _Agent.log_dir
-        self._log = _aglog(log_dir / "_teams.jsonl" if log_dir else None)
-        self._log._lifecycle(
-            "created",
-            team=self.team_name,
-            parent_team=parent_team_name,
+        self.name: str = _agname.allocate_agname(_base, prefix="team")
+        parent_team_name = parent.name if parent is not None else None
+
+        self.data_logger = get_orchestrator(self.agconfig).data_logger
+        self.data_logger.record_event(
+            type="team_created",
+            payload={"team": self.name, "parent_team": parent_team_name},
+            name=self.name,
+            object="agteam",
+            term_message=f"[{self.name}] CREATED  parent={parent_team_name}",
         )
-        if parent_team_name is not None:
-            print(
-                f"  [agteam] {self.team_name} created inside {parent_team_name}",
-                file=sys.stderr,
-                flush=True,
-            )
 
         token = _active_team.set(self)
         try:
@@ -120,16 +125,13 @@ class agteam:
         finally:
             _active_team.reset(token)
 
-        try:
-            from . import agwebui as _agwebui
-
-            if _agwebui._active is not None:
-                _agwebui._active.emitter.team_registered(
-                    self.team_name,
-                    [a.agname for a in self._agents],
-                )
-        except Exception as _e:
-            print(f"[agteam] WARNING: team_registered push failed for {self.team_name}: {_e}")
+        self.data_logger.record_event(
+            type="team_registered",
+            payload={"team_name": self.name, "agents": [a.agname for a in self._agents]},
+            name=self.name,
+            object="agteam",
+            update_latest_snapshot=True,
+        )
 
     # ------------------------------------------------------------------
     # Override points
@@ -146,17 +148,15 @@ class agteam:
     # Helpers
     # ------------------------------------------------------------------
 
-    def change_config(self, agconfig: "agConfig") -> None:
+    def change_config(self, agconfig: "agconfig_cls") -> None:
         """Replace this team's agconfig with a clone of the given one, and
-        push that same clone down to every agent this team has spawned so
-        far (via ``agent.change_config``). Agents created afterward pick up
-        the new ``self.agconfig`` automatically, the same way they do at
-        construction."""
-        self.agconfig = agconfig.clone()
+        push it to every agent already spawned (via ``agent.change_config``).
+        Agents created afterward pick it up automatically at construction."""
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
         for a in self._agents:
             a.change_config(self.agconfig)
 
-    def get_config_copy(self) -> "agConfig | None":
+    def get_config_copy(self) -> "agconfig_cls | None":
         """Return a clone of this team's agconfig, or None if it has none."""
         return self.agconfig.clone() if self.agconfig is not None else None
 
@@ -190,7 +190,6 @@ def _wrap_run(cls) -> None:
         future: Future = Future()
 
         def _task() -> None:
-            import sys
             import traceback
 
             token = _active_team.set(self)
@@ -198,14 +197,37 @@ def _wrap_run(cls) -> None:
                 result = original(self, *args, **kwargs)
                 future.set_result(result if isinstance(result, agdata) else agdata(result=result))
             except Exception as exc:
-                traceback.print_exc(file=sys.stderr)
-                sys.stderr.flush()
+                tb = traceback.format_exc()
+                self.data_logger.record_event(
+                    type="team_run_failed",
+                    payload={"team": self.name, "traceback": tb},
+                    name=self.name,
+                    object="agteam",
+                    term_message=tb,
+                )
                 future.set_exception(exc)
             finally:
                 _active_team.reset(token)
+                with self._run_lock:
+                    self._active_run_futures.discard(future)
+                self.data_logger.record_event(
+                    type="team_registered",
+                    payload={"team_name": self.name, "agents": [a.agname for a in self._agents]},
+                    name=self.name,
+                    object="agteam",
+                    update_latest_snapshot=True,
+                )
 
-        self._run_future = future
-        agprof.spawn_traced(_task).start()
+        with self._run_lock:
+            self._run_future = future
+            self._active_run_futures.add(future)
+        try:
+            agprof.spawn_traced(_task).start()
+        except BaseException as exc:
+            with self._run_lock:
+                self._active_run_futures.discard(future)
+            future.set_exception(exc)
+            raise
         return agdata(_future=future)
 
     cls.run = _async_run

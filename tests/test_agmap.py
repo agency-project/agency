@@ -12,13 +12,13 @@ import time
 import pytest
 
 from agency.agdata import agdata
-from agency.agmap import agmap, agtask
-from agency.agsync import agsync
+from agency.utils.agmap import agmap, agtask
+from agency.utils.agsync import agsync
 
 
 def _runtime_available() -> bool:
     try:
-        from agency.agsandbox import get_container_runtime
+        from agency.sandbox.agsandbox import get_container_runtime
 
         rt = get_container_runtime()
         return subprocess.run([rt, "info"], capture_output=True, timeout=10).returncode == 0
@@ -173,7 +173,7 @@ def test_bare_agsync_inside_worker_does_not_deadlock():
 
 @container
 def _seed_base():
-    from agency.agsandbox import agSandbox
+    from agency.sandbox.agsandbox import agSandbox
 
     base = agSandbox("agmap-base")
     base.write_file("/workspace/repo/data.txt", "hello-from-checkpoint\n")

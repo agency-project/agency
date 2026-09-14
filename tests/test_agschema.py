@@ -270,7 +270,7 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
 # whose only caller was agskill.py's (now-deleted) _build_toolkit(). Native's
 # structured output uses a different mechanism (`submit_output`, see
 # agmcp_server.py) -- fast coverage for that lives in
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py.
+# tests/harness/agharness_backends/test_native_loop_fast.py.
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +279,11 @@ def test_get_return_tool_description_prompt_agpath_warns_against_content():
 
 
 def test_prepare_inputs_in_sandbox_replaces_long_string():
-    from agency.agschema import _AgSchemaFields
+    from agency.configs.agconfig import agconfig
 
     s = agschema(agdata(text=str))
     sb = MagicMock()
-    data = agdata(text="x" * (_AgSchemaFields.input_offload_chars.default + 1))
+    data = agdata(text="x" * (agconfig().schema.input_offload_chars + 1))
     paths, fields = s.prepare_inputs_in_sandbox(data, sb, "skill")
     assert fields == ["text"]
     assert len(paths) == 1
@@ -349,8 +349,8 @@ def test_recover_outputs_no_agtype_fields_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# validate_and_recover() -- whole-schema validation + recovery from a
-# harness's single raw final-answer text (agskill.execute_harness()'s path)
+# validate_and_recover() -- whole-schema validation and recovery from a
+# harness's single raw final-answer text
 # ---------------------------------------------------------------------------
 
 
@@ -405,6 +405,17 @@ def test_validate_and_recover_recovers_agtype_field():
     sb.read_file.return_value = "the recovered content"
     data, paths = s.validate_and_recover('{"doc": "/workspace/out.txt"}', sb)
     assert not isinstance(data, agerror)
-    sb.read_file.assert_called_once_with("/workspace/out.txt")
+    assert sb.read_file.call_count == 2
+    sb.read_file.assert_called_with("/workspace/out.txt")
     assert data.doc == "the recovered content"
     assert paths == ["/workspace/out.txt"]
+
+
+def test_validate_and_recover_rejects_missing_agtype_output_file():
+    s = agschema(agdata(doc=agfile))
+    sb = MagicMock()
+    sb.read_file.side_effect = FileNotFoundError("missing")
+    data, paths = s.validate_and_recover('{"doc": "/workspace/missing.txt"}', sb)
+    assert isinstance(data, agerror)
+    assert "no file found" in data.error
+    assert paths == []

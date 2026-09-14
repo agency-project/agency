@@ -118,45 +118,45 @@ def test_check_schema_agfile_hint_rejects_non_string():
 
 
 # ---------------------------------------------------------------------------
-# agskill._build_system_prompt — agfile prompts injected
+# agskill._build_prompt — agfile prompts injected
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_includes_agfile_input_instructions():
+def test_prompt_includes_agfile_input_instructions():
     sk = agskill(
         "design",
         "Do stuff.",
         input_schema=agdata(background=agfile),
         output_schema=agdata(result=str),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "background" in prompt
     assert "read tool" in prompt
 
 
-def test_system_prompt_includes_agfile_output_instructions():
+def test_prompt_includes_agfile_output_instructions():
     sk = agskill(
         "design",
         "Do stuff.",
         input_schema=agdata(theme=str),
         output_schema=agdata(report=agfile),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed fields" in prompt
     assert "report" in prompt
     assert "write" in prompt.lower()
 
 
-def test_system_prompt_no_agfile_fields_no_file_backed_warning():
+def test_prompt_no_agfile_fields_no_file_backed_warning():
     sk = agskill("t", "Do stuff.", input_schema=agdata(x=str), output_schema=agdata(y=int))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert "File-backed" not in prompt
 
 
-def test_system_prompt_agfile_type_shown_as_file():
+def test_prompt_agfile_type_shown_as_file():
     sk = agskill("t", "", input_schema=agdata(doc=agfile))
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"doc": "file"' in prompt
 
 
@@ -246,7 +246,7 @@ def test_recover_agtype_outputs_no_schema_returns_empty():
 
 
 def test_looks_like_path_detects_workspace_paths():
-    from agency.agutil import _looks_like_path
+    from agency.utils.agutil import _looks_like_path
 
     assert _looks_like_path("/workspace/core.py")
     assert _looks_like_path("/workspace/outputs/report.txt")
@@ -256,14 +256,14 @@ def test_looks_like_path_detects_workspace_paths():
 
 
 def test_looks_like_path_rejects_multiline():
-    from agency.agutil import _looks_like_path
+    from agency.utils.agutil import _looks_like_path
 
     assert not _looks_like_path("def main():\n    pass\n")
     assert not _looks_like_path("/workspace/file.py\nextra content")
 
 
 def test_looks_like_path_rejects_non_absolute():
-    from agency.agutil import _looks_like_path
+    from agency.utils.agutil import _looks_like_path
 
     assert not _looks_like_path("relative/path.py")
     assert not _looks_like_path("just some text")
@@ -271,7 +271,7 @@ def test_looks_like_path_rejects_non_absolute():
 
 
 def test_looks_like_path_rejects_paths_with_spaces():
-    from agency.agutil import _looks_like_path
+    from agency.utils.agutil import _looks_like_path
 
     # Old heuristic would accept these; new regex rejects them
     assert not _looks_like_path("/this is not a path")
@@ -280,7 +280,7 @@ def test_looks_like_path_rejects_paths_with_spaces():
 
 
 def test_looks_like_path_single_segment():
-    from agency.agutil import _looks_like_path
+    from agency.utils.agutil import _looks_like_path
 
     assert _looks_like_path("/bin")
     assert _looks_like_path("/a")

@@ -1,0 +1,112 @@
+"""Optional bridge client for the standalone native harness.
+
+When native_harness is launched BY agency, it's given a `--bridge-base-url`
+pointed at this run's own `agmanager_harness` instance and a `--bridge-
+token` bearer credential -- the same single (base_url, token) pair that
+already serves LLM dispatch (`llm_client.py` points its OpenAI-compatible
+client's `base_url` at `<bridge-base-url>` too), so ONE bridge configures
+policy checks and context-limit lookup at once, mirroring how Claude Code's
+own single `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` pair already serves
+its LLM traffic, its permission hook, and its profiler hook through the
+very same `agmanager_harness` process.
+
+When native_harness is run fully standalone (no `--bridge-base-url`), this
+client is simply never constructed -- every one of these checks is an
+agency-side control-plane concern with no meaning outside agency, so
+`react_loop.py` treats "no bridge configured" as "allow every tool, never
+compact" (context_limit=None), not an error."""
+
+from __future__ import annotations
+
+import httpx
+
+
+class BridgeClient:
+    def __init__(self, base_url: str, token: str, timeout_s: float = 300) -> None:
+        self.token = token
+        self._client = httpx.Client(base_url=base_url, timeout=timeout_s)
+
+    def check_tool_policy(self, tool_name: str, tool_input: dict) -> dict:
+        try:
+            resp = self._client.post(
+                "/agpolicy/check_tool",
+                json={"tool_name": tool_name, "tool_input": tool_input},
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            if resp.status_code != 200:
+                return {"decision": "deny", "reason": f"policy bridge returned {resp.status_code}"}
+            return resp.json()
+        except Exception as e:
+            # Fail closed, not open: an unreachable policy bridge must not
+            # silently become "allow everything."
+            return {"decision": "deny", "reason": f"policy bridge unreachable: {e}"}
+
+    def complete_tool_policy(
+        self,
+        call_id: "str | None",
+        result: object,
+        *,
+        duration_ns: int | None = None,
+        started_wall_ns: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Report a tool call's completion for telemetry. Best-effort: no
+        call_id (an unreachable bridge at admission time, or a denied call
+        that never ran) or a failed post never blocks/affects the tool
+        result already returned to the model."""
+        if not call_id:
+            return
+        try:
+            response = self._client.post(
+                "/agpolicy/complete_tool",
+                json={
+                    "call_id": call_id,
+                    "result": result,
+                    "error": error,
+                    **({"duration_ns": duration_ns} if duration_ns is not None else {}),
+                    **({"started_wall_ns": started_wall_ns} if started_wall_ns is not None else {}),
+                },
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            profiler = getattr(self, "_profiler", None)
+            if profiler is not None:
+                profiler.dropped += 1
+            print(f"[bridge_client] complete_tool_policy request failed: {exc!r}")
+
+    def context_limit(self) -> "int | None":
+        try:
+            resp = self._client.post("/internal/context_limit", json={"token": self.token})
+            if resp.status_code != 200:
+                return None
+            return resp.json().get("context_limit")
+        except Exception:
+            return None
+
+    def profiler_settings(self) -> dict:
+        resp = self._client.get("/agprof/status", headers={"Authorization": f"Bearer {self.token}"})
+        resp.raise_for_status()
+        return resp.json()
+
+    def record_profiler_span(self, payload: dict) -> dict:
+        resp = self._client.post(
+            "/agprof/span", json=payload, headers={"Authorization": f"Bearer {self.token}"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def record_profiler_samples(self, samples: list) -> dict:
+        resp = self._client.post(
+            "/agprof/samples",
+            json={"samples": samples},
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def close(self) -> None:
+        self._client.close()
+
+
+__all__ = ["BridgeClient"]

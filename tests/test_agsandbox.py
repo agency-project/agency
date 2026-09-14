@@ -6,6 +6,7 @@ and skipped automatically when Docker/Podman is unavailable.
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import sys
@@ -16,16 +17,7 @@ import uuid
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agency.agdata import agdata
-from agency.agresources import agResourcePool
-
-
-def _worker_import_agent():
-    """Top-level so ProcessPoolExecutor can pickle it."""
-    from agency.agent import agent  # noqa: F401
-    import multiprocessing
-
-    return multiprocessing.current_process().name
+from agency.orchestrator.agresources import agResourcePool
 
 
 # ---------------------------------------------------------------------------
@@ -61,27 +53,153 @@ def _make_sandbox(**kwargs):
     ``docker`` CLI directly (docker ps/images/rmi/...), so it needs every
     sandbox it builds to actually be a docker container regardless of the
     process-wide auto-detected default (which now prefers podman when both
-    are usable -- see agsandbox_backends.base.agsandbox_backend.for_config()).
+    are usable -- see sandbox.base.agsandbox_backend.for_config()).
     """
-    from agency.agconfig import agConfig
-    from agency.agsandbox import agSandbox
-    from agency.agsandbox_backends import agSandboxBackendConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.sandbox.agsandbox import agSandbox
 
     uid = str(uuid.uuid4())
-    agconfig = kwargs.pop("agconfig", None)
-    cfg = agConfig(agSandboxBackendConfig(backend="docker"), agconfig)
-    return agSandbox(uid, agconfig=cfg, **kwargs)
+    passed_cfg = kwargs.pop("agconfig", None)
+    cfg = passed_cfg.clone() if passed_cfg is not None else agconfig_cls()
+    cfg.sandbox.backend = "docker"
+    # Configuration-only tests do not need a live daemon.  The production
+    # selector now validates explicit runtimes eagerly, so isolate those unit
+    # tests from the daemon probe while leaving @docker operations untouched.
+    with patch("agency.sandbox.base.shutil.which", return_value="/usr/bin/docker"):
+        with patch("agency.sandbox.container._runtime_works", return_value=True):
+            return agSandbox(uid, agconfig=cfg, **kwargs)
 
 
 def _agconfig_with_output_dir(output_dir):
     """Build an agconfig mounting output_dir at /agent_output, replacing the
     old output_dir= constructor kwarg."""
-    from agency.agconfig import agConfig
-    from agency.agsandbox import agSandboxConfig
+    from agency.configs.agconfig import agconfig as agconfig_cls
 
-    cfg = agConfig()
-    agSandboxConfig(cfg).add_mount("agent_output", output_dir, "/agent_output")
+    cfg = agconfig_cls()
+    cfg.sandbox.add_mount("agent_output", output_dir, "/agent_output")
     return cfg
+
+
+def test_facade_construction_does_not_start_backend():
+    from agency.configs.agconfig import agconfig as agconfig_cls
+    from agency.sandbox.agsandbox import agSandbox
+
+    backend = MagicMock()
+    with patch(
+        "agency.sandbox.agsandbox.agsandbox_backend.for_config",
+        return_value=backend,
+    ):
+        sandbox = agSandbox(str(uuid.uuid4()), agconfig=agconfig_cls())
+
+    try:
+        backend._ensure_started.assert_not_called()
+        backend.exec.assert_not_called()
+    finally:
+        sandbox.destroy()
+
+
+def test_fork_without_checkpoint_keeps_lazy_fresh_backend():
+    from agency.sandbox.agsandbox import agSandbox
+
+    parent_backend = MagicMock()
+    child_backend = MagicMock()
+    parent_backend._checkpoint_image = None
+    child_backend._checkpoint_image = None
+    with patch(
+        "agency.sandbox.agsandbox.agsandbox_backend.for_config",
+        side_effect=[parent_backend, child_backend],
+    ):
+        parent = agSandbox("fresh-parent")
+        child = parent.fork("fresh-child")
+    try:
+        assert child._checkpoint_image is None
+        child_backend._ensure_started.assert_not_called()
+    finally:
+        parent.destroy()
+        child.destroy()
+
+
+def test_destroy_can_retry_a_failed_backend_cleanup():
+    from agency.sandbox.agsandbox import agSandbox
+
+    backend = MagicMock()
+    backend.destroy.side_effect = [RuntimeError("removal failed"), None]
+    with patch("agency.sandbox.agsandbox.agsandbox_backend.for_config", return_value=backend):
+        sandbox = agSandbox("retry-cleanup")
+    with pytest.raises(RuntimeError, match="removal failed"):
+        sandbox.destroy()
+    sandbox.destroy()
+    sandbox.destroy()
+    assert backend.destroy.call_count == 2
+
+
+@pytest.mark.parametrize("kind", ["container", "chroot"])
+def test_backend_destroy_remains_retryable_after_removal_failure(kind, tmp_path):
+    from agency.sandbox.container import _ContainerBackendBase
+    from agency.sandbox.chroot import _ChrootBackend
+
+    cls = _ContainerBackendBase if kind == "container" else _ChrootBackend
+    backend = MagicMock()
+    backend._destroyed = False
+    backend._watched_pids = {}
+    backend._checkpoint_image = None
+    backend._accumulator_dir = None
+    backend._root = tmp_path / "sandbox"
+    backend.rm_container.side_effect = [RuntimeError("removal failed"), None]
+    with pytest.raises(RuntimeError, match="removal failed"):
+        cls.destroy(backend)
+    assert not backend._destroyed
+    cls.destroy(backend)
+    cls.destroy(backend)
+    assert backend._destroyed
+    assert backend.rm_container.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        ("exec", ("true",)),
+        ("exec_detached", ("true",)),
+        ("read_file", ("/workspace/file.txt",)),
+        ("write_file", ("/workspace/file.txt", "content")),
+        ("commit", ()),
+        ("stop", ()),
+        ("destroy", ()),
+    ],
+)
+def test_public_facade_operation_uses_shared_lock(operation, args):
+    from agency.sandbox.agsandbox import agSandbox
+
+    sandbox = agSandbox.__new__(agSandbox)
+    sandbox._agname = "lock-test"
+    sandbox._destroyed = operation != "destroy"
+    sandbox._lock = threading.RLock()
+    sandbox._backend = MagicMock()
+
+    attempted = threading.Event()
+    entered_backend = threading.Event()
+    errors = []
+    getattr(sandbox._backend, operation).side_effect = lambda *_args, **_kwargs: (
+        entered_backend.set()
+    )
+
+    def call_operation():
+        attempted.set()
+        try:
+            getattr(sandbox, operation)(*args)
+        except Exception as exc:
+            errors.append(exc)
+
+    with sandbox._lock:
+        worker = threading.Thread(target=call_operation)
+        worker.start()
+        assert attempted.wait(timeout=1)
+        assert not entered_backend.wait(timeout=0.05)
+
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert entered_backend.is_set()
+    assert errors == []
 
 
 # ---------------------------------------------------------------------------
@@ -91,14 +209,14 @@ def _agconfig_with_output_dir(output_dir):
 
 class TestDetectGpus:
     def test_returns_list(self):
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         gpus = detect_gpus()
         assert isinstance(gpus, list)
         assert all(isinstance(g, int) for g in gpus)
 
     def test_nvidia_smi_unavailable_returns_empty(self, monkeypatch):
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         monkeypatch.setattr(
             "subprocess.run", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
@@ -107,7 +225,7 @@ class TestDetectGpus:
 
     def test_nvidia_smi_nonzero_exit_returns_empty(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 1
@@ -117,7 +235,7 @@ class TestDetectGpus:
 
     def test_nvidia_smi_parses_indices(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -131,7 +249,7 @@ class TestDetectGpus:
 
     def test_cvd_filter_applied_to_nvidia_smi_output(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -142,7 +260,7 @@ class TestDetectGpus:
 
     def test_cvd_unset_returns_all_from_nvidia_smi(self, monkeypatch):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_gpus
+        from agency.utils.agutil import detect_gpus
 
         mock = MagicMock()
         mock.returncode = 0
@@ -159,50 +277,50 @@ class TestDetectGpus:
 
 class TestCvdFilter:
     def test_no_env_var_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
         assert _cvd_filter([0, 1, 2, 3]) == [0, 1, 2, 3]
 
     def test_filters_to_allowed_subset(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,3,5,7")
         assert _cvd_filter([0, 1, 2, 3, 4, 5, 6, 7]) == [0, 3, 5, 7]
 
     def test_single_gpu(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
         assert _cvd_filter([0, 1, 2, 3]) == [3]
 
     def test_empty_string_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_nodevfiles_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_none_string_passes_all(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "none")
         assert _cvd_filter([0, 1, 2]) == [0, 1, 2]
 
     def test_cvd_id_not_in_pool_ignored(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         # CVD says GPU 9 is allowed but nvidia-smi only reported [0,1,2]
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,9")
         assert _cvd_filter([0, 1, 2]) == [0]
 
     def test_preserves_order_from_pool_list(self, monkeypatch):
-        from agency.agresources import _cvd_filter
+        from agency.utils.agutil import _cvd_filter
 
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,3,1")
         # Order follows the pool list, not CVD order
@@ -223,14 +341,14 @@ class TestCvdFilter:
 
 class TestDetectCpus:
     def test_returns_positive_int(self):
-        from agency.agresources import detect_cpus
+        from agency.utils.agutil import detect_cpus
 
         cpus = detect_cpus()
         assert isinstance(cpus, int)
         assert cpus >= 1
 
     def test_os_cpu_count_none_returns_one(self, monkeypatch):
-        from agency.agresources import detect_cpus
+        from agency.utils.agutil import detect_cpus
 
         monkeypatch.setattr("os.cpu_count", lambda: None)
         assert detect_cpus() == 1
@@ -238,7 +356,7 @@ class TestDetectCpus:
 
 class TestDetectMemoryMb:
     def test_returns_positive_int(self):
-        from agency.agresources import detect_memory_mb
+        from agency.utils.agutil import detect_memory_mb
 
         mb = detect_memory_mb()
         assert isinstance(mb, int)
@@ -246,7 +364,7 @@ class TestDetectMemoryMb:
 
     def test_fallback_when_proc_missing(self, monkeypatch, tmp_path):
         from unittest.mock import MagicMock
-        from agency.agresources import detect_memory_mb
+        from agency.utils.agutil import detect_memory_mb
 
         # Point /proc/meminfo to a non-existent path and make sysctl fail
         monkeypatch.setattr("builtins.open", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
@@ -282,12 +400,13 @@ class TestPoolAutoDetect:
         assert pool.total_cpus == 4
         assert pool.total_memory_mb == 8192
 
-    def test_agent_has_default_pool(self):
-        from agency.agent import agent
+    def test_orchestrator_has_default_pool(self):
+        from agency.orchestrator import get_orchestrator
 
-        assert agent.agresource_pool is not None
-        assert isinstance(agent.agresource_pool.total_cpus, int)
-        assert isinstance(agent.agresource_pool.total_memory_mb, int)
+        pool = get_orchestrator().agresource_pool
+        assert pool is not None
+        assert isinstance(pool.total_cpus, int)
+        assert isinstance(pool.total_memory_mb, int)
 
 
 # ---------------------------------------------------------------------------
@@ -295,51 +414,63 @@ class TestPoolAutoDetect:
 # ---------------------------------------------------------------------------
 
 
+def _resource_sandbox(name="test-sandbox"):
+    sb = MagicMock()
+    sb._name = name
+    sb._gpu_ids = []
+    sb._cpu_acquired = 0.0
+    sb._memory_acquired_mb = 0
+    return sb
+
+
 class TestAgResourcePool:
     def test_single_gpu_acquire_release(self):
         pool = agResourcePool(gpus=[0])
-        gid = pool.acquire_gpu()
-        assert gid == 0
-        pool.release_gpu(gid)
+        sandbox = _resource_sandbox()
+        gids = pool.acquire_gpus(sandbox, 1)
+        assert gids == [0]
+        pool.release_gpus(sandbox, gids)
 
     def test_two_gpus_both_acquired(self):
         pool = agResourcePool(gpus=[0, 1])
-        g1 = pool.acquire_gpu()
-        g2 = pool.acquire_gpu()
-        assert {g1, g2} == {0, 1}
-        pool.release_gpu(g1)
-        pool.release_gpu(g2)
+        sandbox = _resource_sandbox()
+        g1 = pool.acquire_gpus(sandbox, 1)
+        g2 = pool.acquire_gpus(sandbox, 1)
+        assert set(g1) | set(g2) == {0, 1}
+        pool.release_gpus(sandbox, g1)
+        pool.release_gpus(sandbox, g2)
 
     def test_acquire_blocks_until_released(self):
         pool = agResourcePool(gpus=[0])
-        pool.acquire_gpu()  # hold the only GPU
+        sandbox = _resource_sandbox()
+        pool.acquire_gpus(sandbox, 1)  # hold the only GPU
 
         acquired: list[int] = []
 
         def _waiter():
-            acquired.append(pool.acquire_gpu())
+            acquired.extend(pool.acquire_gpus(_resource_sandbox(), 1))
 
         t = threading.Thread(target=_waiter)
         t.start()
         time.sleep(0.1)
         assert acquired == []  # still blocked
-        pool.release_gpu(0)
+        pool.release_gpus(sandbox, [0])
         t.join(timeout=2)
         assert acquired == [0]
 
     def test_acquire_timeout_raises(self):
         pool = agResourcePool(gpus=[0])
-        pool.acquire_gpu()  # exhaust pool
+        pool.acquire_gpus(_resource_sandbox(), 1)  # exhaust pool
         with pytest.raises(TimeoutError):
-            pool.acquire_gpu(timeout=0.2)
+            pool.acquire_gpus(_resource_sandbox(), 1, timeout=0.2)
 
     def test_release_unowned_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpu(0)  # never acquired — should not raise
+        pool.release_gpus(_resource_sandbox(), [0])  # never acquired — should not raise
 
     def test_release_unknown_gpu_is_safe(self):
         pool = agResourcePool(gpus=[0])
-        pool.release_gpu(99)  # not in pool — should not raise
+        pool.release_gpus(_resource_sandbox(), [99])  # not in pool — should not raise
 
     def test_repr(self):
         pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1g")
@@ -359,28 +490,28 @@ class TestGpuMarkers:
     """GPU markers are now allocated in-process via ctypes (no subprocesses)."""
 
     def test_mark_gpus_false_does_not_call_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=False)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_empty_gpu_list_does_not_call_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[], mark_gpus=True)
         mock_alloc.assert_not_called()
 
     def test_mark_gpus_true_calls_allocate_with_gpu_list(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[0, 1], mark_gpus=True)
         mock_alloc.assert_called_once_with([0, 1])
 
     def test_mark_gpus_true_single_gpu_calls_allocate(self):
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         with patch.object(agresources, "_allocate_gpu_markers") as mock_alloc:
             agResourcePool(gpus=[2], mark_gpus=True)
@@ -395,14 +526,14 @@ class TestGpuMarkers:
         assert not hasattr(pool, "_stop_gpu_markers")
 
     def test_allocate_gpu_markers_skips_on_no_libcuda(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         with patch.object(ctypes, "CDLL", side_effect=OSError("libcuda.so.1 not found")):
             _allocate_gpu_markers([0, 1])  # must not raise
 
     def test_allocate_gpu_markers_skips_on_cuinit_failure(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -415,7 +546,7 @@ class TestGpuMarkers:
         """When CUDA_VISIBLE_DEVICES=0,3,5,7, physical IDs must be remapped to
         CUDA device indices 0-3 before calling cuCtxCreate_v2.  This is the
         exact bug that caused markers to be missing on GPUs 3 and 5."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -435,7 +566,7 @@ class TestGpuMarkers:
     def test_allocate_gpu_markers_falls_back_to_rocm_when_no_libcuda(self):
         """On an AMD-only host (no libcuda.so.1 at all), markers must be
         allocated via ROCm/HIP instead of silently doing nothing."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -455,7 +586,7 @@ class TestGpuMarkers:
         assert mock_hip.hipMalloc.call_count == 2
 
     def test_allocate_gpu_markers_skips_rocm_on_hipinit_failure(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -471,7 +602,7 @@ class TestGpuMarkers:
         mock_hip.hipSetDevice.assert_not_called()
 
     def test_allocate_gpu_markers_skips_entirely_when_neither_cuda_nor_rocm_present(self):
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         with patch.object(ctypes, "CDLL", side_effect=OSError("not found")):
@@ -481,7 +612,7 @@ class TestGpuMarkers:
         """When HIP_VISIBLE_DEVICES=1,3, physical IDs must be remapped to HIP
         device indices 0-1 before calling hipSetDevice -- same remap bug class
         as the CUDA/CUDA_VISIBLE_DEVICES case above, for the ROCm path."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_hip = MagicMock()
@@ -505,7 +636,7 @@ class TestGpuMarkers:
 
     def test_allocate_gpu_markers_does_not_try_rocm_when_cuda_available(self):
         """CUDA present and working -- ROCm/HIP must never be attempted."""
-        from agency.agresources import _allocate_gpu_markers
+        from agency.utils.agutil import _allocate_gpu_markers
         import ctypes
 
         mock_cuda = MagicMock()
@@ -518,7 +649,7 @@ class TestGpuMarkers:
 
     def test_non_main_process_name_blocks_allocation(self):
         """The MainProcess guard must block _allocate_gpu_markers in worker processes."""
-        from agency import agresources
+        from agency.orchestrator import agresources
 
         mock_proc = MagicMock()
         mock_proc.name = "ForkPoolWorker-1"
@@ -532,7 +663,7 @@ class TestGpuMarkers:
         script = (
             "import sys; "
             "from unittest.mock import patch; "
-            "from agency import agresources; "
+            "from agency.orchestrator import agresources; "
             "calls = []; "
             "original = agresources._allocate_gpu_markers; "
             "agresources._allocate_gpu_markers = lambda ids: calls.append(ids) or original(ids); "
@@ -554,61 +685,69 @@ class TestGpuMarkers:
 
 class TestAgSandboxChangeConfigAndGetConfigCopy:
     def test_change_config_replaces_agconfig(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
-        sb.change_config(agConfig({"agllm_backend": {"temperature": 0.2}}))
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+        sb = _make_sandbox(agconfig=agconfig_cls(llmconfig(temperature=0.7)))
+        sb.change_config(agconfig_cls(llmconfig(temperature=0.2)))
+        assert sb.agconfig.llm.temperature == 0.2
 
     def test_change_config_clones_given_agconfig(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        sb = _make_sandbox(agconfig=agConfig())
-        new_cfg = agConfig({"agllm_backend": {"temperature": 0.2}})
+        sb = _make_sandbox(agconfig=agconfig_cls())
+        new_cfg = agconfig_cls(llmconfig(temperature=0.2))
         sb.change_config(new_cfg)
-        new_cfg.agllm_backend.temperature = 0.9
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.2
+        new_cfg.llm.temperature = 0.9
+        assert sb.agconfig.llm.temperature == 0.2
 
     def test_get_config_copy_returns_clone_not_same_object(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        cfg = agConfig({"agllm_backend": {"temperature": 0.7}})
+        cfg = agconfig_cls(llmconfig(temperature=0.7))
         sb = _make_sandbox(agconfig=cfg)
         copy = sb.get_config_copy()
-        assert copy is not sb._agconfig
+        assert copy is not sb.agconfig
 
     def test_get_config_copy_reflects_current_values(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
-        assert sb.get_config_copy().agllm_backend.temperature == 0.7
+        sb = _make_sandbox(agconfig=agconfig_cls(llmconfig(temperature=0.7)))
+        assert sb.get_config_copy().llm.temperature == 0.7
 
     def test_mutating_get_config_copy_does_not_affect_sandbox(self):
-        from agency.agconfig import agConfig
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb = _make_sandbox(agconfig=agconfig_cls(llmconfig(temperature=0.7)))
         copy = sb.get_config_copy()
-        copy.agllm_backend.temperature = 0.1
-        assert sb._agconfig.get("agllm_backend", "temperature") == 0.7
+        copy.llm.temperature = 0.1
+        assert sb.agconfig.llm.temperature == 0.7
 
     @docker
-    def test_get_config_copy_none_when_no_agconfig(self):
+    def test_get_config_copy_defaults_when_no_agconfig_given(self):
         # Bypasses _make_sandbox()'s forced backend="docker" agconfig on purpose --
         # this test is specifically about the truly-no-agconfig-at-all pathway.
-        from agency.agsandbox import agSandbox
+        # agSandbox.agconfig is always a real agconfig instance (never None), so
+        # constructing without one just means the sandbox falls back to defaults.
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.sandbox.agsandbox import agSandbox
 
         sb = agSandbox(str(uuid.uuid4()))
         try:
-            assert sb.get_config_copy() is None
+            copy = sb.get_config_copy()
+            assert copy is not None
+            assert copy.sandbox.base_image == agconfig_cls().sandbox.base_image
         finally:
             sb.destroy()
 
-    def test_change_config_none_clears_agconfig(self):
-        from agency.agconfig import agConfig
+    def test_change_config_none_resets_to_default_agconfig(self):
+        # agSandbox.agconfig can never be None -- change_config(None) resets
+        # it to a fresh default agconfig instead of clearing it.
+        from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
-        sb = _make_sandbox(agconfig=agConfig({"agllm_backend": {"temperature": 0.7}}))
+        sb = _make_sandbox(agconfig=agconfig_cls(llmconfig(temperature=0.7)))
         sb.change_config(None)
-        assert sb.get_config_copy() is None
+        assert sb.get_config_copy() is not None
+        assert sb.get_config_copy().llm.temperature == agconfig_cls().llm.temperature
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +758,7 @@ class TestAgSandboxChangeConfigAndGetConfigCopy:
 class TestAgSandboxLifecycle:
     def test_lifecycle_tag_is_lowercase(self):
         """_lifecycle_tag() must be fully lowercase — Docker rejects uppercase repository names."""
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
         backend = _DockerBackend.__new__(_DockerBackend)
         backend._name = "GenerationAgent_4816622_0000"
@@ -628,7 +767,7 @@ class TestAgSandboxLifecycle:
         assert "generationagent" in tag
 
     def test_lifecycle_tag_format(self):
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
         backend = _DockerBackend.__new__(_DockerBackend)
         backend._name = "myagent_0000"
@@ -689,19 +828,19 @@ class TestAgSandboxLifecycle:
         simulate a second view of the same one (matching what cloudpickle
         actually does across worker processes: it preserves the
         already-computed name rather than reallocating it)."""
-        from agency.agconfig import agConfig
-        from agency.agsandbox import agSandbox
-        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
+        from agency.configs.agconfig import agconfig as agconfig_cls, sandboxconfig
+        from agency.sandbox.agsandbox import agSandbox
+        from agency.sandbox import agsandbox_backend
 
         agname = str(uuid.uuid4())
-        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        cfg = agconfig_cls(sandboxconfig(backend="docker"))
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
         main_backend = agsandbox_backend.for_config(
             cfg,
             agname=sb_worker._backend._agname,
             name=sb_worker._backend._name,
             checkpoint_image=None,
-            base_image=sb_worker.base_image,
+            base_image=sb_worker.agconfig.sandbox.base_image,
             mounts={},
         )  # "main process" — same name, never started it
         tag = f"agency/test-commit-started-false-{agname[:8]}"
@@ -741,8 +880,8 @@ class TestAgSandboxLifecycle:
     def test_ensure_started_reuses_running_container(self):
         """_ensure_started() must reuse a container already running in Docker rather
         than destroying it and starting fresh — the cross-worker-process file-persistence fix."""
-        from agency.agconfig import agConfig
-        from agency.agsandbox_backends import agSandboxBackendConfig, agsandbox_backend
+        from agency.configs.agconfig import agconfig as agconfig_cls, sandboxconfig
+        from agency.sandbox import agsandbox_backend
 
         sb = _make_sandbox()
         # Start the container and write a sentinel file.
@@ -756,13 +895,13 @@ class TestAgSandboxLifecycle:
         # on every construction (see agsandbox.py's __init__), so passing
         # sb's agname through it again would produce a DIFFERENT name, not
         # the same one this test needs to simulate reuse.
-        cfg = agConfig(agSandboxBackendConfig(backend="docker"))
+        cfg = agconfig_cls(sandboxconfig(backend="docker"))
         worker_backend = agsandbox_backend.for_config(
             cfg,
             agname=sb._backend._agname,
             name=sb._backend._name,
             checkpoint_image=None,
-            base_image=sb.base_image,
+            base_image=sb.agconfig.sandbox.base_image,
             mounts={},
         )
         worker_backend._ensure_started()
@@ -770,16 +909,6 @@ class TestAgSandboxLifecycle:
         content = sb.read_file("/workspace/persist.txt")
         assert "still-here" in content
         sb.destroy()
-
-    # test_files_persist_across_process_pool_tool_calls was retired here:
-    # its whole premise (files written by a real run_in_subprocess=True tool
-    # call, in a ProcessPoolExecutor worker, readable by a subsequent
-    # separately-dispatched worker call) no longer exists -- agtool.__call__
-    # always runs in the calling thread/process now (see agtool.py's own
-    # module docstring), and agency/tools/{write,read}.py's `write`/`read`
-    # tool factories it used are themselves retired (make_write is gone;
-    # test_agsandbox.py's own direct sb.write_file()/read_file() tests
-    # already cover file persistence without any tool-dispatch layer).
 
     @docker
     def test_checkpoint_restore_preserves_files(self):
@@ -1089,7 +1218,7 @@ class TestAgSandboxLifecycle:
         release of _container_semaphore when both rm_container() and
         destroy() each independently believed they owed a release.
         """
-        from agency.agsandbox_backends.container import _container_semaphore
+        from agency.sandbox.container import _container_semaphore
 
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
@@ -1139,7 +1268,7 @@ class TestAgSandboxLifecycle:
         containers run concurrently than the kernel keyring quota actually
         supports -- the same class of bug the quota exists to prevent.
         """
-        from agency.agsandbox_backends.container import _container_semaphore
+        from agency.sandbox.container import _container_semaphore
 
         sb = _make_sandbox()
         sb.write_file("/workspace/x.txt", "x\n")
@@ -1167,7 +1296,7 @@ class TestAgSandboxLifecycle:
     @docker
     def test_concurrent_docker_calls_gated_by_docker_semaphore(self):
         """All docker calls go through _run() which holds _docker_semaphore; peak concurrency <= 8."""
-        from agency.agsandbox_backends.container import _docker_semaphore
+        from agency.sandbox.container import _docker_semaphore
 
         sandboxes = [_make_sandbox() for _ in range(4)]
         lifecycle_tags = [sb._backend._lifecycle_tag() for sb in sandboxes]
@@ -1221,7 +1350,16 @@ class TestAgSandboxLifecycle:
         try:
             # Manually create a container in 'Created' state (no --detach run, just create).
             subprocess.run(
-                ["docker", "create", "--name", name, sb.base_image, "tail", "-f", "/dev/null"],
+                [
+                    "docker",
+                    "create",
+                    "--name",
+                    name,
+                    sb.agconfig.sandbox.base_image,
+                    "tail",
+                    "-f",
+                    "/dev/null",
+                ],
                 capture_output=True,
                 check=True,
             )
@@ -1348,7 +1486,7 @@ class TestAgSandboxLifecycle:
 
 # ---------------------------------------------------------------------------
 # agSandbox — persistent sandboxes skip per-tool-call hibernation
-# (agtool.py:dispatch_tools(), agsandbox.py's _AgSandboxFields.persistent)
+# (agtool.py:dispatch_tools(), agconfig.persistent)
 # ---------------------------------------------------------------------------
 
 
@@ -1368,6 +1506,7 @@ class TestAgSandboxPersistentDispatch:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxExec:
     @docker
     def setup_method(self, _):
@@ -1397,11 +1536,18 @@ class TestAgSandboxExec:
         assert "/tmp/mydir" in out
 
     def test_exec_cuda_env_prefix(self):
-        self.sb._gpu_id = 3
+        self.sb._gpu_ids = [3]
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert "3" in out
-        self.sb._gpu_id = None
+        self.sb._gpu_ids = []
+
+    def test_exec_cuda_env_prefix_multiple_gpus(self):
+        self.sb._gpu_ids = [3, 5]
+        out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
+        assert rc == 0
+        assert "3,5" in out
+        self.sb._gpu_ids = []
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1557,7 @@ class TestAgSandboxExec:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxExecDetached:
     @docker
     def setup_method(self, _):
@@ -1456,12 +1603,9 @@ class TestAgSandboxExecDetached:
         actual property a persistent in-container entrypoint depends on.
 
         Scans /proc with shell builtins rather than calling `pgrep`/`ps`:
-        procps is absent from the CPU image (python:3.12-slim + ripgrep,
-        what `GPU_TYPE=cpu ./images/build.sh` builds in CI) but present in
-        the CUDA/ROCm ones, whose full Ubuntu bases ship it -- so a
-        pgrep-based check passes on every GPU-built image and fails only on
-        CPU. Nothing in agency/ needs procps; this was the repo's only
-        caller. Matching the *start* of each cmdline is what keeps the
+        procps is absent from the sandbox base image, so a pgrep-based
+        check would fail outright. Nothing in agency/ needs procps; this
+        was the repo's only caller. Matching the *start* of each cmdline is what keeps the
         scanning shell (argv[0] "bash") and its own children from matching
         the pattern they are searching for.
 
@@ -1505,7 +1649,7 @@ class TestAgSandboxExecDetached:
 class TestAgSandboxAgencyPackageMount:
     @docker
     def test_agency_package_is_mounted_and_matches_host(self):
-        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, agency_package_dir
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, agency_package_dir
 
         sb = _make_sandbox()
         try:
@@ -1524,7 +1668,7 @@ class TestAgSandboxAgencyPackageMount:
 
     @docker
     def test_agency_package_mount_is_read_only(self):
-        from agency.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
 
         sb = _make_sandbox()
         try:
@@ -1537,15 +1681,15 @@ class TestAgSandboxAgencyPackageMount:
 # ---------------------------------------------------------------------------
 # agutil.ensure_python_packages_in_container -- resolves the dependency gap
 # a container-relocated agproxy_llm / full react-loop entrypoint (Phase 2b /
-# 3b) hits: agency-sandbox:latest carries httpx/pydantic but not
-# fastapi/uvicorn/openai.
+# 3b) hits: the sandbox base image is a bare Python image and carries none
+# of httpx/pydantic/fastapi/uvicorn/openai.
 # ---------------------------------------------------------------------------
 
 
 class TestEnsurePythonPackagesInContainer:
     @docker
     def test_installs_a_missing_package(self):
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1561,26 +1705,34 @@ class TestEnsurePythonPackagesInContainer:
 
     @docker
     def test_noop_when_already_present(self):
-        """A package already importable (httpx, confirmed present in the
-        base image) must not trigger any pip install at all -- verified by
-        making pip3 itself unusable and confirming that doesn't matter."""
-        from agency.agutil import ensure_python_packages_in_container
+        """An already-importable package must not trigger any pip install at
+        all -- verified by making pip3 unusable and confirming that doesn't
+        matter.
+
+        Uses a stdlib module rather than a third-party one. This test used to
+        assert httpx was "confirmed present in the base image", which was true
+        only of the old purpose-built sandbox image; against a stock Python
+        base it fails on its own premise rather than on the behaviour it is
+        supposed to be testing. A stdlib import is present in every image, so
+        the test now depends on nothing but the contract.
+        """
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
-            _, rc = sb.exec('python3 -c "import httpx"')
-            assert rc == 0, "httpx must already be present -- test assumes this baseline"
+            _, rc = sb.exec('python3 -c "import json"')
+            assert rc == 0, "stdlib import must work -- test assumes this baseline"
 
             # Break pip3 so any real install attempt would fail loudly.
             sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
 
-            ensure_python_packages_in_container(sb, ["httpx"], timeout_s=30)  # must not raise
+            ensure_python_packages_in_container(sb, ["json"], timeout_s=30)  # must not raise
         finally:
             sb.destroy()
 
     @docker
     def test_raises_on_a_nonexistent_package(self):
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1592,13 +1744,80 @@ class TestEnsurePythonPackagesInContainer:
             sb.destroy()
 
     @docker
+    def test_raises_before_pip_when_network_unreachable(self):
+        """A missing package plus no network must raise a diagnosable error.
+
+        Without the probe, pip's own failure is "Could not find a version
+        that satisfies the requirement X (from versions: none)", which reads
+        like a bad package name rather than a deliberately isolated sandbox.
+        The harness calls this on every launch, so that message would surface
+        as every agent failing to start for no visible reason.
+        """
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.utils.agutil import ensure_python_packages_in_container
+
+        cfg = agconfig_cls()
+        cfg.sandbox.flags = ["--network", "none"]
+        sb = _make_sandbox(agconfig=cfg)
+        try:
+            with pytest.raises(RuntimeError, match="no outbound network"):
+                ensure_python_packages_in_container(sb, ["fastapi"], timeout_s=60)
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_no_network_needed_when_nothing_is_missing(self):
+        """The no-network path must stay usable when the image already carries
+        everything -- this is what makes a --network none sandbox workable at
+        all, rather than the probe simply moving the failure earlier.
+
+        pip3 is broken here too, so reaching either the probe or the install
+        would fail rather than silently pass.
+        """
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.utils.agutil import ensure_python_packages_in_container
+
+        cfg = agconfig_cls()
+        cfg.sandbox.flags = ["--network", "none"]
+        sb = _make_sandbox(agconfig=cfg)
+        try:
+            sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
+            ensure_python_packages_in_container(sb, ["json", "os"], timeout_s=30)
+        finally:
+            sb.destroy()
+
+    @docker
+    def test_probe_reports_reachable_with_network(self):
+        """The probe must not be a blanket "always unreachable" -- otherwise
+        the raise above would fire on every ordinary networked sandbox."""
+        from agency.utils.agutil import _container_can_reach_pypi
+
+        sb = _make_sandbox()
+        try:
+            assert _container_can_reach_pypi(sb) is True
+        finally:
+            sb.destroy()
+
+    def test_probe_is_false_when_exec_raises(self):
+        """A backend that raises rather than returning a non-zero code must
+        read as unreachable, not propagate -- the caller turns this into its
+        own error message."""
+        from agency.utils.agutil import _container_can_reach_pypi
+
+        class _Exploding:
+            def exec(self, *args, **kwargs):
+                raise OSError("daemon gone")
+
+        assert _container_can_reach_pypi(_Exploding()) is False
+
+    @docker
     def test_installs_only_the_missing_subset(self):
         """Mixed request (one present, one missing) must only pip-install
         the missing one -- verified indirectly via the end state (both
         importable afterward), plus the noop-when-present test above
         already covers the "don't touch what's already there" contract
         directly."""
-        from agency.agutil import ensure_python_packages_in_container
+        from agency.utils.agutil import ensure_python_packages_in_container
 
         sb = _make_sandbox()
         try:
@@ -1616,6 +1835,7 @@ class TestEnsurePythonPackagesInContainer:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxFileIO:
     @docker
     def setup_method(self, _):
@@ -1662,14 +1882,16 @@ class TestAgSandboxReadFileUnit:
     """Unit tests for read_file error cases — no Docker required.
 
     read_file()'s base64-decode/error-mapping logic lives on the shared
-    agsandbox_backends.container._ContainerBackendBase, so these unit tests
+    sandbox.container._ContainerBackendBase, so these unit tests
     exercise it directly rather than through the agSandbox facade.
     """
 
     def _make_sb(self):
-        from agency.agsandbox_backends.container import _ContainerBackendBase
+        from agency.configs.agconfig import agconfig as agconfig_cls
+        from agency.sandbox.container import _ContainerBackendBase
 
         sb = _ContainerBackendBase.__new__(_ContainerBackendBase)
+        sb._agconfig = agconfig_cls()
         return sb
 
     def test_read_file_returns_text_content(self):
@@ -1719,6 +1941,7 @@ class TestAgSandboxReadFileUnit:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxPIDTracking:
     @docker
     def setup_method(self, _):
@@ -1809,6 +2032,12 @@ class TestAgSandboxPIDTracking:
         live = self.sb.get_live_pids()
         assert len(live) == 0
 
+    def test_hibernation_check_refreshes_exited_cpu_only_work(self):
+        self.sb.exec("sleep 1 >/dev/null 2>&1 &")
+        assert self.sb._has_pending_background_work() is True
+        time.sleep(1.2)
+        assert self.sb._has_pending_background_work() is False
+
     def test_get_live_pids_empty_when_no_background(self):
         self.sb.exec("echo hi")
         assert self.sb.get_live_pids() == set()
@@ -1852,10 +2081,11 @@ class TestAgSandboxPIDTracking:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxIngestPtracePids:
     """`ingest_ptrace_pids()` is the alternate _watched_pids population path
-    fed by agproxy_ptrace's fork/exit events for harness-driven agents (see
-    docs/agproxy_ptrace.md). Real-container tests here don't require the
+    fed by agproxy_ptrace's fork/exit events for harness-driven agents.
+    Real-container tests here don't require the
     pids to actually exist inside the container's own PID namespace --
     ingest_ptrace_pids()-fed pids are trusted regardless of what the
     container's own /proc scan shows (see get_live_pids()'s docstring-level
@@ -1910,13 +2140,13 @@ class TestAgSandboxIngestPtracePids:
 class TestIngestPtracePidsUnit:
     """Pure-logic tests -- no real container/chroot needed, _container_exec
     mocked to return no processes at all, matching
-    tests/agsandbox_backends/test_base.py's convention."""
+    tests/sandbox/test_base.py's convention."""
 
     def _make_backend(self):
         from unittest.mock import patch
-        from agency.agsandbox_backends.docker import _DockerBackend
+        from agency.sandbox.docker import _DockerBackend
 
-        with patch("agency.agsandbox_backends.container._runtime_works", return_value=True):
+        with patch("agency.sandbox.container._runtime_works", return_value=True):
             backend = _DockerBackend(
                 "unit-test-agent",
                 name="unit-test-container",
@@ -1976,6 +2206,7 @@ class TestIngestPtracePidsUnit:
 # ---------------------------------------------------------------------------
 
 
+@docker
 class TestAgSandboxResourceLimits:
     @docker
     def setup_method(self, _):
@@ -1997,13 +2228,11 @@ class TestAgSandboxResourceLimits:
 
     def test_release_resources_clears_gpu(self):
         pool = agResourcePool(gpus=[0])
-        gpu_id = pool.acquire_gpu()
-        self.sb._gpu_id = gpu_id
-        self.sb._gpu_virtual = True
-        self.sb._gpu_release_fn = pool.release_gpu
+        pool.acquire_gpus(self.sb, 1)
+        self.sb._gpu_count_requested = 1
         self.sb.release_resources(pool)
-        assert self.sb._gpu_id is None
-        assert self.sb._gpu_virtual is False
+        assert self.sb._gpu_ids == []
+        assert self.sb._gpu_count_requested == 0
         assert pool._gpus_acquired == 0
 
     def test_release_resources_none_pool(self):
@@ -2011,56 +2240,14 @@ class TestAgSandboxResourceLimits:
         self.sb.release_resources(None)
 
 
-# ---------------------------------------------------------------------------
-# Sandboxed tool factories
-# ---------------------------------------------------------------------------
-
-
-class TestSandboxedTools:
-    """bash/write/edit/daemon_release-via-tool-wrapper coverage was retired
-    here along with agency/tools/{bash,write,edit,resource}.py themselves
-    (execute_react()-only factories, see agency/tools/__init__.py's own
-    retirement note) -- the underlying sandbox methods these tools were
-    thin wrappers over remain fully covered directly: sb.exec() by
-    TestAgSandboxExec, sb.write_file()/read_file() by TestAgSandboxFileIO,
-    sb.release_daemon() by TestAgSandboxPIDTracking. glob/grep (still-alive
-    factories) are exercised below via make_glob()/make_grep() directly and
-    sb.write_file() for fixture setup, rather than through the retired
-    make_sandboxed_tools() bundle."""
-
-    @docker
-    def setup_method(self, _):
-        self.sb = _make_sandbox()
-
-    @docker
-    def teardown_method(self, _):
-        self.sb.destroy()
-
-    def test_glob_tool_finds_files(self):
-        from agency.tools.glob import make_glob
-
-        self.sb.write_file("/workspace/a.py", "x\n")
-        self.sb.write_file("/workspace/b.py", "y\n")
-        tool = make_glob(self.sb)
-        r = tool.fn(agdata(pattern="*.py", path="/workspace"))
-        assert len(r.files) >= 2
-
-    def test_grep_tool_finds_pattern(self):
-        from agency.tools.grep import make_grep
-
-        self.sb.write_file("/workspace/src.py", "SECRET=42\n")
-        tool = make_grep(self.sb)
-        r = tool.fn(agdata(pattern="SECRET", path="/workspace"))
-        assert any("SECRET" in m["text"] for m in r.matches)
-
-
+@docker
 class TestResourceTools:
     """reserve_gpu/reserve_cpu/cpu_release-via-tool-wrapper coverage was
     retired here along with agency/tools/resource.py itself
     (execute_react()-only factories). The underlying agSandbox/
     agResourcePool mechanics these tools were thin wrappers over (physical
     GPU acquisition during exec(), CPU/memory limit application) remain
-    real and in active use (agharness_internal/agmcp_server.py's own
+    real and in active use (harness/agmcp_server.py's own
     reserve_cpu/cpu_release tools call sandbox.update_limits()/pool.notify_
     cpu_acquired() the same way) -- exercised below by setting sandbox/pool
     state directly instead of through the retired tool wrappers. Tests that
@@ -2077,23 +2264,23 @@ class TestResourceTools:
     def teardown_method(self, _):
         self.sb.destroy()
 
-    def _reserve_gpu(self) -> None:
-        """Mirrors the retired make_gpu_reserve tool's own _run body: a
-        virtual-only reservation, no physical GPU claimed yet."""
-        self.sb._gpu_virtual = True
-        self.sb._gpu_acquire_fn = self.pool.acquire_gpu
-        self.sb._gpu_release_fn = self.pool.release_gpu
+    def _reserve_gpu(self, count: int = 1) -> None:
+        """Mirrors agskill._reserve_resource's own body: a virtual-only
+        reservation, no physical GPU claimed yet."""
+        self.sb._gpu_count_requested = count
+        self.sb._gpu_acquire_fn = functools.partial(self.pool.acquire_gpus, self.sb)
+        self.sb._gpu_release_fn = functools.partial(self.pool.release_gpus, self.sb)
 
     # ── physical GPU acquisition on bash exec ──────────────────────────────
 
-    def test_exec_acquires_physical_gpu_when_virtual_flag_set(self):
-        """exec() claims a physical GPU from the pool when _gpu_virtual is True."""
+    def test_exec_acquires_physical_gpu_when_requested(self):
+        """exec() claims a physical GPU from the pool when _gpu_count_requested > 0."""
         self._reserve_gpu()
         assert self.pool._gpus_acquired == 0
         self.sb.exec("echo hello")
         # Held until stop() (container-exit clear); there is no mid-skill release tool.
         assert self.pool._gpus_acquired == 1
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_ids
 
     def test_exec_sets_cuda_visible_devices(self):
         """CUDA_VISIBLE_DEVICES is set to a digit (the physical GPU ID) during exec()."""
@@ -2101,6 +2288,16 @@ class TestResourceTools:
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert out.strip().isdigit()
+
+    def test_exec_sets_cuda_visible_devices_for_multiple_gpus(self):
+        """CUDA_VISIBLE_DEVICES is a comma-joined list when multiple GPUs are requested."""
+        self._reserve_gpu(count=2)
+        out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
+        assert rc == 0
+        ids = out.strip().split(",")
+        assert len(ids) == 2
+        assert all(i.isdigit() for i in ids)
+        assert sorted(int(i) for i in ids) == sorted(self.sb._gpu_ids)
 
     def test_exec_without_reserve_hides_all_gpus(self):
         """Without reserving, CUDA_VISIBLE_DEVICES is 'NoDevFiles'."""
@@ -2114,27 +2311,27 @@ class TestResourceTools:
         """Physical GPU stays held after exec(); release waits on container exit (stop)."""
         self._reserve_gpu()
         self.sb.exec("echo hello")
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_ids
         assert self.pool._gpus_acquired == 1
-        assert self.sb._gpu_virtual is True
+        assert self.sb._gpu_count_requested > 0
 
     def test_consecutive_foreground_execs_reuse_same_physical_gpu(self):
         """Each foreground exec() reuses the already-held physical GPU."""
         self._reserve_gpu()
         self.sb.exec("echo first")
-        first = self.sb._gpu_id
-        assert first is not None
+        first = list(self.sb._gpu_ids)
+        assert first
         for _ in range(3):
             self.sb.exec("echo iteration")
-            assert self.sb._gpu_id == first
+            assert self.sb._gpu_ids == first
             assert self.pool._gpus_acquired == 1
 
     def test_virtual_reservation_and_physical_gpu_persist_across_execs(self):
-        """_gpu_virtual and the leased GPU stay set across successive exec() calls."""
+        """_gpu_count_requested and the leased GPU stay set across successive exec() calls."""
         self._reserve_gpu()
         self.sb.exec("echo first")
-        assert self.sb._gpu_virtual is True
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_count_requested > 0
+        assert self.sb._gpu_ids
         out, rc = self.sb.exec("echo $CUDA_VISIBLE_DEVICES")
         assert rc == 0
         assert out.strip().isdigit()
@@ -2152,7 +2349,7 @@ class TestResourceTools:
         self.sb.exec("sleep 30 &")
         live = self.sb.get_live_pids()
         assert len(live) > 0
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_ids
         assert self.pool._gpus_acquired == 1
         self.sb.exec("kill %1 2>/dev/null || true")
 
@@ -2161,10 +2358,10 @@ class TestResourceTools:
         self._reserve_gpu()
         self.sb.exec("sleep 30 &")  # ceiling, not a real wait -- see comment above
         self.sb.get_live_pids()
-        first_gpu_id = self.sb._gpu_id
-        assert first_gpu_id is not None
+        first_gpu_ids = list(self.sb._gpu_ids)
+        assert first_gpu_ids
         self.sb.exec("echo checking")
-        assert self.sb._gpu_id == first_gpu_id  # same physical GPU, not re-acquired
+        assert self.sb._gpu_ids == first_gpu_ids  # same physical GPU, not re-acquired
         self.sb.exec("kill %1 2>/dev/null || true")
 
     def test_physical_gpu_held_after_background_process_finishes(self):
@@ -2173,21 +2370,22 @@ class TestResourceTools:
         self.sb.exec("sleep 0.1 &")
         time.sleep(1.0)
         self.sb.get_live_pids()
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_ids
         assert self.pool._gpus_acquired == 1
-        assert self.sb._gpu_virtual is True
+        assert self.sb._gpu_count_requested > 0
 
     # ── waiting for physical GPU when pool is exhausted ────────────────────
 
     def test_exec_blocks_until_pool_gpu_is_freed(self):
         """exec() waits indefinitely for a physical GPU and unblocks once one is released."""
         pool1 = agResourcePool(gpus=[0])
-        pool1.acquire_gpu()  # exhaust the only GPU
+        holder = _resource_sandbox()
+        pool1.acquire_gpus(holder, 1)  # exhaust the only GPU
 
         sb2 = _make_sandbox()
-        sb2._gpu_virtual = True
-        sb2._gpu_acquire_fn = pool1.acquire_gpu
-        sb2._gpu_release_fn = pool1.release_gpu
+        sb2._gpu_count_requested = 1
+        sb2._gpu_acquire_fn = functools.partial(pool1.acquire_gpus, sb2)
+        sb2._gpu_release_fn = functools.partial(pool1.release_gpus, sb2)
 
         exec_started = threading.Event()
         exec_done = threading.Event()
@@ -2202,7 +2400,7 @@ class TestResourceTools:
         exec_started.wait()
         time.sleep(0.2)
         assert not exec_done.is_set()  # still waiting
-        pool1.release_gpu(0)  # free the GPU
+        pool1.release_gpus(holder, [0])  # free the GPU
         exec_done.wait(timeout=60)  # container startup (docker run) can take >5 s
         assert exec_done.is_set()
         sb2.destroy()
@@ -2210,39 +2408,28 @@ class TestResourceTools:
     # ── release_resources ─────────────────────────────────────────────────
 
     def test_release_resources_clears_both_virtual_flag_and_physical_gpu(self):
-        """release_resources() clears _gpu_virtual and returns any held physical GPU."""
+        """release_resources() clears _gpu_count_requested and returns any held physical GPU."""
         self._reserve_gpu()
         self.sb.exec("sleep 30 &")
         self.sb.get_live_pids()
-        assert self.sb._gpu_id is not None
+        assert self.sb._gpu_ids
         self.sb.release_resources(self.pool)
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
+        assert self.sb._gpu_count_requested == 0
+        assert self.sb._gpu_ids == []
         assert self.pool._gpus_acquired == 0
         self.sb.exec("kill %1 2>/dev/null || true")
 
     def test_release_resources_without_reserve_does_not_raise(self):
         """release_resources() is safe when no GPU was ever reserved."""
         self.sb.release_resources(self.pool)
-        assert self.sb._gpu_virtual is False
-        assert self.sb._gpu_id is None
+        assert self.sb._gpu_count_requested == 0
+        assert self.sb._gpu_ids == []
 
     # ── reserve_cpu / cpu_release ─────────────────────────────────────────
 
     def test_reserve_cpu_applies_limits(self):
-        self.sb.update_limits(cpus=2.0, memory="256m")
-        self.sb._cpu_acquired += 2.0
-        self.sb._memory_acquired_mb += 256
-        self.pool.notify_cpu_acquired(2.0, 256)
+        self.pool.acquire_cpu_mem(self.sb, 2.0, 256)
 
     def test_cpu_release_resets_to_idle(self):
-        self.sb.update_limits(cpus=4.0, memory="2g")
-        self.sb._cpu_acquired = 4.0
-        self.sb._memory_acquired_mb = 2048
-        self.pool.notify_cpu_acquired(4.0, 2048)
-
-        self.sb.update_limits(cpus=self.pool.idle_cpus, memory=self.pool.idle_memory)
-        held_cpus, held_mb = self.sb._cpu_acquired, self.sb._memory_acquired_mb
-        self.sb._cpu_acquired = 0.0
-        self.sb._memory_acquired_mb = 0
-        self.pool.notify_cpu_released(held_cpus, held_mb)
+        self.pool.acquire_cpu_mem(self.sb, 4.0, 2048)
+        self.pool.release_cpu_mem(self.sb, cpu=True, memory=True)

@@ -2,15 +2,135 @@
 
 import asyncio
 import json
-import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 
 import pytest
 
-from agency.profiler import agprof
-from agency.profiler import agprof_trace
+from agency.observability.profiler import agprof
+from agency.observability.profiler import agprof_trace
+from agency.observability.agdatalogger import agDataLogger
+
+
+def test_completed_profiler_spans_flow_to_agprofs_own_data_logger(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
+    try:
+        with agprof.span("parent"):
+            agprof.annotate(**{"agency.run_id": "run7"})
+
+            def child() -> None:
+                with agprof.span("child"):
+                    pass
+
+            worker = agprof.spawn_traced(child)
+            worker.start()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+    finally:
+        agprof.stop()
+
+    connection = sqlite3.connect(str(tmp_path / "profile_data.sqlite3"))
+    try:
+        rows = connection.execute(
+            "SELECT span_name,cpu_ms,runqueue_ms,blocked_ms,parent,attributes FROM spans"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    by_name = {row[0]: row for row in rows}
+    assert set(by_name) == {"parent", "child"}
+    parent = by_name["parent"]
+    child_row = by_name["child"]
+    assert parent[1] is not None
+    assert parent[3] is None if parent[2] is None else parent[3] >= 0
+    parent_attributes = json.loads(parent[5])
+    child_attributes = json.loads(child_row[5])
+    assert parent_attributes["agency.run_id"] == "run7"
+    assert child_row[4] == parent_attributes["agency.span_id"]
+    assert child_attributes["agency.parent_span_id"] == parent_attributes["agency.span_id"]
+
+
+def test_external_profiler_span_flows_to_agprofs_own_data_logger(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
+    try:
+        span = agprof.start_external_span(
+            "sync:scheduler_queue",
+            start_perf_ns=1_000_000_000,
+            start_wall_ns=2_000_000_000,
+            metadata={"request_id": "run3"},
+        )
+        assert span is not None
+        span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
+    finally:
+        agprof.stop()
+
+    connection = sqlite3.connect(str(tmp_path / "profile_data.sqlite3"))
+    try:
+        row = connection.execute(
+            "SELECT span_name,start_ts,end_ts,blocked_ms,attributes FROM spans"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row[:3] == ("sync:scheduler_queue", 2.0, 2.25)
+    assert row[3] is None  # Remote CPU/wait were not measured.
+    assert json.loads(row[4])["request_id"] == "run3"
+    record = agprof.profile_records()[0]
+    assert record[4] is None
+    assert record[5] is None
+    summary_row = agprof.summary_metrics()["span_metrics"][0]
+    assert summary_row["cpu_ms"] is None
+    assert summary_row["runqueue_ms"] is None
+    assert summary_row["blocked_ms"] is None
+
+
+def test_external_data_span_name_preserves_profiler_trace_name(monkeypatch):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    agprof.start(None, sample_hz=0, sample_gpu=False)
+    try:
+        span = agprof.start_external_span(
+            "run0:test:agent",
+            start_perf_ns=1_000_000_000,
+            start_wall_ns=2_000_000_000,
+            data_span_name="request:submission_to_completion",
+        )
+        span.end(end_perf_ns=1_250_000_000, end_wall_ns=2_250_000_000)
+    finally:
+        agprof.stop()
+
+    assert [record[1] for record in agprof.profile_records()] == ["run0:test:agent"]
+
+
+def test_profiler_uses_memory_when_its_disk_datalogger_cannot_start(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    real_start = agDataLogger.start
+
+    def start_or_fail(self):
+        if self.db_path != ":memory:":
+            raise OSError("disk unavailable")
+        real_start(self)
+
+    messages = []
+    monkeypatch.setattr(agDataLogger, "start", start_or_fail)
+    monkeypatch.setattr(agprof, "_agprof_print", messages.append)
+
+    with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
+        with agprof.span("memory-fallback"):
+            pass
+
+    assert [record[1] for record in agprof.profile_records()] == ["memory-fallback"]
+    assert any("using memory only: disk unavailable" in message for message in messages)
 
 
 def test_complete_summary_includes_per_process_workload_and_gpu_metrics(monkeypatch):
@@ -121,8 +241,8 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_session_sample_gpu", False)
     monkeypatch.setattr(
         agprof,
-        "_records",
-        [(7, "stage:work", 0, 1_000_000, 500_000, 100_000)],
+        "_load_profile_records",
+        lambda _session_id: [(7, "stage:work", 0, 1_000_000, 500_000, 100_000)],
     )
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
@@ -152,7 +272,7 @@ def test_stop_writes_json_and_markdown_summaries(monkeypatch, tmp_path):
     machine_summary = json.loads((tmp_path / "summary.json").read_text())
     human_summary = (tmp_path / "summary.md").read_text()
     trace = json.loads((tmp_path / "agprof.trace.json").read_text())
-    assert machine_summary["schema_version"] == 5
+    assert machine_summary["schema_version"] == 6
     assert "workload_metrics" in machine_summary
     assert machine_summary["process_metrics"] == []
     assert "host_metrics" not in machine_summary
@@ -177,7 +297,7 @@ def test_stop_reports_and_reraises_fatal_trace_failure(monkeypatch, tmp_path, fa
     monkeypatch.setattr(agprof, "_out_dir", tmp_path)
     monkeypatch.setattr(agprof, "_sampler", None)
     monkeypatch.setattr(agprof, "_session_started_ns", time.perf_counter_ns())
-    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_load_profile_records", lambda _session_id: [])
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
     monkeypatch.setattr(agprof, "_leases_open", {})
@@ -201,6 +321,18 @@ def test_stop_reports_and_reraises_fatal_trace_failure(monkeypatch, tmp_path, fa
     assert messages[1] == f"[agprof] WARNING: trace output failed: {failure}"
 
 
+def test_span_details_bound_text_and_snapshot_structured_values():
+    value = {"path": "calc.py"}
+    metadata = agprof.detail_metadata("tool.arguments", value)
+    value["path"] = "changed.py"
+    assert json.loads(metadata["tool.arguments"]) == {"path": "calc.py"}
+    assert metadata["tool.arguments_truncated"] is False
+    large = agprof.detail_metadata("tool.result", "x" * 40_000)
+    assert len(large["tool.result"]) == 32_768
+    assert large["tool.result_truncated"] is True
+    assert large["tool.result_chars"] == 40_000
+
+
 def test_agprof_print_flushes(monkeypatch):
     calls = []
     monkeypatch.setattr("builtins.print", lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -210,12 +342,13 @@ def test_agprof_print_flushes(monkeypatch):
     assert calls == [(("[agprof] message",), {"flush": True})]
 
 
-def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
+def test_perfetto_trace_emits_harness_spans_counters_and_gpu_leases():
     second = 1_000_000_000
     process_info = {
-        "101-10": {
-            "display_name": "python (PID 101)",
-            "trace_pid": 101,
+        "42-10": {
+            "display_name": "python (PID 42)",
+            "trace_pid": 42,
+            "pid": 42,
             "first_seen_ns": 0,
             "cgroup": "/workload",
             "cmdline": "python job.py",
@@ -247,8 +380,8 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
         ),
     ]
     samples = [
-        (second, "proc:101-10:cpu_s", 1.0),
-        (1_200_000_000, "proc:101-10:cpu_s", 1.04),
+        (second, "proc:42-10:cpu_s", 1.0),
+        (1_200_000_000, "proc:42-10:cpu_s", 1.04),
     ]
 
     trace = agprof_trace.build_trace(
@@ -274,7 +407,7 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
     assert tool["args"]["runqueue_ms"] == "n/a"
     assert counter == {
         "ph": "C",
-        "pid": 101,
+        "pid": 42,
         "tid": 0,
         "ts": 200_000.0,
         "name": "cpu_percent",
@@ -286,10 +419,111 @@ def test_perfetto_trace_emits_spans_counters_process_tracks_and_gpu_leases():
     assert lease["dur"] == 250_000.0
     assert any(
         event.get("name") == "process_name"
-        and event.get("pid") == 101
-        and event["args"]["name"] == "python (PID 101)"
+        and event.get("pid") == 42
+        and event["args"]["name"] == "python (PID 42)"
         for event in events
     )
+
+
+def test_trace_exports_only_harness_process_in_memory_and_on_disk(tmp_path):
+    kwargs = dict(
+        pid=42,
+        profile_root_pid=101,
+        started_ns=0,
+        process_info={
+            "root": {"pid": 101, "trace_pid": 101, "display_name": "Agency harness"},
+            "helper": {"pid": 202, "trace_pid": 202, "display_name": "podman exec"},
+        },
+        automatic_records=[
+            (101, 7, "app.run", __file__, 1, 1000, 1000, "return"),
+            (202, 7, "helper.run", __file__, 1, 1000, 1000, "return"),
+            (-2, 8, "remote.run", __file__, 1, 1000, 1000, "return"),
+        ],
+        thread_labels={(101, 7): (90, "Agency worker"), (202, 7): (90, "helper")},
+        observations=[
+            {"timestamp_ns": 1000, "trace_pid": 101, "trace_name": "rss_mb", "value": 20},
+            {"timestamp_ns": 1000, "trace_pid": 202, "trace_name": "helper_rss", "value": 5},
+            {"timestamp_ns": 1000, "trace_name": "gpu0:util_pct", "value": 50},
+        ],
+    )
+    records = [(7, "tool:read", 1000, 1000, None, None)]
+    trace = agprof_trace.build_trace(records, [], **kwargs)
+    path = agprof_trace.write_trace(tmp_path, records, [], **kwargs)
+    assert json.loads(path.read_text()) == trace
+    events = trace["traceEvents"]
+    assert {event["pid"] for event in events} == {42}
+    names = {event["name"] for event in events}
+    assert {"app.run", "tool:read", "rss_mb", "gpu0:util_pct"} <= names
+    assert names.isdisjoint({"helper.run", "remote.run", "helper_rss", "alive (sampled)"})
+    assert sum(event["name"] == "process_name" for event in events) == 1
+
+
+def test_trace_links_explicit_parents_including_same_thread_and_interrupted_spans(tmp_path):
+    records = [
+        (2, "llm:attempt[0]", 2000, 1000, None, None, {}, 2, 1),
+        (1, "run0:task:agent", 1000, 9000, None, None, {}, 1, None),
+        (1, "nested", 3000, 1000, None, None, {}, 3, 1),
+        (3, "orphan", 3000, 1000, None, None, {}, 4, 99),
+        (4, "legacy", 3000, 1000, None, None),
+    ]
+    kwargs = dict(
+        pid=42,
+        process_info={},
+        observations=[],
+        started_ns=0,
+        interrupted_spans=[
+            {
+                "thread_id": 5,
+                "label": "tool:read",
+                "started_ns": 4000,
+                "duration_ms": 1,
+                "span_id": "0000000000000005",
+                "parent_span_id": "0000000000000001",
+            }
+        ],
+    )
+    trace = agprof_trace.build_trace(records, [], **kwargs)
+    assert (
+        json.loads(agprof_trace.write_trace(tmp_path, records, [], **kwargs).read_text()) == trace
+    )
+    flows = [event for event in trace["traceEvents"] if event.get("cat") == "agprof.relationship"]
+    assert len(flows) == 6
+    starts = {event["id"]: event for event in flows if event["ph"] == "s"}
+    ends = {event["id"]: event for event in flows if event["ph"] == "f"}
+    assert starts.keys() == ends.keys()
+    assert {event["tid"] for event in ends.values()} == {1, 2, 5}
+    for flow_id, start in starts.items():
+        end = ends[flow_id]
+        assert start["tid"] == 1
+        assert start["ts"] == 1.0 <= end["ts"]
+        assert start["pid"] == end["pid"] == 42
+        assert end["bp"] == "e"
+        assert start["args"] == end["args"]
+
+
+def test_trace_links_python_and_legacy_nesting_without_linking_unrelated_tracks():
+    trace = agprof_trace.build_trace(
+        [(1, "tool:read", 3000, 2000, None, None)],
+        [],
+        pid=42,
+        process_info={},
+        observations=[],
+        started_ns=0,
+        automatic_records=[
+            (42, 1, "outer", "app.py", 1, 1000, 10000, "return"),
+            (42, 1, "inner", "app.py", 2, 2000, 5000, "return"),
+            (42, 2, "unrelated", "app.py", 3, 3000, 2000, "return"),
+            (99, 1, "helper", "app.py", 4, 3000, 2000, "return"),
+        ],
+    )
+    events = trace["traceEvents"]
+    names = {e["args"]["trace_span_id"]: e["name"] for e in events if e["ph"] == "X"}
+    links = [e["args"] for e in events if e["ph"] == "s"]
+    assert {(names[e["parent_trace_span_id"]], names[e["child_trace_span_id"]]) for e in links} == {
+        ("outer", "inner"),
+        ("inner", "tool:read"),
+    }
+    assert all(e["relationship"] == "same_track_nesting" for e in links)
 
 
 def test_perfetto_trace_keeps_interrupted_spans():
@@ -314,7 +548,11 @@ def test_perfetto_trace_keeps_interrupted_spans():
     span = next(event for event in trace["traceEvents"] if event.get("ph") == "X")
     assert span["ts"] == 0.0
     assert span["dur"] == 2500.0
-    assert span["args"] == {"reason": "session stopped", "outcome": "interrupted"}
+    assert span["args"] == {
+        "reason": "session stopped",
+        "outcome": "interrupted",
+        "trace_span_id": "slice:0",
+    }
 
 
 def test_write_trace_streams_json_without_building_one_giant_string(monkeypatch, tmp_path):
@@ -427,8 +665,10 @@ def test_derived_rollups_include_outcomes_percentiles_tokens_energy_and_interrup
     assert summary["run_metrics"]["p50_ms"] == 1500.0
     assert summary["llm_metrics"]["calls"] == 2
     assert summary["llm_metrics"]["retries"] == 1
-    assert summary["llm_metrics"]["input_tokens"] == 60
-    assert summary["llm_metrics"]["output_tokens"] == 90
+    assert summary["llm_metrics"]["input_tokens"] is None
+    assert summary["llm_metrics"]["reported_input_tokens"] == 60
+    assert summary["llm_metrics"]["output_tokens"] is None
+    assert summary["llm_metrics"]["reported_output_tokens"] == 90
     assert summary["llm_metrics"]["ttft"]["p50_ms"] == 150.0
     assert summary["llm_metrics"]["output_tokens_per_second"] == 100.0
     assert summary["tool_metrics"]["started"] == 3
@@ -468,7 +708,7 @@ def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
     monkeypatch.setattr(agprof, "_session_started_ns", time.perf_counter_ns() - 1_000_000)
     monkeypatch.setattr(agprof, "_session_sample_hz", 0.0)
     monkeypatch.setattr(agprof, "_session_sample_gpu", False)
-    monkeypatch.setattr(agprof, "_records", [])
+    monkeypatch.setattr(agprof, "_load_profile_records", lambda _session_id: [])
     monkeypatch.setattr(agprof, "_samples", [])
     monkeypatch.setattr(agprof, "_leases", [])
     monkeypatch.setattr(agprof, "_leases_open", {})
@@ -491,7 +731,7 @@ def test_stop_snapshots_open_spans_as_interrupted(monkeypatch, tmp_path):
     assert summary["run_metrics"]["completed"] == 0
     assert summary["run_metrics"]["interrupted"] == 1
     assert summary["incomplete_spans"][0]["label"] == "run0:test:agent"
-    assert not agprof._records
+    assert not agprof.profile_records()
     assert active._span.ended
     assert active._span.attributes["outcome"] == "interrupted"
 
@@ -531,7 +771,7 @@ def test_real_session_keeps_semantic_spans_and_automatic_calls(monkeypatch, tmp_
     assert agprof.summary_metrics()["automatic_function_metrics"]["captured"] > 0
 
 
-def test_trace_emits_semantic_thread_name_and_sampled_process_lifetime():
+def test_trace_emits_semantic_thread_name_without_sampled_process_lifetime():
     process_info = {
         "101-10": {
             "pid": 101,
@@ -564,9 +804,8 @@ def test_trace_emits_semantic_thread_name_and_sampled_process_lifetime():
         and event["args"]["name"] == "Agency tool dispatcher"
         for event in events
     )
-    lifetime = next(event for event in events if event.get("name") == "alive (sampled)")
-    assert lifetime["pid"] == 101
-    assert lifetime["dur"] == 5.0
+    assert not any(event.get("name") == "alive (sampled)" for event in events)
+    assert {event["pid"] for event in events} == {101}
 
 
 def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
@@ -578,7 +817,7 @@ def test_real_otel_session_records_nested_parent_ids(monkeypatch, tmp_path):
             with agprof.span("sandbox:exec"):
                 agprof.annotate(operation="read")
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     run = records["run0:test:agent"]
     sandbox = records["sandbox:exec"]
     assert len(run) == 9
@@ -622,7 +861,7 @@ def test_external_span_completion_can_retime_exact_interval(monkeypatch, tmp_pat
                 metadata={"outcome": "success"},
             )
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     run = records["run0:test:agent"]
     tool = records["tool:bash"]
     assert tool[2] == exact_start_perf_ns
@@ -656,7 +895,7 @@ def test_open_external_span_is_interrupted_at_profiler_stop(monkeypatch, tmp_pat
     assert external._interrupted
     assert external._span.end_time is not None
     external.end(end_perf_ns=time.perf_counter_ns(), end_wall_ns=time.time_ns())
-    assert not any(record[1] == "process:sleep" for record in agprof._records)
+    assert not any(record[1] == "process:sleep" for record in agprof.profile_records())
 
 
 def test_cancel_external_span_is_silent_and_idempotent(monkeypatch, tmp_path):
@@ -677,7 +916,7 @@ def test_cancel_external_span_is_silent_and_idempotent(monkeypatch, tmp_path):
     assert external._cancelled
     assert external._span is None
     assert id(external) not in agprof._open_spans
-    assert not any(record[1] == "tool:duplicate" for record in agprof._records)
+    assert not any(record[1] == "tool:duplicate" for record in agprof.profile_records())
     summary = json.loads((tmp_path / "summary.json").read_text())
     assert not any(span["label"] == "tool:duplicate" for span in summary["incomplete_spans"])
 
@@ -782,7 +1021,7 @@ def test_concurrent_async_spans_keep_annotations_task_local(monkeypatch, tmp_pat
     with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
         asyncio.run(overlap_spans())
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     assert records["async:first"][6]["owner"] == "first"
     assert records["async:second"][6]["owner"] == "second"
     assert records["async:first"][8] is None
@@ -810,8 +1049,12 @@ def test_profile_scope(monkeypatch, value, expected):
     assert agprof.profile_scope() == expected
 
 
-def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeypatch):
+def test_non_linux_environment_profiling_degrades_before_cgroup_or_profiler(monkeypatch, capsys):
+    """AGENCY_PROFILE defaults to on, so this must not crash import on a
+    non-Linux host -- it degrades to running unprofiled instead, same as
+    the sudo/cgroup-unavailable case."""
     monkeypatch.setenv("AGENCY_PROFILE", "1")
+    monkeypatch.setenv("AGENCY_PROFILE_SCOPE", "process")
     monkeypatch.setattr(agprof.sys, "platform", "darwin")
     monkeypatch.setattr(
         agprof,
@@ -824,16 +1067,61 @@ def test_non_linux_environment_profiling_fails_before_cgroup_or_profiler(monkeyp
         lambda: pytest.fail("must reject before profiler startup"),
     )
 
-    with pytest.raises(RuntimeError, match="profiling is Linux-only"):
-        agprof._initialize_environment_profiling()
+    agprof._initialize_environment_profiling()  # must not raise
+
+    assert "profiling is Linux-only" in capsys.readouterr().out
 
 
-def test_environment_cgroup_prefers_system_slice(monkeypatch):
+class _FakeExeced(Exception):
+    """Marks a mocked os.execvp call as 'succeeded' -- the real os.execvp
+    never returns on success (the process image is replaced), so a mock
+    that just records args and returns would wrongly let
+    _ensure_environment_cgroup's code fall through to try the NEXT
+    candidate command too. Raising something other than OSError instead
+    stops it there, the same way a real successful exec would."""
+
+
+def test_environment_cgroup_reexec_tries_user_scope_before_sudo(monkeypatch):
+    """The no-sudo systemd --user scope must be tried first -- passwordless
+    sudo is a fallback, not a hard requirement, on a host with ordinary
+    systemd user-session cgroup delegation."""
+    captured = {}
+
+    def fake_execvp(executable, argv):
+        captured.update(executable=executable, argv=argv)
+        raise _FakeExeced
+
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", raising=False)
+    monkeypatch.setattr(agprof, "_user_scope_available", lambda: True)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
+    monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
+    monkeypatch.setattr(agprof.os, "execvp", fake_execvp)
+
+    with pytest.raises(_FakeExeced):
+        agprof._ensure_environment_cgroup()
+
+    assert captured["executable"] == "systemd-run"
+    command = captured["argv"]
+    assert command[:5] == ["systemd-run", "--user", "--scope", "--collect", "--quiet"]
+    assert "sudo" not in command
+    assert "AGENCY_PROFILE_CGROUP_USER_REEXEC=1" in command
+    assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
+
+
+def test_environment_cgroup_reexec_falls_back_to_sudo_without_user_scope(monkeypatch):
+    """argv[0] must be the resolved interpreter (sys.executable), not whatever
+    bare name the caller typed -- the reconstructed command runs through
+    sudo/systemd-run/setpriv, whose secure_path can override $PATH even under
+    sudo -E, so a bare "python" could resolve to a different interpreter than
+    the one actually running and silently lose the active venv."""
     captured = {}
     monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
-    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
-    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
+    monkeypatch.delenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", raising=False)
+    monkeypatch.setattr(agprof, "_user_scope_available", lambda: False)
+    monkeypatch.setattr(agprof.sys, "orig_argv", ["python", "bench.py", "--quick"])
+    monkeypatch.setattr(agprof.sys, "executable", "/venv/bin/python")
     monkeypatch.setattr(agprof.os, "getuid", lambda: 1234)
     monkeypatch.setattr(agprof.os, "getgid", lambda: 5678)
     monkeypatch.setenv("USER", "benchmark")
@@ -859,95 +1147,26 @@ def test_environment_cgroup_prefers_system_slice(monkeypatch):
     assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
 
 
-def test_environment_cgroup_falls_back_to_user_scope(monkeypatch):
-    captured = {}
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
-    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: False)
-    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: True)
-    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py", "--quick"])
-    monkeypatch.setattr(agprof.uuid, "uuid4", lambda: type("U", (), {"hex": "abcdef012345"})())
+def test_environment_cgroup_adopts_current_dir_after_user_scope_landing(tmp_path, monkeypatch):
+    """A --user-scope cgroup's exact path isn't predictable in advance the
+    way the sudo system-slice path's is, so after landing inside it, the
+    process must discover (not re-exec into) its own current cgroup."""
+    (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
+    (tmp_path / "memory.current").write_text("0")
+    (tmp_path / "cgroup.procs").write_text(f"{__import__('os').getpid()}\n")
+    # Record an undo entry even when this variable was initially absent.
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP", "")
+    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_USER_REEXEC", "1")
+    monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: tmp_path)
     monkeypatch.setattr(
         agprof.os,
         "execvp",
-        lambda executable, argv: captured.update(executable=executable, argv=argv),
+        lambda *_a, **_k: pytest.fail("must not re-exec a second time"),
     )
 
     agprof._ensure_environment_cgroup()
 
-    assert captured["executable"] == "systemd-run"
-    command = captured["argv"]
-    assert command[:3] == ["systemd-run", "--user", "--scope"]
-    unit = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--unit="))
-    assert unit.startswith("agprof-") and unit.endswith(".scope")
-    assert f"AGENCY_PROFILE_USER_SCOPE={unit}" in command
-    assert not any(arg.startswith("AGENCY_PROFILE_CGROUP=") for arg in command)
-    assert not any(arg.startswith("AGENCY_PROFILE_CGROUP_PARENT=") for arg in command)
-    assert command[-3:] == ["/venv/bin/python", "bench.py", "--quick"]
-
-
-def test_environment_cgroup_falls_back_when_system_exec_fails(monkeypatch):
-    commands = []
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
-    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: True)
-    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: True)
-    monkeypatch.setattr(agprof.sys, "orig_argv", ["/venv/bin/python", "bench.py"])
-
-    def fake_execvp(executable, argv):
-        commands.append((executable, argv))
-        if executable == "sudo":
-            raise OSError("sudo disappeared after the capability probe")
-
-    monkeypatch.setattr(agprof.os, "execvp", fake_execvp)
-
-    agprof._ensure_environment_cgroup()
-
-    assert [executable for executable, _argv in commands] == ["sudo", "systemd-run"]
-
-
-def test_system_cgroup_probe_checks_systemd_run_permission(monkeypatch):
-    captured = []
-    monkeypatch.setattr(
-        agprof,
-        "_command_succeeds",
-        lambda command: captured.append(command) or True,
-    )
-
-    assert agprof._system_cgroup_available() is True
-    assert captured == [["sudo", "-n", "systemd-run", "--version"]]
-
-
-def test_environment_cgroup_user_scope_child_discovers_current_cgroup(tmp_path, monkeypatch):
-    scope = tmp_path / "agprof-12ab.scope"
-    scope.mkdir()
-    for name in ("cpu.stat", "memory.current", "cgroup.procs"):
-        (scope / name).write_text("")
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.setenv("AGENCY_PROFILE_CGROUP_PARENT", "agprof-stale.slice")
-    monkeypatch.setenv("AGENCY_PROFILE_USER_SCOPE", scope.name)
-    monkeypatch.setattr(agprof, "_current_cgroup_dir", lambda: scope)
-    monkeypatch.setattr(
-        agprof.os,
-        "execvp",
-        lambda *_args: pytest.fail("user-scope child must not re-exec"),
-    )
-
-    agprof._ensure_environment_cgroup()
-
-    assert os.environ["AGENCY_PROFILE_CGROUP"] == str(scope)
-    assert "AGENCY_PROFILE_CGROUP_PARENT" not in os.environ
-    assert agprof.container_cgroup_parent() is None
-
-
-def test_environment_cgroup_fails_when_neither_systemd_path_is_available(monkeypatch):
-    monkeypatch.delenv("AGENCY_PROFILE_CGROUP", raising=False)
-    monkeypatch.delenv("AGENCY_PROFILE_USER_SCOPE", raising=False)
-    monkeypatch.setattr(agprof, "_system_cgroup_available", lambda: False)
-    monkeypatch.setattr(agprof, "_user_cgroup_available", lambda: False)
-
-    with pytest.raises(RuntimeError, match="passwordless sudo is unavailable"):
-        agprof._ensure_environment_cgroup()
+    assert agprof.os.environ["AGENCY_PROFILE_CGROUP"] == str(tmp_path)
 
 
 def test_workload_cgroup_sampler_reads_aggregate_cpu_memory_and_io(tmp_path, monkeypatch):
@@ -1225,22 +1444,15 @@ def test_process_scope_is_the_only_environment_autostart(monkeypatch):
     ]
 
 
-def test_process_shutdown_drains_shared_services_before_stopping_profiler(monkeypatch):
-    from agency.agharness_internal import shared_services
-
+def test_process_shutdown_stops_profiler_exactly_once(monkeypatch):
     events = []
     monkeypatch.setattr(agprof, "_process_shutdown_started", False)
-    monkeypatch.setattr(
-        shared_services,
-        "drain_shared_services",
-        lambda: events.append("drain"),
-    )
     monkeypatch.setattr(agprof, "stop", lambda: events.append("stop"))
 
     agprof._shutdown_process_profile()
     agprof._shutdown_process_profile()
 
-    assert events == ["drain", "stop"]
+    assert events == ["stop"]
 
 
 def test_process_signal_handler_shuts_down_then_restores_and_reraises(monkeypatch):
@@ -1282,7 +1494,7 @@ def test_spawn_traced_preserves_parent_span_across_thread(monkeypatch, tmp_path)
             thread.join(timeout=2)
             assert not thread.is_alive()
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     assert records["child"][8] == records["parent"][7]
 
 
@@ -1305,7 +1517,7 @@ def test_agmap_tasks_are_traced_children_of_the_enclosing_span(monkeypatch, tmp_
     (silently -- a disconnected root is a valid trace). Each task span must
     instead parent to whatever ran the map, and must stay a *task* label so
     run_metrics keeps counting only agent runs."""
-    from agency.agmap import agmap
+    from agency.utils.agmap import agmap
 
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 
@@ -1315,7 +1527,7 @@ def test_agmap_tasks_are_traced_children_of_the_enclosing_span(monkeypatch, tmp_
 
     assert [task.result for task in results] == [2, 4, 6]
 
-    records = {record[1]: record for record in agprof._records}
+    records = {record[1]: record for record in agprof.profile_records()}
     for index in range(3):
         record = records[f"agmap:_double[{index}]"]
         assert record[8] == records["parent"][7]  # parent_span_id -> the map's span
@@ -1329,7 +1541,7 @@ def test_agmap_task_error_is_annotated_as_a_failure(monkeypatch, tmp_path):
     """A mapped task's exception becomes an agerror rather than propagating,
     so the span cannot see it as a raised exception -- the outcome has to be
     annotated explicitly or a failed fan-out reads as all-success."""
-    from agency.agmap import agmap
+    from agency.utils.agmap import agmap
 
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 
@@ -1338,7 +1550,7 @@ def test_agmap_task_error_is_annotated_as_a_failure(monkeypatch, tmp_path):
 
     assert "mapped task blew up" in result._data["error"]
 
-    record = {record[1]: record for record in agprof._records}["agmap:_boom[0]"]
+    record = {record[1]: record for record in agprof.profile_records()}["agmap:_boom[0]"]
     assert record[6]["outcome"] == "failure"
     assert record[6]["error_type"] == "agmap_task_error"
 
@@ -1365,7 +1577,10 @@ def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
 
 
 def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
-    import agency.agwebui as agwebui_module
+    import agency.observability.agwebui as agwebui_module
+    from agency.observability.agwebui import build_perfetto
+
+    monkeypatch.setattr(build_perfetto, "ensure_viewer", lambda: None)
 
     events = []
 
@@ -1412,3 +1627,31 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     agwebui_module.agwebui.run(fn, run_dir=tmp_path, port=17860, linger=False)
 
     assert events[:3] == ["profile-start", "workload", "profile-stop"]
+
+
+@pytest.mark.parametrize("failure", ["cgroup", "thread_start"])
+def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("sampler startup failed")
+
+    if failure == "cgroup":
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", fail)
+    else:
+        monkeypatch.setattr(agprof, "_process_cgroup_dir", lambda: tmp_path)
+        monkeypatch.setattr(agprof._Sampler, "start", fail)
+    try:
+        with pytest.raises(RuntimeError, match="sampler startup failed"):
+            agprof.start(tmp_path / "failed", sample_hz=10, sample_gpu=False)
+        assert not agprof.enabled()
+        assert agprof._profile_data_logger is None
+        with agprof.session(tmp_path / "retry", sample_hz=0, sample_gpu=False):
+            with agprof.span("retry_succeeded"):
+                pass
+        assert any(row[1] == "retry_succeeded" for row in agprof.profile_records())
+    finally:
+        # The regression must not poison other tests when run against old code.
+        if agprof._sampler is not None and not agprof._sampler.is_alive():
+            agprof._sampler = None
+        agprof.stop()

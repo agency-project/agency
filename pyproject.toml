@@ -10,7 +10,6 @@ dependencies = [
     "cloudpickle",
     "boto3",
     "botocore[crt]",
-    "aws_bedrock_token_generator",
     "anthropic",
     "podman>=5.8.0",
     "textual>=8.2.7",
@@ -18,24 +17,17 @@ dependencies = [
     "uvicorn[standard]>=0.20.0",
     "websocket-client",
     "pyseccomp",
-    "mcp"
-]
-
-[project.optional-dependencies]
-profiler = [
+    "pyte>=0.8.2",
+    "mcp",
+    # Profiling (agprof) is a core dependency, not an opt-in extra: any
+    # install must be able to profile without a separate install step.
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp",
     "nvidia-ml-py",
 ]
+
+[project.optional-dependencies]
 dev = [
-    # The test suite covers the profiler, and tests/test_agprof*.py import
-    # opentelemetry at module scope rather than skipping without it -- so a
-    # dev install missing this extra fails ~19 tests for a reason that looks
-    # like a code regression. `profiler` still exists separately because it is
-    # a runtime feature extra: agency runs fine without OTel (agprof imports
-    # it lazily and only when profiling is actually enabled), so a deployment
-    # that never profiles should not have to carry it.
-    "agency[profiler]",
     "pytest",
     "pytest-mock",
     "pytest-timeout",
@@ -65,16 +57,8 @@ line-length = 100
 # deliberately later rather than fixing/suppressing a wall of pre-existing
 # style findings just to turn a rule on.
 #
-# S110/S112 (flake8-bandit try-except-pass/try-except-continue) added
-# deliberately narrow: catches an except body that does nothing at all (no
-# log, no re-raise) -- true silent swallowing, not the many legitimate
-# best-effort `except Exception as e: print(f"WARNING: {e}")` catches
-# elsewhere in this codebase, which still surface a message. 28 pre-existing
-# hits exist across the repo (agresources.py's GPU/memory-detection
-# fallback probing, a few agwebui/agllm/agterm/agschema spots, two test
-# files) -- like the pycodestyle rules above, this is not being retroactively
-# fixed wall-to-wall; pre-commit only lints changed files by default, so
-# this only blocks *new* silent-swallow patterns going forward.
+# S110/S112 catch silent exception swallowing. Intentional best-effort
+# cleanup sites carry local explanations or report the failure.
 select = ["F", "S110", "S112"]
 
 [tool.pytest.ini_options]

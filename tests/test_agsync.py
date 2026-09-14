@@ -1,21 +1,19 @@
 """Tests for agsync — barrier synchronisation over agents and teams."""
 
-import time
 import pytest
-from agency.agsync import agsync
+from agency.utils.agsync import agsync
 from agency.agteam import agteam
 from agency.agdata import agdata
 from agency.agent import agent
-from agency._context import _active_team
-from agency.agconfig import agConfig
+from agency.agteam import _active_team
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
-LLM_CFG = {"api_key": "k", "model": "m"}
-LLM_AGCONFIG = agConfig({"agllm_backend": LLM_CFG})
+LLM_AGCONFIG = agconfig_cls(llmconfig(api_key="k", model="m"))
 
 
 class _SimpleTeam(agteam):
@@ -30,16 +28,38 @@ class _SimpleTeam(agteam):
         return agdata(done=True)
 
 
-def _slow_team(delay: float = 0.15):
-    class _T(agteam):
-        def setup(self):
-            pass
+def test_agsync_joins_an_earlier_overlapping_team_run(monkeypatch):
+    import threading
 
-        def run(self):
-            time.sleep(delay)
+    release = threading.Event()
+    joining_first = threading.Event()
+
+    class Team(agteam):
+        def run(self, blocked):
+            if blocked:
+                assert release.wait(2)
             return agdata(done=True)
 
-    return _T()
+    team = Team()
+    first = team.run(True)
+    future = object.__getattribute__(first, "_future")
+    result = future.result
+
+    def observed_result(*args, **kwargs):
+        joining_first.set()
+        return result(*args, **kwargs)
+
+    monkeypatch.setattr(future, "result", observed_result)
+    team.run(False).wait(timeout=2)
+    worker = threading.Thread(target=agsync, args=(team,))
+    worker.start()
+    try:
+        assert joining_first.wait(2)
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert first.wait(timeout=2).done
 
 
 # ---------------------------------------------------------------------------
@@ -108,81 +128,6 @@ def test_agsync_raises_on_nested_list():
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent teams
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("n_agents", [1, 2, 3, 5])
-def test_agsync_resolves_all_agents_in_team(n_agents):
-    class _T(agteam):
-        agconfig = LLM_AGCONFIG
-
-        def setup(self):
-            self.ags = [agent() for _ in range(n_agents)]
-
-        def run(self):
-            pass
-
-    agsync(_T())  # must not raise or deadlock
-
-
-# ---------------------------------------------------------------------------
-# Barrier semantics — tasks must be finished before agsync returns
-# ---------------------------------------------------------------------------
-
-
-def test_agsync_waits_for_submitted_team():
-    team = _slow_team(0.15)
-    pending = team.run()
-    assert pending.is_pending()
-    agsync(team)
-    assert not pending.is_pending()
-
-
-def test_agsync_waits_for_multiple_submitted_teams():
-    teams = [_slow_team(0.15) for _ in range(4)]
-    pending = [t.run() for t in teams]
-    agsync(teams)
-    for p in pending:
-        assert not p.is_pending()
-
-
-def test_agsync_is_a_real_barrier_not_early_return():
-    """agsync must not return before the slowest team finishes."""
-    finished = []
-
-    class _T(agteam):
-        def setup(self):
-            pass
-
-        def run(self):
-            time.sleep(0.15)
-            finished.append(1)
-            return agdata(done=True)
-
-    teams = [_T() for _ in range(3)]
-    [t.run() for t in teams]
-    agsync(teams)
-    assert len(finished) == 3
-
-
-def test_agsync_already_finished_team_returns_immediately():
-    team = _slow_team(0.0)
-    team.run()
-    agsync(team)  # fully resolved already
-    t0 = time.perf_counter()
-    agsync(team)
-    assert time.perf_counter() - t0 < 0.1
-
-
-def test_agsync_team_never_run_returns_immediately():
-    team = _SimpleTeam()  # run() never called
-    t0 = time.perf_counter()
-    agsync(team)
-    assert time.perf_counter() - t0 < 0.1
-
-
-# ---------------------------------------------------------------------------
 # Exception propagation
 # ---------------------------------------------------------------------------
 
@@ -242,32 +187,52 @@ def test_agsync_raises_exception_group_for_multiple_failures():
     assert all(isinstance(e, ValueError) for e in exc_info.value.exceptions)
 
 
-def test_agsync_joins_all_teams_before_raising():
-    """A fast-failing team must not cause slow teams to be abandoned."""
-    finished = []
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_agsync_joins_all_teams_before_returning_or_raising(monkeypatch, fail_first):
+    import threading
 
-    class _Fast(agteam):
-        def setup(self):
-            pass
+    release = threading.Event()
+    joining = threading.Event()
+    errors = []
 
-        def run(self):
-            raise RuntimeError("fast failure")
+    class Team(agteam):
+        def run(self, slow=False):
+            if slow:
+                assert release.wait(2)
+            elif fail_first:
+                raise RuntimeError("first failure")
+            return agdata(done=True)
 
-    class _Slow(agteam):
-        def setup(self):
-            pass
+    first, second = Team(), Team()
+    first.run()
+    slow_result = second.run(slow=True)
+    future = object.__getattribute__(slow_result, "_future")
+    original_result = future.result
 
-        def run(self):
-            time.sleep(0.15)
-            finished.append(1)
-            return agdata(ok=True)
+    def observed_result(*args, **kwargs):
+        joining.set()
+        return original_result(*args, **kwargs)
 
-    teams = [_Fast(), _Slow(), _Slow()]
-    [t.run() for t in teams]
-    with pytest.raises(RuntimeError):
-        agsync(teams)
-    # Both slow teams must have completed despite the fast failure.
-    assert len(finished) == 2
+    monkeypatch.setattr(future, "result", observed_result)
+
+    def sync():
+        try:
+            agsync(first, second)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=sync)
+    worker.start()
+    try:
+        assert joining.wait(2)
+        assert errors == []
+        assert slow_result.is_pending()
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert slow_result.wait(timeout=2).done
+    assert [str(error) for error in errors] == (["first failure"] if fail_first else [])
 
 
 def test_agsync_does_not_raise_for_idle_team_that_had_no_error():

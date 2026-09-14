@@ -1,9 +1,9 @@
-import io
+import asyncio
 import json
+from dataclasses import dataclass
+from concurrent.futures import Future
 import pytest
-from unittest.mock import MagicMock, patch
 
-import agency.agwebui as _agwebui_mod
 from agency.agdata import agdata, agerror
 
 
@@ -143,79 +143,18 @@ def test_pending_agdata_resolves_on_to_json():
 
 
 # ---------------------------------------------------------------------------
-# Error emission
+# agerror construction
 # ---------------------------------------------------------------------------
 
 
-class TestErrorEmission:
-    def test_error_string_prints_to_stderr(self):
-        """agerror('...') emits to stderr immediately at construction."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("something went wrong")
-        assert "something went wrong" in buf.getvalue()
-
-    def test_error_string_contains_timestamp(self):
-        """Emitted line includes a HH:MM:SS timestamp."""
-        import re
-
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("ts check")
-        assert re.search(r"\d{2}:\d{2}:\d{2}\.\d{3}", buf.getvalue())
-
-    def test_non_error_agdata_does_not_print(self):
-        """Normal agdata with no error field emits nothing."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agdata(x=1, y="hello")
-        assert buf.getvalue() == ""
-
-    def test_non_string_agerror_raises(self):
-        """agerror only accepts str — passing a type or non-str raises TypeError."""
-        with pytest.raises(TypeError):
-            agerror(str)  # type: ignore[arg-type]
-        with pytest.raises(TypeError):
-            agerror(42)  # type: ignore[arg-type]
-        with pytest.raises(TypeError):
-            agerror(None)  # type: ignore[arg-type]
-
-    def test_error_emitted_to_webui_when_active(self):
-        """When webui is active, the error line is sent to emitter.log via agterm."""
-        mock_webui = MagicMock()
-        mock_webui.emitter.log = MagicMock()
-        old = _agwebui_mod._active
-        _agwebui_mod._active = mock_webui
-        try:
-            agerror("webui error")
-        finally:
-            _agwebui_mod._active = old
-        calls = [str(c) for c in mock_webui.emitter.log.call_args_list]
-        assert any("webui error" in c for c in calls)
-
-    def test_error_always_goes_to_stderr_even_with_webui(self):
-        """Even when webui is active, errors (✗ events) still appear on stderr."""
-        mock_webui = MagicMock()
-        mock_webui.emitter.log = MagicMock()
-        old = _agwebui_mod._active
-        _agwebui_mod._active = mock_webui
-        try:
-            buf = io.StringIO()
-            with patch("agency.agterm.sys.stderr", buf):
-                agerror("always stderr")
-        finally:
-            _agwebui_mod._active = old
-        assert "always stderr" in buf.getvalue()
-
-    def test_multiple_errors_each_emit_once(self):
-        """Each separate agerror(...) emits exactly one line."""
-        buf = io.StringIO()
-        with patch("agency.agterm.sys.stderr", buf):
-            agerror("err A")
-            agerror("err B")
-        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
-        assert sum("err A" in l for l in lines) == 1
-        assert sum("err B" in l for l in lines) == 1
+def test_non_string_agerror_raises():
+    """agerror only accepts str — passing a type or non-str raises TypeError."""
+    with pytest.raises(TypeError):
+        agerror(str)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        agerror(42)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        agerror(None)  # type: ignore[arg-type]
 
 
 def test_pending_repr_before_resolution():
@@ -249,3 +188,107 @@ def test_pending_equality_resolves_both():
 def test_normal_agdata_pending_is_false():
     d = agdata(x=1)
     assert d.is_pending() is False
+
+
+def _pending(value):
+    future = Future()
+    future.set_result(value)
+    return agdata(_future=future)
+
+
+def test_wait_all_and_recursive_dependency_resolution_accept_pending_data():
+    first = _pending(agdata(answer=1))
+    second = _pending(agdata(answer=2))
+    values = [first, second]
+    assert agdata.wait_all(values) is values
+
+    nested = agdata(items=[first, (second,), {"again": first}])
+    nested.resolve_input_dependencies()
+    assert nested.items[0].answer == 1
+    assert nested.items[1][0].answer == 2
+    assert nested.items[2]["again"].answer == 1
+
+
+@dataclass
+class _StructuredValue:
+    result: object
+
+
+class _ModelValue:
+    def __init__(self, result):
+        self.result = result
+
+    def model_dump(self):
+        return {"result": self.result}
+
+
+def test_nested_serialization_materializes_pending_data_tuples_and_models():
+    wrapped = _pending(agdata(result="literal"))
+    value = agdata(
+        tuple_value=(wrapped,),
+        dataclass_value=_StructuredValue(wrapped),
+        model_value=_ModelValue(wrapped),
+    )
+    assert value.to_dict() == {
+        "tuple_value": [{"result": "literal"}],
+        "dataclass_value": {"result": {"result": "literal"}},
+        "model_value": {"result": {"result": "literal"}},
+    }
+
+
+def test_wait_all_rejects_non_waitable_values():
+    with pytest.raises(TypeError, match="not waitable"):
+        agdata.wait_all([object()])
+
+
+def test_wait_with_timeout_raises_when_not_yet_resolved():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    with pytest.raises(TimeoutError):
+        pending.wait(timeout=0.05)
+    assert pending.is_pending()
+
+
+def test_wait_with_timeout_returns_self_once_resolved():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    future.set_result(agdata(answer="done"))
+    assert pending.wait(timeout=1) is pending
+    assert pending.answer == "done"
+
+
+async def _await(value):
+    return await value
+
+
+def test_bare_agdata_is_awaitable_and_field_proxies_after_resolution():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+    future.set_result(agdata(result="literal", other=42))
+
+    resolved = asyncio.run(_await(pending))
+    assert resolved is pending
+    assert pending.other == 42
+    assert pending.result == "literal"
+    assert pending.to_dict() == {"result": "literal", "other": 42}
+
+
+def test_cancelling_one_async_waiter_does_not_cancel_the_shared_future():
+    future: "Future[agdata]" = Future()
+    pending = agdata(_future=future)
+
+    async def scenario():
+        waiter = asyncio.ensure_future(pending)
+        await asyncio.sleep(0)
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("expected the shielded waiter task to be cancelled")
+        future.set_result(agdata(answer="still running"))
+        return await pending
+
+    assert asyncio.run(scenario()).answer == "still running"
+    assert future.cancelled() is False

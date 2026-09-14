@@ -1,25 +1,32 @@
 """Tests for agskill as a self-contained ReAct skill."""
 
 import json
+import shutil
 from unittest.mock import MagicMock
-from agency.agdata import agdata, agerror
-from agency.agcontext import agcontext
-from agency.agconfig import agConfig
+import pytest
+from agency.agdata import agdata
+from agency.configs.agconfig import agconfig, llmconfig
 from agency.agschema import agschema
 from agency.agskill import agskill
-from agency.agllm import _AgLLMFields, agllm
 from agency.agtool import agtool
-from agency.agent import agent as _agent_cls, agent_state as _agent_state_cls
 
-LLM_MAX_RETRIES = _AgLLMFields.max_retries.default
-LLM_IDLE_TIMEOUT = _AgLLMFields.idle_timeout.default
-LLM_STREAM_TIMEOUT = _AgLLMFields.stream_timeout.default
-
-LLM_CONFIG = {"api_key": "test", "model": ""}
-LLM = agllm(agConfig({"agllm_backend": LLM_CONFIG}), context_limit=128_000)
+LLM_MAX_RETRIES = agconfig().llm.max_retries
+LLM_IDLE_TIMEOUT = agconfig().llm.idle_timeout
+LLM_STREAM_TIMEOUT = agconfig().llm.stream_timeout
 
 
-def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s=5):
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    from agency.sandbox.container import _runtime_works
+
+    return _runtime_works("docker")
+
+
+docker = pytest.mark.skipif(not _docker_available(), reason="Docker daemon not reachable")
+
+
+def make_mock_agent(sandbox=None, ping_interval_s=300, poll_interval_s=5):
     _ping = ping_interval_s
     _poll = poll_interval_s
 
@@ -28,11 +35,8 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         ping_interval_s = _ping
         poll_interval_s = _poll
         agconfig = None
-        _drain_inbox = _agent_cls._drain_inbox
-        _check_pause = _agent_cls._check_pause
 
     ag = _MockAgent()
-    ag.llm = llm or LLM
     if sandbox is not None:
         ag.sandbox = sandbox
     else:
@@ -45,25 +49,13 @@ def make_mock_agent(llm=None, sandbox=None, ping_interval_s=300, poll_interval_s
         # it truthy too (see agtool.py's `not sandbox.persistent and ...`).
         ag.sandbox._has_pending_background_work.return_value = False
         ag.sandbox.persistent = False
-    ag.terminal = MagicMock()
-    ag._state = _agent_state_cls("test")
-    ag.log = MagicMock()
-    ag.log.token_usage = {}
+    ag.data_logger = MagicMock()
     ag.agname = "test"
-    ag._set_ui_state = MagicMock()
-    ag._push_live_messages = MagicMock()
-    ag._append_full_history = MagicMock()
-    ag._next_inbox_msg = MagicMock(return_value=None)
-    ag.push_token_count_update_to_ui = MagicMock()
     return ag
 
 
 def _noop(arg: agdata) -> agdata:
     return agdata()
-
-
-def _noop_r1(arg: agdata) -> agdata:
-    return agdata(r=1)
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +115,11 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> list:
     return [_Chunk(tool_calls=[tc]), _Chunk(usage=_Usage())]
 
 
-def make_skill(name="summarise", add_tools=None, replace_tools=None) -> agskill:
+def make_skill(name="summarise", add_host_mcp_tools=None) -> agskill:
     return agskill(
         name=name,
-        system_prompt="You are a summarisation assistant.",
-        add_tools=add_tools,
-        replace_tools=replace_tools,
+        prompt="You are a summarisation assistant.",
+        add_host_mcp_tools=add_host_mcp_tools,
     )
 
 
@@ -146,7 +137,7 @@ def test_name_and_repr():
 # test_run_returns_agdata_and_history / test_run_no_schema_returns_raw_content /
 # test_run_plain_text_fallback were retired here along with execute_react()
 # itself -- basic "the loop returns the model's content correctly" coverage
-# now lives in tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# now lives in tests/harness/agharness_backends/test_native_loop_fast.py
 # (test_bash_tool_round_trip, test_final_text_preserves_raw_content_verbatim),
 # exercising the native loop that replaces execute_react() for every engine.
 
@@ -167,7 +158,7 @@ def test_check_schema_type_mismatch_with_type_object():
     assert "int" in errors[0]
 
 
-def test_system_prompt_type_names_shown_correctly():
+def test_prompt_type_names_shown_correctly():
     from agency.agtype import agfile
 
     sk = agskill(
@@ -176,49 +167,12 @@ def test_system_prompt_type_names_shown_correctly():
         input_schema=agdata(n=int, s=str, doc=agfile),
         output_schema=agdata(result=float),
     )
-    prompt = sk._build_system_prompt()
+    prompt = sk._build_prompt()
     assert '"n": "int"' in prompt  # input schema still uses to_json()
     assert '"s": "str"' in prompt
     assert '"doc": "file"' in prompt
     assert "result" in prompt  # output field listed by name
     assert "float" in prompt  # output field type shown as "float"
-
-
-# ---------------------------------------------------------------------------
-# System prompt is sent but NOT stored in history
-# ---------------------------------------------------------------------------
-
-
-def test_system_prompt_prepended_to_llm_call():
-    # _build_initial_messages() is the shared, engine-agnostic method both
-    # execute_react() and every agharness_backend's execute() build their
-    # first turn from -- calling it directly tests the same contract
-    # without needing a real (or execute_react-only) loop around it.
-    s = make_skill()
-    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
-    assert messages[0]["role"] == "system"
-    assert messages[0]["content"] == "You are a summarisation assistant."
-
-
-def test_system_prompt_not_in_returned_history():
-    s = make_skill()
-    messages, _n_before = s._build_initial_messages(agdata(x=1), agcontext(), None, None, None)
-    # The delta a caller appends back to agcontext.messages is messages[1:]
-    # (dropping the system prompt) -- see _build_initial_messages()'s own
-    # docstring on n_before/messages[n_before+1:].
-    roles = [m["role"] for m in messages[1:]]
-    assert "system" not in roles
-
-
-def test_existing_history_included_in_call():
-    s = make_skill()
-    prior = agcontext(
-        messages=[{"role": "user", "content": "prior"}, {"role": "assistant", "content": "ok"}]
-    )
-    messages, _n_before = s._build_initial_messages(agdata(x=1), prior, None, None, None)
-    # system at [0], prior messages at [1] and [2], new user at [-1]
-    assert messages[1]["content"] == "prior"
-    assert messages[-1]["role"] == "user"
 
 
 # ---------------------------------------------------------------------------
@@ -248,13 +202,10 @@ def test_existing_history_included_in_call():
 
 
 def test_input_schema_missing_field_returns_error():
-    # input_schema validation is shared, engine-agnostic code
-    # (self.input_schema.validate_input(), called directly by both
-    # execute_react() and execute_harness() before any engine/backend is
-    # touched) -- testing it directly here needs no LLM/loop at all.
+    # Input schema validation is engine-agnostic, so it needs no live harness.
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(question=str, context=str),
     )
     error = s.input_schema.validate_input(agdata(question="hi"))
@@ -265,7 +216,7 @@ def test_input_schema_missing_field_returns_error():
 def test_input_schema_type_error_returns_error():
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(count=int),
     )
     error = s.input_schema.validate_input(agdata(count="not-an-int"))
@@ -276,7 +227,7 @@ def test_input_schema_type_error_returns_error():
 def test_input_schema_valid_proceeds():
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(text=str),
     )
     assert s.input_schema.validate_input(agdata(text="hello")) is None
@@ -286,7 +237,7 @@ def test_input_schema_description_value_only_checks_presence():
     """Non-type-name values (descriptions) only trigger a missing-key error."""
     s = agskill(
         name="s",
-        system_prompt="",
+        prompt="",
         input_schema=agdata(query="the search query"),
     )
     assert s.input_schema.validate_input(agdata(query=42)) is None  # 42 is not type-checked
@@ -300,7 +251,7 @@ def test_input_schema_description_value_only_checks_presence():
 # per-field `return_<field>` tool mechanism. Native's structured output
 # uses a different mechanism entirely -- a single `submit_output` MCP tool
 # validated per-call (fast coverage:
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# tests/harness/agharness_backends/test_native_loop_fast.py's
 # test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback) plus a bounded
 # reprompt-across-turns loop one level up in native.py's
@@ -308,25 +259,28 @@ def test_input_schema_description_value_only_checks_presence():
 # test_native.py's TestNativeBackendRealEndToEnd).
 
 
-def test_schemas_appended_to_system_prompt():
+def test_schemas_appended_to_prompt():
     s = agskill(
         name="s",
-        system_prompt="Be helpful.",
+        prompt="Be helpful.",
         input_schema=agdata(text=str),
         output_schema=agdata(summary=str),
     )
-    prompt = s._build_system_prompt()
+    prompt = s._build_prompt()
     assert "Be helpful." in prompt
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
-    assert "return_summary" in prompt
+    assert "submit_output" in prompt
+    assert "return_summary" not in prompt
+    assert "`field`" in prompt and "`value`" in prompt
+    assert "Do not answer" in prompt
     assert "summary" in prompt
     assert "string" in prompt  # per-field description for str output
 
 
-def test_no_schemas_system_prompt_unchanged():
-    s = agskill(name="s", system_prompt="Be helpful.")
-    assert s._build_system_prompt() == "Be helpful."
+def test_no_schemas_prompt_unchanged():
+    s = agskill(name="s", prompt="Be helpful.")
+    assert s._build_prompt() == "Be helpful."
 
 
 # test_return_output_* / test_return_tool_* (all fields correct, type
@@ -338,7 +292,7 @@ def test_no_schemas_system_prompt_unchanged():
 # _build_toolkit(). Native's structured output uses a single `submit_output`
 # MCP tool instead -- fast coverage for the all-fields-correct and
 # type-error-immediate-feedback cases now lives in
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py
+# tests/harness/agharness_backends/test_native_loop_fast.py
 # (test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback).
 # test_semaphore_* / test_timeout_* / test_ssl_error_* / test_oserror_*
@@ -361,331 +315,43 @@ def test_no_schemas_system_prompt_unchanged():
 # execute_react()) -- native has its own, simpler offload (a plain local
 # file write, no sandbox bridge, `read` always available so no lazy
 # tool-injection step exists), already covered fast by
-# tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
+# tests/harness/agharness_backends/test_native_loop_fast.py's
 # test_oversized_tool_output_is_offloaded_to_a_file.
-
-# ---------------------------------------------------------------------------
-# Skill-exit sandbox teardown (agskill.py's own run()/_task() finally block)
-#
-# Per-tool commit/rollback is gone (agtool.py's dispatch_tools() now just
-# calls sandbox.stop() unconditionally after each call -- a separate,
-# already-updated concern, not tested here). The remaining rollback boundary
-# lives one level up, in agskill.py's _task(): on a *skill's own* result
-# being an error, it calls ag.sandbox.rm_container() (discarding everything
-# since the last successful skill's commit()) and pushes a plain string onto
-# ag.inbox describing the revert -- surfaced at the START of the next skill
-# call via ag._drain_inbox() (see execute_react()'s loop), since the failed
-# skill's own result is already final by the time _task() reaches teardown.
-# On success, it calls ag.sandbox.commit() (no args -- squashing is now
-# fully automatic, the old force_squash parameter is gone) and then
-# ag.sandbox.stop() to hibernate again (releasing the session keyring);
-# execute_react()'s output path may have re-woken the container after the
-# last tool-call hibernate, and commit() itself does not stop it.
-#
-# These tests exercise that finally block directly by running skills through
-# the real agent.run()/_task() path (not execute_react() in isolation, which
-# never reaches this teardown) against a real agent and a mocked sandbox,
-# with execute_react() itself replaced by a fake so the scenario -- success,
-# an agerror result, or an uncaught exception -- is fully controlled. Any
-# per-tool run_in_subprocess distinction is irrelevant at this layer (kept
-# only in a few names/docstrings for traceability from the pre-refactor
-# suite these evolved from).
-# ---------------------------------------------------------------------------
-
-
-def _make_sandbox_with_tracking():
-    """Return a sandbox mock that records stop()/commit()/rm_container() calls."""
-    sandbox = MagicMock()
-    sandbox._name = "testbox"
-    sandbox.stop.return_value = None
-    sandbox._has_pending_background_work.return_value = False
-    # A bare MagicMock's auto-attribute for `.persistent` is a truthy Mock,
-    # not the real agSandbox default (False) -- since dispatch_tools() now
-    # short-circuits on `not sandbox.persistent` before ever consulting
-    # `_has_pending_background_work()` (see agtool.py), leaving this unset
-    # would silently skip that check (and any side_effect list queued on
-    # it) in every test using this helper. Match the real default here.
-    sandbox.persistent = False
-    return sandbox
-
-
-def _run_skill_via_agent(s, sandbox, skill_input=None):
-    """Run *s* to completion through a real agent.run() -- the only code
-    path that reaches agskill.py's _task() finally block -- against a real
-    agent and *sandbox* (typically a MagicMock so commit()/rm_container()/
-    inbox.put() calls can be asserted on). Returns (ag, resolved pending
-    agdata)."""
-    cfg = agConfig({"agllm_backend": LLM_CONFIG})
-    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
-    ag.inbox = MagicMock()
-    pending = ag.run(s, skill_input if skill_input is not None else agdata(x=1))
-    pending.wait()
-    return ag, pending
-
-
-def test_tool_success_commits_and_stops():
-    """A skill run that completes successfully must call sandbox.commit()
-    (no args) then sandbox.stop() in agskill.py's _task() finally block,
-    and must not rm_container() or push anything onto the inbox."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
-
-    ag, _ = _run_skill_via_agent(s, sandbox)
-
-    sandbox.commit.assert_called_once_with()
-    sandbox.stop.assert_called_once_with()
-    method_names = [c[0] for c in sandbox.method_calls]
-    assert method_names.index("commit") < method_names.index("stop")
-    sandbox.rm_container.assert_not_called()
-    ag.inbox.put.assert_not_called()
-
-
-def test_tool_success_defers_hibernate_when_background_work_pending():
-    """Same deferral as per-tool stop(): do not hibernate over live
-    background work at skill teardown."""
-    sandbox = _make_sandbox_with_tracking()
-    sandbox._has_pending_background_work.return_value = True
-    s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
-
-    _run_skill_via_agent(s, sandbox)
-
-    sandbox.commit.assert_called_once_with()
-    sandbox.stop.assert_not_called()
-
-
-def test_tool_failure_triggers_stop_without_commit():
-    """When the skill's own result is an error, the finally block must call
-    sandbox.rm_container() (discard since the last successful commit)
-    instead of sandbox.commit()."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("boom"),
-        prev_ctx,
-        [],
-    )
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    sandbox.commit.assert_not_called()
-    assert pending._data.get("error") == "boom"
-
-
-def test_tool_failure_adds_workspace_reverted_note():
-    """The old "workspace_reverted key injected into the tool result JSON"
-    behavior is gone entirely -- the revert notice now goes on ag.inbox as a
-    plain string (queue.Queue[str]), not in the failed skill's own result,
-    since that result is already final by the time _task() reaches
-    teardown. The note is meant to surface at the START of the next skill
-    call via ag._drain_inbox()."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("disk full"),
-        prev_ctx,
-        [],
-    )
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    ag.inbox.put.assert_called_once()
-    (note,), _kwargs = ag.inbox.put.call_args
-    assert isinstance(note, str)
-    assert "revert" in note.lower() or "discard" in note.lower()
-    # The failed skill's own result carries only its own error -- no
-    # revert-related key was added to it at this layer.
-    assert pending._data == {"error": "disk full"}
-
-
-def test_tool_failure_reverts_even_without_subprocess():
-    """The revert-and-notify teardown is triggered purely by the skill's own
-    result being an error -- it doesn't matter whether any tool ran at all,
-    let alone in a subprocess; _task() only ever inspects outer_result."""
-    sandbox = MagicMock()
-    s = make_skill()
-    s.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("nope"),
-        prev_ctx,
-        [],
-    )
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    ag.inbox.put.assert_called_once()
-    assert pending._data.get("error") == "nope"
-
-
-def test_run_in_subprocess_false_still_stops():
-    """The commit()/rm_container() decision is made fresh for every skill
-    call on the same agent -- a later call's failure must still trigger
-    rm_container() (and a fresh inbox note) even though an earlier call
-    already committed successfully."""
-    sandbox = _make_sandbox_with_tracking()
-    ok_skill = make_skill(name="ok")
-    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
-    bad_skill = make_skill(name="bad")
-    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("second call failed"),
-        prev_ctx,
-        [],
-    )
-
-    cfg = agConfig({"agllm_backend": LLM_CONFIG})
-    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
-    ag.inbox = MagicMock()
-    ag.run(ok_skill, agdata(x=1)).wait()
-    ag.run(bad_skill, agdata(x=1)).wait()
-
-    assert sandbox.commit.call_count == 1
-    assert sandbox.stop.call_count == 1  # success path hibernates after commit
-    assert sandbox.rm_container.call_count == 1
-    ag.inbox.put.assert_called_once()
-
-
-def test_tool_exception_triggers_stop_without_commit():
-    """An uncaught exception raised out of execute_react() is caught by
-    _task()'s own outer try/except and turned into an agerror -- which must
-    then trigger the same rm_container()-without-commit teardown as an
-    ordinary agerror result."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-
-    def _raise(ag, prev_ctx, skill_input, max_steps=None):
-        raise RuntimeError("exploded")
-
-    s.execute_harness = _raise
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    sandbox.commit.assert_not_called()
-    assert "exploded" in pending._data.get("error", "")
-
-
-def test_run_in_subprocess_false_success_still_commits():
-    """A skill call's own commit()/rm_container() decision doesn't carry
-    over from an earlier call on the same agent -- a successful call must
-    still commit() even immediately after a prior call's failure already
-    triggered a revert."""
-    sandbox = _make_sandbox_with_tracking()
-    bad_skill = make_skill(name="bad")
-    bad_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agerror("first call failed"),
-        prev_ctx,
-        [],
-    )
-    ok_skill = make_skill(name="ok")
-    ok_skill.execute_harness = lambda ag, prev_ctx, skill_input, max_steps=None: (
-        agdata(result="ok"),
-        prev_ctx,
-        [],
-    )
-
-    cfg = agConfig({"agllm_backend": LLM_CONFIG})
-    ag = _agent_cls(agconfig=cfg, llm=LLM, sandbox=sandbox)
-    ag.inbox = MagicMock()
-    ag.run(bad_skill, agdata(x=1)).wait()
-    ag.run(ok_skill, agdata(x=1)).wait()
-
-    assert sandbox.rm_container.call_count == 1
-    assert sandbox.commit.call_count == 1
-    assert sandbox.stop.call_count == 1  # success path hibernates after commit
-
-
-# test_pending_background_work_defers_stop_entirely was retired here: it
-# tested agtool.py's dispatch_tools() deferring sandbox.stop() while
-# `_has_pending_background_work()` is true -- the per-tool-call hibernate
-# model itself was already retired in Phase 1 (persistent containers), so
-# this check (and the "wait_for_processes() right after" ordering the
-# comment describes) no longer exists in the new execute_harness() path.
-
-# test_pending_background_work_omits_workspace_reverted_note_on_error was
-# retired here: same retired mechanism, errored-tool-call path.
-
-
-def test_tool_exception_with_run_in_subprocess_false_still_stops():
-    """Same exception-triggers-revert teardown as
-    test_tool_exception_triggers_stop_without_commit, confirmed here via a
-    plain ValueError (rather than RuntimeError) raised very early -- before
-    execute_react() ever reaches a tool call -- to show the finally block's
-    rm_container()+inbox path doesn't depend on how far execute_react() got
-    before failing."""
-    sandbox = _make_sandbox_with_tracking()
-    s = make_skill()
-
-    def _raise_early(ag, prev_ctx, skill_input, max_steps=None):
-        raise ValueError("early failure")
-
-    s.execute_harness = _raise_early
-
-    ag, pending = _run_skill_via_agent(s, sandbox)
-
-    sandbox.rm_container.assert_called_once_with()
-    sandbox.commit.assert_not_called()
-    assert "early failure" in pending._data.get("error", "")
-    ag.inbox.put.assert_called_once()
-    (note,), _kwargs = ag.inbox.put.call_args
-    assert "revert" in note.lower() or "discard" in note.lower()
-
-
-# test_tool_exception_with_pending_background_work_defers_stop was
-# retired here: same retired dispatch_tools() pending-background-work
-# stop-deferral mechanism, exception-handler path.
-
-
-# test_dispatch_tools_accepts_camel_case_llm_arguments /
-# test_tool_timeout_uses_agent_provided_value / test_tool_timeout_ignored_if_not_int
-# were retired here: all three tested agtool.py's dispatch_tools()-specific
-# mechanics (camelCase argument-key coercion via agdata.from_json(), and
-# per-call `timeout` override from LLM tool-call args) -- only ever
-# exercised via execute_react(). Native's built-in tools have fixed
-# timeouts and no camelCase-coercion step of their own (they parse JSON
-# arguments directly, see _native_in_container_entrypoint.py's
-# _parse_tool_args), so neither mechanism carries over.
-
 
 # ---------------------------------------------------------------------------
 # build_llm_kwargs
 # ---------------------------------------------------------------------------
 
-from agency.agllm import agllm as _agllm_mod
-
-build_llm_kwargs = _agllm_mod.build_llm_kwargs
+from agency.llm.agllm import agllm as _agllm_mod
 
 
-def _llm_cfg(**fields) -> agConfig:
-    """Test helper: wrap agllm_backend fields in an agConfig."""
-    return agConfig({"agllm_backend": fields})
+def build_llm_kwargs(cfg, messages, openai_tools=None):
+    return _agllm_mod.for_config(cfg).build_kwargs(messages, openai_tools)
+
+
+def _llm_cfg(**fields) -> agconfig:
+    """Test helper: build an agconfig from LLM fields."""
+    return agconfig(llmconfig(**fields))
 
 
 def test_build_llm_kwargs_model_and_messages():
-    msgs = [{"role": "user", "content": "hi"}]
+    msgs = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}]
     kw = build_llm_kwargs(_llm_cfg(model=""), msgs, None)
     assert kw["model"] == ""
-    assert kw["messages"] == msgs
+    assert kw["messages"] == [{"role": "user", "content": "hi"}]
 
 
 def test_build_llm_kwargs_strips_private_keys():
-    msgs = [{"role": "assistant", "content": "ok", "_thinking": "secret"}]
+    msgs = [
+        {
+            "role": "assistant",
+            "blocks": [{"type": "text", "index": 0, "text": "ok"}],
+            "_thinking": "secret",
+        }
+    ]
     kw = build_llm_kwargs(_llm_cfg(model="m"), msgs, None)
     assert "_thinking" not in kw["messages"][0]
-    assert "content" in kw["messages"][0]
+    assert kw["messages"][0]["content"] == "ok"
 
 
 def test_build_llm_kwargs_openai_gen_params():
@@ -712,100 +378,10 @@ def test_build_llm_kwargs_no_tools_key_when_none():
 
 
 # ---------------------------------------------------------------------------
-# build_assistant_msg
-# ---------------------------------------------------------------------------
-
-build_assistant_msg = _agllm_mod.build_assistant_msg
-
-
-def test_build_assistant_msg_plain_content():
-    msg = build_assistant_msg(["hello", " world"], [], {})
-    assert msg["role"] == "assistant"
-    assert msg["content"] == "hello world"
-
-
-def test_build_assistant_msg_reasoning_parts():
-    msg = build_assistant_msg(["answer"], ["think ", "harder"], {})
-    assert msg["_thinking"] == "think harder"
-    assert msg["content"] == "answer"
-
-
-def test_build_assistant_msg_think_tag_stripped():
-    msg = build_assistant_msg(["<think>reasoning</think>answer"], [], {})
-    assert msg.get("_thinking") == "reasoning"
-    assert msg["content"] == "answer"
-
-
-def test_build_assistant_msg_tool_calls_included():
-    tc = {0: {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}}
-    msg = build_assistant_msg([], [], tc)
-    assert len(msg["tool_calls"]) == 1
-    assert msg["tool_calls"][0]["function"]["name"] == "f"
-
-
-def test_build_assistant_msg_tool_calls_sorted_by_index():
-    tc = {
-        1: {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
-        0: {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
-    }
-    msg = build_assistant_msg([], [], tc)
-    assert msg["tool_calls"][0]["function"]["name"] == "a"
-    assert msg["tool_calls"][1]["function"]["name"] == "b"
-
-
-# ---------------------------------------------------------------------------
-# _drain_inbox
-# ---------------------------------------------------------------------------
-
-
-def test_drain_inbox_empty_queue_returns_false():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(return_value=None)
-    messages = []
-    assert ag._drain_inbox(messages) is False
-    assert messages == []
-
-
-def test_drain_inbox_single_message_appended():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hello", None])
-    messages = [{"role": "system", "content": "sys"}]
-    had = ag._drain_inbox(messages)
-    assert had is True
-    assert messages[-1] == {"role": "user", "content": "hello"}
-
-
-def test_drain_inbox_multiple_messages_all_appended():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["msg1", "msg2", None])
-    messages = []
-    ag._drain_inbox(messages)
-    assert len(messages) == 2
-    assert messages[0]["content"] == "msg1"
-    assert messages[1]["content"] == "msg2"
-
-
-def test_drain_inbox_calls_live_fn():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
-    messages = [{"role": "system", "content": "sys"}]
-    ag._drain_inbox(messages)
-    ag._push_live_messages.assert_called_once()
-
-
-def test_drain_inbox_calls_full_history_fn():
-    ag = make_mock_agent()
-    ag._next_inbox_msg = MagicMock(side_effect=["hi", None])
-    messages = []
-    ag._drain_inbox(messages)
-    ag._append_full_history.assert_called_once_with({"role": "user", "content": "hi"})
-
-
-# ---------------------------------------------------------------------------
 # wait_for_processes
 # ---------------------------------------------------------------------------
 
-from agency.agsandbox import agSandbox
+from agency.sandbox.agsandbox import agSandbox
 
 
 def _make_real_sandbox(watched_pids=None):
@@ -829,7 +405,7 @@ def _make_real_sandbox(watched_pids=None):
 
 def test_wait_for_processes_clean_sandbox_returns_none():
     sb = _make_real_sandbox()
-    assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(sb, "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_no_watched_pids_attr_returns_none():
@@ -837,7 +413,7 @@ def test_wait_for_processes_no_watched_pids_attr_returns_none():
         def _has_pending_background_work(self):
             return False
 
-    assert agSandbox.wait_for_processes(NoPids(), "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(NoPids(), "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_mock_sandbox_returns_none():
@@ -845,7 +421,7 @@ def test_wait_for_processes_mock_sandbox_returns_none():
 
     sb = MagicMock()
     sb._has_pending_background_work.return_value = False
-    assert agSandbox.wait_for_processes(sb, "skill", None, None, "", 300, 5) is None
+    assert agSandbox.wait_for_processes(sb, "skill", "", 300, 5) is None
 
 
 def test_wait_for_processes_completes_quickly_returns_completed_msg():
@@ -870,9 +446,7 @@ def test_wait_for_processes_completes_quickly_returns_completed_msg():
             return "PID 1234"
 
     sb = _FakeSandbox()
-    result = agSandbox.wait_for_processes(
-        sb, "skill", None, None, "", ping_interval_s=30, poll_interval_s=0.01
-    )
+    result = agSandbox.wait_for_processes(sb, "skill", "", ping_interval_s=30, poll_interval_s=0.01)
     assert result is not None
     assert "completed" in result.lower() or "Background processes have completed" in result
 
@@ -893,7 +467,7 @@ def test_wait_for_processes_still_running_returns_update_msg():
 
     sb = _FakeSandbox()
     result = agSandbox.wait_for_processes(
-        sb, "skill", None, None, "", ping_interval_s=0.02, poll_interval_s=0.01
+        sb, "skill", "", ping_interval_s=0.02, poll_interval_s=0.01
     )
     assert result is not None
     assert "still running" in result.lower() or "Background processes are still running" in result
@@ -923,8 +497,6 @@ def test_wait_for_processes_calls_state_fn():
     agSandbox.wait_for_processes(
         _FakeSandbox(),
         "myskill",
-        None,
-        None,
         "",
         30,
         0.01,
@@ -948,212 +520,6 @@ def test_validate_input_schema_mismatch_returns_error():
     error = agschema(agdata(x=agrawstring)).validate_input(agdata())
     assert error is not None
     assert "x" in error
-
-
-# ---------------------------------------------------------------------------
-# agskill._build_initial_messages
-# ---------------------------------------------------------------------------
-
-
-def test_build_initial_messages_structure():
-    s = make_skill()
-    history = agcontext(messages=[{"role": "user", "content": "prior"}])
-    msgs, n_before = s._build_initial_messages(agdata(q="hi"), history, None, None, None)
-    assert msgs[0]["role"] == "system"
-    assert msgs[1]["content"] == "prior"
-    assert msgs[-1]["role"] == "user"
-    assert n_before == 1
-
-
-def test_build_initial_messages_fires_live_fn():
-    s = make_skill()
-    live_calls = []
-    s._build_initial_messages(agdata(), agcontext(), None, lambda m: live_calls.append(m), None)
-    assert len(live_calls) == 1
-
-
-def test_build_initial_messages_fires_full_history_fn():
-    s = make_skill()
-    history_items = []
-    s._build_initial_messages(
-        agdata(q="test"), agcontext(), None, None, lambda m: history_items.append(m["role"])
-    )
-    assert "system" in history_items
-    assert "user" in history_items
-
-
-# ---------------------------------------------------------------------------
-# run() — sandbox process monitoring
-# ---------------------------------------------------------------------------
-
-
-# test_run_continues_loop_when_sandbox_has_live_pids /
-# test_run_injects_process_completed_message / test_run_clean_sandbox_returns_immediately
-# were retired here: they tested execute_react()'s specific "loop back and
-# reprompt the model" behavior when agSandbox.wait_for_processes()/
-# get_live_pids() finds pending background work after a final answer --
-# retired along with the per-tool-call hibernate model itself (Phase 1).
-# execute_harness() now calls wait_for_processes() once, non-looping, for
-# native only (see that method's own comment) -- there is no equivalent
-# "reprompt and continue in the same call" behavior to test for any engine
-# today.
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# run() — thinking extraction from stream
-# ---------------------------------------------------------------------------
-
-
-# test_run_extracts_thinking_from_think_tag was retired here, not ported:
-# it tested agllm.py's own <think>-tag stripping (build_assistant_msg's
-# `_thinking` extraction) around execute_react()'s streaming reassembly.
-# Native's own reassembly (_native_in_container_entrypoint.py's
-# _dispatch_via_terminus) does no such stripping today -- a genuine
-# behavior gap, not a like-for-like port; noted in native.py's own
-# "Known gaps" docstring section rather than silently dropped.
-
-# test_run_returns_token_counts was retired here: covered fast, for native,
-# by tests/agharness_internal/agharness_backends/test_native_loop_fast.py's
-# test_token_usage_is_tracked (proving _run_react_loop()'s response usage
-# is real, accumulated per-dispatch data, not an execute_react()-only
-# concern anymore).
-
-
-# ---------------------------------------------------------------------------
-# run() defensively copies skill_input before mutating it
-# ---------------------------------------------------------------------------
-#
-# prepare_inputs_in_sandbox() (called from execute_react(), itself called from
-# run()'s _task()) mutates its skill_input argument in place -- offloaded
-# agtype/oversized fields get overwritten with a sandbox path reference. If a
-# caller hands the *same* agdata object to more than one concurrently-running
-# agent.run() call (a real pattern: fanning one shared input out to several
-# agents, e.g. autoresearch's ClassificationTeam.run()), those calls race on
-# that shared mutation -- whichever run finishes its offload last clobbers the
-# field with its own path, leaving every other run trying to read a file that
-# only exists in that one run's own sandbox. _task() must give each run its
-# own private copy from the moment it starts, regardless of what the caller
-# does with the object it passed in.
-
-
-def test_run_does_not_mutate_callers_shared_input_object():
-    """Regression test: run() must not mutate the skill_input object the
-    caller passed in -- prepare_inputs_in_sandbox()'s offload rewrite must
-    land on a private copy, not the caller's own object."""
-    from agency.agschema import agSchemaConfig
-    from agency.agsandbox_backends import agSandboxBackendConfig
-
-    # Force the docker sandbox backend: agsandbox_backends' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
-    cfg = agConfig(
-        agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": LLM_CONFIG},
-    )
-    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
-
-    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
-        s.input_schema.prepare_inputs_in_sandbox(
-            skill_input,
-            ag.sandbox,
-            s.name,
-            context_limit=ag.llm.context_limit,
-            agconfig=ag.agconfig,
-        )
-        return agdata(answer=skill_input.text), prev_ctx, []
-
-    s.execute_harness = fake_execute_react
-
-    shared_input = agdata(text="x" * 100)
-    ag = _agent_cls(agconfig=cfg)
-    try:
-        result = ag.run(s, shared_input)
-        assert "saved to" in result.answer  # this run's own copy WAS offloaded
-        assert shared_input.text == "x" * 100  # the caller's object was not
-    finally:
-        if ag.sandbox is not None:
-            ag.sandbox.destroy()
-
-
-def test_run_gives_concurrent_runs_sharing_one_input_independent_copies():
-    """Two agents' run() calls sharing one input agdata (the exact
-    ClassificationTeam.run() pattern) must each read back their own
-    offloaded file, not race on the shared object's mutation."""
-    from agency.agschema import agSchemaConfig
-    from agency.agsandbox_backends import agSandboxBackendConfig
-
-    # Force the docker sandbox backend: agsandbox_backends' "auto" selection
-    # prefers podman over docker when both are usable, but CI's
-    # images/build.sh only builds/tags agency-sandbox:latest for docker, so
-    # podman has no local image and would try (and fail) to pull one.
-    cfg = agConfig(
-        agSchemaConfig(input_offload_chars=10),
-        agSandboxBackendConfig(backend="docker"),
-        {"agllm_backend": LLM_CONFIG},
-    )
-    s = agskill(name="offload_test", system_prompt="", input_schema=agdata(text=str))
-
-    def fake_execute_react(ag, prev_ctx, skill_input, max_steps=None, **_):
-        s.input_schema.prepare_inputs_in_sandbox(
-            skill_input,
-            ag.sandbox,
-            s.name,
-            context_limit=ag.llm.context_limit,
-            agconfig=ag.agconfig,
-        )
-        from agency.tools.read import make_read
-
-        path = skill_input.text.split("saved to ")[1].split(" —")[0]
-        r = make_read(ag.sandbox).fn(agdata(file_path=path))
-        return agdata(answer=r.content), prev_ctx, []
-
-    s.execute_harness = fake_execute_react
-
-    shared_input = agdata(text="x" * 100)
-    agents = [_agent_cls(agconfig=cfg) for _ in range(2)]
-    try:
-        pending = [a.run(s, shared_input) for a in agents]
-        for p in pending:
-            assert "x" * 100 in p.answer
-        assert shared_input.text == "x" * 100
-    finally:
-        for a in agents:
-            if a.sandbox is not None:
-                a.sandbox.destroy()
-
-
-# ---------------------------------------------------------------------------
-# plan_mode
-# ---------------------------------------------------------------------------
-
-
-def test_plan_mode_sets_replace_tools_empty():
-    """plan_mode=True sets replace_tools to [] regardless of default."""
-    s = agskill(name="s", system_prompt="", plan_mode=True)
-    assert s.replace_tools == []
-
-
-def test_plan_mode_overrides_replace_tools_kwarg():
-    """plan_mode=True takes precedence over an explicit replace_tools argument."""
-    t = agtool(name="mt", description="my tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", plan_mode=True, replace_tools=[t])
-    assert s.replace_tools == []
-
-
-def test_plan_mode_false_leaves_replace_tools_untouched():
-    """plan_mode=False (default) does not modify replace_tools."""
-    t = agtool(name="mt", description="my tool", fn=_noop_r1)
-    s = agskill(name="s", system_prompt="", plan_mode=False, replace_tools=[t])
-    assert s.replace_tools == [t]
-
-
-# test_plan_mode_no_tools_sent_to_llm was retired here along with
-# execute_react() itself: plan_mode sets replace_tools=[], which is now a
-# documented, currently-unsupported gap for every engine (see the
-# replace_tools/add_tools retirement note above) -- there is no loop left
-# to assert "no tools sent" against.
 
 
 # ---------------------------------------------------------------------------
@@ -1391,3 +757,53 @@ def test_random_schema_prompt_examples_parseable():
             )
 
     assert not failures, f"{len(failures)}/100 trials failed:\n" + "\n".join(failures[:20])
+
+
+# ---------------------------------------------------------------------------
+# host_mcp_tools / sandbox_mcp_tools / policy
+# ---------------------------------------------------------------------------
+
+
+def test_host_mcp_tools_defaults_to_the_default_set():
+    from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
+
+    s = agskill(name="s", prompt="")
+    assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS]
+
+
+def test_add_host_mcp_tools_extends_the_defaults():
+    from agency.agskill import _DEFAULT_HOST_MCP_TOOLS
+
+    extra = agtool(name="extra", description="d", fn=_noop)
+    s = agskill(name="s", prompt="", add_host_mcp_tools=[extra])
+    assert [t.name for t in s.host_mcp_tools] == [t.name for t in _DEFAULT_HOST_MCP_TOOLS] + [
+        "extra"
+    ]
+
+
+def test_sandbox_mcp_tools_defaults_to_empty():
+    s = agskill(name="s", prompt="")
+    assert s.sandbox_mcp_tools == []
+
+
+def test_add_sandbox_mcp_tools_populates_sandbox_mcp_tools():
+    sbx_tool = agtool(name="sbx", description="d", fn=_noop)
+    s = agskill(name="s", prompt="", add_sandbox_mcp_tools=[sbx_tool])
+    assert [t.name for t in s.sandbox_mcp_tools] == ["sbx"]
+
+
+def test_policy_defaults_to_a_fresh_agpolicy():
+    from agency.agpolicy import agpolicy
+
+    s = agskill(name="s", prompt="")
+    assert isinstance(s.policy, agpolicy)
+    assert s.policy.tool_hooks is None
+    assert s.policy.default_to_deny is False
+
+
+def test_policy_stored_verbatim_when_supplied():
+    from agency.agpolicy import agpolicy
+
+    policy = agpolicy(default_to_deny=True)
+    s = agskill(name="s", prompt="", policy=policy)
+    assert s.policy is policy

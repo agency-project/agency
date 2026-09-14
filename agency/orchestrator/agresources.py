@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+import time
+from typing import TYPE_CHECKING, Callable
+
+from ..utils.agutil import (
+    _allocate_gpu_markers,
+    detect_cpus,
+    detect_gpus,
+    detect_memory_mb,
+)
+from ..observability.profiler import agprof
+from ..configs.agconfig import MIN_CPUS, MIN_MEMORY_MB, agconfig as agconfig_cls
+
+if TYPE_CHECKING:
+    from ..observability.agdatalogger import agDataLogger
+
+
+class GpuWaitCancelled(RuntimeError):
+    """Raised by acquire_gpus() when its caller's is_cancelled() went true
+    while still queued -- distinct from TimeoutError so a caller can tell
+    "gave up, no GPU ever came" apart from "the request itself died"."""
+
+
+def _memory_mb_to_docker_str(memory_mb: "float | None") -> "str | None":
+    if memory_mb is None:
+        return None
+    return f"{int(memory_mb)}m"
+
+
+def _floor(value: "float | None", minimum: float) -> "float | None":
+    """None (no cap) passes through unchanged; a real value is never let
+    below *minimum*."""
+    return None if value is None else max(value, minimum)
+
+
+class _GpuRequest:
+    __slots__ = ("count", "granted_ids")
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.granted_ids: "list[int] | None" = None
+
+
+class agResourcePool:
+    """Manages shared GPU tokens and CPU/memory limits for all sandboxes.
+
+    All parameters are optional — call ``agResourcePool()`` with no arguments
+    and GPUs, CPU count, and total memory are detected from the host
+    automatically. Owned by the process-wide orchestrator (constructed
+    eagerly, see ``GlobalAgentOrchestrator.__init__``), so you only need to
+    construct one explicitly when you want to override the detected values.
+
+    Usage::
+
+        # Fully automatic -- no configuration required, this is what the
+        # orchestrator does by default:
+        get_orchestrator().agresource_pool = agResourcePool()
+
+        # Override specific values:
+        get_orchestrator().agresource_pool = agResourcePool(
+            gpus=[0], total_cpus=8, total_memory_mb=16384
+        )
+
+    ``total_cpus`` and ``total_memory_mb`` set the ceiling for ``reserve_cpu``
+    (what an agent may request). ``idle_cpus``/``idle_memory`` are the
+    resting-state limits -- applied both when a sandbox container is first
+    created (see ``agsandbox.py``'s ``_ensure_started()``) and whenever it's
+    reset to idle afterward (restored by ``cpu_release``). Read fresh from
+    ``self.agconfig`` on every use; the keyword arguments below are just a
+    convenience for setting them at construction.
+    """
+
+    def __init__(
+        self,
+        gpus: list[int] | None = None,
+        total_cpus: int | None = None,
+        total_memory_mb: int | None = None,
+        idle_cpus: float | None = None,
+        idle_memory: str | None = None,
+        mark_gpus: bool = False,
+        agconfig: "agconfig_cls | None" = None,
+        data_logger: "agDataLogger | None" = None,
+    ) -> None:
+        self.change_config(agconfig)
+        if idle_cpus is not None:
+            self.agconfig.resources.idle_cpus = idle_cpus
+        if idle_memory is not None:
+            self.agconfig.resources.idle_memory = idle_memory
+        self.gpus = list(gpus) if gpus is not None else detect_gpus()
+        self.total_cpus = total_cpus if total_cpus is not None else detect_cpus()
+        self.total_memory_mb = (
+            total_memory_mb if total_memory_mb is not None else detect_memory_mb()
+        )
+        # A single Condition (rather than one BoundedSemaphore per GPU) so
+        # release_gpu() can directly wake a waiter instead of every
+        # acquire_gpu() call polling every GPU's own lock in a loop -- see
+        # acquire_gpu()/release_gpu() docstrings for the full reasoning.
+        # Guards only _free_gpus/_gpus_acquired -- NOT cpus_acquired/
+        # memory_acquired_mb, which have no invariant linking them to GPU
+        # state (a thread can reserve CPU while another concurrently
+        # acquires a GPU with no interaction between the two), so they get
+        # their own _cpu_mem_cond instead of sharing this one.
+        self._gpu_cond = threading.Condition()
+        self._free_gpus: set[int] = set(self.gpus)
+        self._gpus_acquired: int = 0
+        self._gpu_request_seq = itertools.count()
+        self._gpu_queue: "list[tuple[int, int, _GpuRequest]]" = []
+        # Plain mutex for cpus_acquired/memory_acquired_mb -- a Condition
+        # rather than a bare Lock only for consistency with _gpu_cond above;
+        # nothing here ever calls wait()/notify().
+        self._cpu_mem_cond = threading.Condition()
+        self.cpus_acquired: float = 0.0
+        self.memory_acquired_mb: int = 0
+        # Composed in by the owner (GlobalAgentOrchestrator constructs both
+        # eagerly and wires this one in) -- optional so a standalone pool
+        # (tests, ad-hoc scripts) can skip resource-usage logging entirely
+        # rather than needing a real logger just to exercise allocation
+        # logic.
+        self._data_logger = data_logger
+        if mark_gpus and self.gpus:
+            import multiprocessing
+
+            if multiprocessing.current_process().name == "MainProcess":
+                _allocate_gpu_markers(self.gpus)
+
+    def change_config(self, agconfig: "agconfig_cls | None") -> None:
+        """Replace this pool's agconfig with a clone of the given one."""
+        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
+
+    def get_config_copy(self) -> "agconfig_cls":
+        """Return a clone of this pool's agconfig."""
+        return self.agconfig.clone()
+
+    def acquire_gpus(
+        self,
+        sandbox,
+        count: int,
+        timeout: "float | None" = None,
+        is_cancelled: "Callable[[], bool] | None" = None,
+        poll_interval: float = 0.5,
+    ) -> "list[int]":
+        """Block until *count* GPUs are free; grant them to *sandbox* (setting
+        its `_gpu_ids`) and return their ids.
+
+        Queued (not just waited-on) so multiple concurrent requests for
+        different counts get served smallest-count-first rather than
+        strictly in arrival order: `_dispatch_gpu_queue_locked()` walks the
+        queue in ascending count order and grants whichever prefix of it
+        currently fits in `_free_gpus`, so a request for 1 GPU behind a
+        queued request for 5 doesn't wait on the 5 to be satisfiable first.
+
+        Raises ValueError immediately if `count` exceeds the pool's total
+        size -- that's never satisfiable, so there's no reason to queue it.
+
+        *is_cancelled*, if given, is polled every *poll_interval* seconds
+        while queued (never once for the whole wait -- an external caller
+        that's cancelled mid-wait must be noticed promptly, not just once at
+        entry). On a positive check this request is dequeued and
+        GpuWaitCancelled is raised -- otherwise a cancelled caller's queue
+        entry lives on and can still be granted a real GPU nobody will ever
+        release, since the caller that would have released it is already
+        gone. A plain wall-clock *timeout* is a separate, orthogonal
+        concern (give up waiting after a bounded time regardless of
+        cancellation) and still raises TimeoutError as before.
+        """
+        if count <= 0:
+            return []
+        if count > len(self.gpus):
+            raise ValueError(
+                f"requested {count} GPUs but pool only has {len(self.gpus)} (pool: {self.gpus})"
+            )
+        deadline = None if timeout is None else time.monotonic() + timeout
+        request = _GpuRequest(count)
+        with agprof.span("sync:gpu_wait"), self._gpu_cond:
+            seq = next(self._gpu_request_seq)
+            heapq.heappush(self._gpu_queue, (count, seq, request))
+            self._dispatch_gpu_queue_locked()
+            while request.granted_ids is None:
+                if is_cancelled is not None and is_cancelled():
+                    self._dequeue_gpu_request_locked(request)
+                    raise GpuWaitCancelled(
+                        f"cancelled while waiting for {count} GPU(s) (pool: {self.gpus})"
+                    )
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    self._dequeue_gpu_request_locked(request)
+                    raise TimeoutError(
+                        f"No {count} GPU(s) available within {timeout}s (pool: {self.gpus})"
+                    )
+                slice_s = poll_interval if remaining is None else min(poll_interval, remaining)
+                self._gpu_cond.wait(timeout=slice_s)
+        for gpu_id in request.granted_ids:
+            agprof.gpu_lease_begin(gpu_id)
+        sandbox._gpu_ids = request.granted_ids
+        self._update_resource_log(
+            who=sandbox._name, action="acquire_gpu", count=count, gpu_ids=request.granted_ids
+        )
+        return request.granted_ids
+
+    def _dequeue_gpu_request_locked(self, request: "_GpuRequest") -> None:
+        if request.granted_ids is not None:
+            return
+        self._gpu_queue = [entry for entry in self._gpu_queue if entry[2] is not request]
+        heapq.heapify(self._gpu_queue)
+
+    def _dispatch_gpu_queue_locked(self) -> None:
+        granted_any = False
+        while self._gpu_queue:
+            count, _seq, request = self._gpu_queue[0]
+            if len(self._free_gpus) < count:
+                break
+            heapq.heappop(self._gpu_queue)
+            request.granted_ids = [self._free_gpus.pop() for _ in range(count)]
+            self._gpus_acquired += count
+            granted_any = True
+        if granted_any:
+            self._gpu_cond.notify_all()
+
+    def release_gpus(self, sandbox, gpu_ids: "list[int]") -> None:
+        """Release *gpu_ids* (held by *sandbox*) back to the pool. No "is
+        it idle yet" wait: callers already tear down synchronously first.
+        Guards against an unknown gpu_id and a double-release."""
+        if not gpu_ids:
+            return
+        with self._gpu_cond:
+            for gpu_id in gpu_ids:
+                if gpu_id not in self.gpus:
+                    # DATACOLLECTOR: append -- process-level, real usage-bug signal.
+                    print(
+                        f"[agresources] WARNING: release_gpus called with unknown gpu_id={gpu_id}"
+                    )
+                    continue
+                if gpu_id in self._free_gpus:
+                    # DATACOLLECTOR: append -- process-level, real invariant-violation signal.
+                    print(f"[agresources] WARNING: GPU double-release for gpu_id={gpu_id}")
+                    continue
+                self._free_gpus.add(gpu_id)
+                self._gpus_acquired = max(0, self._gpus_acquired - 1)
+            self._dispatch_gpu_queue_locked()
+        for gpu_id in gpu_ids:
+            agprof.gpu_lease_end(gpu_id)
+        sandbox._gpu_ids = []
+        self._update_resource_log(who=sandbox._name, action="release_gpu", gpu_ids=list(gpu_ids))
+
+    def acquire_cpu_mem(
+        self, sandbox, cpus: "float | None" = None, memory_mb: "float | None" = None
+    ) -> None:
+        """Boost *sandbox*'s CPU/memory limits (applying the min_cpus/
+        min_memory_mb floor), update its `_cpu_acquired`/
+        `_memory_acquired_mb` bookkeeping, and record the acquisition.
+
+        A running container throttled to 0 cpu shares or 0 memory can't
+        make forward progress, so a requested value is never let below the
+        floor -- silently raised rather than rejected, since a too-small
+        request is a caller mistake to correct for, not a real capacity
+        constraint (see the total_cpus/total_memory_mb ceiling check, which
+        IS a real rejection, in agskill.py's _reserve_resource).
+        """
+        if cpus is None and memory_mb is None:
+            return
+        applied_cpus = _floor(cpus, MIN_CPUS)
+        applied_memory_mb = _floor(memory_mb, MIN_MEMORY_MB)
+        sandbox.update_limits(cpus=applied_cpus, memory=_memory_mb_to_docker_str(applied_memory_mb))
+        if applied_cpus is not None:
+            sandbox._cpu_acquired += applied_cpus
+        if applied_memory_mb is not None:
+            sandbox._memory_acquired_mb += applied_memory_mb
+        with self._cpu_mem_cond:
+            self.cpus_acquired += applied_cpus or 0.0
+            self.memory_acquired_mb += applied_memory_mb or 0
+        self._update_resource_log(
+            who=sandbox._name,
+            action="acquire_cpu_mem",
+            cpus=applied_cpus,
+            memory_mb=applied_memory_mb,
+        )
+
+    def release_cpu_mem(self, sandbox, cpu: bool = False, memory: bool = False) -> None:
+        """Reset *sandbox*'s CPU and/or memory limits to idle (flooring
+        idle_cpus at min_cpus), update its `_cpu_acquired`/
+        `_memory_acquired_mb` bookkeeping, and record the release.
+
+        idle_memory is a pre-formatted docker string (e.g. "1g") or None
+        (unlimited) -- unlike memory_mb on the acquire side, it's not a raw
+        MB number, so it's passed straight through rather than floored."""
+        if not (cpu or memory):
+            return
+        held_cpus = sandbox._cpu_acquired if cpu else 0.0
+        held_mb = sandbox._memory_acquired_mb if memory else 0
+        sandbox.update_limits(
+            cpus=_floor(self.agconfig.resources.idle_cpus, MIN_CPUS) if cpu else None,
+            memory=self.agconfig.resources.idle_memory if memory else None,
+        )
+        if cpu:
+            sandbox._cpu_acquired = 0.0
+        if memory:
+            sandbox._memory_acquired_mb = 0
+        with self._cpu_mem_cond:
+            self.cpus_acquired = max(0.0, self.cpus_acquired - held_cpus)
+            self.memory_acquired_mb = max(0, self.memory_acquired_mb - held_mb)
+        self._update_resource_log(
+            who=sandbox._name, action="release_cpu_mem", cpus=held_cpus, memory_mb=held_mb
+        )
+
+    def _emit_resource(self) -> None:
+        dc = self._data_logger
+        if dc is None:
+            return
+        dc.record_event(
+            type="resource_update",
+            payload={
+                "gpus_acquired": self._gpus_acquired,
+                "gpus_total": len(self.gpus),
+                "cpus_acquired": self.cpus_acquired,
+                "cpus_total": self.total_cpus,
+                "memory_acquired_mb": self.memory_acquired_mb,
+                "memory_total_mb": self.total_memory_mb,
+            },
+            name="resource_pool",
+            object="resource_pool",
+            update_latest_snapshot=True,
+        )
+
+    def _update_resource_log(
+        self, *, who: "str | None" = None, action: "str | None" = None, **request
+    ) -> None:
+        dc = self._data_logger
+        if dc is None:
+            return
+        self._emit_resource()
+        dc.record_event(
+            type="resource_request",
+            payload={"who": who, "action": action, "request": request or None},
+            name="resource_pool",
+            object="resource_pool",
+            update_latest_snapshot=False,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"agResourcePool(gpus={self.gpus!r}, "
+            f"total_cpus={self.total_cpus}, total_memory_mb={self.total_memory_mb}, "
+            f"idle_cpus={self.agconfig.resources.idle_cpus}, idle_memory={self.agconfig.resources.idle_memory!r})"
+        )

@@ -4,11 +4,15 @@ import pytest
 from agency.agteam import agteam
 from agency.agskill import agskill
 from agency.agdata import agdata
-from agency.agconfig import agConfig
+from agency.configs.agconfig import agconfig as agconfig_cls, llmconfig
 
 
-def _llm_agconfig(d: dict) -> agConfig:
-    return agConfig({"agllm_backend": dict(d)})
+def _llm_agconfig(d: dict) -> agconfig_cls:
+    return agconfig_cls(llmconfig(**d))
+
+
+def _llm_view(cfg: agconfig_cls, ref: dict) -> dict:
+    return {k: getattr(cfg.llm, k) for k in ref}
 
 
 _ECHO_LLM = {"api_key": "k", "model": "m"}
@@ -23,7 +27,7 @@ class _EchoTeam(agteam):
     agconfig = _llm_agconfig(_ECHO_LLM)
 
     def setup(self):
-        self.skill = agskill(name="echo", system_prompt="Echo.")
+        self.skill = agskill(name="echo", prompt="Echo.")
         from agency.agent import agent
 
         self.agent = agent()
@@ -64,7 +68,7 @@ def test_init_multiple_kwargs_all_become_attributes():
 @pytest.mark.parametrize(
     "llm_cfg",
     [
-        {"api_key": "x", "model": ""},
+        {"api_key": "x", "model": "gpt-4"},
         {"api_key": "y", "model": "claude-3", "base_url": "https://api.example.com"},
         {"api_key": "z", "model": "llama-3", "temperature": 0.7},
         {"api_key": "a", "model": "mistral"},
@@ -73,18 +77,17 @@ def test_init_multiple_kwargs_all_become_attributes():
 def test_init_agconfig_instance_override_does_not_affect_class(llm_cfg):
     cfg = _llm_agconfig(llm_cfg)
     team = _EchoTeam(agconfig=cfg)
-    # team.agconfig is its own clone of cfg, not cfg itself -- see
-    # docs/Design_configuration.md ("Changing a Dynamic field live").
+    # team.agconfig is its own clone of cfg, not cfg itself.
     assert team.agconfig is not cfg
-    assert team.agconfig.data.get("agllm_backend") == llm_cfg
-    assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
+    assert _llm_view(team.agconfig, llm_cfg) == llm_cfg
+    assert _llm_view(_EchoTeam.agconfig, _ECHO_LLM) == _ECHO_LLM
     other = _EchoTeam()
-    assert other.agconfig.data.get("agllm_backend") == _ECHO_LLM
+    assert _llm_view(other.agconfig, _ECHO_LLM) == _ECHO_LLM
 
 
 def test_init_agconfig_none_falls_back_to_class_attr():
     team = _EchoTeam(agconfig=None)
-    assert team.agconfig.data.get("agllm_backend") == _ECHO_LLM
+    assert _llm_view(team.agconfig, _ECHO_LLM) == _ECHO_LLM
 
 
 def test_init_calls_setup_before_returning():
@@ -117,7 +120,7 @@ def test_setup_runs_before_run():
         def run(self):
             calls.append("run")
 
-    from agency.agsync import agsync
+    from agency.utils.agsync import agsync
 
     t = _OrderTeam()
     t.run()
@@ -169,7 +172,7 @@ def test_agent_inherits_team_llm_config(llm_cfg):
             pass
 
     team = _T(agconfig=_llm_agconfig(llm_cfg))
-    assert team.ag.llm.backend.as_dict() == llm_cfg
+    assert _llm_view(team.ag.agconfig, llm_cfg) == llm_cfg
 
 
 def test_multiple_agents_in_setup_all_registered():
@@ -193,18 +196,18 @@ def test_multiple_agents_in_setup_all_registered():
     assert team.a2 is not team.a3
 
 
-def test_agent_agname_kwarg_accepted():
+def test_agent_name_kwarg_accepted():
     from agency.agent import agent
 
     class _T(agteam):
         def setup(self):
-            self.ag = agent(agname="my-custom-agent")
+            self.ag = agent(name="my-custom-agent")
 
         def run(self):
             pass
 
     team = _T(agconfig=_llm_agconfig(_ECHO_LLM))
-    assert team.ag.agname == "my-custom-agent_0000"
+    assert team.ag.agname == "agent_my-custom-agent_0000"
 
 
 def test_agents_property_returns_copy_not_live_list():
@@ -244,26 +247,23 @@ def test_run_not_implemented_on_base():
         agteam().run()
 
 
-def test_run_returns_pending_agdata():
-    result = _EchoTeam().run()
-    assert isinstance(result, agdata)
+def test_run_returns_pending_data_before_work_finishes():
+    import threading
 
+    release = threading.Event()
 
-def test_run_is_nonblocking():
-    import time
-
-    class _SlowTeam(agteam):
-        def setup(self):
-            pass
-
+    class WaitingTeam(agteam):
         def run(self):
-            time.sleep(0.2)
+            assert release.wait(2)
             return agdata(done=True)
 
-    t0 = time.perf_counter()
-    result = _SlowTeam().run()
-    assert time.perf_counter() - t0 < 0.1
-    assert result.done is True  # blocks here
+    result = WaitingTeam().run()
+    try:
+        assert isinstance(result, agdata)
+        assert result.is_pending()
+    finally:
+        release.set()
+    assert result.wait(timeout=2).done
 
 
 @pytest.mark.parametrize(
@@ -315,35 +315,22 @@ def test_run_exception_raises_on_field_access():
 # ---------------------------------------------------------------------------
 
 
-def test_parallel_run_all_results_resolve():
-    teams = [_EchoTeam() for _ in range(4)]
-    results = [t.run() for t in teams]
-    assert all(r.done is True for r in results)
+def test_parallel_runs_reach_the_same_barrier():
+    import threading
 
+    barrier = threading.Barrier(5)
 
-def test_parallel_run_runs_concurrently():
-    import time
-
-    class _SlowTeam(agteam):
-        def setup(self):
-            pass
-
+    class ParallelTeam(agteam):
         def run(self):
-            time.sleep(0.2)
+            barrier.wait(timeout=2)
             return agdata(ok=True)
 
-    teams = [_SlowTeam() for _ in range(4)]
-    t0 = time.perf_counter()
-    results = [t.run() for t in teams]
-    _ = [r.ok for r in results]
-    assert time.perf_counter() - t0 < 0.6  # 4×0.2s sequential = 0.8s
-
-
-@pytest.mark.parametrize("n", [1, 2, 5, 8])
-def test_parallel_run_scales_to_n_teams(n):
-    teams = [_EchoTeam() for _ in range(n)]
-    results = [t.run() for t in teams]
-    assert all(r.done is True for r in results)
+    results = [ParallelTeam().run() for _ in range(4)]
+    try:
+        barrier.wait(timeout=2)
+        assert all(result.wait(timeout=2).ok for result in results)
+    finally:
+        barrier.abort()
 
 
 def test_parallel_run_mixed_success_and_failure():
@@ -424,17 +411,18 @@ def test_config_kwargs_are_independent_per_instance(key, vals):
 
 
 def test_agconfig_overrides_are_independent_per_instance():
-    cfgs = [
-        _llm_agconfig({"api_key": "a", "model": "m1"}),
-        _llm_agconfig({"api_key": "b", "model": "m2"}),
-        _llm_agconfig({"api_key": "c", "model": "m3"}),
+    llm_dicts = [
+        {"api_key": "a", "model": "m1"},
+        {"api_key": "b", "model": "m2"},
+        {"api_key": "c", "model": "m3"},
     ]
+    cfgs = [_llm_agconfig(d) for d in llm_dicts]
     teams = [_EchoTeam(agconfig=c) for c in cfgs]
-    for team, cfg in zip(teams, cfgs):
+    for team, cfg, d in zip(teams, cfgs, llm_dicts):
         # Each team's agconfig is its own clone, not the source cfg itself.
         assert team.agconfig is not cfg
-        assert team.agconfig.data.get("agllm_backend") == cfg.data.get("agllm_backend")
-    assert _EchoTeam.agconfig.data.get("agllm_backend") == _ECHO_LLM
+        assert _llm_view(team.agconfig, d) == d
+    assert _llm_view(_EchoTeam.agconfig, _ECHO_LLM) == _ECHO_LLM
 
 
 def test_many_instances_each_have_own_agent_list():
@@ -449,8 +437,19 @@ def test_many_instances_each_have_own_agent_list():
 
 
 def test_kwargs_can_shadow_non_reserved_names():
+    """`name` itself is reserved now (see test_name_kwarg_seeds_team_name below)
+    -- this exercises the same **config passthrough mechanism (setattr for
+    every kwarg not otherwise used) via a kwarg that isn't."""
+    team = _EchoTeam(custom_field="custom_value")
+    assert team.custom_field == "custom_value"
+
+
+def test_name_kwarg_seeds_team_name():
+    """`name` is reserved: it seeds the auto-suffixed identity name (see
+    agteam.__init__'s `_base = config.get("name") or ...`), not a literal
+    passthrough attribute."""
     team = _EchoTeam(name="custom_name")
-    assert team.name == "custom_name"
+    assert team.name == "team_custom_name_0000"
 
 
 def test_setup_exception_propagates_from_init():
@@ -480,21 +479,21 @@ def test_agent_created_outside_team_requires_explicit_llm_config():
 def test_team_change_config_replaces_agconfig():
     team = _EchoTeam()
     team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
-    assert team.agconfig.get("agllm_backend", "temperature") == 0.2
+    assert team.agconfig.llm.temperature == 0.2
 
 
 def test_team_change_config_clones_given_agconfig():
     team = _EchoTeam()
     new_cfg = _llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2})
     team.change_config(new_cfg)
-    new_cfg.agllm_backend.temperature = 0.9
-    assert team.agconfig.get("agllm_backend", "temperature") == 0.2
+    new_cfg.llm.temperature = 0.9
+    assert team.agconfig.llm.temperature == 0.2
 
 
 def test_team_change_config_propagates_to_spawned_agents():
     team = _EchoTeam()
     team.change_config(_llm_agconfig({"api_key": "k", "model": "m", "temperature": 0.2}))
-    assert team.agent.llm.backend.temperature == 0.2
+    assert team.agent.agconfig.llm.temperature == 0.2
 
 
 def test_team_get_config_copy_returns_clone_not_same_object():
@@ -505,11 +504,57 @@ def test_team_get_config_copy_returns_clone_not_same_object():
 
 def test_team_get_config_copy_reflects_current_values():
     team = _EchoTeam()
-    assert team.get_config_copy().agllm_backend.model == "m"
+    assert team.get_config_copy().llm.model == "m"
+
+
+# ---------------------------------------------------------------------------
+# team_registered snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_team_registered_is_refreshed_after_run_builds_its_agents(tmp_path):
+    """__init__'s team_registered snapshot is taken right after setup(),
+    before run() ever executes -- a team with no setup() override (agents
+    built directly in run(), the common ad-hoc pattern -- see main.py-style
+    scripts) always has an empty _agents set at that point. The wrapped
+    run() must log team_registered again once run() completes so the
+    snapshot reflects the agents run() actually created."""
+    import json
+    import sqlite3
+
+    from agency.agent import agent
+    from agency.utils.agsync import agsync
+
+    class RunBuiltTeam(agteam):
+        agconfig = _llm_agconfig(_ECHO_LLM)
+
+        def run(self):
+            self.worker = agent(name="run_built_worker")
+            return agdata(done=True)
+
+    agent.log_dir = tmp_path
+    team = RunBuiltTeam()
+    team.run()
+    agsync(team)
+    team.data_logger.flush()
+
+    con = sqlite3.connect(team.data_logger.db_path)
+    try:
+        rows = con.execute(
+            "SELECT payload FROM events WHERE object='agteam' AND name=? "
+            "AND type='team_registered' ORDER BY id",
+            (team.name,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    payloads = [json.loads(row[0]) for row in rows]
+    assert payloads[0]["agents"] == []
+    assert payloads[-1]["agents"] == [team.worker.agname]
 
 
 def test_mutating_team_get_config_copy_does_not_affect_team():
     team = _EchoTeam()
     copy = team.get_config_copy()
-    copy.agllm_backend.temperature = 0.9
-    assert team.agconfig.get("agllm_backend", "temperature") is None
+    copy.llm.temperature = 0.9
+    assert team.agconfig.llm.temperature is None

@@ -4,7 +4,7 @@ PTRACE_O_TRACEFORK auto-attach of the grandchild plus argv resolution across
 more than one execve in the same traced tree.
 
 Not a pytest file -- invoked as a subprocess target by
-tests/agharness_internal/test_agproxy_ptrace.py, e.g. `[sys.executable, THIS_FILE]`.
+tests/harness/test_agproxy_ptrace.py, e.g. `[sys.executable, THIS_FILE]`.
 """
 
 import os

@@ -1,11 +1,9 @@
-"""Cross-cutting regression guards for harness profiling.
+"""Cross-cutting interruption and thread-parentage guards.
 
-The end-to-end golden described by M8 depends on a deterministic mock/replay
-endpoint for the five harness engines.  That endpoint is deliberately owned
-outside the profiler roadmap and is not present in this repository yet.  Keep
-the independently useful interruption and static guards here now; add the
-engine golden beside them once the replay endpoint has a concrete protocol and
-fixture.
+The deterministic HTTP adapter/profiler and shared tool-contract golden tests
+live in test_profiler_native.py. They exercise all five wire adapters with a
+fake provider; real CLI binaries, Linux ptrace, cgroups and GPU devices still
+require their environment-specific integration runs.
 """
 
 from __future__ import annotations
@@ -29,86 +27,35 @@ _AGENCY_ROOT = _REPO_ROOT / "agency"
 # (repository-relative path, lexical class/function scope); counts distinguish
 # multiple reviewed calls in one scope without relying on brittle line numbers.
 _BARE_THREAD_ALLOWLIST = {
-    # Harness transcript/service plumbing.
+    # Harness service plumbing.
     (
-        "agency/agharness_internal/agharness_backends/native.py",
-        "_NativeBackend.execute",
-    ): (1, "transcript polling"),
+        "agency/harness/daemon.py",
+        "_HarnessApiServer.start",
+    ): (1, "harness API server"),
     (
-        "agency/agharness_internal/agharness_messenger.py",
-        "agHarnessMessenger.start",
-    ): (1, "TCP server"),
+        "agency/harness/servers/harness_interaction_server.py",
+        "HarnessInteractionServer.start",
+    ): (1, "sandbox interaction server"),
+    # ptrace supervision and subprocess pipe plumbing.
     (
-        "agency/agharness_internal/agharness_messenger.py",
-        "agHarnessMessenger.ensure_uds_started",
-    ): (1, "UDS server"),
-    (
-        "agency/agharness_internal/agllm_terminus.py",
-        "agLLMTerminus.start",
-    ): (1, "TCP server"),
-    (
-        "agency/agharness_internal/agllm_terminus.py",
-        "agLLMTerminus.ensure_uds_started",
-    ): (1, "UDS server"),
-    (
-        "agency/agharness_internal/agmcp_server.py",
-        "agMCPServer.start",
-    ): (1, "TCP server"),
-    (
-        "agency/agharness_internal/agmcp_server.py",
-        "agMCPServer.ensure_uds_started",
-    ): (1, "UDS server"),
-    (
-        "agency/agharness_internal/agprof_ingest.py",
-        "agProfilerIngest.ensure_uds_started",
-    ): (1, "UDS ingest server"),
-    (
-        "agency/agharness_internal/agproxy_llm.py",
-        "agProxyLLM.start",
-    ): (1, "TCP server"),
-    (
-        "agency/agharness_internal/agproxy_llm.py",
-        "agProxyLLM.ensure_uds_started",
-    ): (1, "UDS server"),
-    # ptrace transport and subprocess pipe plumbing.
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_entrypoint.py",
-        "_Tracer.run",
-    ): (2, "subprocess pipe drainers"),
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_launcher.py",
-        "InContainerRelay.start",
-    ): (2, "diagnostic and relay readers"),
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_in_container_launcher.py",
-        "InContainerRelay._drain_diagnostics",
-    ): (2, "subprocess pipe drainers"),
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
-        "_handle_connection",
-    ): (2, "bidirectional relay pumps"),
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tcp_to_uds_relay.py",
-        "main",
-    ): (1, "per-connection handler"),
-    (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop.start",
     ): (1, "tracer loop"),
     (
-        "agency/agharness_internal/agproxy_ptrace_internal/_tracer_loop.py",
+        "agency/harness/ptrace/_tracer_loop.py",
         "TracerLoop._fork_and_exec",
-    ): (2, "subprocess pipe readers"),
-    # General background I/O and UI maintenance.
-    ("agency/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
-    ("agency/agwebui/__init__.py", "agwebui.run"): (1, "UI command relay"),
-    ("agency/agwebui/emitter.py", "agwebui_emitter.emit"): (1, "event pruning"),
-    ("agency/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
+    ): (3, "subprocess pipe readers/writer"),
     (
-        "agency/profiler/agprof_emit.py",
-        "RemoteProfilerEmitter.__init__",
-    ): (1, "bounded telemetry sender"),
-    ("agency/tools/human.py", "ask_human_and_wait"): (1, "stdin reader"),
+        "agency/harness/ptrace/_tracer_loop.py",
+        "TracerLoop._fork_pty",
+    ): (1, "subprocess terminal reader"),
+    # General background I/O and UI maintenance.
+    ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
+    (
+        "agency/observability/agwebui/__init__.py",
+        "agwebui.run",
+    ): (2, "UI command relay + periodic disk-flush loop"),
+    ("agency/observability/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
 }
 
 
@@ -187,6 +134,10 @@ def _bare_thread_calls() -> Counter[tuple[str, str]]:
         # executable thread sites.
         if path.name.startswith("._"):
             continue
+        # The guard audits threads shipped by the library, not concurrency
+        # intentionally created by the library's own tests.
+        if "tests" in path.relative_to(_AGENCY_ROOT).parts:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         threading_aliases, thread_aliases = _thread_import_aliases(tree)
         visitor = _BareThreadVisitor(
@@ -224,7 +175,7 @@ def launch():
 def test_session_stop_preserves_an_inflight_run_as_interrupted(monkeypatch, tmp_path):
     """An interrupted harness run must not disappear or look successful."""
     pytest.importorskip("opentelemetry.sdk.trace")
-    from agency.profiler import agprof
+    from agency.observability.profiler import agprof
 
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     started = threading.Event()

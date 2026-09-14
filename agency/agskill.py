@@ -1,54 +1,232 @@
 from __future__ import annotations
+import functools
 import json
-import threading
-import time
-from concurrent.futures import Future
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 from .agdata import agdata, agerror
+from .agpolicy import agpolicy
 from .agtype import agtype
-from . import agpause
-from .profiler import agprof
 from .agschema import agschema
-from .agcontext import agcontext
 from .agtool import agtool
-from .agllm import agllm
-from .agsandbox import agSandbox, agSandboxConfig
-from .agconfig import agConfig, DynamicConfigParam, _AgConfigViewBase
-from .agutil import format_exception
-from .aglog import _ts
-
-
-# Exists only to register agskill's config fields (via __set_name__ at import
-# time). Constants are plain class attributes (not descriptors) so other code
-# in this file needing the same hardcoded value can reference it directly.
-# Reads use a throwaway instance -- _AgSkillFields(agconfig) -- since
-# agskill instances don't hold their own agconfig (a skill runs on behalf of
-# different agents with different agconfigs), so there's no self to hang a
-# descriptor on.
-class _AgSkillFields:
-    react_max_steps = DynamicConfigParam("agskill", default=4096)
-    agbinary_validate_exec_timeout = DynamicConfigParam("agskill", default=5)
-    error_log_truncate = DynamicConfigParam("agskill", default=300)
-    last_output_log_truncate = DynamicConfigParam("agskill", default=2000)
-
-    def __init__(self, agconfig=None) -> None:
-        self._agconfig = agconfig
-
-
-class agSkillConfig(_AgConfigViewBase):
-    """View over an agConfig for pre-setting agskill tunables in one call::
-
-        cfg = agConfig(agSkillConfig(react_max_steps=64))
-
-    See `_AgConfigViewBase` in agconfig.py for the shared mechanics.
-    """
-
-    _OWNER = "agskill"
 
 
 if TYPE_CHECKING:
     from .agent import agent
+
+
+# ---------------------------------------------------------------------------
+# Default host-side MCP tools
+# ---------------------------------------------------------------------------
+
+
+def _reserve_resource(arg: agdata, sandbox, resource_pool) -> agdata:
+    cpus = arg._data.get("cpus")
+    memory_mb = arg._data.get("memory_mb")
+    gpu = arg._data.get("gpu", 0)
+    messages = []
+    result: dict = {}
+
+    if cpus is not None and cpus > resource_pool.total_cpus:
+        return agerror(f"requested {cpus} cpus but pool only has {resource_pool.total_cpus}")
+    if memory_mb is not None and memory_mb > resource_pool.total_memory_mb:
+        return agerror(
+            f"requested {memory_mb} MB but pool only has {resource_pool.total_memory_mb} MB"
+        )
+    if gpu and gpu > len(resource_pool.gpus):
+        return agerror(f"requested {gpu} gpus but pool only has {len(resource_pool.gpus)}")
+
+    if cpus is not None or memory_mb is not None:
+        resource_pool.acquire_cpu_mem(sandbox, cpus=cpus, memory_mb=memory_mb)
+        messages.append(f"cpus={cpus}, memory_mb={memory_mb}")
+
+    if gpu:
+        sandbox._gpu_count_requested = gpu
+        sandbox._gpu_acquire_fn = functools.partial(resource_pool.acquire_gpus, sandbox)
+        sandbox._gpu_release_fn = functools.partial(resource_pool.release_gpus, sandbox)
+        result["gpu_count_requested"] = gpu
+        messages.append(f"gpu reservation set to {gpu} (granted lazily on next exec)")
+
+    if not messages:
+        return agerror("reserve_resource called with nothing to reserve")
+    result["message"] = "Reserved: " + "; ".join(messages)
+    return agdata(**result)
+
+
+def _release_resource(arg: agdata, sandbox, resource_pool) -> agdata:
+    cpu = arg._data.get("cpu", False)
+    memory = arg._data.get("memory", False)
+    gpu = arg._data.get("gpu", False)
+    messages = []
+
+    if cpu or memory:
+        resource_pool.release_cpu_mem(sandbox, cpu=cpu, memory=memory)
+        messages.append(f"cpu={cpu}, memory={memory} reset to idle")
+
+    if gpu:
+        if sandbox._gpu_count_requested > 0:
+            if sandbox._gpu_ids:
+                resource_pool.release_gpus(sandbox, sandbox._gpu_ids)
+            messages.append(f"gpu reservation ({sandbox._gpu_count_requested}) released")
+            sandbox._gpu_count_requested = 0
+            sandbox._gpu_acquire_fn = None
+            sandbox._gpu_release_fn = None
+        else:
+            messages.append("no gpu was reserved")
+
+    if not messages:
+        return agerror("release_resource called with nothing to release")
+    return agdata(message="; ".join(messages))
+
+
+def _get_current_resources(arg: agdata, sandbox, resource_pool) -> agdata:
+    return agdata(
+        cpus_acquired=sandbox._cpu_acquired,
+        memory_mb_acquired=sandbox._memory_acquired_mb,
+        gpu_count_requested=sandbox._gpu_count_requested,
+        gpu_ids_held=list(sandbox._gpu_ids),
+        total_cpus=resource_pool.total_cpus,
+        total_memory_mb=resource_pool.total_memory_mb,
+        total_gpus=len(resource_pool.gpus),
+    )
+
+
+def _daemon_release(arg: agdata, sandbox) -> agdata:
+    pid = arg._data["pid"]
+    sandbox.release_daemon(pid)
+    return agdata(message=f"PID {pid} released as daemon -- will not block skill completion")
+
+
+def _coerce_submitted_value(hint, value):
+    """submit_output's own tool schema declares no type for `value` (one
+    tool serves every output field, whatever its real type) -- so a model
+    has nothing telling it a given field is numeric/boolean, and routinely
+    emits it as a quoted string (e.g. "42" instead of 42) since that's the
+    one type it can always produce. Cast to the schema's real declared
+    type before validating, rather than rejecting a value the model had
+    no way to type correctly in the first place. Only ever narrows a str
+    to what the field hint actually is -- a value already of the right
+    type (or one that fails to parse) passes through unchanged, so
+    check_field still reports a real mismatch as an error."""
+    if not isinstance(value, str) or not isinstance(hint, type):
+        return value
+    if issubclass(hint, bool):
+        low = value.strip().lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+        return value
+    if issubclass(hint, int):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    if issubclass(hint, float):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
+def _submit_output(arg: agdata, output_schema, submitted_output_store: dict) -> agdata:
+    if output_schema is None:
+        return agerror("this skill declares no output_schema -- nothing to submit")
+    field = arg._data["field"]
+    value = arg._data["value"]
+    if field not in output_schema._data:
+        return agerror(f"unknown output field {field!r}")
+    value = _coerce_submitted_value(output_schema._data[field], value)
+    err = output_schema.check_field(field, value)
+    if err is not None:
+        return agerror(err)
+    submitted_output_store[field] = value
+    required = set(output_schema._data.keys())
+    missing_output_fields = sorted(required - set(submitted_output_store.keys()))
+    if missing_output_fields == []:
+        missing_output_fields = None
+    return agdata(result=f"field {field!r} recorded", missing_output_fields=missing_output_fields)
+
+
+def _submitted_output(arg: agdata, submitted_output_store: dict) -> agdata:
+    return agdata(**submitted_output_store)
+
+
+_DEFAULT_HOST_MCP_TOOLS: "list[agtool]" = [
+    agtool(
+        name="reserve_resource",
+        description=(
+            "Reserve additional CPU/memory/GPU capacity for this sandbox. "
+            "Any combination of cpus/memory_mb/gpu may be given in one call; "
+            "omitted resources are left untouched."
+        ),
+        fn=_reserve_resource,
+        params={
+            "type": "object",
+            "properties": {
+                "cpus": {"type": "number", "description": "CPUs to reserve"},
+                "memory_mb": {"type": "number", "description": "memory to reserve, in MB"},
+                "gpu": {"type": "integer", "description": "number of GPUs to reserve"},
+            },
+            "required": [],
+        },
+    ),
+    agtool(
+        name="release_resource",
+        description=(
+            "Release previously reserved CPU/memory/GPU capacity for this "
+            "sandbox. Any combination of cpu/memory/gpu may be given in one "
+            "call; omitted resources are left untouched."
+        ),
+        fn=_release_resource,
+        params={
+            "type": "object",
+            "properties": {
+                "cpu": {"type": "boolean", "description": "release held CPU"},
+                "memory": {"type": "boolean", "description": "release held memory"},
+                "gpu": {"type": "boolean", "description": "release held GPU(s)"},
+            },
+            "required": [],
+        },
+    ),
+    agtool(
+        name="get_current_resources",
+        description="Return this sandbox's current resource allocation and the pool's totals.",
+        fn=_get_current_resources,
+    ),
+    agtool(
+        name="daemon_release",
+        description=(
+            "Release a background process (by pid) from monitoring so the "
+            "skill can finish without waiting for it."
+        ),
+        fn=_daemon_release,
+        params={
+            "type": "object",
+            "properties": {"pid": {"type": "integer", "description": "pid to release"}},
+            "required": ["pid"],
+        },
+    ),
+    agtool(
+        name="submit_output",
+        description="Submit one required output field's value.",
+        fn=_submit_output,
+        params={
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "description": "output field name"},
+                "value": {"description": "the field's value"},
+            },
+            "required": ["field", "value"],
+        },
+        persistent_vars={"submitted_output_store": dict},
+    ),
+    agtool(
+        name="submitted_output",
+        description="Return the output fields submitted so far.",
+        fn=_submitted_output,
+        persistent_vars={"submitted_output_store": dict},
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +235,10 @@ if TYPE_CHECKING:
 
 
 class agskill:
-    """A named skill with its own system prompt and a self-contained ReAct loop.
+    """A named skill: Input prompt with an input/output schema contract,
+    executed by whichever harness (the native ReAct loop, or an external
+    CLI harness such as Claude Code/Codex) the owning agent is configured
+    with.
 
     input_schema / output_schema are agdata objects whose keys define required
     fields and whose values are Python types (``str``, ``int``, ``float``,
@@ -73,43 +254,44 @@ class agskill:
     def __init__(
         self,
         name: str,
-        system_prompt: str,
-        add_tools: list[agtool] | None = None,
-        replace_tools: list[agtool] | None = None,
+        prompt: str,
+        add_host_mcp_tools: "list[agtool] | None" = None,
+        add_sandbox_mcp_tools: "list[agtool] | None" = None,
         input_schema: agdata | None = None,
         output_schema: agdata | None = None,
         max_output_schema_retries: int = 10,
-        plan_mode: bool = False,
+        policy: "agpolicy | None" = None,
     ):
         self.name = name
-        self.system_prompt = system_prompt
-        self.add_tools = add_tools
-        self.replace_tools = [] if plan_mode else replace_tools
+        self.prompt = prompt
         self.input_schema = agschema(input_schema) if input_schema else None
         self.output_schema = agschema(output_schema) if output_schema else None
         self.max_output_schema_retries = max_output_schema_retries
+        self.policy = policy if policy is not None else agpolicy()
+        self.host_mcp_tools = list(_DEFAULT_HOST_MCP_TOOLS) + (add_host_mcp_tools or [])
+        self.sandbox_mcp_tools = list(add_sandbox_mcp_tools or [])
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, extra: str | None = None) -> str:
-        parts = [self.system_prompt]
+    def _build_prompt(self) -> str:
+        parts = [self.prompt]
 
         # Each agtype subclass (agfile, agbinary, …) can inject extra prompt
         # lines describing how the LLM should handle that field (e.g. file paths,
         # binary encoding).  Collect these for both input and output schemas.
         extra_lines: list[str] = []
         for key, hint in self.input_schema._data.items() if self.input_schema else []:
-            cls = agtype.from_hint(hint)
-            if cls is not None:
-                line = cls.extra_input_prompt(key)
+            schema_type = agtype.from_hint(hint)
+            if schema_type is not None:
+                line = schema_type.extra_input_prompt(key)
                 if line:
                     extra_lines.append(line)
         for key, hint in self.output_schema._data.items() if self.output_schema else []:
-            cls = agtype.from_hint(hint)
-            if cls is not None:
-                line = cls.extra_output_prompt(key, self.name)
+            schema_type = agtype.from_hint(hint)
+            if schema_type is not None:
+                line = schema_type.extra_output_prompt(key, self.name)
                 if line:
                     extra_lines.append(line)
 
@@ -119,10 +301,6 @@ class agskill:
                 "\nFile-backed fields — WARNING: these files are temporary and will "
                 "be automatically deleted after this task ends:\n" + "\n".join(extra_lines)
             )
-
-        # Caller-supplied extra prompt (e.g. compaction summary injection).
-        if extra:
-            parts.append(extra)
 
         # Describe the input shape so the LLM knows what JSON keys to expect.
         # Skipped for agrawstring inputs (the value arrives as plain text, not JSON).
@@ -136,25 +314,26 @@ class agskill:
                     "\nRespond with plain text only — no JSON wrapping, no markdown code fences."
                 )
             else:
-                # Structured output — model must call one return_<field> tool per output field.
-                field_tools = ", ".join(f"return_{f}" for f in self.output_schema._data)
+                # Structured output is collected one field at a time through
+                # the host MCP server's submit_output tool.
                 field_lines = "\n".join(
                     f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
                 )
                 parts.append(
-                    f"\nTo return your results, call the appropriate return_<field> tool "
-                    f"once for each required output field ({field_tools}). "
-                    f"Required fields:\n"
+                    "\nTo return your results, you must call the Agency MCP server's "
+                    "submit_output tool once for each required output field. Pass the field "
+                    "name in `field` and its final value in `value`. Do not answer with the "
+                    "values in assistant text; text does not submit structured output. "
+                    "Required fields:\n"
                     f"{field_lines}\n\n"
-                    "- Call each return_<field> tool separately — one field per call.\n"
-                    "- Only call a return_<field> tool when you have the final value ready — "
-                    "return the output itself as the tool argument. "
-                    "Never call a return_<field> tool with empty or missing arguments.\n"
+                    "- Call submit_output separately for each field — one field per call.\n"
+                    "- Only call submit_output when you have the final value ready. "
+                    "Never call it with an empty or missing `field` or `value`.\n"
                     "- You may continue using other tools after registering outputs if needed."
                 )
         return "\n".join(parts)
 
-    def _build_user_content(self, skill_input: agdata) -> "str | list":
+    def build_user_content(self, skill_input: agdata) -> "str | list":
         """Build the content value for the user message.
 
         Returns a plain string for simple inputs, or a multimodal content array
@@ -169,66 +348,35 @@ class agskill:
 
         schema = self.input_schema
         text_data = dict(skill_input._data)
-        extra_blocks: list[dict] = []
+        multimodal_blocks: list[dict] = []
 
         # Ask each agtype field for its contribution to the user message.
         # Fields with no agtype (e.g. plain str, int) are left as-is.
         if schema is not None:
             for key, hint in schema._data.items():
-                cls = agtype.from_hint(hint)
-                if cls is None:
+                schema_type = agtype.from_hint(hint)
+                if schema_type is None:
                     continue
-                placeholder, blocks = cls.build_content_prompt(key, skill_input._data.get(key))
+                placeholder, blocks = schema_type.build_content_prompt(
+                    key, skill_input._data.get(key)
+                )
                 if placeholder is not None:
                     text_data[key] = placeholder
-                extra_blocks.extend(blocks)
+                multimodal_blocks.extend(blocks)
 
-        # No extra blocks — return a plain JSON string (fast path).
-        if not extra_blocks:
+        # No multimodal blocks — return a plain JSON string (fast path).
+        if not multimodal_blocks:
             return f"[HARNESS SYSTEM] New Skill Input:\n{skill_input.to_json()}"
 
-        # Extra blocks present — build a multimodal content array: text first,
-        # then the type-contributed blocks in schema field order.
+        # Multimodal blocks present — build a multimodal content array: text
+        # first, then the type-contributed blocks in schema field order.
         text = json.dumps(text_data)
         content: list = [{"type": "text", "text": f"New Skill Input:\n{text}"}]
-        content.extend(extra_blocks)
+        content.extend(multimodal_blocks)
         return content
 
-    def _build_initial_messages(
-        self,
-        skill_input: agdata,
-        agent_context: agcontext,
-        _extra_system: "str | None",
-        live_messages_fn: "Callable | None",
-        full_history_fn: "Callable | None",
-    ) -> "tuple[list[dict], int]":
-        """Build initial messages list. Returns (messages, n_before)."""
-        # n_before records how many messages were in agent_context before this skill run
-        # started.  After the run, messages[n_before+1:] (skipping the leading
-        # system prompt) is the "delta" — the new turns added by this call.
-        n_before = len(agent_context.messages)
-
-        # Three-part structure: [system] + persistent history from agent_context + [new user turn].
-        messages: list[dict] = (
-            [{"role": "system", "content": self._build_system_prompt(_extra_system)}]
-            + list(agent_context.messages)
-            + [{"role": "user", "content": self._build_user_content(skill_input)}]
-        )
-
-        # Push the conversation (minus system prompt) to the live UI view so the
-        # user can see the running history before the first LLM response arrives.
-        if live_messages_fn:
-            live_messages_fn(messages[1:])
-
-        # Log the system prompt and the new user message to the full-history sink
-        # (e.g. aglog file writer) so they appear in debug transcripts.
-        if full_history_fn:
-            full_history_fn(messages[0])
-            full_history_fn(messages[-1])
-        return messages, n_before
-
     # ------------------------------------------------------------------
-    # Scheduling wrapper — non-blocking, returns pending agdata
+    # Scheduling wrapper — non-blocking, returns the bare result agdata
     # ------------------------------------------------------------------
 
     def run(
@@ -237,264 +385,11 @@ class agskill:
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> agdata:
-        """Submit a skill run on *ag* and return a pending agdata immediately.
+        """Submit through the global orchestrator and return its result agdata."""
+        from .orchestrator import get_orchestrator
 
-        Spawns a daemon thread that runs execute_harness() and resolves futures
-        when done.  Same-agent calls are serialized via the context future chain.
-        """
-        prev_ctx = ag.ctx
-        result_future: Future[agdata] = Future()
-        ctx_future: Future[agcontext] = Future()
-        agpause.tag_producer(result_future, ag)
-        agpause.tag_producer(ctx_future, ag)
-        ts_start = _ts()
-
-        def _task() -> None:
-            outer_result: agdata | None = None
-            updated_ctx: agcontext = prev_ctx
-            outer_delta: list[dict] = []
-            history_before: list[dict] = []
-            _prev_input_tokens: int = 0
-            _prev_output_tokens: int = 0
-            sandbox_lock: "threading.RLock | None" = None
-            # Fallback for the final logging step below if an exception hits
-            # before the defensive copy further down is made.
-            local_skill_input = skill_input
-            agpause.set_current_worker_agent(ag)
-
-            try:
-                # ── 1. Unblock: wait for any in-flight predecessor to finish,
-                #    then resolve any lazy input futures passed by the caller.
-                with agprof.span("resolve"):
-                    prev_ctx.resolve_prev_dependencies()
-                    skill_input.resolve_input_dependencies()
-
-                # Defensive shallow copy: prepare_inputs_in_sandbox() (called
-                # below, via execute_harness) mutates its skill_input argument
-                # in place (offloading oversized/agtype fields to sandbox
-                # paths). If a caller hands the same agdata object to more
-                # than one concurrent run() call (e.g. one shared input
-                # fanned out to several agents), each run must mutate its
-                # own private copy from here on rather than racing the
-                # others on a shared one. A shallow copy is enough --
-                # prepare_inputs_in_sandbox only ever reassigns top-level
-                # keys on the object it's given, never mutates a nested
-                # value's own contents in place.
-                local_skill_input = agdata(**dict(skill_input._data))
-
-                # ── 1b. Checkpoint — honor a pause requested before this run
-                #    even started, before touching the sandbox.
-                ag._check_pause(self.name)
-
-                # ── 2. Provision sandbox — created once on first run and reused
-                #    across subsequent runs via its internal checkpoint image.
-                if ag.sandbox is None:
-                    with agprof.span("sandbox:provision"):
-                        _out_dir = (
-                            ag.agconfig.get("agent", "output_dir", type(ag).output_dir)
-                            if ag.agconfig is not None
-                            else type(ag).output_dir
-                        )
-                        _out = Path(_out_dir) / ag.agname if _out_dir else None
-                        sb_cfg = ag.agconfig
-                        if _out is not None:
-                            sb_cfg = sb_cfg.clone() if sb_cfg else agConfig()
-                            agSandboxConfig(sb_cfg).add_mount("agent_output", _out, "/agent_output")
-                        ag.sandbox = agSandbox(ag.agname, agconfig=sb_cfg)
-
-                # Hold the sandbox's lock for the rest of the skill run so a
-                # sandbox shared across agents is never driven by more than
-                # one skill run at a time — released in the teardown below.
-                sandbox_lock = ag.sandbox._lock
-                sandbox_lock.acquire()
-
-                history_before = list(prev_ctx.messages)
-                _prev_input_tokens = prev_ctx.total_input_tokens
-                _prev_output_tokens = prev_ctx.total_output_tokens
-
-                ag.terminal.log(
-                    "SKILL ▶  ", f"{self.name}  input={list(local_skill_input._data.keys())}"
-                )
-                ag._set_ui_state("skill", skill=self.name)
-                ag._append_full_history({"type": "skill_start", "skill": self.name, "ts": ts_start})
-
-                # ── 3. Run the skill via this agent's configured engine.
-                # Every engine, "native" included, is now an
-                # agharness_backend (see agharness_backends/base.py's
-                # for_config()) -- native.py's own in-container react loop
-                # is just the one whose "binary" happens to be agency's
-                # own code. See execute_harness().
-                outer_result, updated_ctx, outer_delta = self.execute_harness(
-                    ag,
-                    prev_ctx,
-                    local_skill_input,
-                    max_steps,
-                )
-
-            except Exception as exc:
-                outer_result = agerror(format_exception(exc))
-                updated_ctx = prev_ctx
-                outer_delta = []
-                history_before = list(prev_ctx.messages)
-                ag.terminal.log("SKILL ✗  ", f"{self.name}  exception={exc}")
-            finally:
-                # ── 4. Teardown — commit or discard the sandbox; this is
-                # the only rollback boundary (no per-tool rollback -- the
-                # container is persistent for the whole skill call).
-                _had_error = outer_result is not None and bool(outer_result._data.get("error"))
-                ag._set_ui_state("error" if _had_error else "finished")
-                if ag.sandbox is not None:
-                    if _had_error:
-                        # Discard everything since the last successful
-                        # skill's commit(). The notice can't go into this
-                        # skill's own result (already final by this point)
-                        # -- it goes on the inbox instead, so the NEXT
-                        # skill call's loop (via ag._drain_inbox(), run
-                        # before its first LLM call -- native's own loop
-                        # does this in-process; harness-driven engines have
-                        # no equivalent drain point today) surfaces it right
-                        # as the agent resumes sandbox work, rather than
-                        # never telling it at all.
-                        with agprof.span("teardown:discard"):
-                            ag.sandbox.rm_container()
-                        ag.inbox.put(
-                            "Note: the previous skill call failed. Its sandbox "
-                            "workspace changes have been discarded and the "
-                            "workspace has been reverted to the last "
-                            "successful checkpoint."
-                        )
-                    else:
-                        # commit() squashes automatically once the layer
-                        # chain's actual depth crosses checkpoint_squash_
-                        # max_depth -- see its docstring for why that's a
-                        # depth-triggered check, not a fixed commit count.
-                        #
-                        # Hibernate afterward: execute_react()'s output path
-                        # (recover_outputs / remove_files) re-wakes a
-                        # container that the last tool call already
-                        # hibernated, and commit() itself leaves the
-                        # container running. Without this stop(), finished
-                        # agents (especially one-shot forks) hold a session
-                        # keyring forever while sitting on `tail -f
-                        # /dev/null`. Same pending-work deferral as
-                        # agtool.py -- wait_for_processes() should already
-                        # have drained background jobs before we get here.
-                        with agprof.span("teardown:commit"):
-                            try:
-                                ag.sandbox.commit()
-                            finally:
-                                if not ag.sandbox._has_pending_background_work():
-                                    try:
-                                        ag.sandbox.stop()
-                                    except Exception as _e:
-                                        print(
-                                            f"[agskill] WARNING: post-commit hibernate "
-                                            f"failed for {ag.agname}: {_e}"
-                                        )
-                if sandbox_lock is not None:
-                    sandbox_lock.release()
-                agpause.set_current_worker_agent(None)
-
-            # ── 5. Log result and commit token counts.
-            ts_end = _ts()
-            assert outer_result is not None
-            input_dict = local_skill_input.to_dict()
-            result_dict = outer_result.to_dict()
-            if result_dict.get("error"):
-                _error_log_truncate = _AgSkillFields(ag.agconfig).error_log_truncate
-                ag.terminal.log(
-                    "SKILL ✗  ",
-                    f"{self.name}  error={str(result_dict['error'])[:_error_log_truncate]}",
-                )
-                ag._append_full_history(
-                    {"type": "skill_error", "skill": self.name, "error": str(result_dict["error"])}
-                )
-            else:
-                ag.terminal.log("SKILL ✓  ", f"{self.name}  output={list(result_dict.keys())}")
-            outer_input_tokens = updated_ctx.total_input_tokens - _prev_input_tokens
-            outer_output_tokens = updated_ctx.total_output_tokens - _prev_output_tokens
-            try:
-                ag.log._record(
-                    self.name,
-                    ts_start,
-                    ts_end,
-                    input_dict,
-                    result_dict,
-                    len(updated_ctx.messages),
-                    history_before=history_before,
-                    history_delta=outer_delta,
-                    input_tokens=outer_input_tokens,
-                    output_tokens=outer_output_tokens,
-                )
-                type(ag)._add_global_tokens(outer_input_tokens, outer_output_tokens)
-                _ag_usage = ag.log.token_usage
-                _gl_usage = type(ag).global_token_usage()
-                try:
-                    from . import agwebui as _agwebui
-
-                    if _agwebui._active is not None:
-                        _agwebui._active.emitter.token_update(
-                            ag.agname,
-                            _ag_usage["input_tokens"],
-                            _ag_usage["output_tokens"],
-                            _gl_usage["input_tokens"],
-                            _gl_usage["output_tokens"],
-                        )
-                except Exception as _e:
-                    print(
-                        f"[agskill] WARNING: post-skill token_update push failed for {ag.agname}: {_e}"
-                    )
-            except Exception as log_exc:
-                ag.terminal.log("SKILL ✗  ", f"[log error] {log_exc}")
-
-            # ── 6. Resolve result future — unblocks the caller immediately.
-            ag._snapshot_messages = list(updated_ctx.messages)
-            result_future.set_result(outer_result)
-
-            # ── 7. Prune history, then resolve ctx future for the next chained call.
-            try:
-                with agprof.span("prune"):
-                    pruned_msgs = agllm._prune_tool_outputs(updated_ctx.messages)
-                if pruned_msgs is not updated_ctx.messages:
-                    updated_ctx.messages = pruned_msgs
-                    ag.terminal.log(
-                        "PRUNE    ", f"{self.name}  history pruned to {len(pruned_msgs)} msgs"
-                    )
-            except Exception as prune_exc:
-                ag.terminal.log("PRUNE ✗  ", f"{self.name}  pruning failed: {prune_exc}")
-
-            ctx_future.set_result(updated_ctx)
-
-        # Set synchronously, before the thread even starts, so there is no
-        # window where a run is genuinely in flight but ui_state still reads
-        # "inactive" -- is_settled() treats "inactive" as trivially settled,
-        # which would otherwise let wait_all_paused() race past a run that
-        # hasn't had a chance to update its own state yet.
-        ag._set_ui_state("skill", skill=self.name)
-
-        def _traced_task() -> None:
-            run_id = f"run{agprof.next_index()}"
-            label = f"{run_id}:{self.name}:{ag.agname}"
-            agprof.thread_name(label)
-            with agprof.span(label):
-                agprof.annotate(
-                    **{
-                        "agency.run_id": run_id,
-                        "agency.agent_id": str(ag.agname),
-                        "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
-                    }
-                )
-                _task()
-                profile_result = result_future.result()
-                profile_error = profile_result._data.get("error")
-                agprof.annotate(
-                    outcome="failure" if profile_error else "success",
-                    error_type="skill_error" if profile_error else None,
-                )
-
-        agprof.spawn_traced(_traced_task).start()
-        ag.ctx = agcontext(_future=ctx_future)
-        return agdata(_future=result_future)
+        orchestrator = get_orchestrator(ag.agconfig)
+        return orchestrator.submit(ag, self, skill_input, max_steps=max_steps)
 
     async def asyncio_run(
         self,
@@ -502,143 +397,8 @@ class agskill:
         skill_input: agdata,
         max_steps: "int | None" = None,
     ) -> agdata:
-        """Async wrapper around run() for use in asyncio event loops."""
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        pending = self.run(ag, skill_input, max_steps)
-        await loop.run_in_executor(None, pending._resolve)
-        return pending
-
-    # ------------------------------------------------------------------
-    # execute_react() (the old host-process ReAct loop -- LLM calls direct
-    # from the host, tool dispatch via agtool.py's dispatch_tools() with a
-    # per-tool-call sandbox hibernate) was retired here. Every engine,
-    # native included, now runs through execute_harness() below -- native's
-    # own loop lives in a persistent in-container process
-    # (agharness_backends/native.py), not in this host process.
-    # ------------------------------------------------------------------
-
-    def execute_harness(
-        self,
-        ag: "agent",
-        prev_ctx: agcontext,
-        skill_input: agdata,
-        max_steps: "int | None" = None,
-    ) -> "tuple[agdata, agcontext, list[dict]]":
-        """Run this skill against *ag* via its configured `agharness_backend`
-        -- called unconditionally by `agskill.run()`'s `_task()` for every
-        engine, native included (native is just another backend whose
-        "binary" happens to be agency's own code). Same contract
-        `execute_react()` used to promise on its own: `ctx` is the SAME
-        `prev_ctx` object passed in, mutated in place (`.messages`/
-        `.total_input_tokens`/`.total_output_tokens`); `delta` is
-        `[system_prompt_message] + every message appended since this call
-        started`. By the time `_task()` reaches this branch,
-        `prev_ctx.resolve_prev_dependencies()` has already run (agskill.py's
-        `_task()`), so `.messages` is already a concrete resolved list --
-        this method does not need to resolve futures itself.
-
-        See docs/Design_harness_integration.md for the design this
-        implements: the skill's system prompt + input become a plain
-        user-turn prompt (never injected as the harness's own system
-        prompt or a tool), and the harness's own built-in tools/compaction
-        run untouched -- mediation happens at the syscall level via
-        agproxy_ptrace, not through this method.
-
-        Also where every engine gets agtype/oversized-input offloading and
-        agtype-output recovery -- the same `agschema.prepare_inputs_in_
-        sandbox()`/`recover_outputs()` operations `execute_react()` used to
-        call itself, hoisted up here so they're one shared, engine-agnostic
-        implementation instead of five. A background-job wait
-        (`agSandbox.wait_for_processes()`, `execute_react()`'s third such
-        operation) is only called here for the `native` engine, NOT hoisted
-        for all five -- see the call site's own comment for why the other
-        four engines' ptrace-tracked child processes make that unsafe today.
-        Both hoisted operations are
-        host-side, sandbox-based operations with no dependency on which
-        backend actually dispatched the call.
-        """
-        from .agharness_internal.agharness_backends.base import agharness_backend
-
-        input_error = (
-            self.input_schema.validate_input(skill_input) if self.input_schema is not None else None
-        )
-        if input_error is not None:
-            sys_msg = {"role": "system", "content": self._build_system_prompt()}
-            return agerror(input_error), prev_ctx, [sys_msg]
-
-        _input_suffix = f"_{int(time.time() * 1000)}"
-        with agprof.span("input:prepare"):
-            _offloaded_paths, auto_fields = (
-                self.input_schema.prepare_inputs_in_sandbox(
-                    skill_input,
-                    ag.sandbox,
-                    self.name,
-                    suffix=_input_suffix,
-                    context_limit=ag.llm.context_limit,
-                    agconfig=ag.agconfig,
-                )
-                if self.input_schema is not None
-                else ([], [])
-            )
-        extra_system: "str | None" = None
-        if auto_fields:
-            field_list = ", ".join(f"`{f}`" for f in auto_fields)
-            extra_system = (
-                f"\nNote: The following input fields contain large content "
-                f"that has been automatically saved to temporary files in "
-                f"your sandbox: {field_list}. The file paths are shown in "
-                f"the input JSON. Use the read tool to access the full "
-                f"content. WARNING: these files are temporary and will be "
-                f"automatically deleted after this task ends."
-            )
-
-        backend = agharness_backend.for_config(ag.engine, ag.agconfig)
-        try:
-            result, updated_ctx, delta = backend.execute(
-                ag, prev_ctx, skill_input, max_steps, skill=self, extra_system=extra_system
-            )
-        finally:
-            ag.sandbox.remove_files(_offloaded_paths)
-        if not isinstance(result, agerror):
-            # Give a background job the agent kicked off (e.g. `cmd &` via
-            # a bash-style tool call) a chance to finish before this skill
-            # call's container gets committed/stopped -- same protection
-            # `execute_react()` gives itself.
-            #
-            # Scoped to `native` only, NOT hoisted for every engine as
-            # originally planned: a real-Bedrock/real-`claude` regression
-            # test run surfaced that the 4 external-harness engines leave
-            # ptrace-tracked child PIDs in `agsandbox_backend._watched_pids`
-            # that never receive an `ingest_ptrace_pids(exited=...)` call
-            # even long after the harness CLI's own top-level process has
-            # exited (confirmed: `wait_for_processes()` blocked for the
-            # full 5-minute `ping_interval_s` on 7 real claude_code.py
-            # end-to-end tests before this was narrowed to native-only).
-            # That looks like a pre-existing gap in agproxy_ptrace's PID
-            # exit-event delivery, never exercised before because nothing
-            # called `wait_for_processes()` for a harness-driven engine
-            # until this hoist -- a separate investigation, not something
-            # to paper over here. Native's own persistent entrypoint
-            # process is deliberately excluded from monitoring instead
-            # (`agSandbox.release_daemon()`, see native.py's
-            # `launch_in_container_entrypoint`), which is what makes this
-            # safe for native specifically.
-            if ag.engine == "native":
-                agSandbox.wait_for_processes(
-                    ag.sandbox,
-                    self.name,
-                    ag.terminal,
-                    ag.log,
-                    str(ag.agname),
-                    type(ag).ping_interval_s,
-                    type(ag).poll_interval_s,
-                    ag._set_ui_state,
-                )
-            if self.output_schema is not None:
-                self.output_schema.recover_outputs(result, ag.sandbox)
-        return result, updated_ctx, delta
+        """Async wrapper returning the resolved invocation output."""
+        return await self.run(ag, skill_input, max_steps)
 
     def __repr__(self) -> str:
         return f"agskill(name={self.name!r})"

@@ -1,0 +1,78 @@
+"""Host-side client for the sandbox Harness Manager interaction server."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import httpx
+
+from ...harness.protocol import HarnessAttemptRequest, HarnessAttemptResult
+from ...observability.profiler import agprof
+
+
+class HarnessInteractionClient:
+    def __init__(self, uds_path: str, timeout_s: "float | None" = 300.0) -> None:
+        self._client = httpx.Client(
+            transport=httpx.HTTPTransport(uds=uds_path),
+            base_url="http://agency-sandbox",
+            timeout=timeout_s,
+        )
+
+    def run_harness_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
+        # Envelope: includes daemon/CLI/model/tool work. Never attribute its
+        # whole duration to socket overhead or idle time.
+        with agprof.span("harness:attempt_rpc"):
+            response = self._client.post("/harness_attempt", json=asdict(request))
+            response.raise_for_status()
+        with agprof.span("agency:decode_harness_result"):
+            return HarnessAttemptResult(**response.json())
+
+    def pause_harness(self) -> None:
+        self._client.post("/control/pause").raise_for_status()
+
+    def redirect_harness(self, request_id: str, message: str) -> bool:
+        response = self._client.post(
+            "/redirect", json={"request_id": request_id, "message": message}
+        )
+        response.raise_for_status()
+        return response.json()["delivered"] is True
+
+    def resume_harness(self) -> None:
+        self._client.post("/control/resume").raise_for_status()
+
+    def cancel_harness(self, request_id: str) -> None:
+        self._client.post(
+            "/control/cancel", json={"request_id": request_id}, timeout=10
+        ).raise_for_status()
+
+    def is_ready(self) -> bool:
+        response = self._client.get("/health")
+        response.raise_for_status()
+        return response.json() == {"ready": True}
+
+    def daemon_identity(self) -> "tuple[int, int] | None":
+        response = self._client.get("/health")
+        response.raise_for_status()
+        value = response.headers.get("X-Agency-Daemon-Pid")
+        start = response.headers.get("X-Agency-Daemon-Start-Ticks")
+        if (
+            value is None
+            or not value.isdecimal()
+            or int(value) <= 0
+            or start is None
+            or not start.isdecimal()
+        ):
+            return None
+        return int(value), int(start)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "HarnessInteractionClient":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+
+__all__ = ["HarnessInteractionClient"]

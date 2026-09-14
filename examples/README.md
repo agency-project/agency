@@ -1,126 +1,82 @@
-# Examples
+# Agency tutorial
 
-Simple feature examples showing how to use the agency framework.
+These examples are a progressive, executable tour of Agency's current
+architecture. They follow the same path as the architecture diagram:
 
-## LLM configuration
+1. a user submits skills and data;
+2. the process-wide orchestrator resolves dependencies and schedules work;
+3. a fresh per-request engine exposes host services and the configured LLM;
+4. the selected harness and sandbox tools execute inside an isolated sandbox.
 
-For vLLM endpoint, set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODE` enviroment variables, and launch the example scripts.
+Run the examples in numeric order. Each script is standalone, writes artifacts
+under `runs/tutorials/`, cleans up its own sandboxes, and exits normally. The
+web UI is optional and does not linger in the automated run.
+
+## Configure a model and harness
+
+The default is the Codex harness routed through Agency to OpenAI Luna:
 
 ```bash
+export OPENAI_API_KEY="..."
+export AGENCY_LLM_PROVIDER="openai"
+export AGENCY_LLM_MODEL="gpt-5.6-luna"
+export AGENCY_HARNESS="codex"
+export AGENCY_REASONING_EFFORT="none"
+```
+
+External CLI harnesses must also be runnable inside the sandbox image. If your
+default image does not include the CLI's interpreter (Node for Codex), select a
+compatible image with `AGENCY_SANDBOX_IMAGE`.
+
+The harness and model are independent. For example, the same tutorials can run
+Agency's native harness against an OpenAI-compatible vLLM endpoint:
+
+```bash
+export AGENCY_HARNESS="native"
+export AGENCY_LLM_PROVIDER="vllm"
 export LLM_BASE_URL="http://localhost:8000/v1"
-export LLM_MODEL="YOUR_SERVED_MODEL"
-export LLM_API_KEY="YOUR_API_KEY" # Empty ("") if unused
-python examples/base_example.py
+export LLM_MODEL="your-served-model"
+export LLM_API_KEY=""
 ```
 
-Please refer to the main README.md at project root for other LLM APIs, such as OpenAI or Anthropic APIs.
-
----
-
-## base_example.py
-
-**What it shows:** The simplest complete agent — one agent, two skills, shared history.
-
-- `file_manager` skill writes a file to `/workspace/note.txt` inside the sandbox container using the `write` and `read` tools, then confirms the content.
-- `qa` skill answers a follow-up question using the conversation history accumulated from the first skill run, demonstrating that history is shared across skill runs on the same agent.
+Run everything:
 
 ```bash
-python examples/base_example.py
+uv run python examples/run_all.py
 ```
 
----
-
-## parallel_exec.py
-
-**What it shows:** The two natural parallelism patterns the framework enables.
-
-**Pattern 1 — Sequential chain:** Two `ag.run()` calls on the same agent. The second call automatically waits for the first because they chain through the history future. The agent sees both turns in order.
-
-**Pattern 2 — Fork fan-out:** `agent(parent)` deep-copies the history and copies the parent's checkpoint image via `docker tag`; each fork's `run()` fires immediately and returns a pending `agdata`. All three forks run concurrently in separate containers. Accessing `.summary` on each result blocks until that fork is done.
+Run one lesson:
 
 ```bash
-python examples/parallel_exec.py
+uv run python examples/01_basic_agent.py
 ```
 
----
+## Lessons
 
-## custom_tools.py
+| Lesson | Public surface demonstrated |
+|---|---|
+| [`01_basic_agent.py`](01_basic_agent.py) | `agent`/`Agent`, `agskill`, `agschema`, `agdata`, pending results, serialization, `agerror`, `agcanceled`, `AgError` |
+| [`02_context_and_lifecycle.py`](02_context_and_lifecycle.py) | `agcontext`, ordered submissions, pending dependencies, `history`, `queue_message`, async execution, completed-result redirect fallback, `pause`, `resume`, `cancel` |
+| [`03_tools_and_policy.py`](03_tools_and_policy.py) | `agtool`, host MCP tools, sandbox MCP tools, `agpolicy`, tool schemas and direct calls |
+| [`04_files_images_and_types.py`](04_files_images_and_types.py) | `agtype`, `agfile`, `agbinary`, `agpath`, `agimage`, `agrawstring` |
+| [`05_parallel_workflows.py`](05_parallel_workflows.py) | `Agent.fork`, scheduler dependency fan-in, `agteam`, `agmap`, `agtask`, `agsync`, `agdata.wait_all` |
+| [`06_configuration_and_resources.py`](06_configuration_and_resources.py) | every `agconfig` namespace, cloning/updating/redaction, `change_config`, mounts, resource tools, `agResourcePool` |
+| [`07_sandbox_api.py`](07_sandbox_api.py) | lazy sandbox creation, `agSandbox`, text/binary I/O, exec, detached processes, commit/restore/fork, runtime detection |
+| [`08_checkpoints.py`](08_checkpoints.py) | `save`, `load`, `save_all`, `load_all`, `all`, checkpointed context and filesystem state |
+| [`09_observability.py`](09_observability.py) | global orchestrator, `ExecutionScheduler`, `OrchestratorSnapshot`, `agDataLogger`, `record_state`, `agprof` |
+| [`10_harnesses_and_webui.py`](10_harnesses_and_webui.py) | interchangeable native/Codex harnesses, `agwebui`, graceful process shutdown |
 
-**What it shows:** A multi-step, multi-agent research pipeline combining a custom host-side tool, parallel summarisation forks, and the shared output directory.
+Set `AGENCY_KEEP_EXAMPLE_CHECKPOINTS=1` to retain lesson 8's full sandbox
+checkpoint after its restore check. Set `AGENCY_WEBUI_LINGER=1` to keep lesson
+10's dashboard running for interactive inspection; the acceptance runner uses
+the non-lingering default.
 
-1. **`find_papers`** — calls a custom `search_papers` tool (HTTP request to the arXiv API, runs on the host) and returns a list of papers.
-2. **Parallel summarisation** — one `agent(main_agent)` fork per paper; all `run(summarise_paper, ...)` calls fire concurrently. Each fork runs in its own sandbox container.
-3. **`compile_report`** — waits for all pending summaries (resolved automatically when passed as input), then uses the sandboxed `write` tool to save a markdown report to `/agent_output/<agname>/report.md`.
+`run_all.py` is the acceptance runner used for the EC2 validation. Files with a
+leading underscore are support modules and are deliberately excluded from the
+lesson glob.
 
-The report appears on the host at `runs/<timestamp>_custom_tools/agent_output/<agname>/report.md`.
+## What is intentionally not a tutorial API
 
-```bash
-python examples/custom_tools.py
-python examples/custom_tools.py "speculative decoding"
-MAX_PAPERS=6 python examples/custom_tools.py "flash attention"
-```
-
----
-
-## image_processing.py
-
-**What it shows:** `agimage` — the multimodal image input field type — across three input forms, run concurrently as separate teams.
-
-1. **`SingleImageTeam`** — describes one local image file (`agdata(photo=agimage)`); the path is base64-encoded and injected into the message content automatically.
-2. **`MultiImageTeam`** — compares two local images side by side via `agdata(frames=list[agimage])`.
-3. **`UrlImageTeam`** — analyses an image passed as a public URL; no local encoding needed.
-
-Requires a vision-capable model.
-
-```bash
-LLM_MODEL=google/gemma-4-E2B-it python examples/image_processing.py photo.jpg
-LLM_MODEL=google/gemma-4-E2B-it python examples/image_processing.py before.jpg after.jpg
-```
-
----
-
-## human_in_the_loop.py
-
-**What it shows:** Driving approval loops entirely from Python so `ask_human` is *guaranteed* to be called — the LLM never decides on its own whether to stop and ask.
-
-1. Python asks the human what scene to write next (`ask_human`, no timeout).
-2. A planner skill drafts a paragraph-by-paragraph scene plan.
-3. Python shows the plan and asks for approval; on rejection it loops back into the planner with the human's feedback until approved.
-4. A writer skill generates the full scene prose from the approved plan.
-5. Python shows the prose and asks for approval; on rejection it loops (re-plan → re-write) until approved.
-6. Approved output is appended to `plans.md` / `story.txt` in the run directory, and the loop advances to the next scene.
-
-```bash
-python examples/human_in_the_loop.py
-```
-
----
-
-## sandbox_handoff.py
-
-**What it shows:** Reading and driving an agent's `agSandbox` directly from the host, and handing one sandbox off between two agents — the sandbox is a plain `agent.sandbox` attribute, not something you have to go through a skill to touch.
-
-1. `agent_a` runs a skill that writes `hello.py` inside its sandbox.
-2. The harness reads `agent_a.sandbox` directly and calls `sandbox.exec(...)` to run the file from Python, outside of any skill.
-3. The harness patches the file with `sed` via the same `sandbox.exec(...)`, introducing a syntax error.
-4. `agent_b` is pointed at the same sandbox (`agent_b.sandbox = sandbox`) and runs a skill that fixes the bug.
-5. The harness runs the file again to confirm the fix — `agskill` stops+commits the container after `agent_b`'s skill the same way it would for a sandbox it provisioned itself, and the harness's next `sandbox.exec()` call transparently restarts the container from that checkpoint.
-
-```bash
-python examples/sandbox_handoff.py
-```
-
----
-
-## dynamic_config_example.py
-
-**What it shows:** Composing an `agConfig` from two owners' fields in one call, and updating a `DynamicConfigParam` field on that same `agConfig` between two skill calls on the same agent — no clone, no sandbox teardown, no new agent.
-
-1. `agConfig(agVLLMBackendConfig(...), agSandboxConfig(...))` merges the `agllm_backend` fields (including a deliberately too-small `max_completion_tokens=32`) and an `agSandbox` "data" mount into one config.
-2. **Call 1** runs `write_note` with the tiny token budget; the vLLM server truncates the tool-call JSON mid-argument, so the skill can't complete within a few ReAct steps and the run fails as expected.
-3. `cfg.agllm_backend.max_completion_tokens = 4096` bumps the budget on the *same* `agConfig` — since it's a `DynamicConfigParam`, it's re-read fresh on every LLM call rather than cached/locked.
-4. **Call 2** runs the identical skill again; with the higher budget it completes and the note is written and confirmed.
-
-```bash
-python examples/dynamic_config_example.py
-```
+The private engine, adapter, daemon, protocol, and syscall-tracer modules are
+implementation seams. Model-compatibility matrices, raw `/v1/messages` probes,
+and full profiler workloads belong in tests or benchmarks rather than here.

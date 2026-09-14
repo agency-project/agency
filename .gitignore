@@ -3,6 +3,10 @@ __pycache__/
 .venv/
 *.egg-info/
 .pytest_cache/
-runs/
+.DS_Store
+agency_runs/
 AGENT_INSTRUCTIONS/
 artifacts/
+
+# Generated embedded Perfetto build
+agency/observability/agwebui/static/perfetto/

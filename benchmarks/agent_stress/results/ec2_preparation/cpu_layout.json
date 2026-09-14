@@ -1,0 +1,520 @@
+{
+  "schema_version": 1,
+  "topology": [
+    {
+      "cpu": 0,
+      "core": 0,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 1,
+      "core": 1,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 2,
+      "core": 2,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 3,
+      "core": 3,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 4,
+      "core": 4,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 5,
+      "core": 5,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 6,
+      "core": 6,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 7,
+      "core": 7,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 8,
+      "core": 8,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 9,
+      "core": 9,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 10,
+      "core": 10,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 11,
+      "core": 11,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 12,
+      "core": 12,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 13,
+      "core": 13,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 14,
+      "core": 14,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 15,
+      "core": 15,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 16,
+      "core": 0,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 17,
+      "core": 1,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 18,
+      "core": 2,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 19,
+      "core": 3,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 20,
+      "core": 4,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 21,
+      "core": 5,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 22,
+      "core": 6,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 23,
+      "core": 7,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 24,
+      "core": 8,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 25,
+      "core": 9,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 26,
+      "core": 10,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 27,
+      "core": 11,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 28,
+      "core": 12,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 29,
+      "core": 13,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 30,
+      "core": 14,
+      "socket": 0,
+      "node": 0
+    },
+    {
+      "cpu": 31,
+      "core": 15,
+      "socket": 0,
+      "node": 0
+    }
+  ],
+  "numa_node": 0,
+  "os_runtime_headroom_cpus": [
+    0,
+    1,
+    16,
+    17
+  ],
+  "driver_engine_monitor_cpus": [
+    2,
+    3,
+    18,
+    19
+  ],
+  "worker_cpus": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "worker_smt_siblings_unused_by_benchmark": [
+    [
+      20
+    ],
+    [
+      21
+    ],
+    [
+      22
+    ],
+    [
+      23
+    ],
+    [
+      24
+    ],
+    [
+      25
+    ],
+    [
+      26
+    ],
+    [
+      27
+    ],
+    [
+      28
+    ],
+    [
+      29
+    ],
+    [
+      30
+    ],
+    [
+      31
+    ]
+  ],
+  "max_separate_core_agents": 12,
+  "levels": {
+    "1": [
+      {
+        "slot": 0,
+        "cpus": [
+          4
+        ],
+        "mems": [
+          0
+        ]
+      }
+    ],
+    "2": [
+      {
+        "slot": 0,
+        "cpus": [
+          4
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 1,
+        "cpus": [
+          5
+        ],
+        "mems": [
+          0
+        ]
+      }
+    ],
+    "4": [
+      {
+        "slot": 0,
+        "cpus": [
+          4
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 1,
+        "cpus": [
+          5
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 2,
+        "cpus": [
+          6
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 3,
+        "cpus": [
+          7
+        ],
+        "mems": [
+          0
+        ]
+      }
+    ],
+    "8": [
+      {
+        "slot": 0,
+        "cpus": [
+          4
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 1,
+        "cpus": [
+          5
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 2,
+        "cpus": [
+          6
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 3,
+        "cpus": [
+          7
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 4,
+        "cpus": [
+          8
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 5,
+        "cpus": [
+          9
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 6,
+        "cpus": [
+          10
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 7,
+        "cpus": [
+          11
+        ],
+        "mems": [
+          0
+        ]
+      }
+    ],
+    "12": [
+      {
+        "slot": 0,
+        "cpus": [
+          4
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 1,
+        "cpus": [
+          5
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 2,
+        "cpus": [
+          6
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 3,
+        "cpus": [
+          7
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 4,
+        "cpus": [
+          8
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 5,
+        "cpus": [
+          9
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 6,
+        "cpus": [
+          10
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 7,
+        "cpus": [
+          11
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 8,
+        "cpus": [
+          12
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 9,
+        "cpus": [
+          13
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 10,
+        "cpus": [
+          14
+        ],
+        "mems": [
+          0
+        ]
+      },
+      {
+        "slot": 11,
+        "cpus": [
+          15
+        ],
+        "mems": [
+          0
+        ]
+      }
+    ]
+  },
+  "exclusive_host_isolation": false,
+  "note": "Host services and other users are not repinned. Headroom is an allocation, not an exclusive reservation."
+}

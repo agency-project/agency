@@ -1,0 +1,23 @@
+{
+  "scope": "Preparation only; no benchmark workloads or live affinity probes",
+  "checks": [
+    {
+      "command": ".venv/bin/python -m pytest -q benchmarks/agent_stress/test_placement.py benchmarks/agent_stress/test_evidence.py",
+      "result": "11 passed in 1.18s"
+    },
+    {
+      "command": "ruff check and format; git commit pre-commit checks",
+      "result": "passed"
+    }
+  ],
+  "benchmark_smoke": "NOT RUN per user instruction",
+  "live_affinity": "NOT VALIDATED",
+  "live_overlap": "NOT VALIDATED",
+  "live_rollback_cleanup": "NOT VALIDATED",
+  "remote_checks": {
+    "dependencies": "96 packages compatible",
+    "preparation_tests": "11 passed in 6.54s",
+    "source_and_layout_hashes": "match local",
+    "benchmark_workloads_launched": 0
+  }
+}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from .agutil import _b36_suffix
+from .utils.agutil import _b36_suffix
 
 _NOUNS = [
     "alex",
@@ -239,20 +239,18 @@ class agname(str):
         return cls(name)
 
     @classmethod
-    def allocate_agname(cls, name: str | None = None) -> "agname":
+    def allocate_agname(cls, name: str | None = None, *, prefix: str | None = None) -> "agname":
         """Return a unique name in the form <base>_XXXX and mark it in-use.
-
-        If ``name`` is given, it is used as the base (e.g. ``"Worker"`` →
-        ``"Worker_0000"``).  If ``name`` is ``None``, the next noun from the
-        built-in ``_NOUNS`` list is chosen automatically, cycling back to the
-        start after the last entry.
-
-        XXXX is a 4-character base-36 suffix (1 679 616 unique values per base).
-        """
+        If ``name`` is None, the next ``_NOUNS`` entry is used automatically.
+        ``prefix``, applied after that resolution, makes every object
+        kind's names self-describing and collision-free against other
+        kinds' names."""
         with cls._lock:
             if name is None:
                 name = _NOUNS[cls._noun_index % len(_NOUNS)]
                 cls._noun_index += 1
+            if prefix:
+                name = f"{prefix}_{name}"
             n = cls._noun_counters.get(name, 0)
             cls._noun_counters[name] = n + 1
             full = f"{name}_{_b36_suffix(n)}"
