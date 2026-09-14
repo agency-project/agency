@@ -225,6 +225,14 @@ class PtyDriver:
             sid = payload.get("session_id", payload.get("sessionId"))
             if self.session_id is None:
                 self.session_id = sid
+                if self.name == "grok" and sid:
+                    # Grok's hooks never report a transcript_path (unlike
+                    # codex), but its ACP session log is deterministic from
+                    # cwd + session_id -- undocumented, discovered by
+                    # inspecting a live session directory.
+                    self.transcript_path = (
+                        self.root / "sessions" / "%2Fworkspace" / sid / "updates.jsonl"
+                    )
             if sid != self.session_id:
                 continue
             transcript = payload.get("transcript_path", payload.get("transcriptPath"))
