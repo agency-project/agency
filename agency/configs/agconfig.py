@@ -158,6 +158,11 @@ class sandboxconfig(confignamespace):
     flags: "list[str]" = field(default_factory=list)
 
     backend: str = "auto"  # podman | docker | chroot | auto
+    checkpoint_backend: str = "image_commit"  # image_commit | cow_zfs
+    # Existing host-managed ZFS parent dataset. Provisioning is outside
+    # checkpoint spans; sandbox processes never receive ZFS privileges.
+    checkpoint_zfs_parent: "str | None" = None
+    checkpoint_setup_timeout_s: float = 900
     # Container creation constraints, retained across hibernation and rollback.
     # Changing these on an existing container requires recreating that container.
     cpuset_cpus: "str | None" = None

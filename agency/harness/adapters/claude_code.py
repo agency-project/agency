@@ -223,14 +223,13 @@ class _ClaudeCodeBackend(agharness_backend):
         prior_session_blob: bytes | None,
         max_steps: int | None,
     ) -> AttemptResult:
-        execution = _ClaudePtyExecution(
+        return _ClaudePtyExecution(
             self,
             runtime,
             resume_session_id=resume_session_id,
             prior_session_blob=prior_session_blob,
             max_steps=max_steps,
-        )
-        return execution.run(prompt)
+        ).run(prompt)
 
     def prepare_pty(self, runtime, *, resume_session_id=None, prior_session_blob=None):
         """Prepare isolated native configuration; one process belongs to one attempt."""
@@ -719,8 +718,8 @@ def _mid_array_system_warning(body: dict) -> "str | None":
 class _ClaudePtyExecution:
     """One attempt's PTY, native acknowledgments, and terminal boundary.
 
-    The lock covers both final completion and redirect submission. The process
-    is never reused by another attempt, even when its native transcript resumes.
+    The lock covers both final completion and redirect submission. Each
+    invocation owns one process and closes it at the completed-run boundary.
     """
 
     INPUT_TIMEOUT = 20.0

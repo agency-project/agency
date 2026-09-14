@@ -624,13 +624,34 @@ class _ContainerBackendBase(agsandbox_backend):
         self._validate_config(self._agconfig)
         self._name = name
         self._base_image = base_image
+        self._checkpoint_mounts = tuple(mounts.values())
+        from .checkpoint import checkpoint_backend, ZfsRuntimeStorage, CheckpointCapabilityError
+
+        self._checkpointer = checkpoint_backend(self._agconfig.sandbox.checkpoint_backend)
+        self._checkpoint_storage = None
+        if self._agconfig.sandbox.checkpoint_zfs_parent:
+            if {"_agharness_llm_gateway", "_agency_logs"} & self._agconfig.sandbox.mounts.keys():
+                raise CheckpointCapabilityError(
+                    "Private ZFS storage cannot override Agency's control/log mounts"
+                )
+            if checkpoint_image is not None:
+                raise CheckpointCapabilityError(
+                    "Private ZFS storage cannot import lifecycle image tags"
+                )
+            self._checkpoint_storage = ZfsRuntimeStorage(self)
         self._vol_flags: list[str] = []
-        for host, container, mode in mounts.values():
+        for _mount_name, (host, container, mode) in mounts.items():
             self._vol_flags += ["-v", f"{host}:{container}:{mode}"]
 
     def change_config(self, agconfig: "agconfig_cls | None") -> None:
-        self._agconfig = agconfig if agconfig is not None else agconfig_cls()
-        self._validate_config(self._agconfig)
+        updated = agconfig if agconfig is not None else agconfig_cls()
+        if (
+            updated.sandbox.checkpoint_backend != self._agconfig.sandbox.checkpoint_backend
+            or updated.sandbox.checkpoint_zfs_parent != self._agconfig.sandbox.checkpoint_zfs_parent
+        ):
+            raise ValueError("Checkpoint backend/storage is fixed at sandbox construction")
+        self._validate_config(updated)
+        self._agconfig = updated
 
     def get_config_copy(self) -> "agconfig_cls":
         return self._agconfig.clone()
@@ -719,7 +740,18 @@ class _ContainerBackendBase(agsandbox_backend):
         )
 
     def _ensure_started(self) -> None:
-        with agprof.span("sandbox:start"):
+        storage = getattr(self, "_checkpoint_storage", None)
+        if storage is not None:
+            storage.prepare(self)
+        from .checkpoint import CowZfsCheckpoint
+
+        checkpointer = getattr(self, "_checkpointer", None)
+        restoring = isinstance(checkpointer, CowZfsCheckpoint) and checkpointer.hibernated
+        if isinstance(checkpointer, CowZfsCheckpoint):
+            if checkpointer.hibernated:
+                checkpointer.restore(self, checkpointer.latest)
+        phase = "runtime.container_start" if restoring else "runtime.container_create"
+        with agprof.span("sandbox:start"), agprof.span(phase):
             self._ensure_started_profiled()
         self._register_prof_container()
 
@@ -1080,6 +1112,14 @@ class _ContainerBackendBase(agsandbox_backend):
         (see this module's docstring for the semaphore's shared-pool
         rationale).
         """
+        operation = args[1] if len(args) > 1 else "unknown"
+        storage = getattr(self, "_checkpoint_storage", None)
+        if storage is not None and args[0] == self._runtime:
+            if not storage.prepared:
+                # Never let cleanup or a pre-start inspect contact the shared
+                # Podman store under a private sandbox identity.
+                return subprocess.CompletedProcess(args, 1, b"", b"Private storage not provisioned")
+            args = storage.prefix + args[1:]
         sem = _get_docker_semaphore()
         with agprof.span("sync:container"):
             sem.acquire()
@@ -1094,7 +1134,6 @@ class _ContainerBackendBase(agsandbox_backend):
         try:
             # Excludes semaphore acquisition; includes CLI/daemon response time.
             # Record only the operation verb, never command payloads or credentials.
-            operation = args[1] if len(args) > 1 else "unknown"
             with agprof.span(f"runtime:container_call:{operation}"):
                 return run_with_unkillable_child_grace(
                     lambda: subprocess.run(
@@ -1486,6 +1525,15 @@ class _ContainerBackendBase(agsandbox_backend):
         self._reset_accumulator()
 
     def stop(self) -> None:
+        from .checkpoint import CowZfsCheckpoint
+
+        checkpointer = getattr(self, "_checkpointer", None)
+        if isinstance(checkpointer, CowZfsCheckpoint):
+            checkpointer.checkpoint(self)
+            return
+        self._stop_image()
+
+    def _stop_image(self) -> None:
         """Hibernate the container: `docker/podman stop` it WITHOUT removing
         it, releasing the runtime slot (the session-keyring-derived
         concurrency semaphore) AND the GPU. The container object and its
@@ -1624,6 +1672,48 @@ class _ContainerBackendBase(agsandbox_backend):
             raise rm_exc
 
     def commit(self, tag: "str | None" = None) -> bool:
+        return self.checkpoint(tag) is not None
+
+    def checkpoint(self, tag: "str | None" = None):
+        from .checkpoint import ImageCommitCheckpoint
+
+        checkpointer = getattr(self, "_checkpointer", None) or ImageCommitCheckpoint()
+        return checkpointer.checkpoint(self, tag)
+
+    def _normalized_checkpoint_manifest(self) -> dict:
+        image = json.loads(
+            self._run(
+                [self._runtime, "image", "inspect", self._resolve_image(self._base_image)],
+                check=True,
+            ).stdout
+        )[0]
+        return {
+            "schema_version": 1,
+            "logical_sandbox_id": self._name,
+            "runtime": self._runtime,
+            "base_image_reference": self._base_image,
+            "base_image_id": image["Id"],
+            "platform": {
+                "architecture": image.get("Architecture"),
+                "os": image.get("Os"),
+            },
+            # Kept only in memory. Flags may contain configured environment
+            # secrets and must never be copied into profiler annotations.
+            "launch_flags": tuple(self._agconfig.sandbox.flags),
+            "mounts": self._checkpoint_mounts,
+            "resources": {
+                "cpus": self._agconfig.resources.idle_cpus,
+                "memory": self._agconfig.resources.idle_memory,
+                "cpuset_cpus": self._agconfig.sandbox.cpuset_cpus,
+                "cpuset_mems": self._agconfig.sandbox.cpuset_mems,
+            },
+            "command": ("tail", "-f", "/dev/null"),
+        }
+
+    def delete_checkpoint(self, checkpoint) -> None:
+        self._checkpointer.delete_checkpoint(self, checkpoint)
+
+    def _commit_image(self, tag: "str | None" = None) -> bool:
         """Checkpoint the container's current filesystem into a lifecycle
         image WITHOUT removing the container -- it keeps running (or stays
         hibernating) so the next tool call or skill resumes directly from
@@ -1878,6 +1968,21 @@ class _ContainerBackendBase(agsandbox_backend):
         return True
 
     def restore(self, tag: str) -> None:
+        from .checkpoint import CheckpointHandle, ImageCommitCheckpoint
+
+        checkpointer = getattr(self, "_checkpointer", None) or ImageCommitCheckpoint()
+        if isinstance(tag, CheckpointHandle):
+            if tag.backend != self._agconfig.sandbox.checkpoint_backend:
+                raise ValueError("Checkpoint backend mismatch")
+            checkpointer.restore(self, tag)
+        else:
+            if self._agconfig.sandbox.checkpoint_backend != "image_commit":
+                raise ValueError("cow_zfs restore requires a CheckpointHandle")
+            checkpointer.restore(
+                self, CheckpointHandle("image_commit", self._runtime, self._name, tag)
+            )
+
+    def _restore_image(self, tag: str) -> None:
         """Restore the sandbox to a previously committed image snapshot.
 
         Stops the running container (killing watched pids first), then restarts
@@ -1904,6 +2009,23 @@ class _ContainerBackendBase(agsandbox_backend):
 
     def destroy(self) -> None:
         if self._destroyed:
+            return
+        if getattr(self, "_checkpoint_storage", None) is not None:
+            self._checkpoint_destroying = True
+            try:
+                if self._runtime == "docker":
+                    with agprof.span("checkpoint.cleanup"):
+                        self._checkpoint_storage.destroy()
+                    self.rm_container()
+                    self._checkpoint_storage.prepared = False
+                    self._checkpoint_storage.dataset = None
+                else:
+                    self.rm_container()
+                    with agprof.span("checkpoint.cleanup"):
+                        self._checkpoint_storage.destroy()
+                self._destroyed = True
+            finally:
+                self._checkpoint_destroying = False
             return
         container_name = self._container_name()
 
