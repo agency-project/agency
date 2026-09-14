@@ -956,6 +956,7 @@ def test_deny_openat_blocks_file_read():
     assert stdout == ""
 
 
+@ptrace
 def test_ptrace_ignoring_esrch_swallows_resume_of_an_already_dead_pid():
     """Regression test: resuming a pid that already exited (and was reaped)
     between being queued and being acted on used to kill the whole tracer

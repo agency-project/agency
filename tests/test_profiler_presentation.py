@@ -1,4 +1,5 @@
 import json
+import sys
 import pytest
 
 from agency.observability.profiler.agprof_trace import build_trace, write_trace
@@ -366,6 +367,7 @@ def test_sampler_discovers_registered_sandbox_sibling_and_reads_namespace_identi
     assert any(sample[1] == "proc:99-100:rss_mb" for sample in agprof._samples)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux process namespaces")
 def test_native_spans_report_the_process_identity_needed_by_the_host():
     import os
     from types import SimpleNamespace

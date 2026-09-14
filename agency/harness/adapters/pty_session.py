@@ -131,7 +131,7 @@ class PtyExecution:
     START_TIMEOUT = 45.0
     ATTEMPT_TIMEOUT = 600.0
 
-    def __init__(self, driver, runtime):
+    def __init__(self, driver, runtime, *, cleanup_callbacks=()):
         self.driver = driver
         self.runtime = runtime
         self.handle = None
@@ -145,6 +145,9 @@ class PtyExecution:
         self._interrupted = False
         self._failure = None
         self._deadline = 0
+        self._cleanup_callbacks = tuple(cleanup_callbacks)
+        self._closed = False
+        self._launched = False
         self._last_activity_generation = None
         self.INPUT_TIMEOUT = driver.INPUT_TIMEOUT
         self.START_TIMEOUT = driver.START_TIMEOUT
@@ -269,23 +272,60 @@ class PtyExecution:
                 self.driver.reap(self.handle)
                 return False
 
-    def run(self, prompt):
+    def close(self):
         from ..agharness import cleanup_config_home
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._active = False
+            try:
+                if self.handle is not None:
+                    self.handle.close()
+            finally:
+                for callback in reversed(self._cleanup_callbacks):
+                    callback()
+                cleanup_config_home(self.driver.root)
+
+    def prepare_fast_checkpoint(self):
+        with self._lock:
+            if self._active:
+                raise RuntimeError("cannot checkpoint an active PTY attempt")
+            if self.handle is not None:
+                self.handle.checkpoint_detach()
+
+    def seize_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_seize_frozen()
+
+    def complete_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_reattach()
+
+    def run(self, prompt, *, keep_alive=False):
         from ..ptrace.supervisor import agProxyPtrace
 
         phase = getattr(self.driver, "profile_span", lambda name: nullcontext())
+        completed = False
         try:
             self.validate_prompt(prompt)
-            self.driver.prepare_launch()
-            with phase("harness:launch"):
-                self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
-                    self.driver.argv,
-                    self.driver.env,
-                    cwd=self.driver.cwd,
-                    pty_size=(120, 36),
-                    policy=self.runtime.syscall_policy,
-                    ag=None,
-                )
+            if not self._launched:
+                self.driver.prepare_launch()
+                with phase("harness:launch"):
+                    self.handle = agProxyPtrace(
+                        self.runtime.agconfig, allow_initial_exec=True
+                    ).launch(
+                        self.driver.argv,
+                        self.driver.env,
+                        cwd=self.driver.cwd,
+                        pty_size=(120, 36),
+                        policy=self.runtime.syscall_policy,
+                        ag=None,
+                    )
+                self._launched = True
             self.runtime.register_control_handle(self.handle)
             self.runtime.register_redirect(self.redirect)
             with phase("harness:startup_ready"):
@@ -319,6 +359,7 @@ class PtyExecution:
                             self._active = False
                             with phase("harness:snapshot"):
                                 blob = self.driver.snapshot()
+                            completed = True
                             return AttemptResult(
                                 ok=True,
                                 final_text=self._stop["text"],
@@ -331,11 +372,8 @@ class PtyExecution:
                             raise RuntimeError(f"{self.driver.name} attempt timed out")
                     time.sleep(0.025)
         finally:
-            try:
-                with self._lock:
-                    self._active = False
-                    if self.handle is not None:
-                        with phase("harness:retire"):
-                            self.handle.close()
-            finally:
-                cleanup_config_home(self.driver.root)
+            with self._lock:
+                self._active = False
+            if not (keep_alive and completed):
+                with phase("harness:retire"):
+                    self.close()

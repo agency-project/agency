@@ -58,6 +58,10 @@ class _PodmanBackend(_ContainerBackendBase):
         """Prefix bare image names with ``localhost/``: Podman requires
         fully-qualified names when no unqualified-search registries are
         configured; Docker accepts bare names fine."""
+        if name.startswith("sha256:") or (
+            len(name) == 64 and all(c in "0123456789abcdef" for c in name)
+        ):
+            return name
         if "/" not in name:
             return f"localhost/{name}"
         return name

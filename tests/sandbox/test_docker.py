@@ -1772,6 +1772,9 @@ class TestCheckpointAccumulator:
         # Skip rather than let the timing assertion below flap on a
         # constraint this test has no control over.
         root_and_driver = sb._backend._docker_data_root_and_driver()
+        if root_and_driver is None or root_and_driver[1] not in {"overlay2", "overlayfs"}:
+            sb.destroy()
+            pytest.skip("fast layer accumulator requires Docker overlay2 or overlayfs storage")
         if root_and_driver is not None:
             data_root, driver = root_and_driver
             if driver == "overlay2":

@@ -35,6 +35,7 @@ class HarnessInteractionServer:
         *,
         control_handler: "Callable[..., None] | None" = None,
         redirect_handler: "Callable[[str, str], bool] | None" = None,
+        lifecycle_handler: "Callable[[str], dict] | None" = None,
         startup_timeout_s: float = 10.0,
         shutdown_timeout_s: float = 10.0,
     ) -> None:
@@ -42,6 +43,7 @@ class HarnessInteractionServer:
         self._attempt_handler = attempt_handler
         self._control_handler = control_handler
         self._redirect_handler = redirect_handler
+        self._lifecycle_handler = lifecycle_handler
         self._startup_timeout_s = startup_timeout_s
         self._shutdown_timeout_s = shutdown_timeout_s
         self._server: "uvicorn.Server | None" = None
@@ -111,6 +113,22 @@ class HarnessInteractionServer:
             else:
                 self._control_handler(action)
             return JSONResponse({"ok": True})
+
+        @app.post("/lifecycle/{action}")
+        def _lifecycle(action: str) -> JSONResponse:
+            if self._lifecycle_handler is None:
+                return JSONResponse({"error": "no lifecycle handler configured"}, status_code=501)
+            if action not in {
+                "prepare_fast_checkpoint",
+                "seize_fast_restore",
+                "complete_fast_restore",
+                "abort_fast_checkpoint",
+            }:
+                return JSONResponse({"error": f"unknown action {action!r}"}, status_code=404)
+            try:
+                return JSONResponse(self._lifecycle_handler(action))
+            except Exception as exc:
+                return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=409)
 
         return app
 

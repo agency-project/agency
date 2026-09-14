@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -20,6 +21,7 @@ class _FakeSandbox:
     def __init__(self, sandbox_agconfig) -> None:
         self.detached = []
         self.agconfig = sandbox_agconfig
+        self._backend = SimpleNamespace()
 
     def exec_detached(self, command, workdir):
         self.detached.append((command, workdir))
@@ -151,6 +153,7 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
 
     assert launcher._daemon_config(config) == {
         "harness_adapter": {"binary_path": "/bin/claude"},
+        "sandbox": {"checkpoint_fast_resume": False},
         "ptrace": {
             "syscalls": list(agconfig().ptrace.syscalls),
             "file_access": False,

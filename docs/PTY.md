@@ -10,8 +10,21 @@ format; it never enters the PTY runner.
 The public agent and orchestrator still select an engine. The engine owns host
 services and sends a typed attempt over the existing Unix socket. Inside the
 sandbox, `HarnessManager` selects the adapter, which prepares isolated CLI state
-and starts `PtyExecution`. That runner owns a fresh PTY process for one attempt.
-It never shares a live CLI between attempts or agents.
+and starts `PtyExecution`. With image-commit or filesystem-only COW checkpoints,
+that runner owns a fresh PTY process for one attempt. With COW fast resume enabled,
+the manager retains the successful attempt's idle CLI and PTY for the next turn
+of the same agent. It retires the process on failure or incompatible model,
+step-limit, tool, or syscall-policy configuration changes. Agents never share a CLI.
+
+Hibernation first detaches Agency's ptrace supervisor, then snapshots the mutable
+filesystem and saves the live process tree through the runtime's CRIU support.
+Restore reattaches ptrace before accepting another prompt through the same PTY.
+The ZFS snapshot remains the durable checkpoint: if live restore fails, the
+engine starts a fresh harness and resumes its persisted native session.
+
+Fast-resume MCP endpoints use stateless JSON responses and decline optional GET
+event streams with HTTP 405. An idle CLI can otherwise hold a stream open across
+turns and prevent the host's attempt leases from draining before checkpointing.
 
 The shared runner handles bracketed-paste input, native acknowledgment deadlines,
 pause-aware timeouts, redirects, completion, and process retirement. It contains
@@ -50,8 +63,8 @@ stale by definition and is discarded.
 | Grok Build | `UserPromptSubmit`/`Stop` hooks, then matching `turn_completed` record; full answer and usage come from native updates | Ctrl+C, confirmed by native cancellation; restored drafts are cleared before submission | Native session JSON/JSONL files |
 | OpenCode | `chat.message` identifies the user message; its persisted text part acknowledges acceptance; `session.idle` reads committed assistant messages with that parent ID | Escape, wait for confirmation prompt, Escape; native `MessageAbortedError` confirms | Consistent SQLite backup, including committed WAL pages |
 
-The tested CLI versions are Codex 0.147.0, Grok Build 1.0.0, Kimi Code 0.42.0, and
-OpenCode 1.18.15.
+The tested CLI versions are Claude Code 2.1.251, Codex 0.147.0, Grok Build 1.0.0,
+Kimi Code 0.42.0, and OpenCode 1.18.15.
 These are version-sensitive integrations: readiness or lifecycle changes must
 pass the live tests before claiming support. Unknown or unacknowledged behavior
 fails the attempt; it is never converted from arbitrary terminal text into a
@@ -66,22 +79,26 @@ the private form rather than letting a `TypeError` kill the reader thread.
 
 ## Sessions, policy, and cancellation
 
-Each attempt gets a fresh HOME/config/XDG namespace and only its Agency gateway
-credential. Versioned session bundles carry the harness name and native session
+Each new CLI gets a fresh HOME/config/XDG namespace and only its Agency gateway
+credential. A retained CLI keeps this namespace across fast restores. Versioned
+session bundles carry the harness name and native session
 ID. Restoration rejects mismatched identities, absolute/traversing paths,
 non-session files, and oversized data. Auth files, generated gateway config,
-plugins, hooks, caches, and lock files are not session state.
+plugins, hooks, caches, and lock files are not session state. Kimi's bundle also
+preserves its approved workspace-trust decision so a fresh resumed CLI does not
+lose its model binding behind a second trust prompt.
 
 The existing engine session-blob protocol stages the snapshot and commits it
-after the sandbox commit. Resumption uses native CLI resume flags. A failed
+after the sandbox checkpoint. Fresh-process resumption uses native CLI resume flags. A failed
 attempt cannot publish a partially written session as a successful result.
 
 Model traffic still passes through the existing Responses or Chat Completions
 adapter and Agency's host services. Disconnecting a TUI stream closes its
 upstream model request. Native tool hooks still check Agency policy, and all CLI
 processes and children remain under ptrace. A partial redirect is reaped before
-the runner reports failure to the queue fallback. Every exit path closes the
-PTY and cleans its isolated config, including startup and snapshot failures.
+the runner reports failure to the queue fallback. Retirement closes the PTY and
+cleans its isolated config, including startup and snapshot failures. A successful
+fast-resume attempt leaves both alive until hibernation or retirement.
 
 The shared tracer also handles a kill racing with thread creation: it drains
 all wait events owned by its tracer thread, even when the parent's clone
@@ -102,3 +119,10 @@ socket. A synthetic model tests resumption and redirects during both blocked
 generation and a running shell tool, without API credentials or model charges.
 Executables default to `~/.cache/agency_harness_bin`; set
 `AGENCY_TEST_HARNESS_BIN_DIR` to test another installation.
+
+`tests/sandbox/test_harness_checkpoint_matrix_linux.py` is an opt-in EC2 matrix
+for all six harnesses. It uses real CLIs and deterministic upstream model replies,
+checking three turns with Podman COW fast resume and Docker COW fresh restart.
+It checks filesystem and conversation continuity, retained process identity for
+fast resume, and new daemon identity for fresh restart. The CRIU regression suite
+also verifies ptrace/PTY handoff and filesystem fallback after a failed restore.

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
-from mcp.server.transport_security import TransportSecuritySettings
+from ...harness.mcp_transport import build_http_app
 
 from ...agdata import agdata
 
@@ -75,7 +75,9 @@ class HostMcpServer:
         data_logger: "agDataLogger",
         *,
         is_cancelled: "Callable[[], bool] | None" = None,
+        live_session: bool = False,
     ) -> None:
+        self._live_session = live_session
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
@@ -135,9 +137,7 @@ class HostMcpServer:
             self._register_tool(server, tool)
 
         self._mcp_server = server
-        return server.streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        )
+        return build_http_app(server, live_session=self._live_session)
 
     def lifespan_context(self, app: "Starlette") -> "AbstractAsyncContextManager[None] | None":
         return app.router.lifespan_context(app)

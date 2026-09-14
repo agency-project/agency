@@ -10,6 +10,9 @@ from ...harness.protocol import HarnessAttemptRequest, HarnessAttemptResult
 from ...observability.profiler import agprof
 
 
+_LIFECYCLE_TIMEOUT_S = 30
+
+
 class HarnessInteractionClient:
     def __init__(self, uds_path: str, timeout_s: "float | None" = 300.0) -> None:
         self._client = httpx.Client(
@@ -44,6 +47,32 @@ class HarnessInteractionClient:
         self._client.post(
             "/control/cancel", json={"request_id": request_id}, timeout=10
         ).raise_for_status()
+
+    def prepare_fast_checkpoint(self) -> dict:
+        response = self._client.post(
+            "/lifecycle/prepare_fast_checkpoint", timeout=_LIFECYCLE_TIMEOUT_S
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def complete_fast_restore(self) -> dict:
+        response = self._client.post(
+            "/lifecycle/complete_fast_restore", timeout=_LIFECYCLE_TIMEOUT_S
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def seize_fast_restore(self) -> dict:
+        response = self._client.post("/lifecycle/seize_fast_restore", timeout=_LIFECYCLE_TIMEOUT_S)
+        response.raise_for_status()
+        return response.json()
+
+    def abort_fast_checkpoint(self) -> dict:
+        response = self._client.post(
+            "/lifecycle/abort_fast_checkpoint", timeout=_LIFECYCLE_TIMEOUT_S
+        )
+        response.raise_for_status()
+        return response.json()
 
     def is_ready(self) -> bool:
         response = self._client.get("/health")

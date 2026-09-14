@@ -158,6 +158,19 @@ class agsandbox_backend(AgSandboxBackendFields):
 
     def _validate_config(self, agconfig: "agconfig_cls") -> None:
         backend = agconfig.sandbox.backend
+        checkpoint = agconfig.sandbox.checkpoint_backend
+        if checkpoint not in {"image_commit", "cow_zfs"}:
+            raise ValueError(f"Unknown checkpoint_backend {checkpoint!r}")
+        if checkpoint == "cow_zfs" and not agconfig.sandbox.checkpoint_zfs_parent:
+            raise ValueError(
+                "cow_zfs requires sandbox.checkpoint_zfs_parent (an existing ZFS dataset)"
+            )
+        if agconfig.sandbox.checkpoint_fast_resume and checkpoint != "cow_zfs":
+            raise ValueError("checkpoint_fast_resume requires checkpoint_backend='cow_zfs'")
+        if backend == "chroot" and (
+            checkpoint != "image_commit" or agconfig.sandbox.checkpoint_zfs_parent
+        ):
+            raise ValueError("ZFS checkpoints require a Docker or Podman sandbox runtime")
         required = self._REQUIRED_FIELDS_BY_BACKEND.get(backend, ())
         missing = [name for name in required if not getattr(agconfig.sandbox, name)]
         if missing:

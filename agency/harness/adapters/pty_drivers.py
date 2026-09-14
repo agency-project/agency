@@ -32,29 +32,36 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
     from ...native_harness.bridge_client import BridgeClient
     from ...native_harness.profiling import NativeProfiler
 
-    root = materialize_config_home(runtime.engine_name)
-    try:
-        driver = driver_for(
-            adapter, runtime, root, resume_session_id, prior_session_blob, max_steps
-        )
-    except BaseException:
-        cleanup_config_home(root)
-        raise
-    # Reuse the existing span bridge, without enabling native Python's
-    # automatic function sampler inside the external-harness daemon.
-    bridge = BridgeClient(
-        runtime.harness_base_url, runtime.token, timeout_s=_PROFILER_BRIDGE_TIMEOUT_S
+    key = (
+        "pty",
+        adapter._DEFAULT_BINARY,
+        runtime.model,
+        max_steps,
+        runtime.has_sandbox_mcp_tools,
     )
-    profiler = NativeProfiler(bridge)
-    try:
+
+    def factory():
+        root = materialize_config_home(runtime.engine_name)
+        bridge = BridgeClient(
+            runtime.harness_base_url, runtime.token, timeout_s=_PROFILER_BRIDGE_TIMEOUT_S
+        )
         try:
-            profiler.enabled = bool(bridge.profiler_settings().get("enabled"))
-        except Exception:
-            profiler.enabled = False
-        driver.profile_span = profiler.span
-        return PtyExecution(driver, runtime).run(prompt)
-    finally:
-        bridge.close()
+            driver = driver_for(
+                adapter, runtime, root, resume_session_id, prior_session_blob, max_steps
+            )
+            profiler = NativeProfiler(bridge)
+            try:
+                profiler.enabled = bool(bridge.profiler_settings().get("enabled"))
+            except Exception:
+                profiler.enabled = False
+            driver.profile_span = profiler.span
+            return PtyExecution(driver, runtime, cleanup_callbacks=(bridge.close,))
+        except BaseException:
+            bridge.close()
+            cleanup_config_home(root)
+            raise
+
+    return runtime.run_pty_execution(key, factory, prompt)
 
 
 class PtyDriver:
@@ -339,7 +346,7 @@ class CodexDriver(_HookPtyDriver):
         event_type = payload.get("type")
         if event_type in {"task_started", "turn_started"}:
             self._transcript_turn_id = payload.get("turn_id")
-        elif event_type == "error":
+        elif event_type == "error" or (event_type == "task_complete" and payload.get("error")):
             # Native errors can omit turn_id; associate only with an observed
             # transcript start, never the host's current prompt (which may
             # have changed).
@@ -348,7 +355,7 @@ class CodexDriver(_HookPtyDriver):
                     "kind": "error",
                     "turn_id": payload.get("turn_id") or self._transcript_turn_id,
                     "error": "Codex terminal error: "
-                    + str(payload.get("message", "request failed")),
+                    + str(payload.get("error") or payload.get("message", "request failed")),
                 }
             )
 

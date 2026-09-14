@@ -660,6 +660,58 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
     handle.write_terminal.assert_called_once_with(b"\x03")
 
 
+def test_cow_success_closes_pty_at_invocation_boundary(runtime, tmp_path, monkeypatch):
+    runtime.agconfig.sandbox.checkpoint_backend = "cow_zfs"
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    handle = Mock(returncode=None)
+    handle.is_paused.return_value = False
+    launch = Mock(return_value=handle)
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+
+    def write(data):
+        if data == b"\r":
+            execution.driver.pending += [
+                {"kind": "submit", "turn_id": "turn", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "turn", "text": "done"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    assert execution.run("first").ok
+    assert not tmp_path.exists()
+    handle.close.assert_called_once()
+    launch.assert_called_once()
+
+
+def test_codex_reports_failed_task_complete_without_waiting_for_stop_hook(runtime, tmp_path):
+    driver = driver_for(
+        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    path = tmp_path / "transcript.jsonl"
+    driver.transcript_path = path
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "failed-turn",
+                    "last_agent_message": None,
+                    "error": {"message": "model configuration rejected"},
+                },
+            }
+        )
+        + "\n"
+    )
+    events = driver.events()
+    assert events == [
+        {
+            "kind": "error",
+            "turn_id": "failed-turn",
+            "error": "Codex terminal error: {'message': 'model configuration rejected'}",
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # run_pty_attempt's profiler-status bridge timeout
 # ---------------------------------------------------------------------------
@@ -676,3 +728,37 @@ def test_profiler_bridge_timeout_is_not_too_tight_for_container_startup():
     from agency.harness.adapters.pty_drivers import _PROFILER_BRIDGE_TIMEOUT_S
 
     assert _PROFILER_BRIDGE_TIMEOUT_S >= 5.0
+
+
+def test_retained_unified_pty_prepares_once_and_reuses_handle(runtime, tmp_path, monkeypatch):
+    driver = FakeDriver(tmp_path)
+    driver.prepare_launch = Mock()
+    execution = PtyExecution(driver, runtime)
+    handle = Mock(returncode=None)
+    handle.is_paused.return_value = False
+    launch = Mock(return_value=handle)
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+
+    def write(data):
+        if data == b"\r":
+            driver.pending += [
+                {"kind": "submit", "turn_id": "turn", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "turn", "text": "done"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    try:
+        assert execution.run("first", keep_alive=True).ok
+        execution.prepare_fast_checkpoint()
+        execution.seize_fast_restore()
+        execution.complete_fast_restore()
+        assert execution.run("second", keep_alive=True).ok
+        driver.prepare_launch.assert_called_once()
+        launch.assert_called_once()
+        handle.close.assert_not_called()
+        handle.checkpoint_detach.assert_called_once()
+        handle.checkpoint_seize_frozen.assert_called_once()
+        handle.checkpoint_reattach.assert_called_once()
+    finally:
+        execution.close()
+    handle.close.assert_called_once()
