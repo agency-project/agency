@@ -6,9 +6,10 @@ Deliberately self-contained -- stdlib only (`json`, `os`, `sys`,
 runs as a subprocess of the harness binary itself (e.g. `claude`/`codex`/
 `grok` invoking their own hook), not inside this process, and can't reach
 into this process's Python state directly. Each harness adapter that uses
-it (`claude_code.py`, `codex.py`, `grok.py` -- their PreToolUse/PostToolUse
-hook payload shapes are near-identical) writes this file into the launch's
-own `config_home` and registers it via that CLI's own hook-config format.
+it (`claude_code.py`, `codex.py`, `grok.py`, `kimi.py` -- their PreToolUse/
+PostToolUse payload shapes differ only in field naming, normalized below)
+writes this file into the launch's own `config_home` and registers it via
+that CLI's own hook-config format.
 `AGPOLICY_BASE_URL`/`AGPOLICY_TOKEN` (set on the harness's own env, the same
 values ANTHROPIC_BASE_URL's bearer token already uses) tell it where to
 reach the daemon's `/agpolicy/check_tool`/`/agpolicy/complete_tool` routes
@@ -128,6 +129,17 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None, str | None]":
     return result["decision"], reason, result.get("call_id")
 
 
+def _tool_use_id(payload: dict) -> "str | None":
+    """Every harness names this differently: Claude/Codex `tool_use_id`, Grok
+    `toolUseId`, Kimi `tool_call_id`. Without it PreToolUse cannot hand its
+    `call_id` to the separate PostToolUse process and the span never closes."""
+    for key in ("tool_use_id", "toolUseId", "tool_call_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _call_state_path(tool_use_id: str) -> "str | None":
     state_dir = os.environ.get("AGPOLICY_STATE_DIR")
     if not state_dir:
@@ -141,8 +153,8 @@ def _remember_call_id(payload: dict, call_id: "str | None") -> None:
     telemetry is skipped later, never that admission itself fails."""
     if not call_id:
         return
-    tool_use_id = payload.get("tool_use_id") or payload.get("toolUseId")
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    tool_use_id = _tool_use_id(payload)
+    if tool_use_id is None:
         return
     path = _call_state_path(tool_use_id)
     if path is None:
@@ -155,8 +167,8 @@ def _remember_call_id(payload: dict, call_id: "str | None") -> None:
 
 
 def _report_completion(payload: dict, hook_event_name: str) -> None:
-    tool_use_id = payload.get("tool_use_id") or payload.get("toolUseId")
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    tool_use_id = _tool_use_id(payload)
+    if tool_use_id is None:
         print(
             f"[agpolicy hook] {hook_event_name} missing tool_use_id; telemetry skipped",
             file=sys.stderr,
@@ -185,7 +197,9 @@ def _report_completion(payload: dict, hook_event_name: str) -> None:
     if not base_url or not token:
         return
 
-    result = payload.get("tool_response")
+    # Kimi reports the tool's result as `tool_output`; the others use
+    # `tool_response`, which may legitimately be null.
+    result = payload["tool_response"] if "tool_response" in payload else payload.get("tool_output")
     error = payload.get("error")
     if hook_event_name == "PostToolUseFailure" and error is None:
         error = "Tool reported failure"
