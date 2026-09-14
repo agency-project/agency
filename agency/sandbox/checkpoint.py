@@ -458,12 +458,12 @@ class ZfsRuntimeStorage:
             self.prepared = False
 
 
-def _criu_stats(raw):
+def _criu_stats(raw, key="podman_criu_stats"):
     try:
         result = json.loads(raw)
     except (ValueError, TypeError):
-        return {"criu_stats_unavailable": True}
-    return {"podman_criu_stats": result}
+        return {key + "_unavailable": True}
+    return {key: result}
 
 
 def check_process_resources(sandbox):
@@ -644,7 +644,7 @@ class CowZfsCheckpoint:
             for key, value in artifact["pid_tracking"].items():
                 setattr(sandbox, key, copy.deepcopy(value))
             sandbox._infrastructure_pids = {}
-            artifact["restore_stats"] = _criu_stats(raw)
+            artifact["restore_stats"] = _criu_stats(raw, "podman_criu_restore_stats")
             acquired = False  # Running container owns the acquired slot.
         finally:
             if acquired:

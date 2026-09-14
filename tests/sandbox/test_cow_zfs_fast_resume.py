@@ -47,6 +47,15 @@ def test_fast_resume_is_optional_and_requires_cow_zfs():
         agsandbox_backend()._validate_config(cfg)
 
 
+def test_dump_and_restore_criu_stats_use_distinct_keys():
+    raw = '{"podman_checkpoint_duration": 123}'
+
+    assert cp._criu_stats(raw) == {"podman_criu_stats": {"podman_checkpoint_duration": 123}}
+    assert cp._criu_stats(raw, "podman_criu_restore_stats") == {
+        "podman_criu_restore_stats": {"podman_checkpoint_duration": 123}
+    }
+
+
 def test_successful_process_checkpoint_remains_an_acceleration_layer(monkeypatch):
     backend, state = _backend()
     artifact = {"name": "agency-test", "daemon_count": 1, "live_pty": True}

@@ -623,6 +623,11 @@ def run_one(
                     restore_started = time.perf_counter()
                     learner.sandbox.restore(checkpoint)
                     data["restore_seconds"] = time.perf_counter() - restore_started
+                    # Restore annotates the same checkpoint stats with whether
+                    # the optional CRIU cache was used and its restore stats.
+                    # Persist the post-restore view for offline analysis.
+                    report = {"checkpoint_id": checkpoint.reference, **checkpoint.stats}
+                    save(report_path, report)
                     start_started = time.perf_counter()
                     learner.sandbox._backend._ensure_started()
                     data["container_start_seconds"] = time.perf_counter() - start_started
