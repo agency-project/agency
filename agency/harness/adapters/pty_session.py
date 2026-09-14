@@ -65,6 +65,15 @@ def session_file_allowed(harness, path):
     if harness in {"codex", "grok"}:
         return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
     if harness == "kimi":
+        # Kimi 0.42.0 loses the restored model binding if its trust prompt is
+        # accepted after resume. Carry forward the decision Agency already
+        # approved on the first attempt so later attempts skip that prompt.
+        if (
+            len(path.parts) == 2
+            and path.parts[0] == "workspace-trust"
+            and path.name.startswith("wd_")
+        ):
+            return True
         # The index names each session directory; both are needed to resume.
         if str(path) == "session_index.jsonl":
             return True
@@ -267,6 +276,7 @@ class PtyExecution:
         phase = getattr(self.driver, "profile_span", lambda name: nullcontext())
         try:
             self.validate_prompt(prompt)
+            self.driver.prepare_launch()
             with phase("harness:launch"):
                 self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
                     self.driver.argv,

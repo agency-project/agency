@@ -74,7 +74,7 @@ class _Synthetic(BaseHTTPRequestHandler):
 
 
 @pytest.mark.timeout(180)
-def test_real_kimi_completes_a_turn_through_the_shared_runner(tmp_path):
+def test_real_kimi_resumes_from_the_portable_session_blob(tmp_path):
     binary = _binary()
     if not binary.exists():
         pytest.skip(f"kimi executable not installed at {binary}")
@@ -95,25 +95,45 @@ def test_real_kimi_completes_a_turn_through_the_shared_runner(tmp_path):
         register_control_handle=Mock(),
         register_redirect=Mock(),
     )
-    root = tmp_path / "state"
-    root.mkdir()
-    driver = driver_for(agharness_backend.for_config("kimi", config), runtime, root, None, None, 4)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    driver.cwd = str(workspace)
+    adapter = agharness_backend.for_config("kimi", config)
 
-    execution = PtyExecution(driver, runtime)
-    execution.START_TIMEOUT = 90
+    first_root = tmp_path / "first-state"
+    first_root.mkdir()
+    first_driver = driver_for(adapter, runtime, first_root, None, None, 4)
+    first_driver.cwd = str(workspace)
+    first_execution = PtyExecution(first_driver, runtime)
+    first_execution.START_TIMEOUT = 90
     try:
-        result = execution.run("say hello")
+        first = first_execution.run("say hello")
+
+        second_root = tmp_path / "second-state"
+        second_root.mkdir()
+        second_driver = driver_for(
+            adapter,
+            runtime,
+            second_root,
+            first.session_id,
+            first.session_blob,
+            4,
+        )
+        second_driver.cwd = str(workspace)
+        second_execution = PtyExecution(second_driver, runtime)
+        second_execution.START_TIMEOUT = 90
+        second = second_execution.run("say hello again")
     finally:
         server.shutdown()
 
-    assert result.ok
+    assert first.ok
+    assert second.ok
     # The answer comes from the persisted transcript, never from the screen.
-    assert result.final_text == REPLY
-    assert result.session_id.startswith("session_")
-    bundle = json.loads(result.session_blob)
+    assert first.final_text == REPLY
+    assert second.final_text == REPLY
+    assert first.session_id.startswith("session_")
+    assert second.session_id == first.session_id
+    bundle = json.loads(second.session_blob)
     assert bundle["harness"] == "kimi"
-    assert bundle["session_id"] == result.session_id
+    assert bundle["session_id"] == second.session_id
     assert "session_index.jsonl" in bundle["files"]
+    assert any(name.startswith("workspace-trust/wd_") for name in bundle["files"])

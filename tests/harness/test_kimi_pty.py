@@ -2,6 +2,7 @@
 
 import json
 import tomllib
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,8 +11,11 @@ import pytest
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
 from agency.harness.adapters.pty_drivers import driver_for
-from agency.harness.adapters.pty_session import session_file_allowed
-from pathlib import PurePosixPath
+from agency.harness.adapters.pty_session import (
+    restore_session,
+    session_file_allowed,
+    snapshot_session,
+)
 
 SESSION = "session_ef88f4ce-871e-48e3-b200-61666518f9fd"
 
@@ -131,6 +135,8 @@ def test_restore_repoints_absolute_paths_at_the_new_root(runtime, tmp_path):
     "path,allowed",
     [
         ("session_index.jsonl", True),
+        ("workspace-trust/wd_work_4bcfda", True),
+        ("workspace-trust/not-a-workspace", False),
         ("sessions/wd_work_4bcfda/session_x/agents/main/wire.jsonl", True),
         ("sessions/wd_work_4bcfda/session_x/state.json", True),
         ("config.toml", False),
@@ -140,6 +146,33 @@ def test_restore_repoints_absolute_paths_at_the_new_root(runtime, tmp_path):
 )
 def test_only_session_state_is_portable(path, allowed):
     assert session_file_allowed("kimi", PurePosixPath(path)) is allowed
+
+
+def test_workspace_trust_survives_session_relocation(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    marker = Path("workspace-trust/wd_work_4bcfda")
+    source.joinpath(marker).parent.mkdir(parents=True)
+    source.joinpath(marker).write_text('{"root":"/workspace","trustedAt":1}')
+    (source / "session_index.jsonl").write_text("{}\n")
+
+    blob = snapshot_session(source, "kimi", SESSION)
+    destination.mkdir()
+    restore_session(destination, "kimi", SESSION, blob)
+
+    assert destination.joinpath(marker).read_bytes() == source.joinpath(marker).read_bytes()
+
+
+def test_workspace_is_trusted_before_launch(driver, tmp_path):
+    driver.cwd = "/workspace/"
+
+    driver.prepare_launch()
+
+    marker = tmp_path / "workspace-trust/wd_workspace_c52ddf65534b"
+    record = json.loads(marker.read_text())
+    assert set(record) == {"root", "trustedAt"}
+    assert record["root"] == "/workspace"
+    assert isinstance(record["trustedAt"], int)
 
 
 def test_trust_dialog_is_acknowledged_before_the_composer(driver):
@@ -258,6 +291,22 @@ def test_stop_is_not_completion_until_the_transcript_agrees(driver):
     )
     # The turn is still running: a Stop alone must not finish the attempt.
     assert driver.completed({"turn_id": "0", "text": ""}) is False
+
+
+def test_transcript_completion_survives_a_missing_stop_hook(driver):
+    driver.session_id = SESSION
+    _transcript(
+        driver,
+        [
+            {"type": "turn.ended", "turnId": 0, "reason": "completed"},
+            {"type": "turn.ended", "turnId": 1, "reason": "completed"},
+        ],
+    )
+
+    assert driver.events() == [
+        {"kind": "stop", "turn_id": "0", "text": ""},
+        {"kind": "stop", "turn_id": "1", "text": ""},
+    ]
 
 
 def test_completion_reads_answer_and_usage_from_the_transcript(driver):

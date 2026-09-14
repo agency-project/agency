@@ -99,6 +99,9 @@ class PtyDriver:
     def _configure(self, adapter, runtime, max_steps):
         raise NotImplementedError
 
+    def prepare_launch(self):
+        """Materialize any driver state that depends on the final working directory."""
+
     def ready(self, handle):
         raise NotImplementedError
 

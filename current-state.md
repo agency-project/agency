@@ -2,10 +2,9 @@
 
 Branch: `eric/kimi-code` (off `refactor-master`)
 
-Two pieces of work landed here. The first is finished: every interactive CLI
-harness now runs through one shared PTY runner. The second is mostly finished:
-Kimi Code is integrated end-to-end, but **its resume path is broken** and that
-is the one open problem.
+Two pieces of work landed here, and both are finished: every interactive CLI
+harness now runs through one shared PTY runner, and Kimi Code is integrated
+end-to-end with portable session resume.
 
 ---
 
@@ -91,7 +90,7 @@ Both are tested.
 
 ---
 
-## 2. Kimi Code (integrated; resume broken)
+## 2. Kimi Code (done)
 
 Added as `agency/harness/adapters/kimi.py` — `KimiDriver` plus `_KimiBackend`.
 All of its values were derived empirically against the real CLI, version
@@ -129,95 +128,143 @@ Integrating a fifth harness found three problems that were not Kimi's.
 
 ### Verified working
 
-- `examples/01_basic_agent.py` runs green.
+- `examples/01_basic_agent.py` runs green end-to-end on Linux/x86_64 with the
+  real Kimi 0.42.0 CLI and Arena's `kimi-k3` model.
 - Single-attempt Kimi runs complete in ~1.5s against a stub LLM.
-- 407 harness tests pass, 28 skipped.
+- A real Kimi 0.42.0 process completes a turn, restores only its portable
+  session blob into a fresh config home, and completes a second turn under the
+  same native session ID.
+- The full harness test directory passes on macOS arm64: 374 passed, 65
+  optional/platform tests skipped, and the one x86_64-only ptrace test
+  deselected.
 
 ---
 
-## 3. The open problem: Kimi resume
+## 3. Kimi resume (fixed)
 
-**One line: Kimi bakes absolute config-home paths into its session state, so
-restoring a session into Agency's fresh per-attempt home leaves it with no
-model bound — and it fails silently, as a generic acknowledgment timeout rather
-than an error.**
+### Root cause
 
-### How it presents
+The absolute paths in `session_index.jsonl` and session JSON needed relocation,
+but they were not what cleared the model. The decisive missing state was
+Kimi's `workspace-trust/wd_*` record.
 
-Attempt 1 succeeds in ~1.5s. The engine's second attempt restores the session
-blob into a *new* config home and passes `--session <id>`. Kimi comes up
-showing:
+Agency accepted Kimi's "Trust this folder?" dialog automatically. In Kimi
+0.42.0, accepting that dialog during TUI startup can race with initial model
+binding and leave even a cold session with no active model. The same bug is
+deterministic when the dialog appears after loading `--session <id>`. Kimi then
+displays `LLM not set`, ignores the prompt, and eventually looks like an Agency
+input-acknowledgment timeout.
 
-```
-Error: LLM not set, send "/login" to login
-Model: stub-model
-```
+This was isolated by changing one piece of state at a time: removing only
+`workspace-trust` broke a same-home resume, while preserving only that record
+made a fully relocated fresh-home resume succeed. Changing model aliases,
+copying caches, and relocating additional absolute paths did not affect the
+failure.
 
-It then ignores the pasted prompt entirely — no `TurnStarted` hook, no error
-event, nothing. The runner has no evidence anything is wrong, so it waits the
-full 60s input timeout and reports "timed out waiting for native prompt
-acknowledgment." The message is true and useless.
+### Fix
 
-### Why it happens
+Immediately before launch, the Kimi driver writes the exact narrowly scoped
+`workspace-trust/wd_<slug>_<hash>` record Kimi would write after Agency accepts
+the dialog. This happens after the final working directory is known, avoids the
+startup race on cold attempts, and does not make a new trust decision: Agency
+already accepted the same dialog unconditionally.
 
-Agency's session model is: snapshot the portable state out of one config home,
-restore it into a fresh one next attempt. That contract requires the state to
-be relocatable. Kimi's isn't. It stores the absolute path of the home that
-wrote it in at least:
+Kimi session bundles also carry these records into resumed attempts. The normal
+bundle identity, path traversal, symlink, file-count, and size checks still
+apply.
 
-- `sessionDir` in `session_index.jsonl`
-- `agents.<name>.homedir` in each session's `state.json`
-- a `profile.bind` row in `wire.jsonl` recording `modelAlias`
+`_relocate_session_index()` continues to repoint Kimi's session directory and
+stored home paths at the fresh attempt root.
 
-The paths point at a directory that no longer exists, and the model binding
-names an alias the fresh config didn't define.
+### Regression coverage
 
-### What has been tried (neither fixed it)
-
-1. **Make the alias be the model name.** The config used to key the model entry
-   under a synthetic `agency-proxy` alias. A resumed session restores its
-   binding *by name*, so an alias the new config doesn't define leaves nothing
-   bound. `config.toml` now keys the model under its own name and `--model`
-   passes the same. Correct on its own merits; did not fix resume.
-2. **Relocate every absolute path on restore.** `_relocate_session_index()`
-   rewrites `sessionDir` in the index and replaces the old root prefix
-   throughout every `sessions/**/*.json`. Also correct; also did not fix it.
-
-Still failing, which points at a stored *binding* rather than a stale path —
-the next step is to dump the `config.toml` attempt 2 actually generates and
-confirm the model name resolves at all inside the resumed session.
-
-### Scope: is this Kimi-only?
-
-Unverified, and worth checking before assuming it is. The class of bug — a CLI
-storing absolute paths in state that Agency relocates between attempts — is not
-Kimi-specific, and Codex, Grok and OpenCode all resume through the same
-snapshot/restore contract. Two cheap checks:
-
-- grep their session bundles for absolute paths
-- run the resume reproduction against each of them
-
-If they're clean it's a Kimi quirk. If they aren't, session-state relocation
-should become an explicit `PtyDriver` hook rather than something Kimi does ad
-hoc in `_restore`.
-
-### Reproducing it
-
-`scratchpad/resume_repro.py` runs attempt 1 fresh, then attempt 2 resuming,
-against a stub LLM, in about 30 seconds. It needs the Kimi binary and runs
-inside the `kimidbg` podman container. Set `DUMP_CONFIG=1` to print each
-attempt's generated `config.toml` and argv.
+- A unit test snapshots a Kimi session containing the trust marker, restores it
+  into a different root, and verifies the marker survives byte-for-byte.
+- A unit test verifies the pre-launch marker uses Kimi's exact workspace slug,
+  SHA-256 suffix, canonical root, and JSON record shape.
+- The real-CLI opt-in test now performs two turns with a fresh config home for
+  the second turn and asserts that both use the same Kimi session ID.
+- An exact Kimi 0.42.0 diagnostic run against a synthetic OpenAI-compatible
+  server completed both attempts, produced the expected answer twice, and sent
+  two upstream chat-completion requests.
+- The real `examples/01_basic_agent.py` completed through Agency's Podman
+  sandbox, ptrace PTY, Kimi Code, Agency's OpenAI-compatible proxy, and Arena
+  K3, returning the typed `summary` result and destroying its sandbox cleanly.
 
 ---
 
-## Notes for whoever picks this up
+## 4. Kimi resumed-turn completion (fixed)
 
-- Temporary debug instrumentation was added to `pty_session.py` and
-  `_pty_hook.py` during this investigation and has been **removed**; neither
-  file carries anything from it. Don't re-commit it if you re-add it.
-- Podman is installed rootless under `~/.local/podman`. Two packages
-  (`golang-github-containers-common` among them) are still unconfigured because
-  an `&&` short-circuited the original install; `sudo apt-get -f install` would
-  finish the job. Workarounds are in place in the meantime: a user-level
-  `~/.config/containers/policy.json`, a symlinked `catatonit`, and
-  `CUDA_VISIBLE_DEVICES=-1` to dodge a CDI GPU error.
+### Root cause
+
+Kimi can durably finish a resumed turn without delivering its best-effort
+`Stop` lifecycle hook. The completed `turn.ended` row is present in
+`wire.jsonl`, including the correct turn ID and completion reason, but the PTY
+runner previously consulted that transcript only after receiving `Stop`.
+Agency therefore waited until its deadline even though Kimi had already
+finished successfully.
+
+This was reproduced against the real Kimi 0.42.0 CLI and Arena K3 during the
+multi-turn lifecycle example. The transcript contained `turn.ended` for the
+active resumed turn while no matching hook file arrived.
+
+### Fix
+
+`KimiDriver` now exposes every durable `turn.ended` row as a candidate stop
+event. The shared PTY controller still accepts only the candidate whose
+normalized turn ID matches the currently acknowledged turn, and
+`KimiDriver.completed()` still verifies that the transcript reason is
+`completed` before reconstructing output and usage. This keeps stale and
+cancelled turns from completing the active request while removing the optional
+hook as a single point of failure.
+
+The fallback intentionally does not depend on Kimi's last observed hook turn
+ID: that bookkeeping can itself be missing in the same failure mode.
+
+### Regression coverage
+
+- A unit test writes multiple ended turns without a `Stop` hook and verifies
+  that the driver reports their normalized transcript candidates.
+- The real multi-turn lifecycle example now completes queued context,
+  dependency fan-through, async work, redirect, pause/resume, and cancellation
+  without hanging.
+
+---
+
+## 5. Full example acceptance (passed)
+
+All ten tutorials passed on the EC2 Linux/x86_64 host against Arena's
+`kimi-k3`. Harness-specific lessons kept their intentional native or Codex
+harness overrides; every LLM-backed path still used K3 through the Arena
+OpenAI-compatible endpoint.
+
+1. Basic agent: typed result and history.
+2. Context and lifecycle: queued context, dependencies, async, redirect,
+   pause/resume, and cancellation.
+3. Tools and policy: direct tools, allow/deny policy, host MCP, sandbox MCP,
+   and process boundaries.
+4. Files, images, and types: typed text/binary/path/raw/custom values and image
+   interpretation.
+5. Parallel workflows: `agmap`, `wait_all`, concurrent fork/merge, and teams.
+6. Configuration and resources: namespaces, redaction, clone isolation,
+   mounts, limits, and output paths.
+7. Sandbox API: file and process APIs, limits, checkpoint restore, fork, and
+   stop.
+8. Checkpoints: full save/load and registry save/load.
+9. Observability: counters, Perfetto trace, and trace summary.
+10. Harnesses and web UI: Codex/native comparison plus a temporary embedded
+    Perfetto UI that shut down cleanly.
+
+For lesson 8 only, the sandbox image was changed to the documented lightweight
+`python:3.12-slim` example setup. Serializing the global 24 GB Kimi/CUDA image
+was spending minutes compressing unrelated image contents; the 79.4 MiB slim
+checkpoint exercised the same checkpoint APIs and completed successfully.
+
+The examples retain their five-minute default wait. For slow remote models,
+`AGENCY_EXAMPLE_WAIT_TIMEOUT_SECONDS` can now raise that boundary without
+editing source; the K3 acceptance run used 900 seconds.
+
+The complete remote acceptance artifacts are under
+`/home/eric/agency-kimi-e2e-20260914/runs/all-kimi-k3`. A post-run scan found no
+Arena or project API-key patterns in those artifacts or the Perfetto build
+tree, and no example process, web server, or Podman container was left running.

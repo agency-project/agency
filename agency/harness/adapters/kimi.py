@@ -10,10 +10,13 @@ Completions, served by the shared `ChatCompletionsBackend` seam.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import posixpath
 import re
 import shlex
 import shutil
+import time
 from pathlib import Path, PurePosixPath
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
@@ -71,9 +74,8 @@ class KimiDriver(PtyDriver):
         `session_index.jsonl` and `agents.<name>.homedir` in each session's
         `state.json` -- both naming the config home that produced them. A
         bundle restored into a fresh home therefore points at directories that
-        no longer exist, and Kimi comes up with no model bound at all ("LLM not
-        set, send /login to login"), silently ignoring every prompt. Only the
-        `sessions/<workDirKey>/<sessionId>` tail is portable.
+        no longer exist. Only the `sessions/<workDirKey>/<sessionId>` tail is
+        portable.
         """
         index = self.root / "session_index.jsonl"
         if not index.exists():
@@ -129,6 +131,33 @@ class KimiDriver(PtyDriver):
             (event, policy) for event in ("PreToolUse", "PostToolUse", "PostToolUseFailure")
         ]
         return commands
+
+    def prepare_launch(self):
+        """Pre-approve the workspace before Kimi binds its initial model.
+
+        Agency always accepts Kimi's trust prompt. Kimi 0.42.0 can lose the
+        active model when that prompt is accepted during TUI startup, so write
+        the exact record its trust service would have written before launch.
+        This runs after callers finalize ``cwd`` and also covers cold starts;
+        resumed attempts normally already carry the record in their blob.
+        """
+        root = posixpath.abspath(self.cwd.replace("\\", "/"))
+        normalized = root.rstrip("/")
+        base = normalized.rsplit("/", 1)[-1]
+        slug = re.sub(r"[^a-z0-9._-]+", "-", base.lower()).strip("-")[:40].strip("-")
+        if slug in {"", ".", ".."}:
+            slug = "workspace"
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:12]
+        marker = self.root / "workspace-trust" / f"wd_{slug}_{digest}"
+        if marker.exists():
+            return
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {"root": root, "trustedAt": int(time.time() * 1000)},
+                separators=(",", ":"),
+            )
+        )
 
     def ready(self, handle):
         lines, _x, y, _generation = handle.terminal_screen()
@@ -212,6 +241,23 @@ class KimiDriver(PtyDriver):
                 "error": f"Kimi {kind}: {reason}",
             }
         return None
+
+    def _transcript_events(self):
+        """Recover completion when Kimi omits its best-effort Stop hook.
+
+        Kimi writes ``turn.ended`` to the durable wire transcript before it
+        invokes the Stop hook. The hook can occasionally be absent on a
+        resumed session, so use that authoritative record to wake the runner.
+        ``completed()`` still validates the turn identity and end reason and
+        reconstructs the answer from the transcript.
+        """
+        events = []
+        for row in self._rows():
+            if row.get("type") == "turn.ended":
+                events.append(
+                    {"kind": "stop", "turn_id": self._turn(row.get("turnId")), "text": ""}
+                )
+        return events
 
     def completed(self, event):
         super().completed(event)
