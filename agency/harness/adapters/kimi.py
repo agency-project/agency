@@ -3,6 +3,9 @@
 Verified against Kimi Code CLI 0.42.0. Its lifecycle hooks report a turn
 identity on `TurnStarted` but not on `Stop`, so completion is reconciled
 against the session's own `wire.jsonl` rather than trusted from the event.
+
+Kimi's provider `type = "openai"` means its model traffic is plain Chat
+Completions, served by the shared `ChatCompletionsBackend` seam.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import shutil
 from pathlib import Path
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .openai_protocol import ChatCompletionsBackend
 from .pty_drivers import PtyDriver, run_pty_attempt
 from .pty_session import MAX_SESSION_BYTES, restore_session, snapshot_session
 
@@ -47,6 +51,7 @@ class KimiDriver(PtyDriver):
 
     def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
         self.started = False
+        self._trusted_directory = False
         self._last_turn_id = None
         self._prior_blob = blob
         super().__init__(adapter, runtime, root, session_id, blob, max_steps)
@@ -89,8 +94,13 @@ class KimiDriver(PtyDriver):
         lines, _x, y, _generation = handle.terminal_screen()
         if any("Trust this folder?" in line for line in lines):
             # Same shape as Codex's trust prompt: the default row is already
-            # selected, so Enter accepts and the composer follows.
-            if any("Trust this folder" in line and "❯" in line for line in lines):
+            # selected, so Enter accepts and the composer follows. Answer it
+            # once -- readiness is polled every 25ms, and the surplus Enters
+            # would land in the composer as empty submissions.
+            if not self._trusted_directory and any(
+                "Trust this folder" in line and "❯" in line for line in lines
+            ):
+                self._trusted_directory = True
                 handle.write_terminal(b"\r")
             return False
         # Require the real composer, never silence or scrollback.
@@ -205,7 +215,7 @@ class KimiDriver(PtyDriver):
         return snapshot_session(self.root, self.name, self.session_id)
 
 
-class _KimiBackend(agharness_backend):
+class _KimiBackend(ChatCompletionsBackend, agharness_backend):
     _DEFAULT_BINARY = "kimi"
     _PTY_DRIVER = KimiDriver
     _PROVIDER_NAME = _MODEL_ALIAS
