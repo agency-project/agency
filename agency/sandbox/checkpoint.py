@@ -124,6 +124,9 @@ class ZfsRuntimeStorage:
         self.created = False
         self.criu_ready = False
         self.criu_setup_error = None
+        self.fast_root = None
+        self._fast_resume_id = uuid.uuid4().hex
+        self._runtime_files_restore_pending = False
 
     @property
     def prefix(self):
@@ -172,6 +175,17 @@ class ZfsRuntimeStorage:
                         "DockerRootDir must be the configured checkpoint_zfs_parent mountpoint"
                     )
                 self.path = root
+                self.fast_root = root / "agency-fast-resume" / self._fast_resume_id
+                if sandbox._agconfig.sandbox.checkpoint_fast_resume:
+                    try:
+                        self._prepare_criu(sandbox)
+                        self.criu_ready = True
+                    except Exception as exc:
+                        self.criu_setup_error = f"{type(exc).__name__}: {exc}"
+                        logging.getLogger(__name__).warning(
+                            "Docker CRIU fast resume setup unavailable; ZFS checkpoints remain enabled: %s",
+                            exc,
+                        )
                 self.prepared = True
                 return
             import fcntl
@@ -206,6 +220,7 @@ class ZfsRuntimeStorage:
                         sandbox, image, original, base_dataset, base_path, base_snapshot
                     )
                 self.path = Path(mount) / ("a-" + self.dataset.rsplit("-", 1)[1][:20])
+                self.fast_root = self.path
                 _command(
                     [
                         "zfs",
@@ -285,40 +300,63 @@ class ZfsRuntimeStorage:
 
     @property
     def criu_config(self):
-        if self.path is None:
-            raise CheckpointCapabilityError("Private Podman storage has not been provisioned")
-        return self.path / "criu.conf"
+        if self.fast_root is None:
+            raise CheckpointCapabilityError("CRIU fast-resume storage has not been provisioned")
+        return self.fast_root / "criu.conf"
 
     def _prepare_criu(self, sandbox):
-        if self.runtime != "podman":
-            return
         for binary in ("criu", "runc"):
             if not shutil.which(binary):
                 raise CheckpointCapabilityError(
                     f"Missing {binary}; CRIU fast resume will be unavailable"
                 )
-        if not Path(self.init_path).is_file():
-            raise CheckpointCapabilityError("Podman catatonit init binary is required")
-        cgroups = (
-            _command(
-                ["podman", "info", "--format", "{{.Host.CgroupManager}} {{.Host.CgroupsVersion}}"]
+        if self.runtime == "podman":
+            if not Path(self.init_path).is_file():
+                raise CheckpointCapabilityError("Podman catatonit init binary is required")
+            cgroups = (
+                _command(
+                    [
+                        "podman",
+                        "info",
+                        "--format",
+                        "{{.Host.CgroupManager}} {{.Host.CgroupsVersion}}",
+                    ]
+                )
+                .decode()
+                .strip()
             )
-            .decode()
-            .strip()
-        )
+        else:
+            info = json.loads(_command(["docker", "info", "--format", "{{json .}}"]))
+            if not info.get("ExperimentalBuild"):
+                raise CheckpointCapabilityError(
+                    "Docker daemon experimental features are required for checkpoint/restore"
+                )
+            version = str(info.get("CgroupVersion", ""))
+            cgroups = f"{info.get('CgroupDriver', '')} v{version.removeprefix('v')}"
         if cgroups != "systemd v2":
             raise CheckpointCapabilityError(
-                "CRIU fast resume requires cgroup v2 and Podman systemd cgroup management"
+                "CRIU fast resume requires cgroup v2 and systemd cgroup management"
             )
         _command(["criu", "check"])
-        for operation in ("checkpoint", "restore"):
-            help_text = _command(["podman", "container", operation, "--help"]).decode()
-            for flag in ("--keep", "--file-locks", "--tcp-established", "--print-stats"):
-                if flag not in help_text:
-                    raise CheckpointCapabilityError(f"Podman {operation} lacks {flag}")
-        script = self.path / "restore-runtime-mounts.py"
+        if self.runtime == "podman":
+            for operation in ("checkpoint", "restore"):
+                help_text = _command(["podman", "container", operation, "--help"]).decode()
+                for flag in ("--keep", "--file-locks", "--tcp-established", "--print-stats"):
+                    if flag not in help_text:
+                        raise CheckpointCapabilityError(f"Podman {operation} lacks {flag}")
+        else:
+            start_help = _command(["docker", "start", "--help"]).decode()
+            run_help = _command(["docker", "run", "--help"]).decode()
+            start_flags = set(re.findall(r"--[a-z-]+", start_help))
+            if "--checkpoint" not in start_flags:
+                raise CheckpointCapabilityError("Docker lacks checkpoint restore support")
+            if "--annotation" not in run_help:
+                raise CheckpointCapabilityError("Docker lacks OCI annotation support")
+        self.fast_root.mkdir(mode=0o700, parents=True, exist_ok=self.runtime == "podman")
+        self.fast_root.chmod(0o700)
+        script = self.fast_root / "restore-runtime-mounts.py"
         script.write_bytes(Path(__file__).with_name("_criu_restore_mounts.py").read_bytes())
-        launcher = self.path / "restore-runtime-mounts"
+        launcher = self.fast_root / "restore-runtime-mounts"
         launcher.write_text(
             f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))}\n"
         )
@@ -331,38 +369,60 @@ class ZfsRuntimeStorage:
         )
 
     def prepare_restore_mounts(self, inspection, reference, sessions):
-        if self.runtime != "podman" or self.path is None:
-            raise CheckpointCapabilityError("CRIU restore hooks require private Podman storage")
-        config_path = (
-            self.path
-            / "graphroot"
-            / "overlay-containers"
-            / inspection["Id"]
-            / "userdata"
-            / "config.json"
-        )
-        config = json.loads(config_path.read_text())
+        if self.fast_root is None:
+            raise CheckpointCapabilityError("CRIU restore hooks are not prepared")
         files = []
-        for mount in config["mounts"]:
-            if mount["destination"] not in {
-                "/etc/hosts",
-                "/etc/hostname",
-                "/etc/resolv.conf",
-                "/run/.containerenv",
-            }:
-                continue
-            source = Path(mount["source"]).resolve()
-            if not source.is_relative_to(self.path.resolve()) or not source.is_file():
-                raise CheckpointCapabilityError(
-                    "Runtime bind file is outside the private ZFS dataset"
+        if self.runtime == "podman":
+            config_path = (
+                self.path
+                / "graphroot"
+                / "overlay-containers"
+                / inspection["Id"]
+                / "userdata"
+                / "config.json"
+            )
+            config = json.loads(config_path.read_text())
+            for mount in config["mounts"]:
+                if mount["destination"] not in {
+                    "/etc/hosts",
+                    "/etc/hostname",
+                    "/etc/resolv.conf",
+                    "/run/.containerenv",
+                }:
+                    continue
+                source = Path(mount["source"]).resolve()
+                if not source.is_relative_to(self.path.resolve()) or not source.is_file():
+                    raise CheckpointCapabilityError(
+                        "Runtime bind file is outside the private ZFS dataset"
+                    )
+                files.append(str(source.relative_to(self.path.resolve())))
+        else:
+            backup_root = self.fast_root / "runtime-files"
+            if backup_root.exists():
+                shutil.rmtree(backup_root)
+            backup_root.mkdir(mode=0o700)
+            for field in ("HostsPath", "HostnamePath", "ResolvConfPath"):
+                source = Path(inspection.get(field, "")).resolve()
+                if not source.is_relative_to(self.path.resolve()) or not source.is_file():
+                    raise CheckpointCapabilityError(
+                        f"Docker {field} is outside the isolated ZFS data root"
+                    )
+                backup = backup_root / field
+                shutil.copy2(source, backup)
+                files.append(
+                    {
+                        "target": str(source),
+                        "backup": str(backup.relative_to(self.fast_root)),
+                    }
                 )
-            files.append(str(source.relative_to(self.path.resolve())))
-        (self.path / "restore-mounts.json").write_text(
+        (self.fast_root / "restore-mounts.json").write_text(
             json.dumps(
                 {
                     "snapshot": reference.split("@", 1)[1],
                     "files": files,
                     "container_id": inspection["Id"],
+                    "runtime": self.runtime,
+                    "runtime_root": str(self.path),
                     "stopped_tasks": sorted(
                         {
                             pid
@@ -401,6 +461,20 @@ class ZfsRuntimeStorage:
     def rollback(self, reference):
         # No -r/-R: never discard a newer or unrelated snapshot implicitly.
         _command(["zfs", "rollback", reference])
+        if self.runtime == "docker" and (self.fast_root / "restore-mounts.json").exists():
+            self._runtime_files_restore_pending = True
+
+    def restore_runtime_files_after_start(self):
+        """Repair Docker's generated bind files after a durable fallback start."""
+        if not self._runtime_files_restore_pending:
+            return
+        from ._criu_restore_mounts import restore_runtime_files
+
+        restore_runtime_files(self.fast_root)
+        self._runtime_files_restore_pending = False
+
+    def runtime_files_restored(self):
+        self._runtime_files_restore_pending = False
 
     def delete(self, reference):
         if not reference.startswith(self.dataset + "@agency-"):
@@ -436,6 +510,13 @@ class ZfsRuntimeStorage:
                 for snapshot in snapshots:
                     if snapshot.startswith(self.dataset + "@agency-"):
                         _command(["zfs", "destroy", snapshot])
+            if self.fast_root is not None and self.fast_root.exists():
+                expected = self.path / "agency-fast-resume"
+                if self.fast_root.parent != expected or self.fast_root.name != self._fast_resume_id:
+                    raise CheckpointCapabilityError(
+                        "Refusing to remove unexpected fast-resume path"
+                    )
+                shutil.rmtree(self.fast_root)
             # Keep the runtime usable until _ContainerBackendBase.destroy()
             # removes the container.  Marking this unprepared here makes
             # _run() reject the subsequent `docker rm`, leaking the live
@@ -530,7 +611,13 @@ class CowZfsCheckpoint:
             return
         if sandbox._runtime == "docker":
             sandbox._run(
-                ["docker", "checkpoint", "rm", sandbox._name, artifact["name"]],
+                [
+                    "docker",
+                    "checkpoint",
+                    "rm",
+                    sandbox._name,
+                    artifact["name"],
+                ],
                 check=False,
                 timeout=30,
             )
@@ -539,10 +626,8 @@ class CowZfsCheckpoint:
         if sandbox._gpu_count_requested:
             raise CheckpointCapabilityError("CRIU fast resume is disabled for GPU sandboxes")
         storage = sandbox._checkpoint_storage
-        if sandbox._runtime != "podman" or not storage.criu_ready:
-            detail = (
-                storage.criu_setup_error or "supported only with private rootful Podman storage"
-            )
+        if sandbox._runtime not in {"docker", "podman"} or not storage.criu_ready:
+            detail = storage.criu_setup_error or "runtime checkpoint/restore is unavailable"
             raise CheckpointCapabilityError(f"CRIU fast resume is unavailable: {detail}")
         prepared, sessions, live_pty = self._prepare_daemons(sandbox)
         name = "agency-" + uuid.uuid4().hex
@@ -558,7 +643,7 @@ class CowZfsCheckpoint:
                 )
             }
             inspection = json.loads(
-                sandbox._run(["podman", "inspect", sandbox._name], check=True).stdout
+                sandbox._run([sandbox._runtime, "inspect", sandbox._name], check=True).stdout
             )[0]
             if inspection.get("ExecIDs") or inspection.get("ExecSessions"):
                 raise CheckpointCapabilityError(
@@ -566,24 +651,44 @@ class CowZfsCheckpoint:
                 )
             if inspection.get("Config", {}).get("Tty"):
                 raise CheckpointCapabilityError("Runtime-owned external terminals are unsupported")
+            if (
+                sandbox._runtime == "docker"
+                and inspection.get("HostConfig", {}).get("NetworkMode") != "host"
+            ):
+                raise CheckpointCapabilityError(
+                    "Docker CRIU fast resume currently requires "
+                    "sandbox.flags=['--network=host']; Docker's managed network "
+                    "namespace cannot be restored reliably"
+                )
             reference = self._pending_reference
             storage.prepare_restore_mounts(inspection, reference, sessions)
-            command = [
-                "podman",
-                "container",
-                "checkpoint",
-                "--keep",
-                "--file-locks",
-                "--tcp-established",
-                "--print-stats",
-                sandbox._name,
-            ]
+            if sandbox._runtime == "podman":
+                command = [
+                    "podman",
+                    "container",
+                    "checkpoint",
+                    "--keep",
+                    "--file-locks",
+                    "--tcp-established",
+                    "--print-stats",
+                    sandbox._name,
+                ]
+            else:
+                command = [
+                    "docker",
+                    "checkpoint",
+                    "create",
+                    sandbox._name,
+                    name,
+                ]
+            dump_started = time.monotonic()
             with agprof.span("checkpoint.process_dump"):
                 raw = sandbox._run(
                     command,
                     check=True,
                     timeout=sandbox._agconfig.sandbox.checkpoint_setup_timeout_s,
                 ).stdout
+            dump_seconds = time.monotonic() - dump_started
             sandbox._mark_runtime_checkpoint_stopped()
         except BaseException:
             if sandbox._container_running():
@@ -591,13 +696,19 @@ class CowZfsCheckpoint:
             else:
                 sandbox._mark_runtime_checkpoint_stopped()
             raise
+        runtime_stats = (
+            _criu_stats(raw)
+            if sandbox._runtime == "podman"
+            else {"docker_criu_checkpoint_seconds": dump_seconds}
+        )
         return {
             "name": name,
+            "runtime": sandbox._runtime,
             "daemon_count": len(prepared),
             "live_pty": live_pty,
             "sessions": sessions,
             "process_memory_rss_bytes": memory,
-            **_criu_stats(raw),
+            **runtime_stats,
             "pid_tracking": tracking,
         }
 
@@ -611,25 +722,53 @@ class CowZfsCheckpoint:
                 socket_path.unlink()
             elif socket_path.exists():
                 raise CheckpointCapabilityError(f"Expected harness control socket at {socket_path}")
-        command = [
-            "podman",
-            "container",
-            "restore",
-            "--keep",
-            "--file-locks",
-            "--tcp-established",
-            "--print-stats",
-            sandbox._name,
-        ]
+        if artifact.get("runtime", sandbox._runtime) != sandbox._runtime:
+            raise CheckpointCapabilityError("fast-resume artifact runtime changed")
+        if sandbox._runtime == "podman":
+            command = [
+                "podman",
+                "container",
+                "restore",
+                "--keep",
+                "--file-locks",
+                "--tcp-established",
+                "--print-stats",
+                sandbox._name,
+            ]
+        else:
+            command = [
+                "docker",
+                "start",
+                "--checkpoint",
+                artifact["name"],
+                sandbox._name,
+            ]
         sandbox._acquire_runtime_slot()
         acquired = True
         try:
+            restore_started = time.monotonic()
             with agprof.span("restore.process"):
-                raw = sandbox._run(
-                    command,
-                    check=True,
-                    timeout=sandbox._agconfig.sandbox.checkpoint_setup_timeout_s,
-                ).stdout
+                for attempt in range(3):
+                    try:
+                        raw = sandbox._run(
+                            command,
+                            check=True,
+                            timeout=sandbox._agconfig.sandbox.checkpoint_setup_timeout_s,
+                        ).stdout
+                        break
+                    except (CheckpointCapabilityError, RuntimeError) as exc:
+                        # Moby/containerd can race while publishing the freshly
+                        # created checkpoint blob. CRIU's own Docker tests retry
+                        # this exact transient failure up to three times.
+                        transient = (
+                            sandbox._runtime == "docker"
+                            and "content sha256:" in str(exc)
+                            and "already exists" in str(exc)
+                        )
+                        if not transient or attempt == 2:
+                            raise
+                        time.sleep(0.1 * (attempt + 1))
+            restore_seconds = time.monotonic() - restore_started
             if not sandbox._container_running():
                 raise CheckpointCapabilityError(
                     "CRIU restore returned without a running process tree"
@@ -639,12 +778,17 @@ class CowZfsCheckpoint:
                     client.seize_fast_restore()
             from ._criu_restore_mounts import thaw_retained_tasks
 
-            thaw_retained_tasks(sandbox._checkpoint_storage.path)
+            thaw_retained_tasks(sandbox._checkpoint_storage.fast_root)
             self._resume_daemons(handles)
+            sandbox._checkpoint_storage.runtime_files_restored()
             for key, value in artifact["pid_tracking"].items():
                 setattr(sandbox, key, copy.deepcopy(value))
             sandbox._infrastructure_pids = {}
-            artifact["restore_stats"] = _criu_stats(raw, "podman_criu_restore_stats")
+            artifact["restore_stats"] = (
+                _criu_stats(raw, "podman_criu_restore_stats")
+                if sandbox._runtime == "podman"
+                else {"docker_criu_restore_seconds": restore_seconds}
+            )
             acquired = False  # Running container owns the acquired slot.
         finally:
             if acquired:
@@ -742,7 +886,12 @@ class CowZfsCheckpoint:
                     **{
                         key: value
                         for key, value in fast_artifact.items()
-                        if key in {"podman_criu_stats", "criu_stats_unavailable"}
+                        if key
+                        in {
+                            "podman_criu_stats",
+                            "criu_stats_unavailable",
+                            "docker_criu_checkpoint_seconds",
+                        }
                     },
                 }
                 if fast_artifact

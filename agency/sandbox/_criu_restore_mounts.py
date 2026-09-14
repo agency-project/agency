@@ -17,14 +17,32 @@ def restore_runtime_files(root):
     snapshot = manifest["snapshot"]
     if not snapshot.startswith("agency-") or "/" in snapshot or ".." in snapshot:
         raise ValueError("Invalid snapshot name")
-    for relative in manifest["files"]:
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise ValueError("Invalid runtime bind path")
-        target = root / relative_path
-        if not target.resolve().is_relative_to(root.resolve()):
-            raise ValueError("Runtime bind escaped its private dataset")
-        original = root / ".zfs" / "snapshot" / snapshot / relative_path
+    runtime = manifest.get("runtime", "podman")
+    for entry in manifest["files"]:
+        if runtime == "podman":
+            relative_path = Path(entry)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError("Invalid runtime bind path")
+            target = root / relative_path
+            if not target.resolve().is_relative_to(root.resolve()):
+                raise ValueError("Runtime bind escaped its private dataset")
+            original = root / ".zfs" / "snapshot" / snapshot / relative_path
+        elif runtime == "docker":
+            runtime_root = Path(manifest["runtime_root"]).resolve()
+            target = Path(entry["target"]).resolve()
+            backup = Path(entry["backup"])
+            if (
+                not runtime_root.is_absolute()
+                or not target.is_relative_to(runtime_root)
+                or backup.is_absolute()
+                or ".." in backup.parts
+            ):
+                raise ValueError("Invalid Docker runtime bind path")
+            original = (root / backup).resolve()
+            if not original.is_relative_to(root.resolve()):
+                raise ValueError("Docker runtime backup escaped its private directory")
+        else:
+            raise ValueError("Invalid checkpoint runtime")
         metadata = original.stat()
         if not stat.S_ISREG(metadata.st_mode) or target.is_symlink():
             raise ValueError("Expected a regular runtime bind file")
@@ -70,8 +88,13 @@ def freeze_retained_tasks(root, init_pid):
     control = Path("/sys/fs/cgroup")
     init_group = Path(f"/proc/{init_pid}/cgroup").read_text().strip().split("0::", 1)[1]
     parent = control / init_group.lstrip("/")
-    container = json.loads((root / "restore-mounts.json").read_text())["container_id"]
-    if parent.name != f"libpod-{container}.scope":
+    checkpoint = json.loads((root / "restore-mounts.json").read_text())
+    container = checkpoint["container_id"]
+    runtime = checkpoint.get("runtime", "podman")
+    expected_scope = (
+        f"libpod-{container}.scope" if runtime == "podman" else f"docker-{container}.scope"
+    )
+    if runtime not in {"docker", "podman"} or parent.name != expected_scope:
         raise RuntimeError("Expected the restored container's private cgroup v2 scope")
     freezer = parent / "agency-criu-handoff"
     freezer.mkdir()
@@ -100,9 +123,18 @@ def thaw_retained_tasks(root):
     if not record.exists():
         return
     manifest = json.loads(record.read_text())
-    container = json.loads((root / "restore-mounts.json").read_text())["container_id"]
+    checkpoint = json.loads((root / "restore-mounts.json").read_text())
+    container = checkpoint["container_id"]
+    runtime = checkpoint.get("runtime", "podman")
     parent = Path(manifest["parent"])
-    if not parent.is_relative_to("/sys/fs/cgroup") or parent.name != f"libpod-{container}.scope":
+    expected_scope = (
+        f"libpod-{container}.scope" if runtime == "podman" else f"docker-{container}.scope"
+    )
+    if (
+        runtime not in {"docker", "podman"}
+        or not parent.is_relative_to("/sys/fs/cgroup")
+        or parent.name != expected_scope
+    ):
         raise RuntimeError("Invalid restore freezer scope")
     freezer = parent / "agency-criu-handoff"
     for pid, original in manifest["tasks"].items():

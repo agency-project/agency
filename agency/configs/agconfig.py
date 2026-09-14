@@ -161,7 +161,8 @@ class sandboxconfig(confignamespace):
     checkpoint_backend: str = "image_commit"  # image_commit | cow_zfs
     # Keep the idle harness process tree as a best-effort CRIU acceleration
     # layer.  The ZFS snapshot remains authoritative and is always captured;
-    # any dump or restore failure falls back to a fresh process tree.
+    # any dump or restore failure falls back to a fresh process tree. Docker
+    # currently also requires "--network=host" in sandbox.flags.
     checkpoint_fast_resume: bool = False
     # Existing host-managed ZFS parent dataset. Provisioning is outside
     # checkpoint spans; sandbox processes never receive ZFS privileges.

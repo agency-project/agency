@@ -761,6 +761,7 @@ class _ContainerBackendBase(agsandbox_backend):
     def _ensure_started_profiled(self) -> None:
         """Start the Docker/Podman container on first use."""
         name = self._name
+        storage = getattr(self, "_checkpoint_storage", None)
         running, status = self._inspect_container_state()
         if running:
             # Reuse an already-running container — it already holds whatever
@@ -779,6 +780,8 @@ class _ContainerBackendBase(agsandbox_backend):
             except Exception:
                 self._release_runtime_slot()
                 raise
+            if storage is not None:
+                storage.restore_runtime_files_after_start()
             self._ensure_workspace_dir()
             if self._baseline_pids is None:
                 self._baseline_pids = self._snapshot_pids_started()
@@ -796,19 +799,15 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
         gpu_flags = _gpu_flags(self._runtime)
-        storage = getattr(self, "_checkpoint_storage", None)
         if (
             storage is not None
-            and self._runtime == "podman"
             and self._agconfig.sandbox.checkpoint_fast_resume
             and storage.criu_ready
         ):
-            gpu_flags += [
-                "--cap-add=SYS_PTRACE",
-                f"--init-path={storage.init_path}",
-                "--annotation",
-                f"org.criu.config={storage.criu_config}",
-            ]
+            gpu_flags += ["--cap-add=SYS_PTRACE"]
+            if self._runtime == "podman":
+                gpu_flags += [f"--init-path={storage.init_path}"]
+            gpu_flags += ["--annotation", f"org.criu.config={storage.criu_config}"]
         cgroup_flags = []
         cgroup_parent = agprof.container_cgroup_parent()
         if cgroup_parent is not None and self._runtime == "docker":
@@ -1251,7 +1250,7 @@ class _ContainerBackendBase(agsandbox_backend):
         self._ensure_started()
         if self._agconfig.sandbox.checkpoint_fast_resume:
             # The short exec parent exits and container init adopts the
-            # daemon. CRIU then sees no live Podman exec session or host pipe.
+            # daemon. CRIU then sees no live runtime exec session or host pipe.
             args = [
                 self._runtime,
                 "exec",

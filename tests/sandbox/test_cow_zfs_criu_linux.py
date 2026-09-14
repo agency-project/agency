@@ -1,8 +1,9 @@
 """Opt-in destructive tests confined to a freshly created private ZFS dataset.
 
 Run as root on Linux with AGENCY_COW_CRIU_TEST=1 and AGENCY_TEST_ZFS_PARENT
-pointing to an existing test dataset. The configured base image must already
-be loaded in rootful Podman. Enabled tests fail, rather than skip, on missing
+pointing to an existing test dataset. Select Podman (the default) or Docker
+with AGENCY_TEST_RUNTIME. The configured base image must already be loaded in
+that rootful runtime. Enabled tests fail, rather than skip, on missing
 capabilities. PTY tests use Agency's actual manager/controller/supervisor.
 """
 
@@ -20,18 +21,25 @@ from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AGENCY_COW_CRIU_TEST") != "1",
-    reason="requires opt-in rootful Linux Podman + ZFS + CRIU host",
+    reason="requires opt-in rootful Linux Docker/Podman + ZFS + CRIU host",
 )
+
+RUNTIME = os.environ.get("AGENCY_TEST_RUNTIME", "podman")
 
 
 @pytest.fixture
 def sandbox(request, tmp_path):
     cfg = agconfig()
-    cfg.sandbox.backend = "podman"
+    cfg.sandbox.backend = RUNTIME
     cfg.sandbox.checkpoint_backend = "cow_zfs"
     cfg.sandbox.checkpoint_fast_resume = True
     cfg.sandbox.checkpoint_zfs_parent = os.environ["AGENCY_TEST_ZFS_PARENT"]
     cfg.sandbox.base_image = os.environ.get("AGENCY_TEST_IMAGE", "agency-sandbox:latest")
+    if RUNTIME == "docker":
+        # Moby's experimental restore cannot currently recreate its managed
+        # network namespace. Host networking keeps this opt-in test focused on
+        # process, PTY, and filesystem continuity.
+        cfg.sandbox.flags.append("--network=host")
     cfg.agent.harness = "native"
     cfg.resources.idle_cpus = 1
     sb = agSandbox("cow-criu-integration", agconfig=cfg)
@@ -53,7 +61,7 @@ def sandbox(request, tmp_path):
                     if code == 0:
                         (destination / Path(source).name).write_text(output)
             for extra in ("restore-mounts.json", "restore-runtime-mounts.py"):
-                file = storage.path / extra
+                file = storage.fast_root / extra
                 if file.exists():
                     (destination / extra).write_bytes(file.read_bytes())
             for pattern in (
@@ -151,7 +159,7 @@ def test_discard_rolls_back_both_memory_and_rootfs(sandbox):
     assert memory_state(sandbox)["counter"] == saved["counter"] + 1
     sandbox.write_file("/workspace/uncommitted", "discard me")
     sandbox.rm_container()
-    # The ordinary exec/read API must trigger CRIU restore, never podman start.
+    # The ordinary exec/read API must trigger CRIU restore, never a cold start.
     assert execute(sandbox, "test ! -e /workspace/uncommitted && echo clean") == "clean"
     assert memory_state(sandbox) == {**saved, "counter": saved["counter"] + 1}
 
@@ -192,7 +200,10 @@ def test_criu_restore_failure_falls_back_to_zfs_and_fresh_harness(sandbox, monke
     real_run = sandbox._backend._run
 
     def fail_process_restore(args, **kwargs):
-        if args[:3] == ["podman", "container", "restore"]:
+        if args[:3] == ["podman", "container", "restore"] or args[:2] == [
+            "docker",
+            "start",
+        ]:
             raise RuntimeError("forced CRIU restore failure")
         return real_run(args, **kwargs)
 
@@ -321,11 +332,13 @@ def test_codex_agent_run_continues_same_cli_after_restore(tmp_path):
     )
 
     cfg = agconfig()
-    cfg.sandbox.backend = "podman"
+    cfg.sandbox.backend = RUNTIME
     cfg.sandbox.checkpoint_backend = "cow_zfs"
     cfg.sandbox.checkpoint_fast_resume = True
     cfg.sandbox.checkpoint_zfs_parent = os.environ["AGENCY_TEST_ZFS_PARENT"]
     cfg.sandbox.base_image = CREATION_CONFIG_IMAGE
+    if RUNTIME == "docker":
+        cfg.sandbox.flags.append("--network=host")
     cfg.agent.harness = "codex"
     cfg.agent.log_dir = str(tmp_path / "logs")
     cfg.llm.api_key = Path(os.environ["AGENCY_TEST_API_KEY_FILE"]).read_text().strip()
@@ -392,6 +405,7 @@ def test_codex_agent_run_continues_same_cli_after_restore(tmp_path):
             agency.get_orchestrator().shutdown()
 
 
+@pytest.mark.skipif(RUNTIME != "podman", reason="tests Podman's shared immutable image seed")
 def test_sandboxes_share_one_image_snapshot_but_isolate_writes(sandbox):
     from agency.sandbox.checkpoint import _command
 
@@ -412,6 +426,7 @@ def test_sandboxes_share_one_image_snapshot_but_isolate_writes(sandbox):
         other.destroy()
 
 
+@pytest.mark.skipif(RUNTIME != "podman", reason="tests Podman's private dataset teardown")
 def test_destroy_retries_real_busy_dataset_reader(sandbox, monkeypatch):
     """A host directory reader must not turn normal sandbox cleanup into a leak."""
     from agency.sandbox import checkpoint as cp
