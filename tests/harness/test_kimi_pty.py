@@ -46,7 +46,13 @@ def test_launch_is_interactive_and_isolated(driver, runtime, tmp_path):
     assert driver.env["KIMI_CODE_HOME"] == str(tmp_path)
 
     config = tomllib.loads((tmp_path / "config.toml").read_text())
-    assert config["default_model"] == "agency-proxy"
+    # The model entry is keyed by the model's own name, not by a synthetic
+    # alias: a resumed session restores the binding by name, and a name the
+    # fresh config does not define leaves Kimi with no model bound at all.
+    assert config["default_model"] == "a-model"
+    assert config["models"]["a-model"]["provider"] == "agency-proxy"
+    assert config["models"]["a-model"]["model"] == "a-model"
+    assert driver.argv[driver.argv.index("--model") + 1] == "a-model"
     assert config["default_permission_mode"] == "auto"
     assert config["telemetry"] is False
     assert config["providers"]["agency-proxy"]["type"] == "openai"
@@ -80,6 +86,45 @@ def test_resume_passes_the_native_session_flag(runtime, tmp_path):
     )
     assert driver.argv[-2:] == ["--session", SESSION]
     assert (tmp_path / "session_index.jsonl").read_bytes() == b"{}\n"
+
+
+def test_restore_repoints_absolute_paths_at_the_new_root(runtime, tmp_path):
+    # Kimi bakes the config home that wrote a session into both the index and
+    # the session's own state.json. Restored verbatim into a fresh home those
+    # point at directories that no longer exist and no model gets bound.
+    import base64
+
+    old = "/tmp/previous-attempt"
+    tail = f"sessions/wd_work_4bcfda/{SESSION}"
+    files = {
+        "session_index.jsonl": (
+            json.dumps({"sessionId": SESSION, "sessionDir": f"{old}/{tail}"}) + "\n"
+        ).encode(),
+        f"{tail}/state.json": json.dumps(
+            {"agents": {"main": {"homedir": f"{old}/{tail}/agents/main"}}}
+        ).encode(),
+    }
+    blob = json.dumps(
+        {
+            "version": 1,
+            "harness": "kimi",
+            "session_id": SESSION,
+            "files": {name: base64.b64encode(data).decode() for name, data in files.items()},
+        }
+    ).encode()
+    driver_for(
+        agharness_backend.for_config("kimi", runtime.agconfig),
+        runtime,
+        tmp_path,
+        SESSION,
+        blob,
+        None,
+    )
+    index = json.loads((tmp_path / "session_index.jsonl").read_text())
+    assert index["sessionDir"] == str(tmp_path / tail)
+    state = (tmp_path / tail / "state.json").read_text()
+    assert old not in state
+    assert str(tmp_path / tail / "agents" / "main") in state
 
 
 @pytest.mark.parametrize(

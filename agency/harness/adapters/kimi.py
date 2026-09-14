@@ -11,9 +11,10 @@ Completions, served by the shared `ChatCompletionsBackend` seam.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from .openai_protocol import ChatCompletionsBackend
@@ -25,7 +26,9 @@ def kimi_available() -> bool:
     return shutil.which("kimi") is not None
 
 
-_MODEL_ALIAS = "agency-proxy"
+_PROVIDER = "agency-proxy"
+# Kimi's own session ids; also the guard that keeps one out of a path join.
+_SESSION_ID_RE = re.compile(r"session_[A-Za-z0-9_-]{1,128}")
 _LIFECYCLE_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -59,6 +62,43 @@ class KimiDriver(PtyDriver):
     def _restore(self, session_id, blob):
         restore_session(self.root, self.name, session_id, blob)
         (self.root / "events").mkdir(exist_ok=True)
+        self._relocate_session_index()
+
+    def _relocate_session_index(self):
+        """Repoint a restored session at this attempt's own root.
+
+        Kimi stores absolute paths in two places -- `sessionDir` in
+        `session_index.jsonl` and `agents.<name>.homedir` in each session's
+        `state.json` -- both naming the config home that produced them. A
+        bundle restored into a fresh home therefore points at directories that
+        no longer exist, and Kimi comes up with no model bound at all ("LLM not
+        set, send /login to login"), silently ignoring every prompt. Only the
+        `sessions/<workDirKey>/<sessionId>` tail is portable.
+        """
+        index = self.root / "session_index.jsonl"
+        if not index.exists():
+            return
+        records, previous_roots = [], set()
+        for line in index.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            parts = PurePosixPath(record.get("sessionDir", "")).parts
+            if "sessions" in parts:
+                cut = len(parts) - 1 - parts[::-1].index("sessions")
+                previous_roots.add(str(PurePosixPath(*parts[:cut])))
+                record["sessionDir"] = str(self.root.joinpath(*parts[cut:]))
+            records.append(json.dumps(record))
+        index.write_text("".join(line + "\n" for line in records))
+
+        current = str(self.root)
+        for previous in previous_roots:
+            if not previous or previous == current:
+                continue
+            for path in (self.root / "sessions").rglob("*.json"):
+                text = path.read_text()
+                if previous in text:
+                    path.write_text(text.replace(previous, current))
 
     def _configure(self, adapter, runtime, max_steps):
         adapter._write_kimi_config(
@@ -72,7 +112,7 @@ class KimiDriver(PtyDriver):
         # KIMI_CODE_HOME relocates config, sessions, and credentials together,
         # so the attempt's whole footprint stays inside its isolated root.
         self.env.update(KIMI_CODE_HOME=str(self.root))
-        self.argv += ["--auto", "--model", _MODEL_ALIAS]
+        self.argv += ["--auto", "--model", runtime.model or "default"]
         if self.session_id:
             self.argv += ["--session", self.session_id]
 
@@ -109,21 +149,18 @@ class KimiDriver(PtyDriver):
 
     @property
     def _transcript_path(self):
-        if self.session_id is None:
+        # Located by layout rather than by session_index.jsonl, whose
+        # sessionDir is absolute and belongs to whichever config home first
+        # wrote it: sessions/<workDirKey>/<sessionId>/agents/main/wire.jsonl.
+        if self.session_id is None or not _SESSION_ID_RE.fullmatch(self.session_id):
             return None
-        index = self.root / "session_index.jsonl"
-        if not index.exists():
+        sessions = self.root / "sessions"
+        if not sessions.is_dir():
             return None
-        for line in index.read_text().splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if record.get("sessionId") == self.session_id:
-                # sessionDir is Kimi's own absolute path; keep it inside the root.
-                directory = Path(record["sessionDir"])
-                if not directory.resolve().is_relative_to(self.root.resolve()):
-                    raise RuntimeError("native transcript escaped isolated state")
-                return directory / "agents" / "main" / "wire.jsonl"
+        for bucket in sorted(sessions.iterdir()):
+            candidate = bucket / self.session_id / "agents" / "main" / "wire.jsonl"
+            if candidate.is_file() and candidate.resolve().is_relative_to(self.root.resolve()):
+                return candidate
         return None
 
     def _rows(self):
@@ -218,7 +255,7 @@ class KimiDriver(PtyDriver):
 class _KimiBackend(ChatCompletionsBackend, agharness_backend):
     _DEFAULT_BINARY = "kimi"
     _PTY_DRIVER = KimiDriver
-    _PROVIDER_NAME = _MODEL_ALIAS
+    _PROVIDER_NAME = _PROVIDER
 
     def run_daemon_attempt(
         self,
@@ -242,20 +279,25 @@ class _KimiBackend(ChatCompletionsBackend, agharness_backend):
         # type = "openai" is Kimi's OpenAI Chat Completions protocol, which
         # agproxy_llm already serves unchanged -- the same passthrough route
         # grok and opencode use, with no translation layer.
+        # The alias has to BE the model name: a resumed session restores the
+        # model it was bound to by name, and an alias the fresh config does not
+        # define leaves Kimi with no LLM ("send /login to login") and silently
+        # refuses every prompt.
+        alias = json.dumps(model)
         lines = [
-            f'default_model = "{_MODEL_ALIAS}"',
+            f"default_model = {alias}",
             'default_permission_mode = "auto"',
             "default_plan_mode = false",
             "telemetry = false",
             "",
-            f"[providers.{_MODEL_ALIAS}]",
+            f"[providers.{_PROVIDER}]",
             'type = "openai"',
             f'base_url = "{base_url.rstrip("/")}/v1"',
             f"api_key = {json.dumps(token)}",
             "",
-            f'[models."{_MODEL_ALIAS}"]',
-            f'provider = "{_MODEL_ALIAS}"',
-            f"model = {json.dumps(model)}",
+            f"[models.{alias}]",
+            f'provider = "{_PROVIDER}"',
+            f"model = {alias}",
             "max_context_size = 200000",
             'capabilities = ["tool_use"]',
         ]
