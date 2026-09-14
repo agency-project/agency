@@ -1,22 +1,20 @@
-"""Grok Build interactive PTY adapter and model-protocol translation."""
+"""OpenAI Chat Completions seam shared by harnesses that speak that protocol.
+
+The translation is protocol-level, not harness-level: any CLI pointed at
+Agency's passthrough route with an OpenAI-compatible provider needs exactly
+this `/v1/chat/completions` endpoint and the same block mapping.
+"""
 
 from __future__ import annotations
 
 import json
-import shutil
 import time
 import uuid
 
 from fastapi import Request
 
-from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
 from ..common import extract_bearer_token
-from .pty_drivers import GrokDriver, run_pty_attempt
 from .pty_session import stream_response
-
-
-def grok_available() -> bool:
-    return shutil.which("grok") is not None
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -62,52 +60,8 @@ def _flatten_unknown_data(data):
     return merged
 
 
-def _toml_string(value: str) -> str:
-    """Quote a string for a hand-written TOML file -- only the escapes
-    this module's config values actually need."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-class _GrokBackend(agharness_backend):
-    _DEFAULT_BINARY = "grok"
-    _PTY_DRIVER = GrokDriver
-    _MODEL_NAME = "agency-proxy"
-
-    def run_daemon_attempt(
-        self,
-        runtime: AdapterRuntime,
-        *,
-        prompt: str,
-        resume_session_id: "str | None",
-        prior_session_blob: "bytes | None",
-        max_steps: "int | None",
-    ) -> AttemptResult:
-        return run_pty_attempt(
-            self,
-            runtime,
-            prompt=prompt,
-            resume_session_id=resume_session_id,
-            prior_session_blob=prior_session_blob,
-            max_steps=max_steps,
-        )
-
-    def _write_grok_config(self, config_home, base_url: str, token: str, model: str) -> None:
-        # config.toml, per docs.x.ai/build's configuration guide: a
-        # [model.<name>] block with base_url/api_key/api_backend, and a
-        # [models] table selecting the default model -- api_backend =
-        # "chat_completions" is what makes this usable via agproxy_llm's
-        # existing passthrough route with no translation, the same as
-        # opencode's @ai-sdk/openai-compatible provider.
-        config_toml = (
-            f"[models]\n"
-            f"default = {_toml_string(self._MODEL_NAME)}\n\n"
-            f"[model.{self._MODEL_NAME}]\n"
-            f"model = {_toml_string(model)}\n"
-            f"base_url = {_toml_string(f'{base_url}/v1')}\n"
-            f"api_key = {_toml_string(token)}\n"
-            f'api_backend = "chat_completions"\n'
-        )
-        (config_home / "config.toml").write_text(config_toml)
+class ChatCompletionsBackend:
+    """Mixin supplying the Chat Completions route and its block mapping."""
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -121,51 +75,6 @@ class _GrokBackend(agharness_backend):
                 )
             body = await request.json()
             model = router.resolve_model(token)
-            # Grok requests UI titles and dashboard text separately from turns.
-            # Like Claude's title request, these must not consume invocation
-            # model calls or acknowledge redirects meant for the real turn.
-            is_title = any(
-                message.get("role") == "system"
-                and isinstance(message.get("content"), str)
-                and message["content"].startswith(
-                    "You are tasked with generating the session title."
-                )
-                and "Just generate the session_title and nothing else" in message["content"]
-                for message in body.get("messages", [])
-            )
-            messages = body.get("messages", [])
-            last = messages[-1] if messages else {}
-            is_dashboard = (
-                last.get("role") == "user"
-                and isinstance(last.get("content"), str)
-                and last["content"].startswith(
-                    "<system-reminder>Write an ultra-short dashboard line that captures "
-                    "the AGENT'S REPLY for the last turn only"
-                )
-                and last["content"].endswith("</system-reminder>")
-            )
-            if is_title or is_dashboard:
-                title_response = {
-                    "type": "done",
-                    "message": {
-                        "role": "assistant",
-                        "blocks": [
-                            {
-                                "type": "text",
-                                "index": 0,
-                                "text": "Agency session" if is_title else "Agency turn",
-                            }
-                        ],
-                    },
-                    "stop_reason": "stop",
-                    "usage": {},
-                }
-                if body.get("stream"):
-                    return StreamingResponse(
-                        self._format_agency_stream_to_harness(iter([title_response]), model),
-                        media_type="text/event-stream",
-                    )
-                return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
                 return StreamingResponse(
@@ -372,6 +281,3 @@ class _GrokBackend(agharness_backend):
             yield f"data: {json.dumps(usage_payload)}\n\n"
             yield "data: [DONE]\n\n"
             return
-
-
-__all__ = ["_GrokBackend", "grok_available"]

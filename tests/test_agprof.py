@@ -1578,6 +1578,9 @@ def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
 
 def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     import agency.observability.agwebui as agwebui_module
+    from agency.observability.agwebui import build_perfetto
+
+    monkeypatch.setattr(build_perfetto, "ensure_viewer", lambda: None)
 
     events = []
 

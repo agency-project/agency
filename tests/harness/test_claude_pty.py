@@ -12,7 +12,8 @@ import pytest
 
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime
-from agency.harness.adapters.claude_code import _ClaudePtyExecution
+from agency.harness.adapters.claude_code import ClaudeDriver
+from agency.harness.adapters.pty_session import PtyExecution
 from agency.harness.ptrace.supervisor import ptrace_available
 
 pytestmark = pytest.mark.skipif(not ptrace_available(), reason="Linux ptrace required")
@@ -38,7 +39,8 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
     env = {**os.environ, "AGENCY_CLAUDE_STATE": str(tmp_path), "TEST_PTY_MODE": mode}
     script = Path(__file__).parents[1] / "fixtures" / "claude_pty_cli.py"
     adapter = SimpleNamespace(
-        prepare_pty=lambda *args, **kwargs: ([sys.executable, str(script)], env, tmp_path)
+        agconfig=agconfig(),
+        prepare_pty=lambda *args, **kwargs: ([sys.executable, str(script)], env),
     )
     paused = threading.Event()
 
@@ -56,9 +58,8 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
         SimpleNamespace(check=lambda *args: True),
         register_control_handle=register_handle,
     )
-    execution = _ClaudePtyExecution(
-        adapter, runtime, resume_session_id=None, prior_session_blob=None, max_steps=None
-    )
+    driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
+    execution = PtyExecution(driver, runtime)
     execution.INPUT_TIMEOUT = 1
     if mode == "paused":
         execution.START_TIMEOUT = 0.1

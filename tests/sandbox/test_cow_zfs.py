@@ -107,6 +107,7 @@ def test_profiler_has_filesystem_only_component_spans(sandbox, monkeypatch):
 
 def test_zfs_calls_are_direct_snapshot_and_rollback(monkeypatch):
     storage = cp.ZfsRuntimeStorage.__new__(cp.ZfsRuntimeStorage)
+    storage.runtime = "podman"
     storage.dataset = "tank/private"
     command = Mock()
     monkeypatch.setattr(cp, "_command", command)

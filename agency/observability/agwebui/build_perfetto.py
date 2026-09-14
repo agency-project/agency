@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[3]
 REVISION = "6f78923bd6e6f9bfd9078155226f76df8e0a007c"
 SOURCE = ROOT / "runs" / "perfetto-viewer"
 DEST = Path(__file__).parent / "static/perfetto"
+PRESENTATION = Path(__file__).with_name("perfetto_presentation.ts")
 ORIGINAL = """    const flowStartTs =
       flow.flowToDescendant || flow.begin.sliceStartTs >= flow.end.sliceStartTs
         ? flow.begin.sliceStartTs
@@ -29,7 +30,9 @@ PATCHED = """    // Agency: parent-child relationships connect the starts of bot
 def _fingerprint() -> str:
     # Include the builder itself so changes to packaging or patches invalidate
     # the cache, as well as the explicitly pinned upstream revision.
-    return hashlib.sha256(REVISION.encode() + Path(__file__).read_bytes()).hexdigest()
+    return hashlib.sha256(
+        REVISION.encode() + Path(__file__).read_bytes() + PRESENTATION.read_bytes()
+    ).hexdigest()
 
 
 def viewer_is_current() -> bool:
@@ -74,6 +77,16 @@ def _build_viewer(*, skip_deps: bool) -> None:
         renderer.write_text(text.replace(ORIGINAL, PATCHED, 1))
     elif PATCHED not in text:
         raise RuntimeError("Unrecognized Perfetto renderer; cannot apply start-to-start arrows.")
+    plugin = source / "ui/src/plugins/dev.agency.Presentation"
+    plugin.mkdir(exist_ok=True)
+    shutil.copy2(PRESENTATION, plugin / "index.ts")
+    defaults = source / "ui/src/core/embedder/default_plugins.ts"
+    text = defaults.read_text()
+    if "'dev.agency.Presentation'" not in text:
+        anchor = "  'dev.perfetto.TraceProcessorTrack',"
+        if anchor not in text:
+            raise RuntimeError("Unrecognized Perfetto default plugin list")
+        defaults.write_text(text.replace(anchor, anchor + "\n  'dev.agency.Presentation',"))
     if not skip_deps:
         run("tools/install-build-deps", "--ui")
     run("ui/build")

@@ -23,7 +23,8 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
     runtime = AdapterRuntime(
         config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
-    argv, env, config_home = _ClaudeCodeBackend(config).prepare_pty(runtime)
+    config_home = tmp_path
+    argv, env = _ClaudeCodeBackend(config).prepare_pty(runtime, config_home)
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert json.loads((config_home / ".claude.json").read_text())["bypassPermissionsModeAccepted"]
     assert "-p" not in argv
@@ -59,8 +60,11 @@ def test_native_launch_restores_conversation_before_resuming(tmp_path, monkeypat
     runtime = AdapterRuntime(
         config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
-    argv, _, _ = _ClaudeCodeBackend(config).prepare_pty(
-        runtime, resume_session_id="native-session", prior_session_blob=b'{"type":"user"}\n'
+    argv, _ = _ClaudeCodeBackend(config).prepare_pty(
+        runtime,
+        tmp_path,
+        resume_session_id="native-session",
+        prior_session_blob=b'{"type":"user"}\n',
     )
     assert argv[-2:] == ["--resume", "native-session"]
     from pathlib import Path

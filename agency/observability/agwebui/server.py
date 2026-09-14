@@ -368,14 +368,28 @@ def _fetch_new_term_messages(path: Path, after_id: str) -> list[tuple[str, str]]
     """Return (id, envelope_json) for rows with id > after_id that carry a
     term_message -- the compact human-readable status lines
     (agent_created/skill_start/skill_success/...), not the far more
-    numerous llm_block/event rows the shared log has no use for."""
+    numerous llm_block/event rows the shared log has no use for.
+
+    `agent_state` rows are relayed too, term_message or not: they're what
+    corrects a client's displayed agent state (queued/running_skill/
+    running_harness/agent_idle) after the coarser scheduler-level
+    request_completed ("finished") fires. request_completed reaches the
+    client via the global db's unfiltered _fetch_new_events, but the true
+    agent_idle that immediately follows it (orchestrator._update_agent_
+    display_locked) lives in this per-agent db -- without relaying it too,
+    a client never learns the agent went idle (or started a new request)
+    and the display sticks on "finished" forever. record_state() never
+    sets a term_message (every state transition would otherwise flood the
+    shared log), so these rows would otherwise never pass the term_message
+    filter below; _build_envelope's synthesis has no case for agent_state
+    either, so they still carry no term_message and never touch the log."""
     if not path.exists():
         return []
     try:
         con = _open_db(path)
         rows = con.execute(
             "SELECT id, type, timestamp, name, payload, term_message FROM events "
-            "WHERE id > ? AND term_message IS NOT NULL ORDER BY id",
+            "WHERE id > ? AND (term_message IS NOT NULL OR type = 'agent_state') ORDER BY id",
             (after_id,),
         ).fetchall()
         con.close()

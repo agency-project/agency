@@ -890,8 +890,8 @@ class TestProfilerContainerRegistration:
             agconfig=None,
         )
 
-    def test_profiler_label_unwraps_sandbox_name_and_dedup_suffix(self):
-        assert self._sb()._prof_container_label() == "research_agent"
+    def test_profiler_label_preserves_unique_sandbox_identity(self):
+        assert self._sb()._prof_container_label() == "sandbox_research_agent_a1b2"
         assert self._sb("plain_agent")._prof_container_label() == "plain_agent"
 
     def test_registration_is_a_noop_without_an_active_profiler(self):
@@ -926,8 +926,43 @@ class TestProfilerContainerRegistration:
             sb._name,
         ]
         started.assert_called_once_with(
-            "research_agent",
+            "sandbox_research_agent_a1b2",
             f"/sys/fs/cgroup/user.slice/libpod-{self._CONTAINER_ID}.scope{payload_suffix}",
+            conmon,
+            "conmon",
+        )
+
+    def test_registration_accepts_podman_container_child_of_the_libpod_scope(self):
+        """Podman's systemd cgroup manager (its default when systemd is PID 1)
+        parks the payload in a ``container`` child of ``libpod-<id>.scope``, so
+        the name that identifies the container is the *parent* of the leaf, not
+        the leaf. Registration must accept that layout and still resolve conmon
+        from the enclosing scope.
+        """
+        sb = self._sb()
+        inspect = MagicMock(returncode=0, stdout=f"{self._CONTAINER_ID}|4242\n".encode())
+        rel = (
+            "/user.slice/user-1000.slice/user@1000.service/user.slice"
+            f"/libpod-{self._CONTAINER_ID}.scope/container"
+        )
+        conmon = (
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice"
+            f"/libpod-conmon-{self._CONTAINER_ID}.scope"
+        )
+
+        with patch.object(_container.agprof, "enabled", return_value=True):
+            with patch.object(_container.agprof, "container_registered", return_value=False):
+                with patch.object(sb, "_run", return_value=inspect):
+                    with patch.object(_container.Path, "read_text", return_value=f"0::{rel}\n"):
+                        with patch.object(
+                            _container.os.path, "isdir", side_effect=lambda p: p == conmon
+                        ):
+                            with patch.object(_container.agprof, "container_started") as started:
+                                sb._register_prof_container()
+
+        started.assert_called_once_with(
+            "sandbox_research_agent_a1b2",
+            f"/sys/fs/cgroup{rel}",
             conmon,
             "conmon",
         )
@@ -980,7 +1015,7 @@ class TestProfilerContainerRegistration:
                 with patch.object(sb, "_release_runtime_slot"):
                     with patch.object(_container.agprof, "container_stopped") as stopped:
                         sb.stop()
-        stopped.assert_called_once_with("research_agent")
+        stopped.assert_called_once_with("sandbox_research_agent_a1b2")
 
     def test_failed_stop_keeps_running_container_registered(self):
         sb = self._sb()
@@ -999,7 +1034,7 @@ class TestProfilerContainerRegistration:
                     with patch.object(sb, "_release_runtime_slot"):
                         with patch.object(_container.agprof, "container_stopped") as stopped:
                             sb.rm_container()
-        stopped.assert_called_once_with("research_agent")
+        stopped.assert_called_once_with("sandbox_research_agent_a1b2")
 
     def test_failed_rm_keeps_a_still_running_container_registered(self):
         sb = self._sb()

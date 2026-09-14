@@ -368,3 +368,74 @@ def test_completion_failure_is_swallowed(monkeypatch, capsys, tmp_path):
 
     assert hook.main() == 0
     assert "complete_tool request failed" in capsys.readouterr().err
+
+
+def _kimi_payload(event="PreToolUse"):
+    """Captured from Kimi Code CLI 0.42.0: snake_case like Claude's, but the
+    call identity is `tool_call_id` and the result is `tool_output`."""
+    return {
+        "hook_event_name": event,
+        "session_id": "session_abc",
+        "client_type": "kimi_code_cli",
+        "tool_name": "Read",
+        "tool_input": {"path": "hello.txt"},
+        "tool_call_id": "toolcall_kimi_1",
+    }
+
+
+def test_kimi_tool_call_id_completes_its_span(monkeypatch, capsys, tmp_path):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return _Response({"decision": "allow", "call_id": "call-kimi"})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_kimi_payload())))
+    assert hook.main() == 0
+    assert (
+        json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    )
+
+    post = _kimi_payload("PostToolUse")
+    post["tool_output"] = "1\tfile contents here"
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(post)))
+    assert hook.main() == 0
+
+    assert [request.full_url for request in requests] == [
+        "http://gateway/agpolicy/check_tool",
+        "http://gateway/agpolicy/complete_tool",
+    ]
+    assert json.loads(requests[1].data) == {
+        "call_id": "call-kimi",
+        "result": "1\tfile contents here",
+        "error": None,
+    }
+
+
+def test_explicit_null_tool_response_is_not_overridden_by_tool_output(monkeypatch, tmp_path):
+    """A harness that reports `tool_response: null` means null, not missing."""
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return _Response({"decision": "allow", "call_id": "call-x"})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(_payload())))
+    assert hook.main() == 0
+
+    post = _payload("PostToolUse")
+    post["tool_response"] = None
+    post["tool_output"] = "ignored"
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(post)))
+    assert hook.main() == 0
+    assert json.loads(requests[1].data)["result"] is None

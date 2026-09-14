@@ -110,12 +110,24 @@ def test_prepared_host_symlink_resolves_to_mounted_package(monkeypatch, tmp_path
     entry.symlink_to(binary)
     monkeypatch.setattr(executable.shutil, "which", lambda name: str(entry))
     sandbox = Mock()
-    sandbox.exec.side_effect = [("", 1), ("", 0), ("1.0", 0)]
+    sandbox.exec.side_effect = [("", 1), ("", 0), ("codex-cli 0.147.0", 0)]
     assert executable.prepare_harness_executable(sandbox, "codex", config_for("codex")) == str(
         binary
     )
     assert "--version" in sandbox.exec.call_args.args[0]
     assert f"PATH={executable.HARNESS_PATH}" in sandbox.exec.call_args.args[0]
+
+
+def test_prepare_rejects_codex_versions_other_than_0_147_0(monkeypatch, tmp_path):
+    """0.154.0 hangs waiting for native prompt acknowledgment on large
+    bracketed pastes (see executable.py); fail closed at resolution time
+    instead of a confusing mid-run submit timeout."""
+    binary = install(tmp_path / "app" / "bin" / "cli")
+    monkeypatch.setattr(executable.shutil, "which", lambda name: str(binary))
+    sandbox = Mock()
+    sandbox.exec.side_effect = [("", 1), ("", 0), ("codex-cli 0.154.0", 0)]
+    with pytest.raises(RuntimeError, match="expected"):
+        executable.prepare_harness_executable(sandbox, "codex", config_for("codex"))
 
 
 def test_missing_host_and_container_executable_fails(monkeypatch):

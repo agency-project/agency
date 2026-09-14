@@ -55,7 +55,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
         policy=agpolicy(tool_hooks={"read_file": mock_policy}),
     )
     sandbox = SimpleNamespace(
-        ensure_gpu_acquired=lambda *_args, **_kwargs: None,
+        ensure_gpu_acquired=lambda agname, *, is_cancelled=None: None,
         current_gpu_ids=lambda: None,
     )
     host_manager = HostServerManager(agent, sandbox, skill, SimpleNamespace())

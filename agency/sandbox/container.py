@@ -870,20 +870,8 @@ class _ContainerBackendBase(agsandbox_backend):
             self._baseline_pids = self._snapshot_pids_started()
 
     def _prof_container_label(self) -> str:
-        """Return the plain agent name used for profiler resource series.
-
-        ``agSandbox`` allocates backend names as
-        ``sandbox_<agname>_<four-character-dedup>``. Unwrap that internal
-        envelope so cgroup, process, and GPU series line up with the agent's
-        span lanes.
-        """
-        name = str(self._agname)
-        if name.startswith("sandbox_"):
-            name = name[len("sandbox_") :]
-            base, _, suffix = name.rpartition("_")
-            if base and len(suffix) == 4:
-                name = base
-        return name
+        """Keep the sandbox object's unique identity in every resource series."""
+        return str(self._agname)
 
     def _register_prof_container(self) -> None:
         """Register this running container's kernel cgroup with agprof.

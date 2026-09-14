@@ -10,14 +10,13 @@ import json
 import os
 import re
 import shutil
-import threading
-import time
 import uuid
 from pathlib import Path
 
 from fastapi import Request
 
 from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .pty_drivers import PtyDriver, run_pty_attempt
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -211,8 +210,189 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+class ClaudeDriver(PtyDriver):
+    """Claude Code: Agency-assigned turn identity, transcript-reconciled completion.
+
+    Claude does not report a turn identity of its own, so this driver commits
+    one to `agency-turn.json` and the lifecycle hook stamps events with it. Its
+    Stop hook is likewise not sufficient evidence of completion: the persisted
+    transcript must also show the submitted prompt and the final message.
+    """
+
+    name = "claude"
+    INPUT_TIMEOUT = 20.0
+    START_TIMEOUT = 30.0
+    ATTEMPT_TIMEOUT = _DEFAULT_TIMEOUT_S
+    activity_extends_deadline = True
+
+    def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
+        self.started = False
+        self._prior_blob = blob
+        self._expected_prompt = None
+        self._submission_offset = 0
+        self._attempt_offset = None
+        self._snapshot = None
+        self._interrupt_offset = 0
+        self._interrupt_generation = None
+        self._draft_cleared = False
+        super().__init__(adapter, runtime, root, session_id, blob, max_steps)
+
+    def _restore(self, session_id, blob):
+        """prepare_pty owns the isolated config, including any resumed transcript."""
+
+    def _configure(self, adapter, runtime, max_steps):
+        # Claude's transcript path is derived from the launch cwd, so the
+        # isolated config root has to be the working directory too.
+        self.cwd = str(self.root)
+        self.argv, self.env = adapter.prepare_pty(
+            runtime,
+            self.root,
+            resume_session_id=self.session_id,
+            prior_session_blob=self._prior_blob,
+        )
+        if max_steps is not None:
+            self.argv += ["--max-turns", str(max_steps)]
+
+    def _transcript(self):
+        if self.session_id is None:
+            return b""
+        path = Path(_session_path(str(self.root), self.session_id))
+        return path.read_bytes() if path.exists() else b""
+
+    @staticmethod
+    def _rows(blob):
+        for line in blob.splitlines(keepends=True):
+            if line.endswith(b"\n"):
+                yield json.loads(line)
+
+    @staticmethod
+    def _text(row):
+        content = row.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            return content
+        return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+
+    def _editable_input(self, handle):
+        # Claude 2.1.251's input box, with the cursor inside it. History and
+        # terminal silence are not evidence that input can safely be submitted.
+        lines, _x, y, generation = handle.terminal_screen()
+        upper = next((i for i in range(y - 1, -1, -1) if lines[i].strip().startswith("───")), None)
+        lower = next(
+            (i for i in range(y + 1, len(lines)) if lines[i].strip().startswith("───")), None
+        )
+        if upper is None or lower is None:
+            return None
+        first = lines[upper + 1].lstrip()
+        if not first.startswith("❯"):
+            return None
+        draft = "\n".join(
+            [first[1:].strip(), *[s.strip() for s in lines[upper + 2 : lower]]]
+        ).strip()
+        return draft, generation
+
+    def ready(self, handle):
+        return self.started and (self._editable_input(handle) or (None,))[0] == ""
+
+    def submission_marker(self, label):
+        # This driver fences turns by identity, so the marker needs no nonce.
+        return f"[Agency {label}]"
+
+    def begin_turn(self, prompt):
+        self._expected_prompt = prompt
+        self._submission_offset = len(self._transcript())
+        if self._attempt_offset is None:
+            self._attempt_offset = self._submission_offset
+        turn_id = uuid.uuid4().hex
+        state = self.root / "agency-turn.json"
+        temporary = state.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"turn_id": turn_id}))
+        temporary.replace(state)
+        return turn_id
+
+    def _event_from_payload(self, record):
+        payload = record["payload"]
+        kind = payload.get("hook_event_name")
+        if kind == "SessionStart":
+            self.session_id = payload["session_id"]
+            self.started = True
+            return None
+        event = {"turn_id": record["turn_id"]}
+        if kind == "UserPromptSubmit":
+            event.update(kind="submit", prompt=payload.get("prompt"))
+        elif kind == "Stop":
+            event.update(kind="stop", text=payload.get("last_assistant_message") or "")
+        elif kind in {"StopFailure", "SessionEnd"}:
+            error = payload.get("error", "session ended")
+            event.update(kind="error", error=f"Claude {kind}: {error}")
+        else:
+            return None
+        return event
+
+    def clear_input(self, handle, wait_until):
+        """Claude's restored draft is cleared during interruption; send no key."""
+
+    def begin_interrupt(self, handle):
+        self._interrupt_offset = len(self._transcript())
+        self._interrupt_generation = handle.terminal_screen()[3]
+        self._draft_cleared = False
+
+    def interrupted(self, handle):
+        for row in self._rows(self._transcript()[self._interrupt_offset :]):
+            if row.get("type") == "user" and self._text(row) in {
+                "[Request interrupted by user]",
+                "[Request interrupted by user for tool use]",
+            }:
+                return True
+        editable = self._editable_input(handle)
+        if editable and editable[0] and editable[1] > self._interrupt_generation:
+            # Before its first response Claude restores the original prompt as a
+            # draft. Clear it here; the caller then requires an empty box.
+            if not self._draft_cleared:
+                self._draft_cleared = True
+                handle.write_terminal(b"\x1b\x1b")
+            return True
+        return False
+
+    def reap(self, handle):
+        handle.kill()
+
+    def completed(self, event):
+        super().completed(event)
+        blob = self._transcript()
+        submitted = False
+        for row in self._rows(blob[self._submission_offset :]):
+            text = self._text(row)
+            if row.get("type") == "user" and text == self._expected_prompt:
+                submitted = True
+            if not submitted:
+                continue
+            if event["text"] == "":
+                # Claude can finish after tool output without persisting a final
+                # assistant message. Its durable turn marker closes that
+                # transcript after the Stop hook has returned.
+                if row.get("type") == "system" and row.get("subtype") == "turn_duration":
+                    self._record_usage(blob, event)
+                    return True
+            elif row.get("type") == "assistant" and text == event["text"]:
+                self._record_usage(blob, event)
+                return True
+        return False
+
+    def _record_usage(self, blob, event):
+        self._snapshot = blob
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        for row in self._rows(blob[self._attempt_offset :]):
+            for key in usage:
+                usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
+        event.update(usage)
+
+    def snapshot(self):
+        return self._snapshot
+
+
 class _ClaudeCodeBackend(agharness_backend):
     _DEFAULT_BINARY = "claude"
+    _PTY_DRIVER = ClaudeDriver
 
     def run_daemon_attempt(
         self,
@@ -223,25 +403,20 @@ class _ClaudeCodeBackend(agharness_backend):
         prior_session_blob: bytes | None,
         max_steps: int | None,
     ) -> AttemptResult:
-        key = ("pty", "claude", runtime.model, max_steps, runtime.has_sandbox_mcp_tools)
-        return runtime.run_pty_execution(
-            key,
-            lambda: _ClaudePtyExecution(
-                self,
-                runtime,
-                resume_session_id=resume_session_id,
-                prior_session_blob=prior_session_blob,
-                max_steps=max_steps,
-            ),
-            prompt,
+        return run_pty_attempt(
+            self,
+            runtime,
+            prompt=prompt,
+            resume_session_id=resume_session_id,
+            prior_session_blob=prior_session_blob,
+            max_steps=max_steps,
         )
 
-    def prepare_pty(self, runtime, *, resume_session_id=None, prior_session_blob=None):
+    def prepare_pty(self, runtime, config_home, *, resume_session_id=None, prior_session_blob=None):
         """Prepare isolated native configuration; one process belongs to one attempt."""
         from .. import agharness
 
         resolved = self.agconfig.harness_adapter.binary_path or self._DEFAULT_BINARY
-        config_home = agharness.materialize_config_home(runtime.engine_name)
         try:
             if resume_session_id and prior_session_blob is not None:
                 _write_session_blob(
@@ -338,7 +513,7 @@ class _ClaudeCodeBackend(agharness_backend):
             ]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
-            return argv, envp, config_home
+            return argv, envp
         except BaseException:
             agharness.cleanup_config_home(config_home)
             raise
@@ -718,320 +893,6 @@ def _mid_array_system_warning(body: dict) -> "str | None":
         "(system must be the top-level `system` field, never a `messages` "
         "entry); folding into the leading system message before forwarding"
     )
-
-
-class _ClaudePtyExecution:
-    """One attempt's PTY, native acknowledgments, and terminal boundary.
-
-    The lock covers both final completion and redirect submission. Each
-    invocation owns one process and closes it at the completed-run boundary.
-    """
-
-    INPUT_TIMEOUT = 20.0
-    START_TIMEOUT = 30.0
-
-    def __init__(self, adapter, runtime, *, resume_session_id, prior_session_blob, max_steps):
-        self.runtime = runtime
-        self.argv, self.env, self.config_home = adapter.prepare_pty(
-            runtime, resume_session_id=resume_session_id, prior_session_blob=prior_session_blob
-        )
-        if max_steps is not None:
-            self.argv += ["--max-turns", str(max_steps)]
-        self.handle = None
-        self._lock = threading.RLock()
-        self._active = False
-        self._session_id = resume_session_id
-        self._started = False
-        self._turn_id = None
-        self._expected_prompt = None
-        self._acknowledged = False
-        self._stop = None
-        self._failure = None
-        self._submission_offset = 0
-        self._attempt_offset = 0
-        self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
-        self._last_activity_generation = None
-        self._closed = False
-        self._launched = False
-
-    @property
-    def _transcript_path(self):
-        if self._session_id is None:
-            return None
-        return Path(_session_path(str(self.config_home), self._session_id))
-
-    def _transcript(self):
-        path = self._transcript_path
-        if path is None or not path.exists():
-            return b""
-        return path.read_bytes()
-
-    def _poll(self):
-        for path in sorted((self.config_home / "events").glob("*.json")):
-            event = json.loads(path.read_text())
-            path.unlink()
-            payload = event["payload"]
-            kind = payload.get("hook_event_name")
-            if kind == "SessionStart":
-                self._session_id = payload["session_id"]
-                self._started = True
-            if event["turn_id"] != self._turn_id:
-                continue
-            if kind == "UserPromptSubmit" and payload.get("prompt") == self._expected_prompt:
-                self._acknowledged = True
-            elif kind == "Stop":
-                self._stop = payload.get("last_assistant_message") or ""
-            elif kind in {"StopFailure", "SessionEnd"}:
-                self._failure = f"Claude {kind}: {payload.get('error', 'session ended')}"
-
-    def _check_alive(self):
-        if self._failure:
-            raise RuntimeError(self._failure)
-        if self.handle.returncode is not None:
-            raise RuntimeError(f"Claude process exited ({self.handle.returncode})")
-
-    def _wait_until(self, predicate, description, timeout=None):
-        deadline = time.monotonic() + (self.INPUT_TIMEOUT if timeout is None else timeout)
-        last_poll = time.monotonic()
-        while True:
-            now = time.monotonic()
-            if self.handle.is_paused():
-                deadline += now - last_poll
-            last_poll = now
-            self._poll()
-            if predicate():
-                return
-            self._check_alive()
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"Claude timed out waiting for {description}")
-            time.sleep(0.025)
-
-    def _editable_input(self):
-        # Claude 2.1.251's input box, with the cursor inside it. History and
-        # terminal silence are not evidence that input can safely be submitted.
-        lines, _x, y, generation = self.handle.terminal_screen()
-        upper = next((i for i in range(y - 1, -1, -1) if lines[i].strip().startswith("───")), None)
-        lower = next(
-            (i for i in range(y + 1, len(lines)) if lines[i].strip().startswith("───")), None
-        )
-        if upper is None or lower is None:
-            return None
-        first = lines[upper + 1].lstrip()
-        if not first.startswith("❯"):
-            return None
-        draft = "\n".join(
-            [first[1:].strip(), *[s.strip() for s in lines[upper + 2 : lower]]]
-        ).strip()
-        return draft, generation
-
-    @staticmethod
-    def _validate_prompt(prompt):
-        if any((ord(c) < 32 and c not in "\n\t") or ord(c) == 127 for c in prompt):
-            raise ValueError("native prompt contains terminal control characters")
-
-    def _submit(self, prompt):
-        self._validate_prompt(prompt)
-        self._turn_id = uuid.uuid4().hex
-        self._expected_prompt = prompt
-        self._acknowledged = False
-        self._stop = None
-        self._submission_offset = len(self._transcript())
-        state = self.config_home / "agency-turn.json"
-        temporary = state.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"turn_id": self._turn_id}))
-        temporary.replace(state)
-        self.handle.write_terminal(b"\x1b[200~" + prompt.encode() + b"\x1b[201~")
-        self.handle.write_terminal(b"\r")
-        self._wait_until(lambda: self._acknowledged, "UserPromptSubmit acknowledgment")
-        self._deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
-
-    @staticmethod
-    def _rows(blob):
-        for line in blob.splitlines(keepends=True):
-            if line.endswith(b"\n"):
-                yield json.loads(line)
-
-    @staticmethod
-    def _text(row):
-        content = row.get("message", {}).get("content", [])
-        if isinstance(content, str):
-            return content
-        return "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-
-    def _completed_snapshot(self):
-        if self._stop is None:
-            return None
-        blob = self._transcript()
-        submitted = False
-        for row in self._rows(blob[self._submission_offset :]):
-            text = self._text(row)
-            if row.get("type") == "user" and text == self._expected_prompt:
-                submitted = True
-            if submitted:
-                if self._stop == "":
-                    # Claude can finish after tool output without persisting a
-                    # final assistant message. Its durable turn marker closes
-                    # that transcript after the Stop hook has returned.
-                    if row.get("type") == "system" and row.get("subtype") == "turn_duration":
-                        return blob
-                elif row.get("type") == "assistant" and text == self._stop:
-                    return blob
-        return None
-
-    def _interrupt(self):
-        offset = len(self._transcript())
-        generation = self.handle.terminal_screen()[3]
-        self.handle.write_terminal(b"\x1b")
-
-        def interrupted():
-            # Native completion can win just after the caller's active check.
-            # Preserve that result and queue the redirect instead of treating
-            # the idle CLI's lack of an interruption record as a failed run.
-            if self._stop is not None:
-                return True
-            for row in self._rows(self._transcript()[offset:]):
-                if row.get("type") == "user" and self._text(row) in {
-                    "[Request interrupted by user]",
-                    "[Request interrupted by user for tool use]",
-                }:
-                    return True
-            editable = self._editable_input()
-            if editable and editable[0] and editable[1] > generation:
-                # Before its first response Claude restores the original prompt
-                # as a draft. Clear that known draft, then require an empty box.
-                self.handle.write_terminal(b"\x1b\x1b")
-                self._wait_until(
-                    lambda: (self._editable_input() or (None,))[0] == "", "empty input"
-                )
-                return True
-            return False
-
-        self._wait_until(interrupted, "native interruption")
-        return self._stop is None
-
-    def redirect(self, message: str) -> bool:
-        with self._lock:
-            if not self._active:
-                return False
-            if self.handle.is_paused():
-                return False
-            self._poll()
-            if self._stop is not None:
-                return False
-            try:
-                self._validate_prompt(message)
-            except ValueError:
-                return False
-            try:
-                self._check_alive()
-                if not self._interrupt():
-                    return False
-                self._submit("[Agency redirect]\n" + message)
-                return True
-            except (OSError, RuntimeError) as exc:
-                # A partial or unacknowledged submission cannot remain alive:
-                # terminate this attempt before the caller queues its fallback.
-                self._active = False
-                self._failure = str(exc)
-                self.handle.kill()
-                return False
-
-    def close(self):
-        from ..agharness import cleanup_config_home
-
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._active = False
-            try:
-                if self.handle is not None:
-                    self.handle.close()
-            finally:
-                cleanup_config_home(self.config_home)
-
-    def prepare_fast_checkpoint(self):
-        with self._lock:
-            if self._active:
-                raise RuntimeError("cannot checkpoint an active PTY attempt")
-            if self.handle is not None:
-                self.handle.checkpoint_detach()
-
-    def seize_fast_restore(self):
-        with self._lock:
-            if self.handle is not None:
-                self.handle.checkpoint_seize_frozen()
-
-    def complete_fast_restore(self):
-        with self._lock:
-            if self.handle is not None:
-                self.handle.checkpoint_reattach()
-
-    def run(self, prompt, *, keep_alive=False):
-        from ..ptrace.supervisor import agProxyPtrace
-
-        completed = False
-        try:
-            if not self._launched:
-                self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
-                    self.argv,
-                    self.env,
-                    cwd=str(self.config_home),
-                    pty_size=(120, 36),
-                    policy=self.runtime.syscall_policy,
-                    ag=None,
-                )
-                self._launched = True
-            self.runtime.register_control_handle(self.handle)
-            self.runtime.register_redirect(self.redirect)
-            # Startup does not hold the delivery lock: early redirects return
-            # False immediately instead of waiting for a harness to become ready.
-            self._wait_until(
-                lambda: self._started and (self._editable_input() or (None,))[0] == "",
-                "startup input",
-                self.START_TIMEOUT,
-            )
-            self._attempt_offset = len(self._transcript())
-            self._submit("[Agency run]\n" + prompt)
-            with self._lock:
-                self._active = True
-            last_poll = time.monotonic()
-            while True:
-                with self._lock:
-                    now = time.monotonic()
-                    if self.handle.is_paused():
-                        self._deadline += now - last_poll
-                    else:
-                        generation = self.handle.terminal_screen()[3]
-                        if generation != self._last_activity_generation:
-                            self._last_activity_generation = generation
-                            self._deadline = now + _DEFAULT_TIMEOUT_S
-                    last_poll = now
-                    self._poll()
-                    self._check_alive()
-                    snapshot = self._completed_snapshot()
-                    if snapshot is not None:
-                        self._active = False
-                        usage = {"input_tokens": 0, "output_tokens": 0}
-                        for row in self._rows(snapshot[self._attempt_offset :]):
-                            for key in usage:
-                                usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
-                        completed = True
-                        return AttemptResult(
-                            ok=True,
-                            final_text=self._stop,
-                            session_id=self._session_id,
-                            session_blob=snapshot,
-                            **usage,
-                        )
-                    if time.monotonic() > self._deadline:
-                        raise RuntimeError("Claude attempt timed out")
-                time.sleep(0.025)
-        finally:
-            with self._lock:
-                self._active = False
-            if not (keep_alive and completed):
-                self.close()
 
 
 __all__ = ["_ClaudeCodeBackend", "claude_code_available"]

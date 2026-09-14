@@ -157,6 +157,7 @@ class agharness_backend:
         from .claude_code import _ClaudeCodeBackend
         from .codex import _CodexBackend
         from .grok import _GrokBackend
+        from .kimi import _KimiBackend
         from .native import _NativeBackend
         from .opencode import _OpencodeBackend
 
@@ -170,6 +171,8 @@ class agharness_backend:
             return _CodexBackend(agconfig)
         if harness == "grok":
             return _GrokBackend(agconfig)
+        if harness == "kimi":
+            return _KimiBackend(agconfig)
         raise ValueError(
             f"Unknown harness {harness!r} -- set agent(harness=...) to one of "
             f"'native', 'opencode', 'claude_code', 'codex', 'grok'"

@@ -210,6 +210,13 @@ def _wrap_run(cls) -> None:
                 _active_team.reset(token)
                 with self._run_lock:
                     self._active_run_futures.discard(future)
+                self.data_logger.record_event(
+                    type="team_registered",
+                    payload={"team_name": self.name, "agents": [a.agname for a in self._agents]},
+                    name=self.name,
+                    object="agteam",
+                    update_latest_snapshot=True,
+                )
 
         with self._run_lock:
             self._run_future = future

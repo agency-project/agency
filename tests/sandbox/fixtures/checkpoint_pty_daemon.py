@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.agharness_backend import AdapterRuntime
 from agency.harness.adapters.pty_session import PtyExecution
+from agency.harness.adapters.pty_drivers import PtyDriver
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptResult
 
@@ -24,7 +25,10 @@ cfg.sandbox.checkpoint_backend = "cow_zfs"
 cfg.sandbox.checkpoint_fast_resume = True
 
 
-class ShellDriver:
+class ShellDriver(PtyDriver):
+    def __init__(self):
+        pass
+
     name = "shell"
     argv = [
         "/bin/bash",

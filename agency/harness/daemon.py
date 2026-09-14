@@ -94,7 +94,15 @@ class _HostSyscallPolicy:
 
     def check(self, _agent, syscall):
         if syscall.syscall in self._hooked_syscalls or syscall.syscall in self._ALWAYS_SYNCHRONOUS:
-            return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+            try:
+                return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+            except Exception:
+                if self._host_services.validate_token(self._attempt_token):
+                    raise
+                # A retained CLI can reach another exec stop as its completed
+                # attempt is revoked. Deny it without killing the tracer that
+                # must still quiesce the tree for checkpointing.
+                return False, "inactive harness attempt", None, None
         _SYSCALL_LOG_POOL.submit(self._log_admission_best_effort, syscall)
         return (not self._default_to_deny, None, None, None)
 
@@ -120,7 +128,13 @@ class _HostSyscallPolicy:
         # _tracer_loop.py), but stay defensive here too.
         if not call_id:
             return
-        self._host_services.complete_syscall_policy(self._attempt_token, call_id, return_value)
+        try:
+            self._host_services.complete_syscall_policy(self._attempt_token, call_id, return_value)
+        except Exception:
+            if self._host_services.validate_token(self._attempt_token):
+                raise
+            # The syscall was already admitted. Its late completion cannot
+            # report into a retired host attempt or fail the retained tracer.
 
 
 class _LocalSandboxBackend:
@@ -162,7 +176,14 @@ class _LocalSandbox:
 
 
 class _HarnessApiServer:
-    def __init__(self, host_uds_path: str, port: int, harness_backend: agharness_backend) -> None:
+    def __init__(
+        self,
+        host_uds_path: str,
+        port: int,
+        harness_backend: agharness_backend,
+        *,
+        live_session: bool = False,
+    ) -> None:
         self._bridge = HostServicesClient(host_uds_path)
         self._port = port
         self._harness_backend = harness_backend
@@ -170,6 +191,7 @@ class _HarnessApiServer:
         self._thread: "threading.Thread | None" = None
         self._loop: "asyncio.AbstractEventLoop | None" = None
         self._sandbox_mcp_app = None
+        self._persistent = live_session
 
     @property
     def base_url(self) -> str:
@@ -387,8 +409,11 @@ class HarnessManager:
     ) -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._engine_name = engine_name
+        self._persistent = bool(self._agconfig.sandbox.checkpoint_fast_resume)
         harness_backend = agharness_backend.for_config(harness, self._agconfig)
-        self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port, harness_backend)
+        self._harness_api = _HarnessApiServer(
+            host_uds_path, harness_api_port, harness_backend, live_session=self._persistent
+        )
         self._attempt_handler = (
             attempt_handler if attempt_handler is not None else self._run_adapter_request
         )
@@ -402,7 +427,6 @@ class HarnessManager:
         self._current_request_cancelled = False
         self._current_request_id: "str | None" = None
         self._redirect_handler: "Callable[[str], bool] | None" = None
-        self._persistent = bool(self._agconfig.sandbox.checkpoint_fast_resume)
         self._live_execution = None
         self._live_execution_key = None
         self._live_local_token: "str | None" = None

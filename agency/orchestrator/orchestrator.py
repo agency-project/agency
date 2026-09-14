@@ -9,6 +9,7 @@ import threading
 import time
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -135,7 +136,8 @@ class GlobalAgentOrchestrator:
             thread_name_prefix="agency-execution",
         )
         self.scheduler = ExecutionScheduler(self)
-        self._scheduler_thread = agprof.spawn_traced(self._scheduler_main, daemon=True)
+        with agprof.execution_context({"agency.component": "orchestrator"}):
+            self._scheduler_thread = agprof.spawn_traced(self._profiled_scheduler_main, daemon=True)
         self._scheduler_thread.name = "agency-global-scheduler"
         self._scheduler_thread.start()
         self._record_global_event(
@@ -388,6 +390,11 @@ class GlobalAgentOrchestrator:
                 f"{format_exception(callback_exc)}"
             )
 
+    def _profiled_scheduler_main(self) -> None:
+        with agprof.span("orchestrator:scheduler"):
+            agprof.annotate(**{"agency.component": "orchestrator"})
+            self._scheduler_main()
+
     def _scheduler_main(self) -> None:
         try:
             while True:
@@ -533,6 +540,8 @@ class GlobalAgentOrchestrator:
                 "skill": skill_name,
                 "agency.run_id": request_id,
                 "agency.agent_id": str(ag.agname),
+                "agency.execution_side": "host",
+                "agency.sandbox_id": agprof.sandbox_identity(ag.sandbox),
                 "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
             },
             parent_context=parent_context,
@@ -596,13 +605,22 @@ class GlobalAgentOrchestrator:
         def run_if_accepted() -> None:
             admission.wait()
             if accepted:
-                # Reused threads must not carry ContextVar/OTel state from one
-                # invocation into the next.  The durable profiling parent is
-                # supplied explicitly by _engine_worker from the request.
-                contextvars.Context().run(self._engine_worker, request)
+                self._engine_worker(request)
 
         try:
-            self._execution_workers.submit(run_if_accepted)
+            owned = agprof.bind_execution(
+                run_if_accepted,
+                {
+                    "agency.agent_id": str(request.agent.agname),
+                    "agency.sandbox_id": agprof.sandbox_identity(request.agent.sandbox),
+                    "agency.execution_side": "host",
+                },
+                parent_context=request.parent_context,
+            )
+            # A fresh context prevents reused pool workers from carrying any
+            # request state forward. Ownership is installed before the callback
+            # starts, including its automatic function span.
+            self._execution_workers.submit(partial(contextvars.Context().run, owned))
         except BaseException:
             admission.set()
             raise
@@ -627,6 +645,7 @@ class GlobalAgentOrchestrator:
                         "skill": request.skill.name,
                         "agency.run_id": request.request_id,
                         "agency.agent_id": str(request.agent.agname),
+                        "agency.sandbox_id": agprof.sandbox_identity(request.agent.sandbox),
                         "agency.parent_agent_id": getattr(request.agent, "_parent_agent_id", None),
                     }
                 )

@@ -159,6 +159,7 @@ def test_gateway_dir_ignores_tmpdir(tmp_path, monkeypatch):
     deleted by scratch-space cleanup policies -- survivable for a temp file,
     fatal for a live socket."""
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("AGENCY_TMP_ROOT", raising=False)
     monkeypatch.setattr(_agutil, "_gateway_dir", None)
     monkeypatch.setattr(_agutil, "_run_dir", None)
     monkeypatch.setattr(_agutil, "_run_dir_reap_done", True)

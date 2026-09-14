@@ -652,3 +652,33 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
         if t == "response.output_item.done" and d["item"]["type"] == "local_shell_call"
     )
     assert done_item["call_id"] == "c1"
+
+
+# ---------------------------------------------------------------------------
+# _tool_wire_name
+# ---------------------------------------------------------------------------
+
+
+def test_tool_wire_name_is_readable_like_claude_code_mcp_names():
+    """Was a bare sha256 hash (agency_<48 hex chars>) -- unreadable in a
+    transcript or log. Now mirrors Claude Code's own MCP tool naming scheme
+    (`mcp__<server>__<tool>`), flattening a dotted/nested namespace into
+    "__"-joined segments instead."""
+    from agency.harness.adapters.codex import _tool_wire_name
+
+    assert _tool_wire_name("function", "read") == "read"
+    assert _tool_wire_name("function", "exec", "files") == "mcp__files__exec"
+    assert _tool_wire_name("function", "exec", "files.local") == "mcp__files__local__exec"
+    # A non-function kind gets its own trailing segment so it can't collide
+    # on the wire with a same-named, same-namespace "function" tool.
+    assert _tool_wire_name("custom", "exec", "files") == "mcp__files__exec__custom"
+    assert _tool_wire_name("custom", "exec") == "mcp__exec__custom"
+
+
+def test_tool_wire_name_truncates_from_the_front_when_over_64_chars():
+    from agency.harness.adapters.codex import _tool_wire_name
+
+    name = _tool_wire_name("function", "exec", "a." * 40 + "deep")
+    assert len(name) == 64
+    # The tail -- the actual tool name -- survives the truncation intact.
+    assert name.endswith("__exec")

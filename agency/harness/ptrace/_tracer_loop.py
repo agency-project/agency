@@ -76,6 +76,26 @@ class StopDecision:
 _EPERM = 1
 
 
+def _terminal_screen(columns: int, lines: int):
+    """A pyte screen that tolerates private-mode status queries.
+
+    pyte 0.8.2 dispatches `CSI ? <n> n` into `report_device_status(n,
+    private=True)`, which its own Screen does not accept -- feeding one raises
+    and would kill the reader thread mid-attempt. Kimi Code emits `CSI ? 996 n`
+    (color-scheme query) at startup. Answering queries is this module's job
+    anyway, not the screen's, so the private form is simply not modelled.
+    """
+    import pyte
+
+    class _Screen(pyte.Screen):
+        def report_device_status(self, mode, private=False):
+            if private:
+                return
+            super().report_device_status(mode)
+
+    return _Screen(columns, lines)
+
+
 def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0) -> None:
     """A fire-and-forget ptrace() restart/setoptions call: *pid* may have
     already exited and been reaped between being observed and acted on here
@@ -305,9 +325,9 @@ class TracerLoop:
             raise ValueError("PTY input must use write_terminal")
         self._pty_size = pty_size
         if pty_size is not None:
+            self._terminal_screen = _terminal_screen(*pty_size)
             import pyte
 
-            self._terminal_screen = pyte.Screen(*pty_size)
             self._terminal_stream = pyte.ByteStream(self._terminal_screen)
         started = threading.Event()
         start_error: "list[BaseException]" = []

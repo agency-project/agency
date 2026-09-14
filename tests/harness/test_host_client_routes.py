@@ -423,3 +423,32 @@ def test_mcp_proxy_streams_and_closes_long_lived_upstream_on_client_disconnect()
         assert stream.closed.is_set()
 
     asyncio.run(scenario())
+
+
+def test_profiler_bridge_calls_use_a_safe_timeout_not_2s():
+    """record_profiler_span/record_profiler_samples/profiler_settings used to
+    hardcode timeout=2.0 -- tighter than the 10s the container-side bridge in
+    pty_drivers.py now waits, so this inner leg would become the new binding
+    constraint and could still silently drop harness:* phase spans under load
+    even after that outer timeout was fixed. Guard the actual per-request
+    httpx timeout directly rather than just the outer value."""
+    seen_timeouts = []
+
+    def handler(request):
+        seen_timeouts.append(request.extensions.get("timeout"))
+        return httpx.Response(
+            200, json={"ok": True, "enabled": True, "automatic": None, "rejected": 0}
+        )
+
+    bridge = _bridge(handler)
+    try:
+        bridge.record_profiler_span("token", {"name": "s", "span_id": "1", "attributes": {}})
+        bridge.record_profiler_samples("token", [{"name": "f"}])
+        bridge.profiler_settings("token")
+    finally:
+        bridge.close()
+
+    assert len(seen_timeouts) == 3
+    for timeout in seen_timeouts:
+        assert timeout["connect"] >= 5.0
+        assert timeout["read"] >= 5.0

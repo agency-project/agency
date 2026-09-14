@@ -311,6 +311,46 @@ def test_host_syscall_policy_check_completion_is_a_noop_without_a_call_id():
     assert host_services.complete_calls == []
 
 
+@pytest.mark.parametrize("completion", [False, True])
+@pytest.mark.parametrize("retired", [False, True])
+def test_syscall_racing_attempt_retirement_preserves_the_tracer(monkeypatch, completion, retired):
+    from agency.harness._syscall_event import agsyscallevent
+    from agency.harness.clients.host_services_client import HostServicesClient
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    bridge = HostServicesClient("/unused/host.sock")
+    bridge.register_attempt_token("attempt-token")
+    policy = _HostSyscallPolicy(bridge, "attempt-token")
+
+    def racing_request(*args, **kwargs):
+        if retired:
+            bridge.clear_attempt_token("attempt-token")
+        raise RuntimeError("request failed")
+
+    monkeypatch.setattr(bridge.client, "post", racing_request)
+    event = agsyscallevent(
+        syscall="execve", pid=1, tid=1, argv=[], envp={}, path="/bin/true", timestamp=0
+    )
+    invoke = (
+        (lambda: policy.check_completion(None, "admitted-call", 0))
+        if completion
+        else (lambda: policy.check(None, event))
+    )
+    try:
+        if retired:
+            result = invoke()
+            assert (
+                result is None
+                if completion
+                else result == (False, "inactive harness attempt", None, None)
+            )
+        else:
+            with pytest.raises(RuntimeError, match="request failed"):
+                invoke()
+    finally:
+        bridge.close()
+
+
 def test_pause_finishes_before_a_concurrent_redirect_can_start():
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace

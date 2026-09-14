@@ -10,10 +10,10 @@ from typing import Annotated, Any, Callable
 import cloudpickle
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
-from mcp.server.transport_security import TransportSecuritySettings
 
 from ..agdata import agdata
 from ..agtool import agtool
+from .mcp_transport import build_http_app
 
 
 class SandboxMcpSetupError(RuntimeError):
@@ -49,10 +49,7 @@ def build_app(payload: str, is_active: Callable[[], bool], *, live_session=False
                 f"sandbox MCP setup failed registering tool {tool.name!r} ({type(exc).__name__})"
             ) from None
 
-    return server.streamable_http_app(
-        **({"stateless_http": True, "json_response": True} if live_session else {}),
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    )
+    return build_http_app(server, live_session=live_session)
 
 
 def _register_tool(server, tool, persistent_vars, persistent_lock, is_active) -> None:

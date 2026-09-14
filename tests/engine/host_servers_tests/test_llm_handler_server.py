@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -706,6 +707,7 @@ def test_start_stream_uses_spawn_traced(monkeypatch):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.skipif(sys.platform != "linux", reason="agprof requires Linux /proc and cgroups")
 def test_llm_trace_includes_transcript_and_token_counts(tmp_path, streaming):
     def create(**kwargs):
         usage = _FakeUsage(prompt_tokens=12, completion_tokens=3, total_tokens=15)

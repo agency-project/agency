@@ -46,6 +46,7 @@ class HostInteractionServer:
     ) -> None:
         self._profile_context = parent_context
         self._profile_attributes = dict(profile_attributes or {})
+        self._profile_attributes["agency.agent_id"] = str(agname)
         self._policy = skill.policy
         self._data_logger = data_logger
         self._agname = agname  # for _record_admission's term_message tag
@@ -309,7 +310,14 @@ class HostInteractionServer:
             return {"ok": False, "error": "sample batch exceeds 128 events"}
         harness = self._profile_attributes.get("harness") or "remote"
         rejected = agprof.ingest_auto_samples(
-            self._profile_pid, samples, thread_label=f"{harness} thread"
+            self._profile_pid,
+            samples,
+            thread_label=f"{harness} thread",
+            metadata={
+                **self._profile_attributes,
+                "agency.execution_side": "sandbox",
+                "agency.reporter_id": self._profile_pid,
+            },
         )
         return {"ok": rejected == 0, "rejected": rejected}
 
@@ -429,7 +437,12 @@ class HostInteractionServer:
                     parent_context=(
                         parent_span.context() if parent_span is not None else self._profile_context
                     ),
-                    metadata={**self._profile_attributes, **attributes},
+                    metadata={
+                        **attributes,
+                        **self._profile_attributes,
+                        "agency.execution_side": "sandbox",
+                        "agency.reporter_id": self._profile_pid,
+                    },
                 )
             if end_ts is None:
                 if opened is not None:

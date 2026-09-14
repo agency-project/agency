@@ -33,10 +33,6 @@ _BARE_THREAD_ALLOWLIST = {
         "_HarnessApiServer.start",
     ): (1, "harness API server"),
     (
-        "agency/engine/host_servers/host_server_manager.py",
-        "HostServerManager.start",
-    ): (1, "host UDS server"),
-    (
         "agency/harness/servers/harness_interaction_server.py",
         "HarnessInteractionServer.start",
     ): (1, "sandbox interaction server"),

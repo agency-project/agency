@@ -11,7 +11,6 @@ import base64
 import json
 import threading
 import time
-import uuid
 from contextlib import nullcontext
 from pathlib import PurePosixPath
 
@@ -65,6 +64,20 @@ def session_file_allowed(harness, path):
         return False
     if harness in {"codex", "grok"}:
         return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
+    if harness == "kimi":
+        # Kimi 0.42.0 loses the restored model binding if its trust prompt is
+        # accepted after resume. Carry forward the decision Agency already
+        # approved on the first attempt so later attempts skip that prompt.
+        if (
+            len(path.parts) == 2
+            and path.parts[0] == "workspace-trust"
+            and path.name.startswith("wd_")
+        ):
+            return True
+        # The index names each session directory; both are needed to resume.
+        if str(path) == "session_index.jsonl":
+            return True
+        return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
     return harness == "opencode" and str(path) == "data/opencode/opencode.db"
 
 
@@ -114,7 +127,7 @@ async def stream_response(router, token, context, model, formatter):
 
 
 class PtyExecution:
-    INPUT_TIMEOUT = 20.0
+    INPUT_TIMEOUT = 60.0
     START_TIMEOUT = 45.0
     ATTEMPT_TIMEOUT = 600.0
 
@@ -126,6 +139,8 @@ class PtyExecution:
         self._active = False
         self._expected_prompt = None
         self._turn_id = None
+        self._turn_started = False
+        self._acknowledged = False
         self._stop = None
         self._interrupted = False
         self._failure = None
@@ -133,6 +148,10 @@ class PtyExecution:
         self._cleanup_callbacks = tuple(cleanup_callbacks)
         self._closed = False
         self._launched = False
+        self._last_activity_generation = None
+        self.INPUT_TIMEOUT = driver.INPUT_TIMEOUT
+        self.START_TIMEOUT = driver.START_TIMEOUT
+        self.ATTEMPT_TIMEOUT = driver.ATTEMPT_TIMEOUT
 
     @staticmethod
     def validate_prompt(prompt):
@@ -143,14 +162,23 @@ class PtyExecution:
 
     def _poll(self):
         for event in self.driver.events():
-            prompt, expected = event.get("prompt"), self._expected_prompt
-            if self.driver.name == "opencode" and isinstance(prompt, str) and expected is not None:
-                # OpenCode can append a newline when persisting bracketed paste.
-                prompt, expected = prompt.rstrip(), expected.rstrip()
-            if event.get("kind") == "submit" and prompt == expected:
+            if event.get("kind") == "submit" and self.driver.prompt_matches(
+                event.get("prompt"), self._expected_prompt
+            ):
+                # A CLI that owns its turn identity reports it here; a driver
+                # that mints its own has already set it in _submit.
                 if event.get("turn_id"):
                     self._turn_id = event["turn_id"]
-            if self._turn_id is None or event.get("turn_id") != self._turn_id:
+                self._acknowledged = True
+            if self._turn_id is None:
+                # Nothing can complete or be interrupted before a turn exists,
+                # but a CLI that fails during startup must not be waited out to
+                # the deadline. Once any turn has run, a turn-less event is
+                # stale and cannot fail its replacement.
+                if not self._turn_started and event.get("kind") == "error":
+                    self._failure = event.get("error", "native turn failed")
+                continue
+            if event.get("turn_id") != self._turn_id:
                 continue
             if event["kind"] == "stop":
                 self._stop = event
@@ -183,14 +211,17 @@ class PtyExecution:
 
     def _submit(self, text, label):
         self.validate_prompt(text)
-        # Unique content also fences two submissions with identical user text.
-        self._expected_prompt = f"[Agency {label} {uuid.uuid4().hex}]\n{text}"
-        self._turn_id = None
+        self._turn_started = True
+        self._expected_prompt = f"{self.driver.submission_marker(label)}\n{text}"
+        # A driver that fences turns itself returns the identity it just
+        # committed; the rest learn it from the CLI's own acknowledgment.
+        self._turn_id = self.driver.begin_turn(self._expected_prompt)
+        self._acknowledged = False
         self._stop = None
         self._interrupted = False
         self.handle.write_terminal(b"\x1b[200~" + self._expected_prompt.encode() + b"\x1b[201~")
         self.handle.write_terminal(b"\r")
-        self._wait_until(lambda: self._turn_id is not None, "native prompt acknowledgment")
+        self._wait_until(lambda: self._acknowledged, "native prompt acknowledgment")
         self._deadline = time.monotonic() + self.ATTEMPT_TIMEOUT
 
     def redirect(self, text):
@@ -207,6 +238,7 @@ class PtyExecution:
             try:
                 self._check_alive()
                 self._interrupted = False
+                self.driver.begin_interrupt(self.handle)
                 self.handle.write_terminal(self.driver.interrupt_key)
                 if self.driver.confirm_interrupt:
                     self._wait_until(
@@ -219,7 +251,12 @@ class PtyExecution:
                         return False
                     self.handle.write_terminal(self.driver.interrupt_key)
                 self._wait_until(
-                    lambda: self._interrupted or self._stop is not None, "native interruption"
+                    lambda: (
+                        self._interrupted
+                        or self._stop is not None
+                        or self.driver.interrupted(self.handle)
+                    ),
+                    "native interruption",
                 )
                 if self._stop is not None:
                     return False
@@ -232,7 +269,7 @@ class PtyExecution:
                 self._active = False
                 # Reap before reporting failure: a queued fallback must not race
                 # a partially accepted redirect in a still-running CLI.
-                self.handle.close()
+                self.driver.reap(self.handle)
                 return False
 
     def close(self):
@@ -276,6 +313,7 @@ class PtyExecution:
         try:
             self.validate_prompt(prompt)
             if not self._launched:
+                self.driver.prepare_launch()
                 with phase("harness:launch"):
                     self.handle = agProxyPtrace(
                         self.runtime.agconfig, allow_initial_exec=True
@@ -307,6 +345,13 @@ class PtyExecution:
                         now = time.monotonic()
                         if self.handle.is_paused():
                             self._deadline += now - last_poll
+                        elif self.driver.activity_extends_deadline:
+                            # Terminal output is the only progress signal some
+                            # CLIs emit during a long tool call.
+                            generation = self.handle.terminal_screen()[3]
+                            if generation != self._last_activity_generation:
+                                self._last_activity_generation = generation
+                                self._deadline = now + self.ATTEMPT_TIMEOUT
                         last_poll = now
                         self._poll()
                         self._check_alive()

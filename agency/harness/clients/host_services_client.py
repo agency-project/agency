@@ -336,7 +336,7 @@ class HostServicesClient:
             "/interaction/record_span",
             json=payload,
             headers=self._attempt_headers(token),
-            timeout=2.0,
+            timeout=5.0,
         )
         response.raise_for_status()
         return response.json()
@@ -347,7 +347,7 @@ class HostServicesClient:
             "/interaction/record_samples",
             json={"samples": samples},
             headers=self._attempt_headers(token),
-            timeout=2.0,
+            timeout=5.0,
         )
         response.raise_for_status()
         return response.json()
@@ -358,7 +358,7 @@ class HostServicesClient:
             "/interaction/profile_settings",
             json={},
             headers=self._attempt_headers(token),
-            timeout=2.0,
+            timeout=5.0,
         )
         response.raise_for_status()
         return response.json()

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
-from mcp.server.transport_security import TransportSecuritySettings
+from ...harness.mcp_transport import build_http_app
 
 from ...agdata import agdata
 
@@ -137,10 +137,7 @@ class HostMcpServer:
             self._register_tool(server, tool)
 
         self._mcp_server = server
-        return server.streamable_http_app(
-            **({"stateless_http": True, "json_response": True} if self._live_session else {}),
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        return build_http_app(server, live_session=self._live_session)
 
     def lifespan_context(self, app: "Starlette") -> "AbstractAsyncContextManager[None] | None":
         return app.router.lifespan_context(app)
