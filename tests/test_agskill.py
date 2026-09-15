@@ -137,7 +137,7 @@ def test_name_and_repr():
 # test_run_returns_agdata_and_history / test_run_no_schema_returns_raw_content /
 # test_run_plain_text_fallback were retired here along with execute_react()
 # itself -- basic "the loop returns the model's content correctly" coverage
-# now lives in tests/harness/agharness_backends/test_native_loop_fast.py
+# now lives in tests/harness/adapters/test_native_loop_fast.py
 # (test_bash_tool_round_trip, test_final_text_preserves_raw_content_verbatim),
 # exercising the native loop that replaces execute_react() for every engine.
 
@@ -185,7 +185,7 @@ def test_prompt_type_names_shown_correctly():
 # were retired here along with execute_react() itself: add_tools/
 # replace_tools are host-authored Python tool closures with no execution
 # path today for ANY engine -- execute_react() was the only one that ever
-# ran them, and native.py's `_NativeBackend.execute()` explicitly rejects
+# ran them, and native.py's `NativeAdapter.execute()` explicitly rejects
 # them (a real, currently-open gap -- see that module's "Known gaps"
 # docstring section; building real container-side support, e.g. shipping a
 # picklable closure into the container plus a minimal pure-agdata shim
@@ -251,11 +251,11 @@ def test_input_schema_description_value_only_checks_presence():
 # per-field `return_<field>` tool mechanism. Native's structured output
 # uses a different mechanism entirely -- a single `submit_output` MCP tool
 # validated per-call (fast coverage:
-# tests/harness/agharness_backends/test_native_loop_fast.py's
+# tests/harness/adapters/test_native_loop_fast.py's
 # test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback) plus a bounded
 # reprompt-across-turns loop one level up in native.py's
-# `_NativeBackend.execute()` (Docker-only coverage today, see
+# `NativeAdapter.execute()` (Docker-only coverage today, see
 # test_native.py's TestNativeBackendRealEndToEnd).
 
 
@@ -292,7 +292,7 @@ def test_no_schemas_prompt_unchanged():
 # _build_toolkit(). Native's structured output uses a single `submit_output`
 # MCP tool instead -- fast coverage for the all-fields-correct and
 # type-error-immediate-feedback cases now lives in
-# tests/harness/agharness_backends/test_native_loop_fast.py
+# tests/harness/adapters/test_native_loop_fast.py
 # (test_submit_output_all_fields_collected /
 # test_submit_output_type_error_returns_immediate_feedback).
 # test_semaphore_* / test_timeout_* / test_ssl_error_* / test_oserror_*
@@ -315,7 +315,7 @@ def test_no_schemas_prompt_unchanged():
 # execute_react()) -- native has its own, simpler offload (a plain local
 # file write, no sandbox bridge, `read` always available so no lazy
 # tool-injection step exists), already covered fast by
-# tests/harness/agharness_backends/test_native_loop_fast.py's
+# tests/harness/adapters/test_native_loop_fast.py's
 # test_oversized_tool_output_is_offloaded_to_a_file.
 
 # ---------------------------------------------------------------------------

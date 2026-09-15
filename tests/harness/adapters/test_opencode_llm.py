@@ -1,4 +1,4 @@
-"""Tests for _GrokBackend's LLM wire-format translation -- plain OpenAI
+"""Tests for OpenCodeAdapter's LLM wire-format translation -- plain OpenAI
 chat-completions <-> agency format, both directions, both streaming and
 non-streaming."""
 
@@ -7,11 +7,11 @@ from __future__ import annotations
 import json
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.grok import _GrokBackend
+from agency.harness.adapters.opencode import OpenCodeAdapter
 
 
-def _backend() -> _GrokBackend:
-    return _GrokBackend(agconfig())
+def _backend() -> OpenCodeAdapter:
+    return OpenCodeAdapter(agconfig())
 
 
 def test_harness_to_agency_plain_messages():

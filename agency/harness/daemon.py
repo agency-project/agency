@@ -12,6 +12,7 @@ import asyncio
 import base64
 import concurrent.futures
 import json
+import os
 import signal
 import subprocess
 import threading
@@ -24,9 +25,14 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from ..configs.agconfig import agconfig as agconfig_cls, harnessadapterconfig, ptraceconfig
+from ..configs.agconfig import (
+    agconfig as agconfig_cls,
+    harnessadapterconfig,
+    ptraceconfig,
+    sandboxconfig,
+)
 from . import interaction_router, mcp_proxy, sandbox_mcp
-from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .adapters.base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
@@ -88,7 +94,15 @@ class _HostSyscallPolicy:
 
     def check(self, _agent, syscall):
         if syscall.syscall in self._hooked_syscalls or syscall.syscall in self._ALWAYS_SYNCHRONOUS:
-            return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+            try:
+                return self._host_services.check_syscall_policy(self._attempt_token, syscall)
+            except Exception:
+                if self._host_services.validate_token(self._attempt_token):
+                    raise
+                # A retained CLI can reach another exec stop as its completed
+                # attempt is revoked. Deny it without killing the tracer that
+                # must still quiesce the tree for checkpointing.
+                return False, "inactive harness attempt", None, None
         _SYSCALL_LOG_POOL.submit(self._log_admission_best_effort, syscall)
         return (not self._default_to_deny, None, None, None)
 
@@ -114,7 +128,13 @@ class _HostSyscallPolicy:
         # _tracer_loop.py), but stay defensive here too.
         if not call_id:
             return
-        self._host_services.complete_syscall_policy(self._attempt_token, call_id, return_value)
+        try:
+            self._host_services.complete_syscall_policy(self._attempt_token, call_id, return_value)
+        except Exception:
+            if self._host_services.validate_token(self._attempt_token):
+                raise
+            # The syscall was already admitted. Its late completion cannot
+            # report into a retired host attempt or fail the retained tracer.
 
 
 class _LocalSandboxBackend:
@@ -156,7 +176,14 @@ class _LocalSandbox:
 
 
 class _HarnessApiServer:
-    def __init__(self, host_uds_path: str, port: int, harness_backend: agharness_backend) -> None:
+    def __init__(
+        self,
+        host_uds_path: str,
+        port: int,
+        harness_backend: HarnessAdapter,
+        *,
+        live_session: bool = False,
+    ) -> None:
         self._bridge = HostServicesClient(host_uds_path)
         self._port = port
         self._harness_backend = harness_backend
@@ -164,6 +191,7 @@ class _HarnessApiServer:
         self._thread: "threading.Thread | None" = None
         self._loop: "asyncio.AbstractEventLoop | None" = None
         self._sandbox_mcp_app = None
+        self._persistent = live_session
 
     @property
     def base_url(self) -> str:
@@ -213,17 +241,20 @@ class _HarnessApiServer:
             return
         await app(scope, receive, send)
 
-    async def run_sandbox_attempt(self, request, handler) -> HarnessAttemptResult:
+    async def run_sandbox_attempt(
+        self, request, handler, *, local_token: "str | None" = None
+    ) -> HarnessAttemptResult:
         # Enter and exit MCP's task-group lifespan in the same API-loop task.
         # Closing it drains admitted tool calls before another attempt can start.
+        accepted_token = local_token if local_token is not None else request.attempt_token
         async with AsyncExitStack() as stack:
             try:
                 app = sandbox_mcp.build_app(
                     request.sandbox_mcp_tools_b64,
                     lambda: (
-                        self._sandbox_mcp_app is app
-                        and self._bridge.validate_token(request.attempt_token)
+                        self._sandbox_mcp_app is app and self._bridge.validate_token(accepted_token)
                     ),
+                    live_session=self._persistent,
                 )
                 await stack.enter_async_context(app.router.lifespan_context(app))
             except Exception as exc:
@@ -248,11 +279,19 @@ class _HarnessApiServer:
         self._server = None
         self._thread = None
 
-    def register_attempt_token(self, token: str) -> None:
-        self._bridge.register_attempt_token(token)
+    def register_attempt_token(self, token: str, *, local_token: "str | None" = None) -> None:
+        self._bridge.register_attempt_token(token, local_token=local_token)
 
     def clear_attempt_token(self, token: str) -> bool:
         return self._bridge.clear_attempt_token(token)
+
+    def prepare_fast_checkpoint(self) -> None:
+        # Drop idle host-UDS keepalive sockets.  A restored daemon reconnects
+        # lazily through the same mounted path when the next attempt starts.
+        self._bridge.quiesce_connections()
+
+    def complete_fast_restore(self) -> None:
+        return None
 
     def resolve_model(self, token: str) -> str:
         return self._bridge.resolve_model(token)
@@ -291,13 +330,15 @@ def _run_adapter_attempt(
     syscall_policy,
     register_control_handle: "Callable[[object], None]",
     register_redirect: "Callable[[Callable[[str], bool]], None]",
+    run_pty_execution=None,
+    local_attempt_token: "str | None" = None,
 ) -> HarnessAttemptResult:
-    attempt_token = request.attempt_token
+    attempt_token = local_attempt_token or request.attempt_token
     if not isinstance(attempt_token, str) or not attempt_token:
         return HarnessAttemptResult(ok=False, error_message="missing harness attempt token")
     try:
-        adapter = agharness_backend.for_config(request.harness, agconfig)
-        if type(adapter).run_daemon_attempt is agharness_backend.run_daemon_attempt:
+        adapter = HarnessAdapter.for_config(request.harness, agconfig)
+        if type(adapter).run_daemon_attempt is HarnessAdapter.run_daemon_attempt:
             return HarnessAttemptResult(
                 ok=False,
                 error_message=(
@@ -309,6 +350,10 @@ def _run_adapter_attempt(
         # The daemon is already inside the sandbox. Native uses a local
         # filesystem facade; external CLIs launch directly in this process's
         # namespace. No host-side agent or skill object crosses this boundary.
+        if run_pty_execution is None:
+            from .adapters.base import _run_one_pty_execution
+
+            run_pty_execution = _run_one_pty_execution
         runtime = AdapterRuntime(
             agconfig=agconfig,
             model=model,
@@ -320,6 +365,7 @@ def _run_adapter_attempt(
             has_sandbox_mcp_tools=request.sandbox_mcp_tools_b64 is not None,
             register_control_handle=register_control_handle,
             register_redirect=register_redirect,
+            run_pty_execution=run_pty_execution,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
@@ -363,8 +409,11 @@ class HarnessManager:
     ) -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._engine_name = engine_name
-        harness_backend = agharness_backend.for_config(harness, self._agconfig)
-        self._harness_api = _HarnessApiServer(host_uds_path, harness_api_port, harness_backend)
+        self._persistent = bool(self._agconfig.sandbox.checkpoint_fast_resume)
+        harness_backend = HarnessAdapter.for_config(harness, self._agconfig)
+        self._harness_api = _HarnessApiServer(
+            host_uds_path, harness_api_port, harness_backend, live_session=self._persistent
+        )
         self._attempt_handler = (
             attempt_handler if attempt_handler is not None else self._run_adapter_request
         )
@@ -378,6 +427,10 @@ class HarnessManager:
         self._current_request_cancelled = False
         self._current_request_id: "str | None" = None
         self._redirect_handler: "Callable[[str], bool] | None" = None
+        self._live_execution = None
+        self._live_execution_key = None
+        self._live_local_token: "str | None" = None
+        self._fast_checkpoint_prepared = False
         # Sticky: persists across attempts for this daemon's whole life, so
         # a pause requested between attempts (or before the first one ever
         # ran) still applies the instant the next harness process exists --
@@ -388,7 +441,76 @@ class HarnessManager:
             self._dispatch_attempt,
             control_handler=self.control,
             redirect_handler=self.redirect,
+            lifecycle_handler=self.lifecycle,
         )
+
+    def _retire_live_execution(self) -> None:
+        execution = getattr(self, "_live_execution", None)
+        self._live_execution = None
+        self._live_execution_key = None
+        self._live_local_token = None
+        if execution is not None:
+            execution.close()
+
+    def _run_pty_execution(self, key, factory, prompt):
+        """Run one prompt, retaining an idle PTY only for CRIU fast resume."""
+        if not self._persistent:
+            return factory().run(prompt)
+        execution = self._live_execution
+        if execution is not None and (
+            self._live_execution_key != key
+            or execution.handle is None
+            or execution.handle.returncode is not None
+        ):
+            self._retire_live_execution()
+            execution = None
+        if execution is None:
+            execution = factory()
+            self._live_execution = execution
+            self._live_execution_key = key
+        try:
+            return execution.run(prompt, keep_alive=True)
+        except BaseException:
+            self._retire_live_execution()
+            raise
+
+    def lifecycle(self, action: str) -> dict:
+        """Quiesce or resume the retained ptrace tree around runtime CRIU."""
+        with self._attempt_lock:
+            execution = self._live_execution
+            handle = execution.handle if execution is not None else None
+
+            def status():
+                return {
+                    "ok": True,
+                    "live_pty": execution is not None,
+                    "daemon_pid": os.getpid(),
+                    "root_pid": handle.root_pid if handle is not None else None,
+                    "pids": sorted(handle.pids()) if handle is not None else [],
+                }
+
+            if action == "prepare_fast_checkpoint":
+                if self._fast_checkpoint_prepared:
+                    return status()
+                self._harness_api.prepare_fast_checkpoint()
+                if execution is not None:
+                    execution.prepare_fast_checkpoint()
+                self._fast_checkpoint_prepared = True
+                return status()
+            if action == "seize_fast_restore":
+                if not self._fast_checkpoint_prepared:
+                    raise RuntimeError("fast checkpoint handoff is not prepared")
+                if execution is not None:
+                    execution.seize_fast_restore()
+                return status()
+            if action in {"complete_fast_restore", "abort_fast_checkpoint"}:
+                if self._fast_checkpoint_prepared:
+                    if execution is not None:
+                        execution.complete_fast_restore()
+                    self._harness_api.complete_fast_restore()
+                    self._fast_checkpoint_prepared = False
+                return status()
+            raise ValueError(f"unknown lifecycle action {action!r}")
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
@@ -407,6 +529,10 @@ class HarnessManager:
                     handle.pause()
                 except Exception as exc:
                     print(f"[harness_daemon] WARNING: pause() on new attempt failed: {exc}")
+            elif self._persistent:
+                # A restored tracee remains parked until the next invocation
+                # has installed its token and syscall policy.
+                handle.resume()
 
     def _clear_control_handle(self) -> None:
         with self._control_lock:
@@ -465,8 +591,12 @@ class HarnessManager:
         if not isinstance(token, str) or not token:
             return HarnessAttemptResult(ok=False, error_message="missing harness attempt token")
         with self._attempt_lock:
+            local_token = getattr(self, "_live_local_token", None) or token
             try:
-                self._harness_api.register_attempt_token(token)
+                if local_token == token:
+                    self._harness_api.register_attempt_token(token)
+                else:
+                    self._harness_api.register_attempt_token(token, local_token=local_token)
             except Exception as exc:
                 return HarnessAttemptResult(
                     ok=False,
@@ -480,7 +610,9 @@ class HarnessManager:
             try:
                 if request.sandbox_mcp_tools_b64 is not None:
                     return asyncio.run_coroutine_threadsafe(
-                        self._harness_api.run_sandbox_attempt(request, self._attempt_handler),
+                        self._harness_api.run_sandbox_attempt(
+                            request, self._attempt_handler, local_token=local_token
+                        ),
                         self._harness_api._loop,
                     ).result()
                 return self._attempt_handler(request)
@@ -488,26 +620,42 @@ class HarnessManager:
                 self._clear_control_handle()
                 self._current_attempt_token = None
                 self._harness_api.clear_attempt_token(token)
+                if (
+                    getattr(self, "_live_execution", None) is not None
+                    and getattr(self, "_live_local_token", None) is None
+                ):
+                    self._live_local_token = local_token
 
     def _run_adapter_request(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = self._current_attempt_token
         if token is None or request.attempt_token != token:
             return HarnessAttemptResult(ok=False, error_message="no active harness attempt token")
+        local_token = getattr(self, "_live_local_token", None) or token
         try:
-            return _run_adapter_attempt(
+            arguments = (
                 request,
                 self._agconfig,
                 self._harness_api.base_url,
-                self._harness_api.resolve_model(token),
+                self._harness_api.resolve_model(local_token),
                 self._engine_name,
                 self._harness_api.syscall_policy(
-                    token,
+                    local_token,
                     default_to_deny=request.syscall_default_to_deny,
                     hooked_syscalls=frozenset(request.syscall_hooked_names or ()),
                 ),
                 self._register_control_handle,
                 self._register_redirect,
             )
+            if getattr(self, "_persistent", False):
+                policy_key = (
+                    bool(request.syscall_default_to_deny),
+                    tuple(sorted(request.syscall_hooked_names or ())),
+                )
+                runner = lambda key, factory, prompt: self._run_pty_execution(
+                    (policy_key, key), factory, prompt
+                )
+                return _run_adapter_attempt(*arguments, runner, local_token)
+            return _run_adapter_attempt(*arguments)
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")
 
@@ -520,6 +668,7 @@ class HarnessManager:
             raise
 
     def stop(self) -> None:
+        self._retire_live_execution()
         self._interaction_server.stop()
         self._harness_api.stop()
 
@@ -546,6 +695,7 @@ def main(argv: "list[str] | None" = None) -> None:
         agconfig=agconfig_cls(
             harnessadapterconfig(**payload.get("harness_adapter", {})),
             ptraceconfig(**payload.get("ptrace", {})),
+            sandboxconfig(**payload.get("sandbox", {})),
         ),
         harness_api_port=args.harness_api_port,
     )

@@ -452,6 +452,15 @@ class agProxyPtraceHandle:
     def resume(self) -> None:
         self._loop.resume()
 
+    def checkpoint_detach(self) -> None:
+        self._loop.checkpoint_handoff("detach")
+
+    def checkpoint_seize_frozen(self) -> None:
+        self._loop.checkpoint_handoff("seize_frozen")
+
+    def checkpoint_reattach(self) -> None:
+        self._loop.checkpoint_handoff("reattach")
+
 
 class agProxyPtrace:
     """Entry point for launching a process under syscall-level supervision.
@@ -586,6 +595,8 @@ class agProxyPtrace:
         loop_args = dict(
             syscalls=syscalls, syscall_hook=syscall_hook, syscall_exit_hook=syscall_exit_hook
         )
+        if self._agconfig is not None and self._agconfig.sandbox.checkpoint_fast_resume:
+            loop_args["checkpointable"] = True
         if track_access:
             loop_args["file_access"] = True
         loop = TracerLoop(**loop_args)

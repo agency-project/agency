@@ -10,6 +10,7 @@ import platform
 import random
 import re
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,13 @@ REPOSITORY = "psf/requests"
 REPOSITORY_COMMIT = "040ee8c95a4bd91dde598105d7b12bc83306488a"
 DATASET_BASE_COMMIT = "3c88e520da24ae6f736929a750876e7654accc3d"
 CREATION_IMAGE = "sha256:605aaf09a3a137a8c3a247d468046c5edbff3568eb99baf1415ce2d7a3df67a2"
+# Docker 29's ID above is the OCI index. Its linux/amd64 manifest points to
+# this config digest, which Podman uses as its image ID. These are the SAME
+# image, not a rebuilt/tag-substituted benchmark base.
+CREATION_PLATFORM_MANIFEST = (
+    "sha256:baff84e829a563ab754843116a93bd1bec58c199deb9622009ca072064b52e18"
+)
+CREATION_CONFIG_IMAGE = "sha256:fdf3adde7ef9d0e04034282b01fce743954168fa73dffc8bcfbaeb43c7f9a21e"
 OFFICIAL_IMAGE = (
     "swebench/sweb.eval.x86_64.psf_1776_requests-1921"
     "@sha256:2ee0a4c706f04d2926a1622ec51b53d4ce6010b80d3ee10d414ea2a276c26cc9"
@@ -37,7 +45,7 @@ PAYLOAD_PATH = "/testbed/.agency-checkpoint-payload.bin"
 AES_KEY = "7a3e12c6f55b904adcf8016b90e8f1a3c27d99e048bc61184d0a6b3fce752490"
 AES_IV = "40670f28421b88c34719f80d15e6082b"
 ORDER_SEED = 731_991
-INITIAL_SIZES = [0, 64 * 1024, 1024**2, 16 * 1024**2, 128 * 1024**2, 1024**3]
+INITIAL_SIZES = [0, 64 * 1024, 128 * 1024**2, 1024**3]
 
 SYSTEM_PROMPT = """You are executing one controlled filesystem operation, not solving a software issue. Submit the exact functions.exec JavaScript in payload_instruction without changing it. If functions.exec yields a cell ID, use functions.wait only to wait for that same program to finish. Do not inspect the repository or task. Do not run any other command. Do not modify any file except /testbed/.agency-checkpoint-payload.bin when the requested size is greater than zero. For zero bytes, do not create or modify that file and make no intentional filesystem modification. After the program succeeds, copy its complete output verbatim into summary and finish."""
 
@@ -56,8 +64,33 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def image_inspect(image: str) -> dict:
-    return json.loads(output(["docker", "image", "inspect", image]))[0]
+def executing_revision():
+    result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def executing_source_digest():
+    import agency
+
+    root = Path(agency.__file__).parent
+    accumulator = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        accumulator.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes())
+    return accumulator.hexdigest()
+
+
+def image_inspect(image: str, runtime: str = "docker") -> dict:
+    return json.loads(output([runtime, "image", "inspect", image]))[0]
+
+
+def host_docker_image_inspect(image: str) -> dict:
+    return json.loads(
+        output(["docker", "--host", "unix:///var/run/docker.sock", "image", "inspect", image])
+    )[0]
+
+
+def runtime_creation_image(runtime: str) -> str:
+    return CREATION_CONFIG_IMAGE if runtime == "podman" else CREATION_IMAGE
 
 
 def payload_command(size: int) -> str:
@@ -161,7 +194,15 @@ def choose_sizes(free_bytes: int) -> tuple[list[int], dict | None]:
     raise RuntimeError("Insufficient EC2 disk for a safe payload condition of at least 256 MiB")
 
 
-def prepare(root: Path, prior_root: Path) -> None:
+def prepare(
+    root: Path,
+    prior_root: Path,
+    *,
+    checkpoint_backend: str = "image_commit",
+    runtime: str = "docker",
+    checkpoint_zfs_parent: str | None = None,
+    checkpoint_fast_resume: bool = False,
+) -> None:
     if root.exists():
         raise RuntimeError(f"Experiment directory already exists: {root}")
     root.mkdir(parents=True)
@@ -175,18 +216,28 @@ def prepare(root: Path, prior_root: Path) -> None:
     if digest(source_manifest) != SOURCE_MANIFEST_SHA256:
         raise RuntimeError("Measured Agency source snapshot drifted")
 
-    creation = image_inspect(CREATION_IMAGE)
-    if creation["Id"] != CREATION_IMAGE:
+    selected_image = (
+        CREATION_CONFIG_IMAGE
+        if checkpoint_backend == "cow_zfs"
+        else runtime_creation_image(runtime)
+    )
+    creation = image_inspect(selected_image, runtime)
+    if creation["Id"].removeprefix("sha256:") != selected_image.removeprefix("sha256:"):
         raise RuntimeError("Pinned creation image ID is not locally available")
-    official = image_inspect(OFFICIAL_IMAGE)
+    official = host_docker_image_inspect(OFFICIAL_IMAGE)
+    if runtime == "podman":
+        original = host_docker_image_inspect(CREATION_IMAGE)
+        for field in ("RootFS", "Config", "Architecture", "Os"):
+            if creation.get(field) != original.get(field):
+                raise RuntimeError(f"Imported image {field} differs from the pinned Docker image")
     repo_probe = output(
         [
-            "docker",
+            runtime,
             "run",
             "--rm",
             "--entrypoint",
             "/bin/bash",
-            CREATION_IMAGE,
+            selected_image,
             "-lc",
             'cd /testbed && git rev-parse HEAD && test -z "$(git status --porcelain)"',
         ]
@@ -220,7 +271,10 @@ def prepare(root: Path, prior_root: Path) -> None:
         "max_steps": 80,
         "sample_hz": 5,
         "sample_gpu": False,
-        "backend": "docker",
+        "backend": runtime,
+        "checkpoint_backend": checkpoint_backend,
+        "checkpoint_fast_resume": checkpoint_fast_resume,
+        "checkpoint_zfs_parent": checkpoint_zfs_parent,
         "sandbox_cpus": 4,
         "sandbox_memory": "8g",
         "harness": "codex",
@@ -236,6 +290,8 @@ def prepare(root: Path, prior_root: Path) -> None:
         "ec2": ec2_identity(),
         "docker_version": json.loads(output(["docker", "version", "--format", "{{json .}}"])),
         "docker_info": json.loads(output(["docker", "info", "--format", "{{json .}}"])),
+        "selected_runtime_version": output([runtime, "version", "--format", "{{json .}}"]),
+        "selected_runtime_info": output([runtime, "info", "--format", "{{json .}}"]),
         "disk_usage": usage._asdict(),
         "creation_image_inspect": creation,
         "official_image_inspect": official,
@@ -243,6 +299,10 @@ def prepare(root: Path, prior_root: Path) -> None:
             ["ps", "-eo", "user,pid,etimes,pcpu,pmem,args", "--sort=-pcpu"]
         ).splitlines()[:50],
     }
+    if checkpoint_backend == "cow_zfs":
+        environment["checkpoint_runtime"] = {
+            "zfs_version": output(["zfs", "version"]),
+        }
     save(root / "environment.json", environment)
     manifest = {
         "schema_version": 1,
@@ -254,6 +314,7 @@ def prepare(root: Path, prior_root: Path) -> None:
             "repo_commit_in_creation_image": REPOSITORY_COMMIT,
             "dataset_base_commit": DATASET_BASE_COMMIT,
             "creation_image_id": CREATION_IMAGE,
+            "runtime_creation_image_id": selected_image,
             "official_image_digest": OFFICIAL_IMAGE,
             "normal_issue_description_passed_to_agent": False,
             "base_image_rebuilt_or_mutated": False,
@@ -261,9 +322,13 @@ def prepare(root: Path, prior_root: Path) -> None:
         "agency_source": {
             "git_head": AGENCY_GIT_HEAD,
             "dirty": True,
-            "description": "Pinned instrumentation-enabled working-tree snapshot used by the measured trace",
+            "description": "Original measured snapshot is identified by the retained manifest; executing_source fields identify the current implementation used for this cohort",
             "manifest_sha256": SOURCE_MANIFEST_SHA256,
             "prior_measured_plan_sha256": PRIOR_PLAN_SHA256,
+            "executing_source_git_head": executing_revision(),
+            "executing_source_sha256": executing_source_digest(),
+            "executing_runner_sha256": digest(Path(__file__)),
+            "checkpoint_backend": checkpoint_backend,
         },
         "config": config,
         "payload": {
@@ -284,7 +349,7 @@ def prepare(root: Path, prior_root: Path) -> None:
     }
     save(root / "manifest.json", manifest)
     (root / "COMMAND.txt").write_text(
-        f"PYTHONPATH={prior_root / 'source'} {prior_root / '.venv/bin/python'} "
+        f"PYTHONPATH={shlex.quote(str(source.parents[2]))} {shlex.quote(sys.executable)} "
         f"{root / 'runner.py'} cohort --root {root} --key-file {prior_root / '.openai-key'}\n"
     )
 
@@ -347,7 +412,10 @@ def configure(root: Path, key_file: Path):
     cfg.llm.api_key = key_file.read_text().strip()
     cfg.agent.harness = config["harness"]
     cfg.sandbox.backend = config["backend"]
-    cfg.sandbox.base_image = CREATION_IMAGE
+    cfg.sandbox.checkpoint_backend = config.get("checkpoint_backend", "image_commit")
+    cfg.sandbox.checkpoint_fast_resume = config.get("checkpoint_fast_resume", False)
+    cfg.sandbox.checkpoint_zfs_parent = config.get("checkpoint_zfs_parent")
+    cfg.sandbox.base_image = manifest["control"]["runtime_creation_image_id"]
     cfg.sandbox.checkpoint_diagnostics = True
     cfg.sandbox.checkpoint_diagnostics_extended = True
     cfg.ptrace.file_access = True
@@ -355,6 +423,19 @@ def configure(root: Path, key_file: Path):
     cfg.resources.idle_cpus = config["sandbox_cpus"]
     cfg.resources.idle_memory = config["sandbox_memory"]
     return cfg
+
+
+def validate_checkpoint_comparison(config: dict) -> None:
+    """Never spend an LLM invocation on an invalid checkpoint comparison."""
+    from agency.sandbox.checkpoint import CheckpointCapabilityError
+
+    backend = config.get("checkpoint_backend", "image_commit")
+    if backend not in {"image_commit", "cow_zfs"}:
+        raise ValueError(f"Unknown checkpoint_backend {backend!r}")
+    if backend == "cow_zfs" and not config.get("checkpoint_zfs_parent"):
+        raise CheckpointCapabilityError("COW comparison requires checkpoint_zfs_parent")
+    if config.get("checkpoint_fast_resume") and backend != "cow_zfs":
+        raise CheckpointCapabilityError("CRIU fast resume requires cow_zfs")
 
 
 def extract_payload_result(database: Path, summary: str = "") -> dict | None:
@@ -403,7 +484,7 @@ def extract_payload_result(database: Path, summary: str = "") -> dict | None:
     }
 
 
-def verify_checkpoint_payload(image_id: str, requested_bytes: int) -> dict:
+def verify_checkpoint_payload(image_id: str | None, requested_bytes: int, *, sandbox=None) -> dict:
     if requested_bytes == 0:
         command = f"test ! -e {PAYLOAD_PATH} && printf 'PAYLOAD_BYTES=0 PAYLOAD_SHA256=NONE\\n'"
     else:
@@ -414,7 +495,34 @@ def verify_checkpoint_payload(image_id: str, requested_bytes: int) -> dict:
             'printf \'PAYLOAD_BYTES=%s PAYLOAD_SHA256=%s\\n\' "$actual" "$digest"'
         )
     started = time.perf_counter_ns()
-    raw = output(["docker", "run", "--rm", "--entrypoint", "/bin/bash", image_id, "-lc", command])
+    if sandbox is None:
+        raw = output(
+            ["docker", "run", "--rm", "--entrypoint", "/bin/bash", image_id, "-lc", command]
+        )
+    elif image_id is None:
+        raw, code = sandbox.exec(command)
+        if code != 0:
+            raise RuntimeError(f"Restored payload verification failed: {raw}")
+        raw = raw.strip()
+    else:
+        backend = sandbox._backend
+        raw = (
+            backend._run(
+                [
+                    backend._runtime,
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "/bin/bash",
+                    image_id,
+                    "-lc",
+                    command,
+                ],
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
     elapsed = (time.perf_counter_ns() - started) / 1e9
     match = re.fullmatch(r"PAYLOAD_BYTES=(\d+) PAYLOAD_SHA256=([0-9a-f]+|NONE)", raw)
     if not match:
@@ -430,6 +538,13 @@ def run_one(
     root: Path, key_file: Path, requested_bytes: int, replicate: int, order: int, validation: bool
 ) -> dict:
     import agency
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    validate_checkpoint_comparison(manifest["config"])
+    if executing_source_digest() != manifest["agency_source"]["executing_source_sha256"]:
+        raise RuntimeError("Agency source changed after cohort preparation")
+    if digest(Path(__file__)) != manifest["agency_source"]["executing_runner_sha256"]:
+        raise RuntimeError("Benchmark runner changed after cohort preparation")
 
     label = (
         "validation" if validation else f"order-{order:02d}-bytes-{requested_bytes}-r{replicate}"
@@ -452,6 +567,7 @@ def run_one(
         "start_wall_ns": time.time_ns(),
         "start_perf_ns": time.perf_counter_ns(),
         "creation_image_id": CREATION_IMAGE,
+        "runtime_creation_image_id": cfg.sandbox.base_image,
         "instance_id": INSTANCE_ID,
         "repo": REPOSITORY,
         "repo_commit": REPOSITORY_COMMIT,
@@ -484,32 +600,72 @@ def run_one(
                 if "error" in result_payload:
                     raise RuntimeError(f"Agent returned an error: {result_payload['error']}")
 
-                container_name = learner.sandbox._backend._name
-                container = json.loads(output(["docker", "container", "inspect", container_name]))[
-                    0
-                ]
-                if container["Image"] != CREATION_IMAGE:
-                    raise RuntimeError(
-                        f"Container creation image drifted: {container['Image']} != {CREATION_IMAGE}"
-                    )
+                backend = learner.sandbox._backend
+                container_name = backend._name
+                container = json.loads(
+                    backend._run(
+                        [backend._runtime, "container", "inspect", container_name], check=True
+                    ).stdout
+                )[0]
+                if container["Image"].removeprefix(
+                    "sha256:"
+                ) != cfg.sandbox.base_image.removeprefix("sha256:"):
+                    raise RuntimeError("Container creation image drifted")
                 learner.data_logger.flush()
-                diagnostic_dir = directory / "logs" / "checkpoint-diagnostics"
-                reports = [
-                    path
-                    for path in diagnostic_dir.glob("*.json")
-                    if not path.name.endswith((".reuse.json", ".state.json"))
-                ]
-                if len(reports) != 1:
-                    raise RuntimeError(f"Expected one checkpoint report, got {len(reports)}")
-                report = json.loads(reports[0].read_text())
-                if report.get("base_image_id") != CREATION_IMAGE:
-                    raise RuntimeError("Checkpoint report base image drifted")
-                if not report.get("commit_success") or report.get("errors"):
-                    raise RuntimeError(f"Checkpoint diagnostics failed: {report.get('errors')}")
-                checkpoint_image = report["image_id"]
-                inspect = image_inspect(checkpoint_image)
-                history = image_history(checkpoint_image)
-                verification = verify_checkpoint_payload(checkpoint_image, requested_bytes)
+                history, inspect = [], {}
+                if cfg.sandbox.checkpoint_backend == "cow_zfs":
+                    checkpoint = backend._checkpointer.latest
+                    if checkpoint is None or not backend._checkpointer.hibernated:
+                        raise RuntimeError("Invocation did not produce a hibernated checkpoint")
+                    report = {"checkpoint_id": checkpoint.reference, **checkpoint.stats}
+                    report_path = directory / "cow-zfs-checkpoint.json"
+                    save(report_path, report)
+                    restore_started = time.perf_counter()
+                    learner.sandbox.restore(checkpoint)
+                    data["restore_seconds"] = time.perf_counter() - restore_started
+                    # Restore annotates the same checkpoint stats with whether
+                    # the optional CRIU cache was used and its restore stats.
+                    # Persist the post-restore view for offline analysis.
+                    report = {"checkpoint_id": checkpoint.reference, **checkpoint.stats}
+                    save(report_path, report)
+                    start_started = time.perf_counter()
+                    learner.sandbox._backend._ensure_started()
+                    data["container_start_seconds"] = time.perf_counter() - start_started
+                    verification = verify_checkpoint_payload(
+                        None, requested_bytes, sandbox=learner.sandbox
+                    )
+                    data["checkpoint_seconds"] = report["checkpoint_total_seconds"]
+                else:
+                    diagnostic_dir = directory / "logs" / "checkpoint-diagnostics"
+                    reports = [
+                        path
+                        for path in diagnostic_dir.glob("*.json")
+                        if not path.name.endswith((".reuse.json", ".state.json"))
+                    ]
+                    if len(reports) != 1:
+                        raise RuntimeError(f"Expected one checkpoint report, got {len(reports)}")
+                    report_path = reports[0]
+                    report = json.loads(report_path.read_text())
+                    if report.get("base_image_id", "").removeprefix(
+                        "sha256:"
+                    ) != cfg.sandbox.base_image.removeprefix("sha256:"):
+                        raise RuntimeError("Checkpoint report base image drifted")
+                    if not report.get("commit_success") or report.get("errors"):
+                        raise RuntimeError(f"Checkpoint diagnostics failed: {report.get('errors')}")
+                    checkpoint_image = report["image_id"]
+                    inspect = json.loads(
+                        backend._run(
+                            [backend._runtime, "image", "inspect", checkpoint_image], check=True
+                        ).stdout
+                    )[0]
+                    if backend._runtime == "docker":
+                        history = image_history(checkpoint_image)
+                    verification = verify_checkpoint_payload(
+                        checkpoint_image, requested_bytes, sandbox=learner.sandbox
+                    )
+                    data["checkpoint_seconds"] = report["commit_seconds"]
+                data["checkpoint_backend"] = cfg.sandbox.checkpoint_backend
+                data["sandbox_runtime"] = cfg.sandbox.backend
                 agent_databases = [
                     path
                     for path in (directory / "logs").glob("*_data.sqlite3")
@@ -535,7 +691,7 @@ def run_one(
                     container_name=container_name,
                     container_id=container["Id"],
                     container_creation_image_id=container["Image"],
-                    checkpoint_report_path=str(reports[0].relative_to(root)),
+                    checkpoint_report_path=str(report_path.relative_to(root)),
                     profiler_path=str((directory / "profile").relative_to(root)),
                     checkpoint_image_id=checkpoint_image,
                     checkpoint_image_size_bytes=inspect.get("Size"),
@@ -564,19 +720,38 @@ def run_one(
         data["end_wall_ns"] = time.time_ns()
         data["wall_seconds"] = (data["end_perf_ns"] - data["start_perf_ns"]) / 1e9
         try:
-            save(directory / "records.json", agency.agprof.profile_records())
+            records = agency.agprof.profile_records()
+            save(directory / "records.json", records)
+            if data.get("checkpoint_seconds") is not None:
+                detach = sum(
+                    row[3] / 1e9
+                    for row in records
+                    if len(row) > 3 and row[1] == "checkpoint.ptrace_detach"
+                )
+                data["boundary_ptrace_detach_seconds"] = detach
+                data["checkpoint_including_handoff_seconds"] = data["checkpoint_seconds"] + detach
         except Exception as exc:
             data["records_error"] = f"{type(exc).__name__}: {exc}"
         cleanup_started = time.perf_counter_ns()
         try:
             if learner is not None and learner.sandbox is not None:
+                storage = getattr(learner.sandbox._backend, "_checkpoint_storage", None)
+                if storage is not None and storage.path is not None and storage.path.exists():
+                    native = directory / "native-checkpoint"
+                    native.mkdir(exist_ok=True)
+                    for pattern in (
+                        "graphroot/overlay-containers/*/userdata/*.log",
+                        "graphroot/overlay-containers/*/userdata/checkpoint/*.log",
+                    ):
+                        for log in storage.path.glob(pattern):
+                            (native / log.name).write_bytes(log.read_bytes())
                 learner.sandbox.destroy()
             agency.get_orchestrator().shutdown()
         except Exception as exc:
             data["cleanup_error"] = f"{type(exc).__name__}: {exc}"
             data["status"] = "failed"
         data["cleanup_seconds"] = (time.perf_counter_ns() - cleanup_started) / 1e9
-        if checkpoint_image:
+        if checkpoint_image and cfg.sandbox.backend == "docker":
             data["checkpoint_image_present_after_normal_destroy"] = (
                 subprocess.run(
                     ["docker", "image", "inspect", checkpoint_image],
@@ -598,7 +773,7 @@ def invoke_one(root: Path, key_file: Path, condition: dict, validation: bool = F
     unit = f"agency-checkpoint-size-{label}-{time.time_ns()}"
     command = [
         "systemd-run",
-        "--user",
+        *([] if os.geteuid() == 0 else ["--user"]),
         "--scope",
         "--quiet",
         "--unit",
@@ -627,6 +802,7 @@ def invoke_one(root: Path, key_file: Path, condition: dict, validation: bool = F
 def run_cohort(root: Path, key_file: Path) -> None:
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    validate_checkpoint_comparison(manifest["config"])
     validation_condition = {"requested_bytes": 4096, "replicate": 0, "order": 0}
     validation = invoke_one(root, key_file, validation_condition, validation=True)
     if validation["status"] != "completed":
@@ -652,7 +828,9 @@ def run_cohort(root: Path, key_file: Path) -> None:
     by_size: dict[int, list[float]] = {}
     for path in (root / "runs").glob("*/run.json"):
         row = json.loads(path.read_text())
-        by_size.setdefault(row["requested_bytes"], []).append(row["report_commit_seconds"])
+        by_size.setdefault(row["requested_bytes"], []).append(
+            row.get("checkpoint_seconds", row.get("report_commit_seconds"))
+        )
     triggered = []
     for size, durations in sorted(by_size.items()):
         if len(durations) != 3:
@@ -690,6 +868,12 @@ def main() -> None:
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--root", type=Path, required=True)
     prepare_parser.add_argument("--prior-root", type=Path, required=True)
+    prepare_parser.add_argument(
+        "--checkpoint-backend", choices=("image_commit", "cow_zfs"), default="image_commit"
+    )
+    prepare_parser.add_argument("--runtime", choices=("docker", "podman"), default="docker")
+    prepare_parser.add_argument("--checkpoint-zfs-parent")
+    prepare_parser.add_argument("--checkpoint-fast-resume", action="store_true")
     cohort_parser = subparsers.add_parser("cohort")
     cohort_parser.add_argument("--root", type=Path, required=True)
     cohort_parser.add_argument("--key-file", type=Path, required=True)
@@ -704,7 +888,14 @@ def main() -> None:
     refresh_parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     if args.mode == "prepare":
-        prepare(args.root, args.prior_root)
+        prepare(
+            args.root,
+            args.prior_root,
+            checkpoint_backend=args.checkpoint_backend,
+            runtime=args.runtime,
+            checkpoint_zfs_parent=args.checkpoint_zfs_parent,
+            checkpoint_fast_resume=args.checkpoint_fast_resume,
+        )
     elif args.mode == "cohort":
         run_cohort(args.root, args.key_file)
     elif args.mode == "refresh-protocol":

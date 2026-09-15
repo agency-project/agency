@@ -13,7 +13,7 @@ import uuid
 
 from fastapi import Request
 
-from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -67,7 +67,7 @@ def _session_file_path(session_dir: str, session_id: str) -> str:
     return f"{session_dir}/{session_id}.json"
 
 
-class _NativeBackend(agharness_backend):
+class NativeAdapter(HarnessAdapter):
     def run_daemon_attempt(
         self,
         runtime: AdapterRuntime,
@@ -413,4 +413,4 @@ class _NativeBackend(agharness_backend):
             return
 
 
-__all__ = ["_NativeBackend"]
+__all__ = ["NativeAdapter"]

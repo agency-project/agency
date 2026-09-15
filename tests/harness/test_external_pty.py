@@ -8,9 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.pty_drivers import PtyDriver
-from agency.harness.adapters.pty_session import PtyExecution, restore_session, snapshot_session
+from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+from agency.harness.adapters.opencode import OpencodeDriver
+from agency.harness.adapters.pty.driver import PtyDriver, driver_for
+from agency.harness.adapters.pty.execution import PtyExecution, restore_session, snapshot_session
 
 
 @pytest.fixture
@@ -29,8 +30,8 @@ def runtime():
 
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
 def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, 4
+    driver = driver_for(
+        HarnessAdapter.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     assert driver.argv[0] == name
     assert not set(driver.argv) & {"exec", "run", "--json", "--format", "--prompt-file"}
@@ -65,8 +66,8 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
 
 def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
     runtime = replace(runtime, has_sandbox_mcp_tools=True)
-    PtyDriver(
-        agharness_backend.for_config("codex", runtime.agconfig),
+    driver_for(
+        HarnessAdapter.for_config("codex", runtime.agconfig),
         runtime,
         tmp_path,
         None,
@@ -82,13 +83,13 @@ def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
     }
 
 
-class FakeDriver:
+class FakeDriver(PtyDriver):
+    """Subclasses the real contract so new driver hooks reach this double too."""
+
     name = "fake"
     cwd = "/workspace"
     argv = ["interactive-cli"]
     env = {"TERM": "xterm-256color"}
-    interrupt_key = b"\x1b"
-    confirm_interrupt = False
     session_id = "native-session"
 
     def __init__(self, root):
@@ -115,8 +116,8 @@ class FakeDriver:
 
 
 def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
+    driver = driver_for(
+        HarnessAdapter.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     driver.transcript_path = tmp_path / "transcript.jsonl"
     driver.transcript_path.write_text(
@@ -137,8 +138,8 @@ def test_codex_transcript_error_keeps_original_turn(runtime, tmp_path):
 
 
 def test_codex_accepts_empty_completion_after_mcp_submission(runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
+    driver = driver_for(
+        HarnessAdapter.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, 4
     )
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
@@ -175,6 +176,7 @@ def execution(runtime, tmp_path):
     execution.START_TIMEOUT = 0.05
     execution.ATTEMPT_TIMEOUT = 0.1
     handle = Mock(returncode=None)
+    handle.terminal_screen.return_value = ([""], 0, 0, 0)
     handle.is_paused.return_value = False
     execution.handle = handle
     execution._active = True
@@ -210,6 +212,24 @@ def test_delayed_stop_and_wrong_prompt_do_not_acknowledge_current_turn(execution
     execution._poll()
     assert execution._turn_id is None
     assert execution._stop is None
+
+
+def test_startup_failure_is_reported_before_any_turn_exists(execution):
+    execution._turn_id = None
+    execution._turn_started = False
+    execution.driver.pending = [{"kind": "error", "turn_id": None, "error": "bad credential"}]
+    execution._poll()
+    assert execution._failure == "bad credential"
+
+
+def test_turnless_error_cannot_fail_a_replacement_turn(execution):
+    # A delayed error from a retired turn must not kill the redirect that
+    # replaced it, which is still waiting to learn its own turn identity.
+    execution._turn_id = None
+    execution._turn_started = True
+    execution.driver.pending = [{"kind": "error", "turn_id": None, "error": "stale failure"}]
+    execution._poll()
+    assert execution._failure is None
 
 
 def test_redirect_interrupts_then_requires_exact_native_ack(execution):
@@ -405,8 +425,8 @@ def test_restore_rejects_symlinked_parent(tmp_path):
 def test_sqlite_snapshot_includes_wal_without_mutating_live_database(runtime, tmp_path):
     import sqlite3
 
-    driver = PtyDriver(
-        agharness_backend.for_config("opencode", runtime.agconfig),
+    driver = driver_for(
+        HarnessAdapter.for_config("opencode", runtime.agconfig),
         runtime,
         tmp_path,
         None,
@@ -464,8 +484,8 @@ def test_terminal_confirmation_is_required_before_second_escape(execution):
 
 @pytest.mark.parametrize("name", ["codex", "grok"])
 def test_driver_fences_native_turns_and_rejects_child_events(name, runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
+    driver = driver_for(
+        HarnessAdapter.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
     )
     if name == "codex":
         payload = {
@@ -493,8 +513,8 @@ def test_driver_fences_native_turns_and_rejects_child_events(name, runtime, tmp_
 def test_driver_requires_matching_complete_native_record_and_ignores_partial_tail(
     name, runtime, tmp_path
 ):
-    driver = PtyDriver(
-        agharness_backend.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
+    driver = driver_for(
+        HarnessAdapter.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, None
     )
     path = tmp_path / "transcript.jsonl"
     driver.transcript_path = path
@@ -513,8 +533,8 @@ def test_driver_requires_matching_complete_native_record_and_ignores_partial_tai
 
 
 def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver.transcript_path = tmp_path / "transcript.jsonl"
     text = "long answer " * 2000
@@ -547,7 +567,7 @@ def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(r
 
 def test_stream_cancellation_closes_upstream_generator():
     import asyncio
-    from agency.harness.adapters.pty_session import stream_response
+    from agency.harness.adapters.pty.execution import stream_response
 
     closed = []
 
@@ -574,7 +594,7 @@ def test_stream_cancellation_closes_upstream_generator():
 
 
 def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch):
-    from agency.harness.adapters import pty_session
+    from agency.harness.adapters.pty import execution as pty_execution
 
     clock = SimpleNamespace(now=0.0)
 
@@ -582,7 +602,7 @@ def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch
         clock.now += seconds
 
     monkeypatch.setattr(
-        pty_session, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+        pty_execution, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
     )
     execution.handle.is_paused.side_effect = lambda: clock.now < 0.2
     execution._wait_until(lambda: clock.now >= 0.225, "resumed acknowledgment")
@@ -590,8 +610,8 @@ def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch
 
 
 def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "[Agency run test]\nprevious prompt"
     driver._last_turn_id = "turn"
@@ -607,9 +627,25 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
     handle.write_terminal.assert_not_called()
 
 
+@pytest.mark.parametrize("placeholder", ["┃  Ask anything...", "┃  Ask anything…"])
+def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
+    driver = OpencodeDriver.__new__(OpencodeDriver)
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            ["", placeholder + ' "Fix broken tests"', "┃  Build auto · model Agency Proxy"],
+            0,
+            1,
+            1,
+        )
+    )
+
+    assert driver.ready(handle)
+
+
 @pytest.mark.parametrize("suffix", ["\n", " \n"])
 def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
     execution.driver.name = "opencode"
+    execution.driver.prompt_matches = OpencodeDriver.prompt_matches.__get__(execution.driver)
     execution._expected_prompt = "[Agency run test]\ncurrent instruction"
     execution._turn_id = None
     execution.driver.pending = [
@@ -624,8 +660,8 @@ def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
 
 
 def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
-    driver = PtyDriver(
-        agharness_backend.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "\n".join(["[Agency run test]"] + ["previous line"] * 10)
     driver._last_turn_id = "turn"
@@ -641,6 +677,59 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
     handle.write_terminal.assert_called_once_with(b"\x03")
 
 
+def test_cow_success_closes_pty_at_invocation_boundary(runtime, tmp_path, monkeypatch):
+    runtime.agconfig.sandbox.checkpoint_backend = "cow_zfs"
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    handle = Mock(returncode=None)
+    handle.terminal_screen.return_value = ([""], 0, 0, 0)
+    handle.is_paused.return_value = False
+    launch = Mock(return_value=handle)
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+
+    def write(data):
+        if data == b"\r":
+            execution.driver.pending += [
+                {"kind": "submit", "turn_id": "turn", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "turn", "text": "done"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    assert execution.run("first").ok
+    assert not tmp_path.exists()
+    handle.close.assert_called_once()
+    launch.assert_called_once()
+
+
+def test_codex_reports_failed_task_complete_without_waiting_for_stop_hook(runtime, tmp_path):
+    driver = driver_for(
+        HarnessAdapter.for_config("codex", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    path = tmp_path / "transcript.jsonl"
+    driver.transcript_path = path
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "failed-turn",
+                    "last_agent_message": None,
+                    "error": {"message": "model configuration rejected"},
+                },
+            }
+        )
+        + "\n"
+    )
+    events = driver.events()
+    assert events == [
+        {
+            "kind": "error",
+            "turn_id": "failed-turn",
+            "error": "Codex terminal error: {'message': 'model configuration rejected'}",
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # run_pty_attempt's profiler-status bridge timeout
 # ---------------------------------------------------------------------------
@@ -654,6 +743,41 @@ def test_profiler_bridge_timeout_is_not_too_tight_for_container_startup():
     await_cli phase span for the whole attempt would silently become a
     no-op. Guarded directly since the failure mode has no visible symptom
     to catch it with otherwise."""
-    from agency.harness.adapters.pty_drivers import _PROFILER_BRIDGE_TIMEOUT_S
+    from agency.harness.adapters.pty.driver import _PROFILER_BRIDGE_TIMEOUT_S
 
     assert _PROFILER_BRIDGE_TIMEOUT_S >= 5.0
+
+
+def test_retained_unified_pty_prepares_once_and_reuses_handle(runtime, tmp_path, monkeypatch):
+    driver = FakeDriver(tmp_path)
+    driver.prepare_launch = Mock()
+    execution = PtyExecution(driver, runtime)
+    handle = Mock(returncode=None)
+    handle.terminal_screen.return_value = ([""], 0, 0, 0)
+    handle.is_paused.return_value = False
+    launch = Mock(return_value=handle)
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+
+    def write(data):
+        if data == b"\r":
+            driver.pending += [
+                {"kind": "submit", "turn_id": "turn", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "turn", "text": "done"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    try:
+        assert execution.run("first", keep_alive=True).ok
+        execution.prepare_fast_checkpoint()
+        execution.seize_fast_restore()
+        execution.complete_fast_restore()
+        assert execution.run("second", keep_alive=True).ok
+        driver.prepare_launch.assert_called_once()
+        launch.assert_called_once()
+        handle.close.assert_not_called()
+        handle.checkpoint_detach.assert_called_once()
+        handle.checkpoint_seize_frozen.assert_called_once()
+        handle.checkpoint_reattach.assert_called_once()
+    finally:
+        execution.close()
+    handle.close.assert_called_once()

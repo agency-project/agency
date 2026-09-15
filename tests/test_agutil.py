@@ -10,6 +10,31 @@ import pytest
 from agency.utils.agutil import _strip_thinking, _extract_thinking, sigterm_as_exit
 
 
+def test_pinned_harness_python_fails_before_any_install(monkeypatch):
+    from agency.utils import agutil
+
+    commands = []
+
+    class Sandbox:
+        def exec(self, command, **_kwargs):
+            commands.append(command)
+            return "missing", 1
+
+    monkeypatch.setattr(
+        agutil,
+        "_container_can_reach_pypi",
+        lambda *_args: pytest.fail("Network probe must not run for pinned runtime"),
+    )
+    with pytest.raises(RuntimeError, match="refusing package installation"):
+        agutil.ensure_python_packages_in_container(
+            Sandbox(),
+            ["cloudpickle"],
+            python_executable="/opt/e1a1-venv/bin/python",
+            install_missing=False,
+        )
+    assert commands == ['/opt/e1a1-venv/bin/python -c "import cloudpickle"']
+
+
 def test_strip_thinking_removes_think_tag():
     assert _strip_thinking("<think>reasoning</think>answer") == "answer"
 
@@ -159,6 +184,7 @@ def test_gateway_dir_ignores_tmpdir(tmp_path, monkeypatch):
     deleted by scratch-space cleanup policies -- survivable for a temp file,
     fatal for a live socket."""
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("AGENCY_TMP_ROOT", raising=False)
     monkeypatch.setattr(_agutil, "_gateway_dir", None)
     monkeypatch.setattr(_agutil, "_run_dir", None)
     monkeypatch.setattr(_agutil, "_run_dir_reap_done", True)
