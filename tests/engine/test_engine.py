@@ -583,6 +583,19 @@ def test_execute_defers_stop_while_background_work_is_pending(monkeypatch):
     ]
 
 
+def test_cow_checkpoint_stops_background_work_before_snapshot(monkeypatch):
+    agent = _FakeAgent()
+    agent.agconfig.sandbox.checkpoint_backend = "cow_zfs"
+    agent.sandbox.background_work_pending = True
+    agent.sandbox._backend = SimpleNamespace(
+        _ensure_started=lambda: agent.sandbox.events.append("restore")
+    )
+    engine = AgentEngine(agent)
+    monkeypatch.setattr(engine, "_execute_harness", lambda *_args, **_kwargs: agdata(done=True))
+    engine.execute(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), None, agent.sandbox)
+    assert agent.sandbox.events == ["acquire", "commit", "stop", "release"]
+
+
 def test_execute_control_wins_after_harness_and_before_commit(monkeypatch):
     agent = _FakeAgent()
     engine = AgentEngine(agent)

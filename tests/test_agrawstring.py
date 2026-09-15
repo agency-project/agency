@@ -104,11 +104,11 @@ def test_build_user_content_normal_input_still_json():
 # test_raw_output_with_raw_input / test_raw_output_preserves_newlines_and_quotes
 # (and their _make_chunk()/_make_mock_agent()/_run_skill_with_mock_response()
 # helpers) were retired here: they exercised execute_react()'s raw-text
-# output path via the full loop. Native's `_NativeBackend.execute()` shares
+# output path via the full loop. Native's `NativeAdapter.execute()` shares
 # the identical raw_key()-passthrough logic (`agdata(**{out_key: final_text})`)
 # one level above the entrypoint's own react loop -- fast, no-Docker
 # coverage of the entrypoint's own final_text plumbing (which this logic
-# wraps) lives in tests/harness/agharness_backends/
+# wraps) lives in tests/harness/adapters/
 # test_native_loop_fast.py; the agdata-wrapping step itself is Docker-only
 # coverage today (test_native.py's TestNativeBackendRealEndToEnd), same
 # tier gap noted for the return_output-family tests elsewhere in this

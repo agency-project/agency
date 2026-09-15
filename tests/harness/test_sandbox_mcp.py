@@ -36,7 +36,7 @@ from agency.native_harness.mcp_client import _decode_tool_result
 from agency.observability.agdatalogger import agDataLogger
 
 
-def _serve_manager(directory, ready, release, stop):
+def _serve_manager(directory, ready, release, stop, live_session):
     def attempt(request):
         ready.put(request.attempt_token)
         if not release.wait(20):
@@ -45,11 +45,14 @@ def _serve_manager(directory, ready, release, stop):
             raise RuntimeError("adapter failed")
         return HarnessAttemptResult(ok=request.prompt.user_content != "fail", final_text="done")
 
+    config = agconfig()
+    config.sandbox.checkpoint_fast_resume = live_session
     manager = HarnessManager(
         f"{directory}/sandbox.sock",
         f"{directory}/host.sock",
         "sandbox-mcp-test",
         "native",
+        agconfig=config,
         attempt_handler=attempt,
         harness_api_port=0,
     )
@@ -61,8 +64,8 @@ def _serve_manager(directory, ready, release, stop):
         manager.stop()
 
 
-@pytest.fixture
-def sandbox_manager():
+@pytest.fixture(params=[False, True], ids=["fresh", "retained"])
+def sandbox_manager(request):
     ctx = multiprocessing.get_context("spawn")
     ready, release, stop = ctx.Queue(), ctx.Event(), ctx.Event()
     host_calls = []
@@ -80,6 +83,7 @@ def sandbox_manager():
             hostserverconfig(uds_path=f"{directory}/host.sock"),
             dataloggerconfig(db_path=f"{directory}/agent.db"),
         )
+        config.sandbox.checkpoint_fast_resume = request.param
         agent = SimpleNamespace(
             agname="agent-1",
             agconfig=config,
@@ -89,7 +93,9 @@ def sandbox_manager():
         )
         skill = agskill("host", "test", add_host_mcp_tools=[agtool("host_probe", "", host_tool)])
         host = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())
-        process = ctx.Process(target=_serve_manager, args=(directory, ready, release, stop))
+        process = ctx.Process(
+            target=_serve_manager, args=(directory, ready, release, stop, request.param)
+        )
         client = HarnessInteractionClient(f"{directory}/sandbox.sock", timeout_s=25)
         engine = AgentEngine(agent)
         engine._host_server_manager = host

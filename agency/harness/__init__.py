@@ -1,5 +1,5 @@
 """Implementation details behind agency's `agharness` engine seam --
-`agproxy_ptrace` (the syscall-level supervisor) and `agharness_backends/`
+`agproxy_ptrace` (the syscall-level supervisor) and `adapters/`
 (one concrete off-the-shelf harness CLI per file). The per-agent
 host/harness-side managers each backend actually dispatches through live
 in `agency/manager/` (`agmanager_host`/`agmanager_harness`), not here.

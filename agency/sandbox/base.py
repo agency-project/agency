@@ -158,6 +158,19 @@ class agsandbox_backend(AgSandboxBackendFields):
 
     def _validate_config(self, agconfig: "agconfig_cls") -> None:
         backend = agconfig.sandbox.backend
+        checkpoint = agconfig.sandbox.checkpoint_backend
+        if checkpoint not in {"image_commit", "cow_zfs"}:
+            raise ValueError(f"Unknown checkpoint_backend {checkpoint!r}")
+        if checkpoint == "cow_zfs" and not agconfig.sandbox.checkpoint_zfs_parent:
+            raise ValueError(
+                "cow_zfs requires sandbox.checkpoint_zfs_parent (an existing ZFS dataset)"
+            )
+        if agconfig.sandbox.checkpoint_fast_resume and checkpoint != "cow_zfs":
+            raise ValueError("checkpoint_fast_resume requires checkpoint_backend='cow_zfs'")
+        if backend == "chroot" and (
+            checkpoint != "image_commit" or agconfig.sandbox.checkpoint_zfs_parent
+        ):
+            raise ValueError("ZFS checkpoints require a Docker or Podman sandbox runtime")
         required = self._REQUIRED_FIELDS_BY_BACKEND.get(backend, ())
         missing = [name for name in required if not getattr(agconfig.sandbox, name)]
         if missing:
@@ -342,6 +355,8 @@ class agsandbox_backend(AgSandboxBackendFields):
         """Run a user command inside the container."""
         # Lazily acquire the requested physical GPU(s) now that we have a
         # bash call to run. Blocks until enough GPUs in the pool are free.
+        if self._gpu_count_requested > 0 and not self._agconfig.sandbox.gpu_passthrough:
+            raise RuntimeError("GPU reservation is forbidden by this sandbox's CPU-only policy")
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
 

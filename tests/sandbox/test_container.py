@@ -1260,6 +1260,55 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
             f"called before container creation: {run_cmd}"
         )
 
+    def test_cpu_only_docker_run_omits_gpu_flags_on_a_gpu_host(self):
+        from agency.configs.agconfig import agconfig
+        from agency.sandbox.docker import _DockerBackend
+
+        cfg = agconfig()
+        cfg.sandbox.gpu_passthrough = False
+        sb = _DockerBackend(
+            "agent",
+            name="docker-cpu-only-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=cfg,
+        )
+        with patch.object(_container, "_gpu_flags", return_value=["--gpus", "all"]) as gf:
+            with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
+                with patch.object(sb, "_acquire_runtime_slot"):
+                    with patch.object(sb, "_resolve_image", return_value="img"):
+                        with patch.object(sb, "_cfs_supported", return_value=False):
+                            with patch.object(sb, "_run_with_conflict_retry") as run_retry:
+                                with patch.object(sb, "_run"):
+                                    with patch.object(
+                                        sb, "_snapshot_pids_started", return_value=set()
+                                    ):
+                                        sb._ensure_started()
+
+        gf.assert_not_called()
+        run_cmd = run_retry.call_args.args[0]
+        assert "--gpus" not in run_cmd
+        assert "--device" not in run_cmd
+
+    def test_cpu_only_docker_rejects_gpu_reservation(self):
+        from agency.configs.agconfig import agconfig
+        from agency.sandbox.docker import _DockerBackend
+
+        cfg = agconfig()
+        cfg.sandbox.gpu_passthrough = False
+        sb = _DockerBackend(
+            "agent",
+            name="docker-cpu-only-gpu-request-test",
+            checkpoint_image=None,
+            base_image="img",
+            mounts={},
+            agconfig=cfg,
+        )
+        sb._gpu_count_requested = 1
+        with pytest.raises(RuntimeError, match="CPU-only policy"):
+            sb._ensure_started()
+
     def test_docker_run_uses_profiler_cgroup_parent(self):
         from agency.sandbox.docker import _DockerBackend
 

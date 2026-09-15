@@ -1552,7 +1552,7 @@ class TestAgSandboxExec:
 
 # ---------------------------------------------------------------------------
 # agSandbox — exec_detached (Phase 3 foundation: launching a persistent
-# in-container process, e.g. agharness_backends/native.py's react-loop
+# in-container process, e.g. adapters/native.py's react-loop
 # entrypoint or a container-relocated agproxy_llm)
 # ---------------------------------------------------------------------------
 

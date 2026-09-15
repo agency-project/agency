@@ -1,5 +1,5 @@
 """Tests for agharness.py -- the thin, engine-agnostic glue shared by every
-agharness_backends/* concrete backend."""
+adapters/* concrete backend."""
 
 from __future__ import annotations
 
