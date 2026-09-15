@@ -148,7 +148,6 @@ class PtyExecution:
         self._cleanup_callbacks = tuple(cleanup_callbacks)
         self._closed = False
         self._launched = False
-        self._last_activity_generation = None
         self.INPUT_TIMEOUT = driver.INPUT_TIMEOUT
         self.START_TIMEOUT = driver.START_TIMEOUT
         self.ATTEMPT_TIMEOUT = driver.ATTEMPT_TIMEOUT
@@ -161,7 +160,9 @@ class PtyExecution:
             raise ValueError("native prompt contains terminal control characters")
 
     def _poll(self):
-        for event in self.driver.events():
+        """Returns True if the harness showed any sign of life this cycle."""
+        events = list(self.driver.events())
+        for event in events:
             if event.get("kind") == "submit" and self.driver.prompt_matches(
                 event.get("prompt"), self._expected_prompt
             ):
@@ -186,6 +187,7 @@ class PtyExecution:
                 self._interrupted = True
             elif event["kind"] == "error":
                 self._failure = event.get("error", "native turn failed")
+        return bool(events)
 
     def _check_alive(self):
         if self._failure:
@@ -337,6 +339,7 @@ class PtyExecution:
             with self._lock:
                 self._active = True
             last_poll = time.monotonic()
+            last_generation = self.handle.terminal_screen()[3]
             # Explicit envelope, not a claim of idle CPU: the CLI may be
             # working while this controller awaits its terminal event.
             with phase("harness:await_cli"):
@@ -345,15 +348,13 @@ class PtyExecution:
                         now = time.monotonic()
                         if self.handle.is_paused():
                             self._deadline += now - last_poll
-                        elif self.driver.activity_extends_deadline:
-                            # Terminal output is the only progress signal some
-                            # CLIs emit during a long tool call.
-                            generation = self.handle.terminal_screen()[3]
-                            if generation != self._last_activity_generation:
-                                self._last_activity_generation = generation
-                                self._deadline = now + self.ATTEMPT_TIMEOUT
                         last_poll = now
-                        self._poll()
+                        had_events = self._poll()
+                        generation = self.handle.terminal_screen()[3]
+                        screen_changed = generation != last_generation
+                        last_generation = generation
+                        if had_events or screen_changed:
+                            self._deadline = now + self.ATTEMPT_TIMEOUT
                         self._check_alive()
                         if self._stop is not None and self.driver.completed(self._stop):
                             self._active = False
