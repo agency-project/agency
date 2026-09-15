@@ -122,6 +122,10 @@ base-image import happen in `checkpoint.setup`, outside checkpoint latency.
 
 ## Configuration
 
+To provision a new supported Ubuntu host, use the explicit
+[`agency setup-host` command](setup-host.md). The configuration below remains
+available for separately managed storage.
+
 ```python
 cfg.sandbox.backend = "podman"  # or "docker" with a ZFS-backed daemon
 cfg.sandbox.checkpoint_backend = "cow_zfs"

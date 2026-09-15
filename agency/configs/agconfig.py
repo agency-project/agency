@@ -349,6 +349,10 @@ class agconfig:
     def __init__(self, *namespaces: Any) -> None:
         self.llm = llmconfig()
         self.sandbox = sandboxconfig()
+        # Only the explicit `agency run` launcher selects host defaults.
+        from agency.host.profile import apply_selected_profile
+
+        apply_selected_profile(self.sandbox)
         self.orchestrator = orchestratorconfig()
         self.resources = resourcesconfig()
         self.agent = agentconfig()

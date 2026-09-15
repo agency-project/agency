@@ -28,6 +28,10 @@ pre-commit install   # one-time; runs ruff (lint + format) and hygiene checks on
 
 The sandbox image installs `torch torchvision transformers datasets accelerate numpy scipy matplotlib`. The build script selects the NVIDIA, AMD, or CPU path automatically and runs an inline PyTorch smoke check.
 
+For optional ZFS checkpoints and CRIU resume on a rootful Ubuntu host, see the
+[one-time host setup command](docs/setup-host.md). Ordinary installation keeps
+the existing image-commit defaults.
+
 ## Quick start
 
 Supply LLM backends to agents by building an `agconfig` object and passing it to the agents:
