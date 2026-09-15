@@ -33,11 +33,19 @@ from agency.configs.agconfig import (
 
 DEFAULT_HARNESS = "codex"
 DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_WAIT_TIMEOUT_SECONDS = 300
 
 # Profiling gets its own explicit lesson. Keeping process-lifetime profiling
 # off everywhere else makes the tutorial suite faster and its artifacts easier
 # to understand.
 os.environ.setdefault("AGENCY_PROFILE", "0")
+
+
+def example_wait_timeout() -> float:
+    """Return the per-result wait bound, allowing slower backends to opt up."""
+    return float(
+        os.environ.get("AGENCY_EXAMPLE_WAIT_TIMEOUT_SECONDS", DEFAULT_WAIT_TIMEOUT_SECONDS)
+    )
 
 
 def tutorial_config(

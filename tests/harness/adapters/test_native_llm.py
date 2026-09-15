@@ -1,4 +1,4 @@
-"""Tests for _NativeBackend's LLM wire-format translation -- plain OpenAI
+"""Tests for NativeAdapter's LLM wire-format translation -- plain OpenAI
 chat-completions <-> agency format, both directions, both streaming and
 non-streaming."""
 
@@ -7,11 +7,11 @@ from __future__ import annotations
 import json
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.native import _NativeBackend
+from agency.harness.adapters.native import NativeAdapter
 
 
-def _backend() -> _NativeBackend:
-    return _NativeBackend(agconfig())
+def _backend() -> NativeAdapter:
+    return NativeAdapter(agconfig())
 
 
 def test_harness_to_agency_plain_messages():

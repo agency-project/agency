@@ -13,6 +13,8 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+_anthropic_timeout_type = _anthropic_sdk.Timeout if _anthropic_sdk is not None else None
+
 
 def _anthropic_sdk_timeout(timeout: httpx.Timeout):
     """The installed anthropic SDK validates its `timeout` kwarg against its
@@ -23,9 +25,9 @@ def _anthropic_sdk_timeout(timeout: httpx.Timeout):
     whichever one this installed version actually needs (confirmed via
     identity check against both), so construct through it directly instead
     of guessing which package is installed."""
-    if _anthropic_sdk is None:
+    if _anthropic_sdk is None or _anthropic_timeout_type is None:
         return timeout
-    return _anthropic_sdk.Timeout(
+    return _anthropic_timeout_type(
         connect=timeout.connect, read=timeout.read, write=timeout.write, pool=timeout.pool
     )
 

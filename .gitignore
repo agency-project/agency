@@ -7,6 +7,7 @@ __pycache__/
 agency_runs/
 AGENT_INSTRUCTIONS/
 artifacts/
+benchmarks/checkpoint_size_microbenchmark/results
 
 # Generated embedded Perfetto build
 agency/observability/agwebui/static/perfetto/

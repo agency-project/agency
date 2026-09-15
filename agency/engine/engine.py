@@ -140,11 +140,17 @@ class AgentEngine:
                     return output
                 if not claim_completion():
                     return self._controlled_error()
+                cow_zfs = (
+                    getattr(sandbox, "agconfig", self.agconfig).sandbox.checkpoint_backend
+                    == "cow_zfs"
+                )
                 with agprof.span("teardown:commit"):
                     try:
                         sandbox.commit()
                     finally:
-                        pending = sandbox._has_pending_background_work()
+                        # A COW checkpoint intentionally ends process state at
+                        # the completed-run boundary, including background jobs.
+                        pending = False if cow_zfs else sandbox._has_pending_background_work()
                         diagnostic = None
                         if getattr(self.agconfig.sandbox, "hibernation_diagnostics", False):
                             from ..sandbox.pid_diagnostics import decision_snapshot
@@ -251,7 +257,7 @@ class AgentEngine:
             engine_name = str(
                 getattr(self._agent, "agname", getattr(self._agent, "harness", "agent"))
             )
-            with agprof.span("sandbox:ensure_daemon"):
+            with agprof.span("sandbox:ensure_daemon"), agprof.span("runtime.harness_start"):
                 handle = ensure_harness_daemon(
                     sandbox,
                     host_uds_path,

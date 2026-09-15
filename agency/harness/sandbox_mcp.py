@@ -10,17 +10,17 @@ from typing import Annotated, Any, Callable
 import cloudpickle
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import WithJsonSchema
-from mcp.server.transport_security import TransportSecuritySettings
 
 from ..agdata import agdata
 from ..agtool import agtool
+from .mcp_transport import build_http_app
 
 
 class SandboxMcpSetupError(RuntimeError):
     """Setup diagnostics safe to return across the attempt RPC."""
 
 
-def build_app(payload: str, is_active: Callable[[], bool]):
+def build_app(payload: str, is_active: Callable[[], bool], *, live_session=False):
     try:
         tools = cloudpickle.loads(base64.b64decode(payload, validate=True))
         if (
@@ -49,9 +49,7 @@ def build_app(payload: str, is_active: Callable[[], bool]):
                 f"sandbox MCP setup failed registering tool {tool.name!r} ({type(exc).__name__})"
             ) from None
 
-    return server.streamable_http_app(
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    )
+    return build_http_app(server, live_session=live_session)
 
 
 def _register_tool(server, tool, persistent_vars, persistent_lock, is_active) -> None:

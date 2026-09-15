@@ -14,10 +14,10 @@ config, is a real second implementation of Component 3 mediation, which is
 out of scope for what this phase calls a "reduced-coverage fallback."
 
 **Lives at the `harness` top level, not inside
-`agharness_backends/`**: `agprof_ingest.py`/`agmanager_host/profiler_ingest.py` (both
+`adapters/`**: `agprof_ingest.py`/`agmanager_host/profiler_ingest.py` (both
 top-level-ish "service" modules) need to import this for hook-payload
-parsing, while every concrete backend in `agharness_backends/` imports
-`agprof_ingest.py`. Nesting this module inside `agharness_backends/` made
+parsing, while every concrete backend in `adapters/` imports
+`agprof_ingest.py`. Nesting this module inside `adapters/` made
 that a real circular dependency between the two layers (a service module
 reaching down into the backends package, while the backends package reaches
 back up into the service module) -- not a hard `ImportError` (every import

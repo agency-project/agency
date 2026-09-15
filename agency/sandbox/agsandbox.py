@@ -148,7 +148,7 @@ class agSandbox:
             mounts[name] = mount
         # Same rationale again, for the `agency` package itself (see
         # agutil.agency_package_dir's docstring) -- needed by a persistent
-        # in-container entrypoint (agharness_backends/native.py's
+        # in-container entrypoint (adapters/native.py's
         # react-loop process, or a container-relocated agproxy_llm) to
         # `import agency` and run the EXACT same code as the host process,
         # not a second copy baked into the sandbox's base image. Read-only,
@@ -190,6 +190,8 @@ class agSandbox:
 
     @_gpu_count_requested.setter
     def _gpu_count_requested(self, value: int) -> None:
+        if value > 0 and not self.agconfig.sandbox.gpu_passthrough:
+            raise RuntimeError("GPU reservation is forbidden by this sandbox's CPU-only policy")
         self._backend._gpu_count_requested = value
 
     @property
@@ -268,6 +270,13 @@ class agSandbox:
 
     @property
     def _checkpoint_image(self) -> "str | None":
+        if self.agconfig.sandbox.checkpoint_backend == "cow_zfs":
+            from .checkpoint import CheckpointCapabilityError
+
+            raise CheckpointCapabilityError(
+                "Private ZFS checkpoints cannot be saved/exported as portable agent images; "
+                "use the same sandbox's CheckpointHandle"
+            )
         return self._backend._checkpoint_image
 
     @_checkpoint_image.setter
@@ -286,8 +295,9 @@ class agSandbox:
         """Replace this sandbox's agconfig with a clone of the given one.
         Only affects fields read live going forward -- image/mounts were
         resolved once at construction."""
-        self.agconfig = agconfig.clone() if agconfig is not None else agconfig_cls()
-        self._backend.change_config(self.agconfig)
+        updated = agconfig.clone() if agconfig is not None else agconfig_cls()
+        self._backend.change_config(updated)
+        self.agconfig = updated
 
     def get_config_copy(self) -> "agconfig_cls":
         """Return a clone of this sandbox's agconfig."""
@@ -351,6 +361,15 @@ class agSandbox:
             with agprof.span("sandbox:commit"):
                 return self._backend.commit(*args, **kwargs)
 
+    def checkpoint(self):
+        """Capture a container checkpoint at an idle boundary and return its handle."""
+        with self._lock:
+            return self._backend.checkpoint()
+
+    def delete_checkpoint(self, checkpoint) -> None:
+        with self._lock:
+            self._backend.delete_checkpoint(checkpoint)
+
     def stop(self, *args, **kwargs) -> None:
         with self._lock:
             with agprof.span("sandbox:stop"):
@@ -407,6 +426,10 @@ class agSandbox:
         auto-deduplicated). Without *agconfig*, inherits this sandbox's
         own config unchanged. Caller must destroy() the result."""
         with self._lock, agprof.span("sandbox:fork"):
+            if self.agconfig.sandbox.checkpoint_backend == "cow_zfs":
+                raise ValueError(
+                    "Private ZFS checkpoints currently support same-sandbox restore only"
+                )
             cfg = agconfig if agconfig is not None else self.agconfig
             fork_sb = agSandbox(new_name, agconfig=cfg)
             checkpoint_image = self._backend._checkpoint_image

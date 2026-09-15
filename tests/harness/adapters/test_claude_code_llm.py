@@ -1,4 +1,4 @@
-"""Tests for _ClaudeCodeBackend's LLM wire-format translation -- Anthropic
+"""Tests for ClaudeCodeAdapter's LLM wire-format translation -- Anthropic
 Messages API <-> agency format, both directions, both streaming and
 non-streaming."""
 
@@ -7,11 +7,11 @@ from __future__ import annotations
 import json
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.claude_code import _ClaudeCodeBackend
+from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 
 
-def _backend() -> _ClaudeCodeBackend:
-    return _ClaudeCodeBackend(agconfig())
+def _backend() -> ClaudeCodeAdapter:
+    return ClaudeCodeAdapter(agconfig())
 
 
 def _text_block(text, index=0):

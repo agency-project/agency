@@ -11,11 +11,10 @@ import base64
 import json
 import threading
 import time
-import uuid
 from contextlib import nullcontext
 from pathlib import PurePosixPath
 
-from .agharness_backend import AttemptResult
+from ..base import AttemptResult
 
 
 MAX_SESSION_BYTES = 64 * 1024 * 1024
@@ -64,6 +63,20 @@ def session_file_allowed(harness, path):
     if path.is_absolute() or ".." in path.parts or not path.parts:
         return False
     if harness in {"codex", "grok"}:
+        return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
+    if harness == "kimi":
+        # Kimi 0.42.0 loses the restored model binding if its trust prompt is
+        # accepted after resume. Carry forward the decision Agency already
+        # approved on the first attempt so later attempts skip that prompt.
+        if (
+            len(path.parts) == 2
+            and path.parts[0] == "workspace-trust"
+            and path.name.startswith("wd_")
+        ):
+            return True
+        # The index names each session directory; both are needed to resume.
+        if str(path) == "session_index.jsonl":
+            return True
         return path.parts[0] == "sessions" and path.suffix in {".jsonl", ".json"}
     return harness == "opencode" and str(path) == "data/opencode/opencode.db"
 
@@ -118,7 +131,7 @@ class PtyExecution:
     START_TIMEOUT = 45.0
     ATTEMPT_TIMEOUT = 600.0
 
-    def __init__(self, driver, runtime):
+    def __init__(self, driver, runtime, *, cleanup_callbacks=()):
         self.driver = driver
         self.runtime = runtime
         self.handle = None
@@ -126,10 +139,18 @@ class PtyExecution:
         self._active = False
         self._expected_prompt = None
         self._turn_id = None
+        self._turn_started = False
+        self._acknowledged = False
         self._stop = None
         self._interrupted = False
         self._failure = None
         self._deadline = 0
+        self._cleanup_callbacks = tuple(cleanup_callbacks)
+        self._closed = False
+        self._launched = False
+        self.INPUT_TIMEOUT = driver.INPUT_TIMEOUT
+        self.START_TIMEOUT = driver.START_TIMEOUT
+        self.ATTEMPT_TIMEOUT = driver.ATTEMPT_TIMEOUT
 
     @staticmethod
     def validate_prompt(prompt):
@@ -142,14 +163,23 @@ class PtyExecution:
         """Returns True if the harness showed any sign of life this cycle."""
         events = list(self.driver.events())
         for event in events:
-            prompt, expected = event.get("prompt"), self._expected_prompt
-            if self.driver.name == "opencode" and isinstance(prompt, str) and expected is not None:
-                # OpenCode can append a newline when persisting bracketed paste.
-                prompt, expected = prompt.rstrip(), expected.rstrip()
-            if event.get("kind") == "submit" and prompt == expected:
+            if event.get("kind") == "submit" and self.driver.prompt_matches(
+                event.get("prompt"), self._expected_prompt
+            ):
+                # A CLI that owns its turn identity reports it here; a driver
+                # that mints its own has already set it in _submit.
                 if event.get("turn_id"):
                     self._turn_id = event["turn_id"]
-            if self._turn_id is None or event.get("turn_id") != self._turn_id:
+                self._acknowledged = True
+            if self._turn_id is None:
+                # Nothing can complete or be interrupted before a turn exists,
+                # but a CLI that fails during startup must not be waited out to
+                # the deadline. Once any turn has run, a turn-less event is
+                # stale and cannot fail its replacement.
+                if not self._turn_started and event.get("kind") == "error":
+                    self._failure = event.get("error", "native turn failed")
+                continue
+            if event.get("turn_id") != self._turn_id:
                 continue
             if event["kind"] == "stop":
                 self._stop = event
@@ -183,14 +213,17 @@ class PtyExecution:
 
     def _submit(self, text, label):
         self.validate_prompt(text)
-        # Unique content also fences two submissions with identical user text.
-        self._expected_prompt = f"[Agency {label} {uuid.uuid4().hex}]\n{text}"
-        self._turn_id = None
+        self._turn_started = True
+        self._expected_prompt = f"{self.driver.submission_marker(label)}\n{text}"
+        # A driver that fences turns itself returns the identity it just
+        # committed; the rest learn it from the CLI's own acknowledgment.
+        self._turn_id = self.driver.begin_turn(self._expected_prompt)
+        self._acknowledged = False
         self._stop = None
         self._interrupted = False
         self.handle.write_terminal(b"\x1b[200~" + self._expected_prompt.encode() + b"\x1b[201~")
         self.handle.write_terminal(b"\r")
-        self._wait_until(lambda: self._turn_id is not None, "native prompt acknowledgment")
+        self._wait_until(lambda: self._acknowledged, "native prompt acknowledgment")
         self._deadline = time.monotonic() + self.ATTEMPT_TIMEOUT
 
     def redirect(self, text):
@@ -207,6 +240,7 @@ class PtyExecution:
             try:
                 self._check_alive()
                 self._interrupted = False
+                self.driver.begin_interrupt(self.handle)
                 self.handle.write_terminal(self.driver.interrupt_key)
                 if self.driver.confirm_interrupt:
                     self._wait_until(
@@ -218,28 +252,14 @@ class PtyExecution:
                     if self._stop is not None:
                         return False
                     self.handle.write_terminal(self.driver.interrupt_key)
-                if self.driver.name == "grok":
-                    # Grok's hooks never report a transcript_path, so there is
-                    # no rollout file to confirm a StopCancelled/turn_completed
-                    # event against -- Ctrl+C instead just disconnects the
-                    # in-flight model request and silently restores the
-                    # interrupted prompt as a composer draft, with no hook or
-                    # transcript event marking the cancellation. That
-                    # restoration is Grok's only observable signal here.
-                    self._wait_until(
-                        lambda: (
-                            self._interrupted
-                            or self._stop is not None
-                            or self.driver.grok_draft_restored(self.handle)
-                        ),
-                        "native interruption",
-                    )
-                    if self._stop is None:
-                        self._interrupted = True
-                else:
-                    self._wait_until(
-                        lambda: self._interrupted or self._stop is not None, "native interruption"
-                    )
+                self._wait_until(
+                    lambda: (
+                        self._interrupted
+                        or self._stop is not None
+                        or self.driver.interrupted(self.handle)
+                    ),
+                    "native interruption",
+                )
                 if self._stop is not None:
                     return False
                 self.driver.clear_input(self.handle, self._wait_until)
@@ -251,25 +271,63 @@ class PtyExecution:
                 self._active = False
                 # Reap before reporting failure: a queued fallback must not race
                 # a partially accepted redirect in a still-running CLI.
-                self.handle.close()
+                self.driver.reap(self.handle)
                 return False
 
-    def run(self, prompt):
-        from ..agharness import cleanup_config_home
-        from ..ptrace.supervisor import agProxyPtrace
+    def close(self):
+        from ...agharness import cleanup_config_home
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._active = False
+            try:
+                if self.handle is not None:
+                    self.handle.close()
+            finally:
+                for callback in reversed(self._cleanup_callbacks):
+                    callback()
+                cleanup_config_home(self.driver.root)
+
+    def prepare_fast_checkpoint(self):
+        with self._lock:
+            if self._active:
+                raise RuntimeError("cannot checkpoint an active PTY attempt")
+            if self.handle is not None:
+                self.handle.checkpoint_detach()
+
+    def seize_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_seize_frozen()
+
+    def complete_fast_restore(self):
+        with self._lock:
+            if self.handle is not None:
+                self.handle.checkpoint_reattach()
+
+    def run(self, prompt, *, keep_alive=False):
+        from ...ptrace.supervisor import agProxyPtrace
 
         phase = getattr(self.driver, "profile_span", lambda name: nullcontext())
+        completed = False
         try:
             self.validate_prompt(prompt)
-            with phase("harness:launch"):
-                self.handle = agProxyPtrace(self.runtime.agconfig, allow_initial_exec=True).launch(
-                    self.driver.argv,
-                    self.driver.env,
-                    cwd=self.driver.cwd,
-                    pty_size=(120, 36),
-                    policy=self.runtime.syscall_policy,
-                    ag=None,
-                )
+            if not self._launched:
+                self.driver.prepare_launch()
+                with phase("harness:launch"):
+                    self.handle = agProxyPtrace(
+                        self.runtime.agconfig, allow_initial_exec=True
+                    ).launch(
+                        self.driver.argv,
+                        self.driver.env,
+                        cwd=self.driver.cwd,
+                        pty_size=(120, 36),
+                        policy=self.runtime.syscall_policy,
+                        ag=None,
+                    )
+                self._launched = True
             self.runtime.register_control_handle(self.handle)
             self.runtime.register_redirect(self.redirect)
             with phase("harness:startup_ready"):
@@ -302,6 +360,7 @@ class PtyExecution:
                             self._active = False
                             with phase("harness:snapshot"):
                                 blob = self.driver.snapshot()
+                            completed = True
                             return AttemptResult(
                                 ok=True,
                                 final_text=self._stop["text"],
@@ -314,11 +373,8 @@ class PtyExecution:
                             raise RuntimeError(f"{self.driver.name} attempt timed out")
                     time.sleep(0.025)
         finally:
-            try:
-                with self._lock:
-                    self._active = False
-                    if self.handle is not None:
-                        with phase("harness:retire"):
-                            self.handle.close()
-            finally:
-                cleanup_config_home(self.driver.root)
+            with self._lock:
+                self._active = False
+            if not (keep_alive and completed):
+                with phase("harness:retire"):
+                    self.close()

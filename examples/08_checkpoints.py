@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agency import Agent, agdata, agskill
 
-from _common import close_sandboxes, run_example, tutorial_config
+from _common import close_sandboxes, example_wait_timeout, run_example, tutorial_config
 
 
 WRITE_STATE = agskill(
@@ -61,7 +61,7 @@ def main() -> None:
     worker = Agent("checkpointed", agconfig=cfg, harness="native")
     result = worker.run(WRITE_STATE, agdata(request="Persist state."))
     assert result.confirmation == "CHECKPOINTED"
-    result.wait(timeout=300)
+    result.wait(timeout=example_wait_timeout())
     worker.context.resolve_prev_dependencies()
     assert not worker.context.is_pending()
     print("checkpoint precondition: result and ordered context are fully settled")

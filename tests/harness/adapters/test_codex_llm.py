@@ -1,4 +1,4 @@
-"""Tests for _CodexBackend's LLM wire-format translation -- OpenAI Responses
+"""Tests for CodexAdapter's LLM wire-format translation -- OpenAI Responses
 API <-> agency format, both directions, both streaming and non-streaming."""
 
 from __future__ import annotations
@@ -7,11 +7,11 @@ import json
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.codex import _CodexBackend
+from agency.harness.adapters.codex import CodexAdapter
 
 
-def _backend() -> _CodexBackend:
-    return _CodexBackend(agconfig())
+def _backend() -> CodexAdapter:
+    return CodexAdapter(agconfig())
 
 
 def _text_block(text, index=0):

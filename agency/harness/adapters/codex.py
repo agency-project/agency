@@ -10,10 +10,10 @@ from functools import partial
 
 from fastapi import Request
 
-from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter
 from ..common import extract_bearer_token
-from .pty_drivers import run_pty_attempt
-from .pty_session import stream_response
+from .pty.driver import _HookPtyDriver, run_pty_attempt
+from .pty.execution import stream_response
 
 
 def codex_available() -> bool:
@@ -192,8 +192,95 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-class _CodexBackend(agharness_backend):
+class CodexDriver(_HookPtyDriver):
+    name = "codex"
+    _HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
+    _HOOK_PATH = ("hooks.json",)
+
+    def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
+        self._trusted_directory = False
+        super().__init__(adapter, runtime, root, session_id, blob, max_steps)
+
+    def _configure(self, adapter, runtime, max_steps):
+        adapter._write_codex_config(
+            self.root,
+            runtime.harness_base_url,
+            runtime.model or "default",
+            has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
+        )
+        with (self.root / "config.toml").open("a") as config:
+            config.write('\n[projects."/workspace"]\ntrust_level = "trusted"\n')
+        self.env.update(CODEX_HOME=str(self.root), AGENCY_PROXY_API_KEY=runtime.token)
+        # Codex has no CLI step-limit flag, as with its previous adapter.
+        self.argv += [
+            "--no-alt-screen",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+        ]
+        if self.session_id:
+            self.argv += ["resume", self.session_id]
+        self._write_hooks()
+
+    def ready(self, handle):
+        lines, x, y, _generation = handle.terminal_screen()
+        if not self._trusted_directory and any(
+            "Do you trust the contents of this directory?" in line for line in lines
+        ):
+            if any(self.cwd in line for line in lines) and any(
+                "1. Yes, continue" in line for line in lines
+            ):
+                self._trusted_directory = True
+                handle.write_terminal(b"\r")
+            return False
+        # Require the actual composer, never silence or an old message in history.
+        return lines[y].strip().startswith("›") and x <= 3
+
+    def _stop_event(self, event, payload):
+        event = super()._stop_event(event, payload)
+        # Codex reports JSON null when a turn ends immediately after a
+        # successful MCP submission. The protocol represents that as
+        # an empty final string so the engine can consume the output
+        # collected by submit_output.
+        if event["text"] is None:
+            event["text"] = ""
+        return event
+
+    def _scan_dialect_row(self, row, pending):
+        payload = row.get("payload", {})
+        if row.get("type") != "event_msg":
+            return
+        event_type = payload.get("type")
+        if event_type in {"task_started", "turn_started"}:
+            self._transcript_turn_id = payload.get("turn_id")
+        elif event_type == "error" or (event_type == "task_complete" and payload.get("error")):
+            # Native errors can omit turn_id; associate only with an observed
+            # transcript start, never the host's current prompt (which may
+            # have changed).
+            pending.append(
+                {
+                    "kind": "error",
+                    "turn_id": payload.get("turn_id") or self._transcript_turn_id,
+                    "error": "Codex terminal error: "
+                    + str(payload.get("error") or payload.get("message", "request failed")),
+                }
+            )
+
+    def completed(self, event):
+        super().completed(event)
+        for row in self._rows():
+            payload = row.get("payload", {})
+            if (
+                row.get("type") == "event_msg"
+                and payload.get("type") == "task_complete"
+                and payload.get("turn_id") == event["turn_id"]
+            ):
+                return True
+        return False
+
+
+class CodexAdapter(HarnessAdapter):
     _DEFAULT_BINARY = "codex"
+    _PTY_DRIVER = CodexDriver
     _PROVIDER_NAME = "agency-proxy"
     _ENV_KEY_NAME = "AGENCY_PROXY_API_KEY"
 
@@ -664,4 +751,4 @@ class _CodexBackend(agharness_backend):
             return
 
 
-__all__ = ["_CodexBackend", "codex_available"]
+__all__ = ["CodexAdapter", "codex_available"]

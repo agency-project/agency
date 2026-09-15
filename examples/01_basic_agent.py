@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from agency import AgError, Agent, agcanceled, agdata, agent, agerror, agschema, agskill
 
-from _common import close_sandboxes, run_example, tutorial_config
+from _common import close_sandboxes, example_wait_timeout, run_example, tutorial_config
 
 
 def main() -> None:
@@ -37,7 +37,7 @@ def main() -> None:
 
     result = learner.run(summarize, payload)
     print(f"submitted: pending={result.is_pending()}")
-    result.wait(timeout=300)
+    result.wait(timeout=example_wait_timeout())
     print(f"summary: {result.summary}")
     print(f"result JSON: {result.to_json()}")
     print(f"history messages: {len(learner.history.messages)}")

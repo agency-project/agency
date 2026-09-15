@@ -493,7 +493,7 @@ def uds_listener_is_live(path: "str | None", thread) -> bool:
 
 # Fixed container-side mount point for agency_package_dir() below -- shared
 # between agsandbox.py (which bind-mounts it) and any in-container
-# entrypoint (agharness_backends/native.py's react-loop process, or a
+# entrypoint (adapters/native.py's react-loop process, or a
 # container-relocated agproxy_llm) that needs to know where to point
 # PYTHONPATH to import agency.
 AGENCY_PACKAGE_CONTAINER_MOUNT = "/opt/agency_pkg"
@@ -530,18 +530,34 @@ def _container_can_reach_pypi(sandbox, timeout_s: int = 30) -> bool:
         return False
 
 
-def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 180) -> None:
+def ensure_python_packages_in_container(
+    sandbox,
+    packages,
+    *,
+    timeout_s: int = 180,
+    python_executable: str = "python3",
+    install_missing: bool = True,
+) -> None:
     """Ensure each of `packages` (import names) is importable inside
     `sandbox`'s container, `pip3 install`-ing any missing after checking
     real importability (not just `pip list` presence). Raises RuntimeError
     if pip itself fails."""
     import shlex
 
+    executable = shlex.quote(python_executable)
     missing = [
-        pkg for pkg in packages if sandbox.exec(f'python3 -c "import {pkg}"', timeout=30)[1] != 0
+        pkg
+        for pkg in packages
+        if sandbox.exec(f'{executable} -c "import {pkg}"', timeout=30)[1] != 0
     ]
     if not missing:
         return
+
+    if not install_missing:
+        raise RuntimeError(
+            f"Pinned sandbox harness Python {python_executable} lacks {missing}; "
+            "refusing package installation during an experiment"
+        )
 
     if not _container_can_reach_pypi(sandbox):
         raise RuntimeError(
@@ -552,7 +568,8 @@ def ensure_python_packages_in_container(sandbox, packages, *, timeout_s: int = 1
             "package index on an isolated network would also probe as unreachable."
         )
 
-    install_cmd = "pip3 install --quiet " + " ".join(shlex.quote(p) for p in missing)
+    installer = "pip3" if python_executable == "python3" else f"{executable} -m pip"
+    install_cmd = installer + " install --quiet " + " ".join(shlex.quote(p) for p in missing)
     out, rc = sandbox.exec(install_cmd, timeout=timeout_s)
     if rc != 0:
         raise RuntimeError(f"failed to install {missing} inside container: {out}")

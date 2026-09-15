@@ -8,15 +8,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.claude_code import _ClaudeCodeBackend
-from agency.harness.adapters.codex import _CodexBackend
-from agency.harness.adapters.grok import _GrokBackend
-from agency.harness.adapters.native import _NativeBackend
-from agency.harness.adapters.opencode import _OpencodeBackend
+from agency.harness.adapters.claude_code import ClaudeCodeAdapter
+from agency.harness.adapters.codex import CodexAdapter
+from agency.harness.adapters.grok import GrokAdapter
+from agency.harness.adapters.native import NativeAdapter
+from agency.harness.adapters.opencode import OpenCodeAdapter
 
 
 @pytest.mark.parametrize(
-    "backend_cls", [_ClaudeCodeBackend, _CodexBackend, _GrokBackend, _OpencodeBackend]
+    "backend_cls", [ClaudeCodeAdapter, CodexAdapter, GrokAdapter, OpenCodeAdapter]
 )
 def test_external_stream_only_emits_authoritative_text_after_redirect(backend_cls):
     stream = [
@@ -39,11 +39,11 @@ def test_external_stream_only_emits_authoritative_text_after_redirect(backend_cl
 @pytest.mark.parametrize(
     ("backend_cls", "path"),
     [
-        (_ClaudeCodeBackend, "/v1/messages"),
-        (_CodexBackend, "/v1/responses"),
-        (_GrokBackend, "/v1/chat/completions"),
-        (_NativeBackend, "/v1/chat/completions"),
-        (_OpencodeBackend, "/v1/chat/completions"),
+        (ClaudeCodeAdapter, "/v1/messages"),
+        (CodexAdapter, "/v1/responses"),
+        (GrokAdapter, "/v1/chat/completions"),
+        (NativeAdapter, "/v1/chat/completions"),
+        (OpenCodeAdapter, "/v1/chat/completions"),
     ],
 )
 def test_registered_adapter_routes_inject_fastapi_request(backend_cls, path):
@@ -69,7 +69,7 @@ def test_claude_session_title_request_is_answered_without_model_dispatch(stream,
         dispatch_stream=MagicMock(side_effect=AssertionError("title request reached the model")),
         log_warning=MagicMock(),
     )
-    _ClaudeCodeBackend(agconfig()).register(app, bridge)
+    ClaudeCodeAdapter(agconfig()).register(app, bridge)
     body = {
         "stream": stream,
         "messages": [
@@ -110,7 +110,7 @@ def test_grok_auxiliary_request_is_answered_without_model_dispatch(stream, auxil
         dispatch=MagicMock(side_effect=AssertionError("title request reached the model")),
         dispatch_stream=MagicMock(side_effect=AssertionError("title request reached the model")),
     )
-    _GrokBackend(agconfig()).register(app, bridge)
+    GrokAdapter(agconfig()).register(app, bridge)
     body = {
         "stream": stream,
         "messages": [
@@ -167,7 +167,7 @@ def test_codex_disconnect_before_first_frame_closes_upstream():
             resolve_model=lambda token: "test-model",
             dispatch_stream_async=stream,
         )
-        _CodexBackend(agconfig()).register(app, bridge)
+        CodexAdapter(agconfig()).register(app, bridge)
         body = json.dumps({"stream": True, "input": "test cancellation"}).encode()
         sent_body = False
         responses = []

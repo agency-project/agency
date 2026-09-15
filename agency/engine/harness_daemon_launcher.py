@@ -67,6 +67,7 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
             "profiler": agconfig.ptrace.profiler,
             "disable_harness_native_sandbox": agconfig.ptrace.disable_harness_native_sandbox,
         },
+        "sandbox": {"checkpoint_fast_resume": agconfig.sandbox.checkpoint_fast_resume},
     }
 
 
@@ -127,12 +128,22 @@ def ensure_harness_daemon(
     timeout_s: float = 30.0,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox."""
+    config = agconfig if agconfig is not None else sandbox.agconfig
     handles = getattr(sandbox, "_agency_harness_daemon_handles", None)
     if handles is None:
         handles = {}
         sandbox._agency_harness_daemon_handles = handles
+        # Checkpointing runs on the backend while daemon discovery runs on
+        # the facade.  Share the same handle map so the backend can quiesce
+        # and resume every live daemon around a container-level CRIU dump.
+        sandbox._backend._agency_harness_daemon_handles = handles
 
     existing = handles.get(engine_name)
+    if existing is not None and config.sandbox.checkpoint_fast_resume:
+        # Restoring the sandbox is what makes the retained daemon's UDS
+        # listener reachable again. A failed CRIU restore falls back inside
+        # the backend, after which this path launches a fresh daemon below.
+        sandbox._backend._ensure_started()
     if existing is not None and _is_ready(existing):
         _register_daemon(sandbox, existing)
         return existing
@@ -146,32 +157,40 @@ def ensure_harness_daemon(
         container_sandbox_uds_path=_container_socket_path(sandbox_path),
         engine_name=engine_name,
     )
-    daemon_config = _daemon_config(agconfig)
-    config = agconfig if agconfig is not None else sandbox.agconfig
+    daemon_config = _daemon_config(config if config.sandbox.checkpoint_fast_resume else agconfig)
     binary_path = prepare_harness_executable(sandbox, harness, config)
     if binary_path is not None:
         daemon_config.setdefault("harness_adapter", {})["binary_path"] = binary_path
     config_json = json.dumps(daemon_config, separators=(",", ":"))
 
+    harness_python = config.sandbox.harness_python_path or "python3"
     ensure_python_packages_in_container(
         sandbox,
         ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle", "pyte"],
         timeout_s=180,
+        python_executable=harness_python,
+        install_missing=config.sandbox.harness_python_path is None,
     )
 
-    _preclaim_host_daemon_log(sandbox)
+    log_path = _DAEMON_LOG_PATH
+    if config.sandbox.checkpoint_zfs_parent:
+        # Keep the open log descriptor inside the snapshotted filesystem so
+        # CRIU never has to restore a host-owned bind-file handle.
+        log_path = "/var/log/agency-daemon.log"
+    else:
+        _preclaim_host_daemon_log(sandbox)
 
     # Actual launch of the daemon
     command = (
         f"PATH={HARNESS_PATH} "
         f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)} "
-        "exec python3 -m agency.harness.daemon "
+        f"exec {shlex.quote(harness_python)} -m agency.harness.daemon "
         f"--sandbox-uds {shlex.quote(handle.container_sandbox_uds_path)} "
         f"--host-uds {shlex.quote(handle.container_host_uds_path)} "
         f"--engine-name {shlex.quote(engine_name)} "
         f"--harness {shlex.quote(harness)} "
         f"--config-json {shlex.quote(config_json)} "
-        f"> {shlex.quote(_DAEMON_LOG_PATH)} 2>&1"
+        f"> {shlex.quote(log_path)} 2>&1"
     )
 
     sandbox.exec_detached(command, workdir="/workspace")
@@ -186,14 +205,14 @@ def ensure_harness_daemon(
 
     try:
         log_tail, _ = sandbox.exec(
-            f"tail -c 4000 {shlex.quote(_DAEMON_LOG_PATH)} 2>/dev/null",
+            f"tail -c 4000 {shlex.quote(log_path)} 2>/dev/null",
             timeout=10,
         )
     except Exception as exc:
         log_tail = f"could not read daemon log: {exc}"
     raise RuntimeError(
         f"Harness Manager did not become ready at {handle.sandbox_uds_path!r} "
-        f"within {timeout_s}s. Log ({_DAEMON_LOG_PATH}):\n{log_tail}"
+        f"within {timeout_s}s. Log ({log_path}):\n{log_tail}"
     )
 
 

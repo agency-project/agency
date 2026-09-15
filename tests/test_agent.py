@@ -90,7 +90,7 @@ def _llm_agconfig(d: dict) -> agconfig_cls:
     # leave model="" -- they care about api_key/temperature/etc., not model.
     d = dict(d)
     d.setdefault("provider", "mock")
-    return agconfig_cls(llmconfig(**d), sandboxconfig(backend="docker"))
+    return agconfig_cls(llmconfig(**d), sandboxconfig(backend="docker", gpu_passthrough=False))
 
 
 def _inherited_config_snapshot(cfg: agconfig_cls) -> dict:
@@ -385,11 +385,11 @@ def test_run_returns_direct_answer_from_engine():
 
 # test_end_to_end_with_tool was retired here along with execute_react()
 # itself: add_tools is a host-authored closure with no execution path
-# today for any engine -- native.py's `_NativeBackend.execute()` explicitly
+# today for any engine -- native.py's `NativeAdapter.execute()` explicitly
 # rejects it (a real, currently-open gap -- see that module's "Known gaps"
 # docstring; container-side support is deliberately scoped as separate
 # follow-up work, not done here). Basic tool-calling end-to-end coverage
-# now lives in tests/harness/agharness_backends/
+# now lives in tests/harness/adapters/
 # test_native_loop_fast.py's test_bash_tool_round_trip.
 
 
