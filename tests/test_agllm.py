@@ -7,7 +7,10 @@ from agency.configs.agconfig import agconfig, llmconfig
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build an agconfig with the given llmconfig fields."""
+    """Test helper: build an agconfig with the given llmconfig fields.
+    Defaults base_url since the OpenAI-compatible backend (the default
+    fallthrough for an unspecified provider) now requires one explicitly."""
+    fields.setdefault("base_url", "http://localhost/v1")
     return agconfig(llmconfig(**fields))
 
 
@@ -19,7 +22,9 @@ LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localh
 
 
 def test_build_llm_kwargs_includes_reasoning_effort():
-    cfg = agconfig(llmconfig(model="gpt-5.6-luna", reasoning_effort="none"))
+    cfg = agconfig(
+        llmconfig(model="gpt-5.6-luna", reasoning_effort="none", base_url="http://localhost/v1")
+    )
 
     kwargs = build_llm_kwargs(
         cfg, [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}], None

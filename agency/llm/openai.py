@@ -34,7 +34,19 @@ def _is_chatcompletions_tool_choice(tool_choice) -> bool:
 
 
 class _OpenAICompatibleBackend(agllm):
-    """Default backend: OpenAI, vLLM, or any other OpenAI-compatible endpoint."""
+    """Default backend: OpenAI, vLLM, litellm, or any other OpenAI-compatible
+    endpoint. base_url is always required (see _validate_config) -- the
+    openai SDK's own default (api.openai.com) is exactly the kind of silent
+    wrong-endpoint footgun this backend exists to avoid: a real OpenAI key
+    still needs base_url='https://api.openai.com/v1' spelled out."""
+
+    def _validate_config(self) -> None:
+        super()._validate_config()
+        if not self.agconfig.llm.base_url:
+            raise ValueError(
+                f"agconfig.llm with provider={self.agconfig.llm.provider!r} "
+                "requires an explicit base_url."
+            )
 
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
         return openai.OpenAI(

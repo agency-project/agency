@@ -39,7 +39,7 @@ def test_reverse_host_rpc_completes_while_harness_attempt_rpc_remains_open():
         return True, "mock policy allowed"
 
     config = agconfig(
-        llmconfig(model="test-model"),
+        llmconfig(model="test-model", base_url="http://x/v1"),
         hostserverconfig(uds_path=str(host_socket)),
         dataloggerconfig(db_path=str(database)),
     )

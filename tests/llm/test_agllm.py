@@ -27,7 +27,11 @@ except ImportError:
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build an agconfig with the given llmconfig fields."""
+    """Test helper: build an agconfig with the given llmconfig fields.
+    Defaults base_url since the OpenAI-compatible backend (the default
+    fallthrough for provider=None/openai/vllm/litellm/...) now requires
+    one explicitly; individual tests override it where it matters."""
+    fields.setdefault("base_url", "http://x/v1")
     return agconfig(llmconfig(**fields))
 
 

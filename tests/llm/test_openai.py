@@ -6,13 +6,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.openai import _OpenAICompatibleBackend
 
 
 def _cfg(**fields) -> agconfig:
-    """Test helper: build an agconfig with the given llmconfig fields."""
+    """Test helper: build an agconfig with the given llmconfig fields.
+    Defaults base_url since _OpenAICompatibleBackend now requires one
+    explicitly -- most tests here exercise formatting logic that doesn't
+    care about its actual value."""
+    fields.setdefault("base_url", "http://x/v1")
     return agconfig(llmconfig(**fields))
 
 
@@ -60,8 +65,9 @@ class TestOpenAICompatibleBackend:
         backend = _OpenAICompatibleBackend(_cfg(base_url="http://x:8000/v1/"))
         assert backend.tokenize_url() == "http://x:8000"
 
-    def test_tokenize_url_none_when_no_base_url(self):
-        assert _OpenAICompatibleBackend(_cfg()).tokenize_url() is None
+    def test_construction_without_base_url_raises_value_error(self):
+        with pytest.raises(ValueError, match="requires an explicit base_url"):
+            _OpenAICompatibleBackend(agconfig(llmconfig(model="m")))
 
     def test_tokenize_url_preserves_non_v1_path(self):
         backend = _OpenAICompatibleBackend(_cfg(base_url="http://x:8000/custom"))

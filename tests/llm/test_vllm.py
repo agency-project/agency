@@ -1,11 +1,11 @@
 """Tests for the vLLM LLM backend config/dispatch (agency.llm.vllm).
 
-vLLM has no backend class of its own -- it speaks the same OpenAI-compatible
-chat.completions API as `.openai._OpenAICompatibleBackend`, which
-`agllm.for_config()` routes to directly (after checking base_url is
-set, since -- unlike real OpenAI -- there's no well-known default URL for a
-self-hosted vLLM endpoint). See test_openai.py for _OpenAICompatibleBackend's
-own behavior.
+vLLM has no backend class or provider branch of its own -- "vllm" isn't a
+recognized name in `agllm.for_config()` at all, so it falls through to the
+same `.openai._OpenAICompatibleBackend` as any other unrecognized provider
+(litellm, plain "openai", ...). That backend requires base_url explicitly
+for every provider it handles, real OpenAI included -- see test_openai.py
+for _OpenAICompatibleBackend's own behavior.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class TestVllmDispatch:
         assert isinstance(backend, _OpenAICompatibleBackend)
 
     def test_vllm_without_base_url_raises_value_error(self):
-        with pytest.raises(ValueError, match="missing required field.*base_url"):
+        with pytest.raises(ValueError, match="requires an explicit base_url"):
             agllm.for_config(agconfig(llmconfig(provider="vllm", model="m")))
 
     def test_config_fixes_provider_to_vllm(self):

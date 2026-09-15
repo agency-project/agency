@@ -239,7 +239,7 @@ def test_adapter_http_dispatch_reaches_real_profiler(engine, monkeypatch, tmp_pa
         "grok": "_GrokBackend",
     }
     module = importlib.import_module("agency.harness.adapters." + engine)
-    config = agconfig(llmconfig(model="fixture-model"))
+    config = agconfig(llmconfig(model="fixture-model", base_url="http://x/v1"))
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
     with agprof.session(tmp_path, sample_hz=0, auto_functions=False):
         with agprof.span("run0:fixture:agent"):

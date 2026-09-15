@@ -145,6 +145,7 @@ class _FakeDataLogger:
 
 
 def _cfg(**fields) -> agconfig:
+    fields.setdefault("base_url", "http://x/v1")
     return agconfig(llmconfig(**fields))
 
 

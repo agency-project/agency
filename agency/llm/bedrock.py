@@ -82,6 +82,9 @@ class _OpenAICompatibleBedrockBackend(_OpenAICompatibleBackend):
     endpoint (its /openai/v1 path) — every Bedrock model except Anthropic's
     own and openai.gpt-5.x (see module docstring above)."""
 
+    def _validate_config(self) -> None:
+        agllm._validate_config(self)
+
     def make_client(self, timeout: httpx.Timeout) -> openai.OpenAI:
         region = self.agconfig.llm.region or "us-east-1"
         api_key = _require_bedrock_bearer_token(self.agconfig.llm)

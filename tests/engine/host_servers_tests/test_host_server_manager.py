@@ -30,7 +30,7 @@ from agency.observability.profiler import agprof
 
 def _make_manager(tmp_path, policy=None, is_cancelled=None, harness="claude_code"):
     cfg = agconfig(
-        llmconfig(model="test-model"),
+        llmconfig(model="test-model", base_url="http://x/v1"),
         hostserverconfig(uds_path=str(tmp_path / "host.sock")),
         dataloggerconfig(db_path=str(tmp_path / "agent.db")),
     )
@@ -387,7 +387,7 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
     uds_path = f"/tmp/hsm_test_{suffix}.sock"
     db_path = f"/tmp/hsm_test_{suffix}.db"
     cfg = agconfig(
-        llmconfig(model="test-model"),
+        llmconfig(model="test-model", base_url="http://x/v1"),
         hostserverconfig(uds_path=uds_path),
         dataloggerconfig(db_path=db_path),
     )

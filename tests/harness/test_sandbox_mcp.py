@@ -76,7 +76,7 @@ def sandbox_manager():
 
     with tempfile.TemporaryDirectory(prefix="agency-mcp-", dir="/tmp") as directory:
         config = agconfig(
-            llmconfig(model="test-model"),
+            llmconfig(model="test-model", base_url="http://x/v1"),
             hostserverconfig(uds_path=f"{directory}/host.sock"),
             dataloggerconfig(db_path=f"{directory}/agent.db"),
         )

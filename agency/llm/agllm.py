@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import ClassVar, Generator
+from typing import Generator
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
 from ..configs.agconfig import agconfig as agconfig_cls
@@ -65,17 +65,6 @@ class agllm:
     call).
     """
 
-    # Fields with no viable runtime/env-var fallback for a given provider --
-    # checked eagerly on every config change rather than failing lazily deep
-    # inside a request. Providers not listed here (openai/anthropic/bedrock/
-    # anthropicAWS) have no field that's *strictly* required from agconfig
-    # alone: credentials fall back to environment variables/IAM, and an
-    # empty model is a real (if useless) request rather than a malformed
-    # config.
-    _REQUIRED_FIELDS_BY_PROVIDER: "ClassVar[dict[str, tuple[str, ...]]]" = {
-        "vllm": ("base_url",),
-    }
-
     def __init__(self, agconfig: "agconfig_cls") -> None:
         self.change_config(agconfig)
 
@@ -90,14 +79,13 @@ class agllm:
         self._validate_config()
 
     def _validate_config(self) -> None:
-        provider = self.agconfig.llm.provider
-        required = self._REQUIRED_FIELDS_BY_PROVIDER.get(provider, ())
-        missing = [name for name in required if not getattr(self.agconfig.llm, name)]
-        if missing:
-            raise ValueError(
-                f"agconfig.llm with provider={provider!r} is missing required "
-                f"field(s): {', '.join(missing)}"
-            )
+        """No fields are unconditionally required at this base level: bedrock/
+        anthropic credentials fall back to environment variables/IAM, and an
+        empty model is a real (if useless) request rather than a malformed
+        config. Concrete backends override this (calling super() first) to
+        add their own checks -- e.g. _OpenAICompatibleBackend requires
+        base_url, since that backend has no viable default endpoint for any
+        provider name (openai/vllm/litellm/anything else)."""
 
     def get_config_copy(self) -> "agconfig_cls":
         """Return a clone of this instance's agconfig."""
@@ -132,9 +120,9 @@ class agllm:
             return _AnthropicAWSBackend(agconfig)
         if provider == "anthropic":
             return _AnthropicBackend(agconfig)
-        # _OpenAICompatibleBackend.__init__ -> change_config() validates
-        # provider="vllm"'s required base_url -- no need to duplicate that
-        # check here just to fail one call frame earlier.
+        # _OpenAICompatibleBackend.__init__ -> change_config() validates the
+        # required base_url -- no need to duplicate that check here just to
+        # fail one call frame earlier.
         return _OpenAICompatibleBackend(agconfig)
 
     def make_client(self, timeout: httpx.Timeout):

@@ -67,8 +67,7 @@ def tutorial_config(
             raise SystemExit("OPENAI_API_KEY is required for AGENCY_LLM_PROVIDER=openai")
         if api_key:
             llm_kwargs["api_key"] = api_key
-        if os.environ.get("OPENAI_BASE_URL"):
-            llm_kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+        llm_kwargs["base_url"] = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     elif provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key and require_llm:

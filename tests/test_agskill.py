@@ -331,6 +331,7 @@ def build_llm_kwargs(cfg, messages, openai_tools=None):
 
 def _llm_cfg(**fields) -> agconfig:
     """Test helper: build an agconfig from LLM fields."""
+    fields.setdefault("base_url", "http://x/v1")
     return agconfig(llmconfig(**fields))
 
 
