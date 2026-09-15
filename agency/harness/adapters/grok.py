@@ -17,16 +17,6 @@ def grok_available() -> bool:
     return shutil.which("grok") is not None
 
 
-
-
-
-
-
-
-
-
-
-
 def _toml_string(value: str) -> str:
     """Quote a string for a hand-written TOML file -- only the escapes
     this module's config values actually need."""
@@ -140,7 +130,6 @@ class GrokDriver(_HookPtyDriver):
         return False
 
 
-
 class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
     _DEFAULT_BINARY = "grok"
     _PTY_DRIVER = GrokDriver
@@ -249,9 +238,6 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
                 )
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
-
-
-
 
 
 __all__ = ["GrokAdapter", "grok_available"]

@@ -194,7 +194,9 @@ class _HookPtyDriver(PtyDriver):
         lifecycle = self.root / "lifecycle_hook.py"
         lifecycle.write_bytes((hook_dir / "_lifecycle_hook.py").read_bytes())
         permission = self.root / "agpolicy_hook.py"
-        permission.write_bytes((hook_dir.parent.parent / "_harness_permission_hook.py").read_bytes())
+        permission.write_bytes(
+            (hook_dir.parent.parent / "_harness_permission_hook.py").read_bytes()
+        )
 
         def command(script):
             return [

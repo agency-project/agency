@@ -94,6 +94,7 @@ class OpencodeDriver(PtyDriver):
         finally:
             temporary.unlink()
 
+
 class OpenCodeAdapter(ChatCompletionsProtocol, HarnessAdapter):
     _DEFAULT_BINARY = "opencode"
     _PTY_DRIVER = OpencodeDriver
@@ -155,7 +156,9 @@ class OpenCodeAdapter(ChatCompletionsProtocol, HarnessAdapter):
         plugin_path = plugin_dir / "agpolicy_plugin.js"
         from pathlib import Path
 
-        plugin_path.write_bytes((Path(__file__).parent / "pty" / "_opencode_pty_plugin.js").read_bytes())
+        plugin_path.write_bytes(
+            (Path(__file__).parent / "pty" / "_opencode_pty_plugin.js").read_bytes()
+        )
         return plugin_path
 
 

@@ -278,7 +278,6 @@ class CodexDriver(_HookPtyDriver):
         return False
 
 
-
 class CodexAdapter(HarnessAdapter):
     _DEFAULT_BINARY = "codex"
     _PTY_DRIVER = CodexDriver
