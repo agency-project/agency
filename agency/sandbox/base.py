@@ -355,6 +355,8 @@ class agsandbox_backend(AgSandboxBackendFields):
         """Run a user command inside the container."""
         # Lazily acquire the requested physical GPU(s) now that we have a
         # bash call to run. Blocks until enough GPUs in the pool are free.
+        if self._gpu_count_requested > 0 and not self._agconfig.sandbox.gpu_passthrough:
+            raise RuntimeError("GPU reservation is forbidden by this sandbox's CPU-only policy")
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
 

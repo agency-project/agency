@@ -90,7 +90,7 @@ def _llm_agconfig(d: dict) -> agconfig_cls:
     # leave model="" -- they care about api_key/temperature/etc., not model.
     d = dict(d)
     d.setdefault("provider", "mock")
-    return agconfig_cls(llmconfig(**d), sandboxconfig(backend="docker"))
+    return agconfig_cls(llmconfig(**d), sandboxconfig(backend="docker", gpu_passthrough=False))
 
 
 def _inherited_config_snapshot(cfg: agconfig_cls) -> dict:

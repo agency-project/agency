@@ -163,10 +163,13 @@ def ensure_harness_daemon(
         daemon_config.setdefault("harness_adapter", {})["binary_path"] = binary_path
     config_json = json.dumps(daemon_config, separators=(",", ":"))
 
+    harness_python = config.sandbox.harness_python_path or "python3"
     ensure_python_packages_in_container(
         sandbox,
         ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle", "pyte"],
         timeout_s=180,
+        python_executable=harness_python,
+        install_missing=config.sandbox.harness_python_path is None,
     )
 
     log_path = _DAEMON_LOG_PATH
@@ -181,7 +184,7 @@ def ensure_harness_daemon(
     command = (
         f"PATH={HARNESS_PATH} "
         f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)} "
-        "exec python3 -m agency.harness.daemon "
+        f"exec {shlex.quote(harness_python)} -m agency.harness.daemon "
         f"--sandbox-uds {shlex.quote(handle.container_sandbox_uds_path)} "
         f"--host-uds {shlex.quote(handle.container_host_uds_path)} "
         f"--engine-name {shlex.quote(engine_name)} "

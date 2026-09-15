@@ -190,6 +190,8 @@ class agSandbox:
 
     @_gpu_count_requested.setter
     def _gpu_count_requested(self, value: int) -> None:
+        if value > 0 and not self.agconfig.sandbox.gpu_passthrough:
+            raise RuntimeError("GPU reservation is forbidden by this sandbox's CPU-only policy")
         self._backend._gpu_count_requested = value
 
     @property

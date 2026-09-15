@@ -796,9 +796,11 @@ class _ContainerBackendBase(agsandbox_backend):
         # CUDA_VISIBLE_DEVICES points at -- _gpu_flags() below attaches every
         # GPU device to the container unconditionally, so it no longer
         # matters whether this runs before or after reserve_resource().
+        if self._gpu_count_requested > 0 and not self._agconfig.sandbox.gpu_passthrough:
+            raise RuntimeError("GPU reservation is forbidden by this sandbox's CPU-only policy")
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
-        gpu_flags = _gpu_flags(self._runtime)
+        gpu_flags = _gpu_flags(self._runtime) if self._agconfig.sandbox.gpu_passthrough else []
         if (
             storage is not None
             and self._agconfig.sandbox.checkpoint_fast_resume

@@ -156,6 +156,10 @@ class sandboxconfig(confignamespace):
     checkpoint_diagnostics_extended: bool = False
     mounts: "dict[str, tuple[str, str, str]]" = field(default_factory=dict)
     flags: "list[str]" = field(default_factory=list)
+    # CPU-only sandboxes can omit device flags even on a host with GPUs.
+    gpu_passthrough: bool = True
+    # Optional immutable interpreter supplied by a sandbox-specific read-only mount.
+    harness_python_path: "str | None" = None
 
     backend: str = "auto"  # podman | docker | chroot | auto
     checkpoint_backend: str = "image_commit"  # image_commit | cow_zfs

@@ -76,6 +76,39 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert "pyte" in installed
 
 
+def test_pinned_sandbox_python_is_used_for_probe_and_daemon_without_install(monkeypatch, tmp_path):
+    from agency.configs.agconfig import sandboxconfig
+
+    sandbox = _fake_sandbox(
+        tmp_path,
+        harnessadapterconfig(binary_path="/bin/claude"),
+        sandboxconfig(harness_python_path="/opt/e1a1-venv/bin/python"),
+    )
+    probes = []
+    monkeypatch.setattr(
+        launcher,
+        "ensure_python_packages_in_container",
+        lambda _sandbox, _packages, **kwargs: probes.append(kwargs),
+    )
+    monkeypatch.setattr(launcher, "_is_ready", lambda _handle, timeout_s=0.5: True)
+    launcher.ensure_harness_daemon(
+        sandbox,
+        "/tmp/agency/gw/run/host-agent.sock",
+        "agent-1",
+        "claude_code",
+        agconfig=sandbox.agconfig,
+        timeout_s=1.0,
+    )
+    assert probes == [
+        {
+            "timeout_s": 180,
+            "python_executable": "/opt/e1a1-venv/bin/python",
+            "install_missing": False,
+        }
+    ]
+    assert "exec /opt/e1a1-venv/bin/python -m agency.harness.daemon" in sandbox.detached[0][0]
+
+
 def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch, tmp_path):
     sandbox = _fake_sandbox(tmp_path)
     probes = []
