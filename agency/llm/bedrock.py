@@ -30,6 +30,7 @@ from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBackend,
     _ANTHROPIC_BEDROCK_MODEL_RE,
+    _anthropic_sdk_timeout,
     _known_anthropic_context_window,
 )
 
@@ -102,7 +103,9 @@ class _AnthropicBedrockBackend(_AnthropicBackend):
             )
         region = self.agconfig.llm.region or "us-east-1"
         api_key = _require_bedrock_bearer_token(self.agconfig.llm)
-        return _anthropic_sdk.AnthropicBedrock(aws_region=region, api_key=api_key, timeout=timeout)
+        return _anthropic_sdk.AnthropicBedrock(
+            aws_region=region, api_key=api_key, timeout=_anthropic_sdk_timeout(timeout)
+        )
 
     def list_models(self) -> list:
         return []  # Bedrock's native invoke_model API has no OpenAI-style /v1/models
@@ -614,7 +617,7 @@ class _AnthropicAWSBackend(_AnthropicBackend):
     """
 
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
-        kwargs: dict = dict(timeout=timeout)
+        kwargs: dict = dict(timeout=_anthropic_sdk_timeout(timeout))
         api_key = self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_AWS_API_KEY")
         if api_key:
             kwargs["api_key"] = api_key

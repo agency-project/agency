@@ -416,7 +416,7 @@ class _CodexBackend(agharness_backend):
                                     "type": "thinking",
                                     "index": 0,
                                     "text": summary_text,
-                                    "signature": item.get("encrypted_content", ""),
+                                    "signature": item.get("encrypted_content") or "",
                                 }
                             ],
                         }
@@ -476,6 +476,7 @@ class _CodexBackend(agharness_backend):
                         "type": "reasoning",
                         "id": f"rs_{uuid.uuid4().hex}",
                         "summary": [{"type": "summary_text", "text": b["text"]}],
+                        "encrypted_content": b.get("signature", ""),
                     }
                 )
             elif b["type"] == "tool_use":
@@ -586,6 +587,7 @@ class _CodexBackend(agharness_backend):
                         "type": "reasoning",
                         "id": f"rs_{uuid.uuid4().hex}",
                         "summary": [{"type": "summary_text", "text": b["text"]}],
+                        "encrypted_content": b.get("signature", ""),
                     }
                     yield _sse(
                         "response.output_item.added",

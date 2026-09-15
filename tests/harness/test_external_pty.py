@@ -625,6 +625,21 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
     handle.write_terminal.assert_not_called()
 
 
+@pytest.mark.parametrize("placeholder", ["┃  Ask anything...", "┃  Ask anything…"])
+def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
+    driver = OpencodeDriver.__new__(OpencodeDriver)
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            ["", placeholder + ' "Fix broken tests"', "┃  Build auto · model Agency Proxy"],
+            0,
+            1,
+            1,
+        )
+    )
+
+    assert driver.ready(handle)
+
+
 @pytest.mark.parametrize("suffix", ["\n", " \n"])
 def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
     execution.driver.name = "opencode"

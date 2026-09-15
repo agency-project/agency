@@ -215,6 +215,12 @@ class _HookPtyDriver(PtyDriver):
         sid = payload.get("session_id", payload.get("sessionId"))
         if self.session_id is None:
             self.session_id = sid
+            if self.name == "grok" and sid:
+                # Grok's hooks omit transcript_path, but its ACP session log
+                # has a deterministic location beneath GROK_HOME.
+                self.transcript_path = (
+                    self.root / "sessions" / "%2Fworkspace" / sid / "updates.jsonl"
+                )
         if sid != self.session_id:
             return None
         transcript = payload.get("transcript_path", payload.get("transcriptPath"))
@@ -409,34 +415,27 @@ class GrokDriver(_HookPtyDriver):
             return None
         return super()._stop_event(event, payload)
 
+    def interrupted(self, handle):
+        """Recognize Grok's restored composer draft as interrupt evidence."""
+        if self._last_prompt is None:
+            return False
+        marker = self._last_prompt.split("\n", 1)[0]
+        pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
+        lines, _x, y, _generation = handle.terminal_screen()
+        # Grok collapses a restored multiline paste into a token. The prompt
+        # marker then appears only in the old transcript.
+        return (
+            self.ready(handle)
+            or any("│ ❯ " + marker in line for line in lines)
+            or pasted in lines[y]
+        )
+
     def clear_input(self, handle, wait_until):
         # Grok restores a pre-response cancellation as a draft. Its idle
         # Ctrl+C clears that draft; Ctrl+U would trigger self-update.
         if self._last_prompt is None:
             return
-        committed = False
-        for row in self._rows():
-            params = row.get("params", {})
-            if params.get("_meta", {}).get("promptId") == self._last_turn_id and params.get(
-                "update", {}
-            ).get("sessionUpdate") in {"agent_message_chunk", "tool_call"}:
-                committed = True
-        if committed:
-            return
-        marker = self._last_prompt.split("\n", 1)[0]
-        pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
-
-        def restored_input():
-            lines, _x, y, _generation = handle.terminal_screen()
-            # Grok collapses a restored multiline paste into a token.
-            # The prompt marker then appears only in the old transcript.
-            return (
-                self.ready(handle)
-                or any("│ ❯ " + marker in line for line in lines)
-                or pasted in lines[y]
-            )
-
-        wait_until(restored_input, "restored Grok input")
+        wait_until(lambda: self.interrupted(handle), "restored Grok input")
         if not self.ready(handle):
             handle.write_terminal(b"\x03")
 
@@ -512,7 +511,9 @@ class OpencodeDriver(PtyDriver):
     def ready(self, handle):
         lines, _x, y, _generation = handle.terminal_screen()
         current = lines[y].strip()
-        empty_composer = current == "┃" or current.startswith("┃  Ask anything...")
+        empty_composer = current == "┃" or current.startswith(
+            ("┃  Ask anything...", "┃  Ask anything…")
+        )
         return empty_composer and any(
             "Build" in line and "Agency Proxy" in line for line in lines[max(0, y - 1) : y + 4]
         )

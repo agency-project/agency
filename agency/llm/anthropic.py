@@ -13,6 +13,25 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+_anthropic_timeout_type = _anthropic_sdk.Timeout if _anthropic_sdk is not None else None
+
+
+def _anthropic_sdk_timeout(timeout: httpx.Timeout):
+    """The installed anthropic SDK validates its `timeout` kwarg against its
+    own Timeout type -- httpx.Timeout in older SDK releases, the separate
+    httpx2 package's Timeout in newer ones -- and rejects the other one with
+    a TypeError (older releases fail worse: they accept it, then break deep
+    in socket setup). `anthropic.Timeout` is the SDK's own stable alias for
+    whichever one this installed version actually needs (confirmed via
+    identity check against both), so construct through it directly instead
+    of guessing which package is installed."""
+    if _anthropic_sdk is None or _anthropic_timeout_type is None:
+        return timeout
+    return _anthropic_timeout_type(
+        connect=timeout.connect, read=timeout.read, write=timeout.write, pool=timeout.pool
+    )
+
+
 # Matches the region + "anthropic." prefix Bedrock model IDs carry (e.g.
 # "us.anthropic.claude-sonnet-5-...") -- a no-op substitution on plain
 # api.anthropic.com model IDs ("claude-sonnet-5"), which carry no such
@@ -234,7 +253,7 @@ class _AnthropicBackend(agllm):
     def _client_kwargs(self, timeout: httpx.Timeout) -> dict:
         kwargs: dict = dict(
             api_key=self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_API_KEY"),
-            timeout=timeout,
+            timeout=_anthropic_sdk_timeout(timeout),
         )
         workspace_id = self.agconfig.llm.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
