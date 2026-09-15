@@ -36,6 +36,7 @@ calling thread and is attributed via lease intervals + device sampling, not thre
 from __future__ import annotations
 
 import atexit
+import bisect
 import copy
 import importlib.util
 import itertools
@@ -2308,6 +2309,9 @@ def _resource_observations(samples, *, process_info=None) -> list[dict]:
             "value": float(measured),
             "interval_total": total_value,
             "total_unit": total_unit,
+            # Where interval_total accrued, so a consumer can apportion it over spans.
+            # None for a gauge, whose value is an instant rather than an accumulation.
+            "interval_start_ns": prior[0] if total_value is not None else None,
         }
         if process is not None:
             observation["process_identity"] = identity
@@ -2374,6 +2378,73 @@ def _build_summary(records) -> "dict[str, dict]":
             else None
         )
     return out
+
+
+_SPAN_IO_FIELDS = {"io_read_mb_s": "io_read_mb", "io_write_mb_s": "io_write_mb"}
+
+
+def _span_io_by_label(records, observations) -> "dict[str, dict[str, float]]":
+    """Sandbox disk bytes attributed to each span label by time overlap.
+
+    Both halves of this were already recorded and never joined: the sampler reads the
+    sandbox cgroup's io.stat into a rate series, and every span carries a
+    perf_counter_ns start plus a wall duration on the same clock. Summing the series
+    over the whole session -- which is what sandbox_metrics reports -- leaves a caller
+    unable to tell setup I/O from the work being measured, and setup can dominate. A
+    container start that pip-installs or imports a large dependency tree reads far more
+    than the tool calls under study, so the headline figure describes the framework
+    rather than the workload.
+
+    Intervals are apportioned pro rata: one straddling a span boundary contributes the
+    fraction of its bytes matching the fraction of its duration inside the span.
+    Sampling is periodic, so a span shorter than the interval gets an interpolated
+    estimate rather than an exact count -- attribution is as coarse as sample_hz.
+
+    Only sandbox-scoped series are attributed. workload_total already aggregates them,
+    so counting both would double up. Nested spans each get the full overlap, exactly
+    as wall_ms already double counts a parent and its child.
+    """
+    intervals: "dict[str, list[tuple[int, int, float]]]" = {}
+    for observation in observations:
+        name = observation["name"]
+        if not name.startswith("sandbox:"):
+            continue
+        field = _SPAN_IO_FIELDS.get(name.rsplit(":", 1)[-1])
+        total = observation["interval_total"]
+        start = observation.get("interval_start_ns")
+        end = observation["timestamp_ns"]
+        if field is None or total is None or start is None or end <= start:
+            continue
+        intervals.setdefault(field, []).append((start, end, total))
+    if not intervals:
+        return {}
+
+    # Sorted by start, and non-overlapping within a series, so a span's intervals are
+    # one contiguous run -- bisect on the end times finds where it begins.
+    ends = {}
+    for field, spans in intervals.items():
+        spans.sort()
+        ends[field] = [end for _start, end, _total in spans]
+
+    out: "dict[str, dict[str, float]]" = {}
+    for record in records:
+        _tid, name, started, wall = record[0], record[1], record[2], record[3]
+        if started is None or wall is None or wall <= 0:
+            continue
+        finished = started + wall
+        bucket = out.setdefault(_span_key(name), dict.fromkeys(intervals, 0.0))
+        for field, spans in intervals.items():
+            index = bisect.bisect_right(ends[field], started)
+            while index < len(spans) and spans[index][0] < finished:
+                start, end, total = spans[index]
+                overlap = min(end, finished) - max(start, started)
+                if overlap > 0:
+                    bucket[field] += total * overlap / (end - start)
+                index += 1
+    return {
+        label: {field: round(value, 6) for field, value in fields.items()}
+        for label, fields in out.items()
+    }
 
 
 def _span_key(name: str) -> str:
@@ -2449,6 +2520,12 @@ def _build_run_summary(
     for record in completed_records:
         completed_by_label.setdefault(_span_key(record[1]), []).append(record)
 
+    # Resolved before the span rows, not just for the resource table below: spans are
+    # attributed disk I/O from these same observations.
+    if observations is None:
+        observations = _resource_observations(samples)
+    span_io = _span_io_by_label(completed_records, observations)
+
     span_rows = []
     base_summary = _build_summary(records)
     for label in sorted(
@@ -2492,13 +2569,14 @@ def _build_run_summary(
                 "cpu_percent": round(100 * row["cpu_ms"] / wall_ms, 1)
                 if wall_ms and row["cpu_ms"] is not None and label_records
                 else None,
+                # Absent rather than zero when nothing was sampled: no sandbox series
+                # means unmeasured, and a zero would read as "this span did no I/O".
+                **span_io.get(label, {}),
                 **_latency_stats(wall_values),
             }
         )
 
     grouped: "dict[str, list[dict]]" = {}
-    if observations is None:
-        observations = _resource_observations(samples)
     for observation in observations:
         grouped.setdefault(observation["name"], []).append(observation)
     resource_rows = []
@@ -3140,8 +3218,8 @@ def _render_summary_markdown(summary: dict) -> str:
         lines.extend(
             [
                 "| Label | Completed/started | Failed | Interrupted | Wall (s) | CPU (s) | "
-                "Blocked (s) | Mean (ms) | p50 (ms) | p95 (ms) |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "Blocked (s) | Disk read (MB) | Mean (ms) | p50 (ms) | p95 (ms) |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in summary["span_metrics"]:
@@ -3149,7 +3227,8 @@ def _render_summary_markdown(summary: dict) -> str:
                 f"| {_markdown_escape(row['label'])} | {row['calls']}/{row['started']} | "
                 f"{row['failed']} | {row['interrupted']} | "
                 f"{row['wall_ms'] / 1e3:.3f} | {number(None if row['cpu_ms'] is None else row['cpu_ms'] / 1e3)} | "
-                f"{number(None if row['blocked_ms'] is None else row['blocked_ms'] / 1e3)} | {number(row['mean_ms'])} | "
+                f"{number(None if row['blocked_ms'] is None else row['blocked_ms'] / 1e3)} | "
+                f"{number(row.get('io_read_mb'), 3)} | {number(row['mean_ms'])} | "
                 f"{number(row['p50_ms'])} | {number(row['p95_ms'])} |"
             )
     else:

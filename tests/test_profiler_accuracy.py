@@ -110,3 +110,59 @@ def test_partial_usage_does_not_look_like_a_complete_token_total():
     assert result["reported_input_tokens"] == 10
     assert result["usage_missing_attempts"] == 1
     assert result["failed_attempts"] == 0
+
+
+def sandbox_io_samples(reads_mb):
+    """One cumulative io.stat series, one MB step per second, from t=0."""
+    total = 0
+    samples = [(0, "cg:box:io_r", 0.0)]
+    for index, megabytes in enumerate(reads_mb, start=1):
+        total += int(megabytes * 2**20)
+        samples.append((index * 1_000_000_000, "cg:box:io_r", float(total)))
+    return samples
+
+
+def test_span_disk_io_separates_setup_from_the_work_being_measured():
+    """A session total cannot answer "was that the framework or my workload?"."""
+    samples = sandbox_io_samples([80.0, 4.0])
+    result = agprof._build_run_summary(
+        [
+            # Reads 80 MB in the first second, then the tool reads 4 MB in the second.
+            (1, "sandbox:ensure_daemon", 0, 1_000_000_000, 0, 0, {"outcome": "success"}),
+            (1, "tool:grep", 1_000_000_000, 1_000_000_000, 0, 0, {"outcome": "success"}),
+        ],
+        samples,
+        [],
+        started_ns=0,
+        ended_ns=2_000_000_000,
+        sample_hz=1,
+        sample_gpu=False,
+        gpu_sampling_available=False,
+    )
+    by_label = {row["label"]: row for row in result["span_metrics"]}
+    assert by_label["sandbox:ensure_daemon"]["io_read_mb"] == 80
+    assert by_label["tool:grep"]["io_read_mb"] == 4
+    # The parts still add up to what sandbox_metrics reports for the whole session.
+    assert result["sandbox_metrics"][0]["io_read_mb"] == 84
+    assert "Disk read (MB)" in agprof._render_summary_markdown(result)
+
+
+def test_span_disk_io_is_absent_rather_than_zero_when_no_sandbox_was_sampled():
+    """Zero would claim the span did no I/O; nothing was measured at all."""
+    row = summary([(1, "tool:grep", 0, 1_000_000_000, 0, 0, {})])["span_metrics"][0]
+    assert "io_read_mb" not in row
+
+
+def test_span_disk_io_apportions_an_interval_that_straddles_a_boundary():
+    """Sampling is periodic, so a span shorter than a sample interval is interpolated."""
+    result = agprof._build_run_summary(
+        [(1, "tool:read", 0, 500_000_000, 0, 0, {})],
+        sandbox_io_samples([10.0]),
+        [],
+        started_ns=0,
+        ended_ns=1_000_000_000,
+        sample_hz=1,
+        sample_gpu=False,
+        gpu_sampling_available=False,
+    )
+    assert result["span_metrics"][0]["io_read_mb"] == 5
