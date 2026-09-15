@@ -8,12 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.claude_code import _ClaudeCodeBackend
-from agency.harness.adapters.codex import _CodexBackend
-from agency.harness.adapters.grok import _GrokBackend
-from agency.harness.adapters.native import _NativeBackend
-from agency.harness.adapters.opencode import _OpencodeBackend
+from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+from agency.harness.adapters.claude_code import ClaudeCodeAdapter
+from agency.harness.adapters.codex import CodexAdapter
+from agency.harness.adapters.grok import GrokAdapter
+from agency.harness.adapters.native import NativeAdapter
+from agency.harness.adapters.opencode import OpenCodeAdapter
 
 
 def _runtime(*, sandbox=None) -> AdapterRuntime:
@@ -30,14 +30,14 @@ def _runtime(*, sandbox=None) -> AdapterRuntime:
 
 @pytest.mark.parametrize("name", ["native", "claude_code", "codex", "grok", "opencode"])
 def test_every_engine_implements_daemon_attempt_seam(name):
-    adapter = agharness_backend.for_config(name, agconfig())
-    assert type(adapter).run_daemon_attempt is not agharness_backend.run_daemon_attempt
+    adapter = HarnessAdapter.for_config(name, agconfig())
+    assert type(adapter).run_daemon_attempt is not HarnessAdapter.run_daemon_attempt
 
 
-@pytest.mark.parametrize("backend_cls", [_CodexBackend, _GrokBackend, _OpencodeBackend])
+@pytest.mark.parametrize("backend_cls", [CodexAdapter, GrokAdapter, OpenCodeAdapter])
 def test_external_adapters_use_the_shared_pty_runner(monkeypatch, backend_cls):
-    from agency.harness.adapters.agharness_backend import AttemptResult
-    from agency.harness.adapters.pty_session import PtyExecution
+    from agency.harness.adapters.base import AttemptResult
+    from agency.harness.adapters.pty.execution import PtyExecution
 
     captured = {}
 
@@ -81,7 +81,7 @@ def test_claude_uses_staged_path_and_local_session_files(monkeypatch, tmp_path, 
     )
     session = Path(_session_path(str(config_home), "session-one"))
 
-    argv, _env = _ClaudeCodeBackend(config).prepare_pty(
+    argv, _env = ClaudeCodeAdapter(config).prepare_pty(
         replace(_runtime(sandbox=sandbox), agconfig=config),
         config_home,
         resume_session_id="session-one",
@@ -162,10 +162,10 @@ def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome
     runtime = replace(_runtime(sandbox=sandbox), register_control_handle=register)
     kwargs = dict(prompt="work", resume_session_id=None, prior_session_blob=None, max_steps=1)
     if outcome == "timeout":
-        assert not _NativeBackend(agconfig()).run_daemon_attempt(runtime, **kwargs).ok
+        assert not NativeAdapter(agconfig()).run_daemon_attempt(runtime, **kwargs).ok
     else:
         with pytest.raises(RuntimeError, match="failed"):
-            _NativeBackend(agconfig()).run_daemon_attempt(runtime, **kwargs)
+            NativeAdapter(agconfig()).run_daemon_attempt(runtime, **kwargs)
 
 
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):
@@ -179,7 +179,7 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
         _native_launch(captured, json.dumps({"result": "native-ok", "usage": {}})),
     )
 
-    result = _NativeBackend(agconfig()).run_daemon_attempt(
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
         _runtime(sandbox=sandbox),
         prompt="do the thing",
         resume_session_id=None,
@@ -204,7 +204,7 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
         _native_launch(captured, json.dumps({"result": "native-ok", "usage": {}})),
     )
 
-    result = _NativeBackend(agconfig()).run_daemon_attempt(
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
         _runtime(sandbox=sandbox),
         prompt="do the thing",
         resume_session_id=None,
@@ -217,11 +217,11 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
     assert argv[argv.index("--max-steps") + 1] == "20"
 
 
-@pytest.mark.parametrize("backend_cls", [_NativeBackend, _ClaudeCodeBackend])
+@pytest.mark.parametrize("backend_cls", [NativeAdapter, ClaudeCodeAdapter])
 @pytest.mark.parametrize("has_sandbox_tools", [False, True])
 def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, has_sandbox_tools):
     captured = {}
-    sandbox = _NativeSandbox() if backend_cls is _NativeBackend else None
+    sandbox = _NativeSandbox() if backend_cls is NativeAdapter else None
 
     def launch(_self, argv, envp, **kwargs):
         captured["argv"] = argv
@@ -235,7 +235,7 @@ def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, 
         "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
     )
     runtime = replace(_runtime(sandbox=sandbox), has_sandbox_mcp_tools=has_sandbox_tools)
-    if backend_cls is _ClaudeCodeBackend:
+    if backend_cls is ClaudeCodeAdapter:
         from agency.harness.agharness import cleanup_config_home, materialize_config_home
 
         config_home = materialize_config_home(runtime.engine_name)

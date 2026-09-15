@@ -274,7 +274,7 @@ class toolconfig(confignamespace):
 
 @dataclass(slots=True)
 class harnessadapterconfig(confignamespace):
-    """agency/harness/adapters/agharness_backend.py."""
+    """agency/harness/adapters/base.py."""
 
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None

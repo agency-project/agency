@@ -12,8 +12,8 @@ import pytest
 from agency.configs.agconfig import agconfig, llmconfig, sandboxconfig
 from agency.agdata import agdata
 from agency.agent import agent
-from agency.harness.adapters.claude_code import _ClaudeCodeBackend, claude_code_available
-from agency.harness.adapters.agharness_backend import AdapterRuntime
+from agency.harness.adapters.claude_code import ClaudeCodeAdapter, claude_code_available
+from agency.harness.adapters.base import AdapterRuntime
 from agency.agskill import agskill
 
 
@@ -24,7 +24,7 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
         config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
     config_home = tmp_path
-    argv, env = _ClaudeCodeBackend(config).prepare_pty(runtime, config_home)
+    argv, env = ClaudeCodeAdapter(config).prepare_pty(runtime, config_home)
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert json.loads((config_home / ".claude.json").read_text())["bypassPermissionsModeAccepted"]
     assert "-p" not in argv
@@ -46,7 +46,7 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
     commands = {entry["hooks"][0]["command"] for entries in hooks.values() for entry in entries}
     assert commands == {
         f"python3 {config_home}/agpolicy_hook.py",
-        f"python3 {config_home}/claude_pty_hook.py",
+        f"python3 {config_home}/claude_lifecycle_hook.py",
     }
     assert not (config_home / "agency_lifecycle.py").exists()
     assert (config_home / "agency-turn.json").exists()
@@ -60,7 +60,7 @@ def test_native_launch_restores_conversation_before_resuming(tmp_path, monkeypat
     runtime = AdapterRuntime(
         config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
     )
-    argv, _ = _ClaudeCodeBackend(config).prepare_pty(
+    argv, _ = ClaudeCodeAdapter(config).prepare_pty(
         runtime,
         tmp_path,
         resume_session_id="native-session",

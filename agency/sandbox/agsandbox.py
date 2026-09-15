@@ -148,7 +148,7 @@ class agSandbox:
             mounts[name] = mount
         # Same rationale again, for the `agency` package itself (see
         # agutil.agency_package_dir's docstring) -- needed by a persistent
-        # in-container entrypoint (agharness_backends/native.py's
+        # in-container entrypoint (adapters/native.py's
         # react-loop process, or a container-relocated agproxy_llm) to
         # `import agency` and run the EXACT same code as the host process,
         # not a second copy baked into the sandbox's base image. Read-only,

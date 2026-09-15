@@ -15,8 +15,8 @@ from pathlib import Path
 
 from fastapi import Request
 
-from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
-from .pty_drivers import PtyDriver, run_pty_attempt
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .pty.driver import PtyDriver, run_pty_attempt
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -390,7 +390,7 @@ class ClaudeDriver(PtyDriver):
         return self._snapshot
 
 
-class _ClaudeCodeBackend(agharness_backend):
+class ClaudeCodeAdapter(HarnessAdapter):
     _DEFAULT_BINARY = "claude"
     _PTY_DRIVER = ClaudeDriver
 
@@ -428,8 +428,10 @@ class _ClaudeCodeBackend(agharness_backend):
             hook_path = f"{config_home}/agpolicy_hook.py"
             Path(hook_path).write_bytes(hook_src)
             hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
-            lifecycle_path = config_home / "claude_pty_hook.py"
-            lifecycle_path.write_bytes(Path(__file__).with_name("_claude_pty_hook.py").read_bytes())
+            lifecycle_path = config_home / "claude_lifecycle_hook.py"
+            lifecycle_path.write_bytes(
+                (Path(__file__).parent / "pty" / "_claude_pty_hook.py").read_bytes()
+            )
             lifecycle_hook = {
                 "hooks": [{"type": "command", "command": f"python3 {lifecycle_path}"}]
             }
@@ -895,4 +897,4 @@ def _mid_array_system_warning(body: dict) -> "str | None":
     )
 
 
-__all__ = ["_ClaudeCodeBackend", "claude_code_available"]
+__all__ = ["ClaudeCodeAdapter", "claude_code_available"]

@@ -5,7 +5,7 @@ identity on `TurnStarted` but not on `Stop`, so completion is reconciled
 against the session's own `wire.jsonl` rather than trusted from the event.
 
 Kimi's provider `type = "openai"` means its model traffic is plain Chat
-Completions, served by the shared `ChatCompletionsBackend` seam.
+Completions, served by the shared `ChatCompletionsProtocol` seam.
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ import shutil
 import time
 from pathlib import Path, PurePosixPath
 
-from .agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
-from .openai_protocol import ChatCompletionsBackend
-from .pty_drivers import PtyDriver, run_pty_attempt
-from .pty_session import MAX_SESSION_BYTES, restore_session, snapshot_session
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .openai_chat_completions import ChatCompletionsProtocol
+from .pty.driver import PtyDriver, run_pty_attempt
+from .pty.execution import MAX_SESSION_BYTES, restore_session, snapshot_session
 
 
 def kimi_available() -> bool:
@@ -120,8 +120,8 @@ class KimiDriver(PtyDriver):
 
     def _hook_commands(self):
         hook_dir = Path(__file__).parent
-        lifecycle = self.root / "pty_hook.py"
-        lifecycle.write_bytes((hook_dir / "_pty_hook.py").read_bytes())
+        lifecycle = self.root / "lifecycle_hook.py"
+        lifecycle.write_bytes((hook_dir / "pty" / "_lifecycle_hook.py").read_bytes())
         permission = self.root / "agpolicy_hook.py"
         permission.write_bytes((hook_dir.parent / "_harness_permission_hook.py").read_bytes())
         run = "python3 " + shlex.quote(str(lifecycle))
@@ -298,7 +298,7 @@ class KimiDriver(PtyDriver):
         return snapshot_session(self.root, self.name, self.session_id)
 
 
-class _KimiBackend(ChatCompletionsBackend, agharness_backend):
+class KimiAdapter(ChatCompletionsProtocol, HarnessAdapter):
     _DEFAULT_BINARY = "kimi"
     _PTY_DRIVER = KimiDriver
     _PROVIDER_NAME = _PROVIDER
@@ -360,4 +360,4 @@ class _KimiBackend(ChatCompletionsBackend, agharness_backend):
         (config_home / "config.toml").write_text("\n".join(lines) + "\n")
 
 
-__all__ = ["_KimiBackend", "KimiDriver", "kimi_available"]
+__all__ = ["KimiAdapter", "KimiDriver", "kimi_available"]

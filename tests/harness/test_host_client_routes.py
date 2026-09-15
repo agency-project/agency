@@ -428,7 +428,7 @@ def test_mcp_proxy_streams_and_closes_long_lived_upstream_on_client_disconnect()
 def test_profiler_bridge_calls_use_a_safe_timeout_not_2s():
     """record_profiler_span/record_profiler_samples/profiler_settings used to
     hardcode timeout=2.0 -- tighter than the 10s the container-side bridge in
-    pty_drivers.py now waits, so this inner leg would become the new binding
+    pty/driver.py now waits, so this inner leg would become the new binding
     constraint and could still silently drop harness:* phase spans under load
     even after that outer timeout was fixed. Guard the actual per-request
     httpx timeout directly rather than just the outer value."""

@@ -1,10 +1,7 @@
-"""Harness backend base class, shared config, and backend selection.
+"""Harness adapter base class, runtime dependencies, and adapter selection.
 
-Mirrors `llm/base.py`'s shape: one base (`agharness_backend`)
-concrete backends subclass, a shared `Fields` class so every backend reads
-its tunables as plain attributes, and a `for_config()` selector with lazy,
-function-local imports of the concrete backends (avoids a circular import,
-same reasoning as llm).
+Concrete adapters subclass `HarnessAdapter`. Its `for_config()` selector
+imports them lazily to avoid circular imports.
 
 Selection dispatches on the `harness` string itself (e.g. `ag.harness ==
 "claude_code"`, set via `agent(harness=...)`) rather than a separate
@@ -12,7 +9,7 @@ Selection dispatches on the `harness` string itself (e.g. `ag.harness ==
 harness" signal, so there is no second place a user
 would need to keep in sync with it.
 
-Every concrete backend implements the sandbox-daemon
+Every concrete adapter implements the sandbox-daemon
 `run_daemon_attempt(AdapterRuntime, ...)` seam.
 """
 
@@ -91,10 +88,10 @@ class AdapterRuntime:
     )
 
 
-class agharness_backend:
-    """One backend instance per agconfig -- drives one off-the-shelf
+class HarnessAdapter:
+    """One adapter instance per agconfig -- drives one off-the-shelf
     harness CLI in place of agskill's native ReAct loop. Use
-    `agharness_backend.for_config(engine, agconfig)` to get the right
+    `HarnessAdapter.for_config(engine, agconfig)` to get the right
     subclass; don't instantiate a subclass directly."""
 
     _DEFAULT_BINARY: ClassVar[str | None] = None
@@ -153,27 +150,27 @@ class agharness_backend:
         raise NotImplementedError
 
     @staticmethod
-    def for_config(harness: str, agconfig: "agconfig_cls") -> "agharness_backend":
-        from .claude_code import _ClaudeCodeBackend
-        from .codex import _CodexBackend
-        from .grok import _GrokBackend
-        from .kimi import _KimiBackend
-        from .native import _NativeBackend
-        from .opencode import _OpencodeBackend
+    def for_config(harness: str, agconfig: "agconfig_cls") -> "HarnessAdapter":
+        from .claude_code import ClaudeCodeAdapter
+        from .codex import CodexAdapter
+        from .grok import GrokAdapter
+        from .kimi import KimiAdapter
+        from .native import NativeAdapter
+        from .opencode import OpenCodeAdapter
 
         if harness == "native":
-            return _NativeBackend(agconfig)
+            return NativeAdapter(agconfig)
         if harness == "opencode":
-            return _OpencodeBackend(agconfig)
+            return OpenCodeAdapter(agconfig)
         if harness == "claude_code":
-            return _ClaudeCodeBackend(agconfig)
+            return ClaudeCodeAdapter(agconfig)
         if harness == "codex":
-            return _CodexBackend(agconfig)
+            return CodexAdapter(agconfig)
         if harness == "grok":
-            return _GrokBackend(agconfig)
+            return GrokAdapter(agconfig)
         if harness == "kimi":
-            return _KimiBackend(agconfig)
+            return KimiAdapter(agconfig)
         raise ValueError(
             f"Unknown harness {harness!r} -- set agent(harness=...) to one of "
-            f"'native', 'opencode', 'claude_code', 'codex', 'grok'"
+            f"'native', 'opencode', 'claude_code', 'codex', 'grok', 'kimi'"
         )

@@ -1223,7 +1223,7 @@ class _ContainerBackendBase(agsandbox_backend):
         """Launch sh_cmd inside the container (`docker/podman exec -d`) and
         return as soon as it's registered, without waiting for it to finish
         -- for starting a long-lived in-container process (an
-        agharness_backends/native.py react-loop entrypoint, or a
+        adapters/native.py react-loop entrypoint, or a
         container-relocated agproxy_llm) that the caller reaches afterward
         over its own bridge (a bind-mounted UDS -- see agsandbox.py's
         `_agharness_llm_gateway` mount), not via this call's stdout/exit

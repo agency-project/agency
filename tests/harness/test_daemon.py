@@ -10,10 +10,10 @@ import pytest
 from agency.configs.agconfig import agconfig
 from agency.engine.clients import HarnessInteractionClient
 from agency.harness import daemon
-from agency.harness.adapters.agharness_backend import (
+from agency.harness.adapters.base import (
     AdapterRuntime,
     AttemptResult,
-    agharness_backend,
+    HarnessAdapter,
 )
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
@@ -23,7 +23,7 @@ from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult,
 def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_payload):
     seen = {}
 
-    class FakeAdapter(agharness_backend):
+    class FakeAdapter(HarnessAdapter):
         engine_key = "fake"
 
         def run_daemon_attempt(self, runtime, **kwargs):
@@ -37,7 +37,7 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
             )
 
     monkeypatch.setattr(
-        agharness_backend,
+        HarnessAdapter,
         "for_config",
         classmethod(lambda cls, name, config: FakeAdapter(config)),
     )

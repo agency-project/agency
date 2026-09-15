@@ -14,7 +14,7 @@ import uuid
 from fastapi import Request
 
 from ..common import extract_bearer_token
-from .pty_session import stream_response
+from .pty.execution import stream_response
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -60,7 +60,7 @@ def _flatten_unknown_data(data):
     return merged
 
 
-class ChatCompletionsBackend:
+class ChatCompletionsProtocol:
     """Mixin supplying the Chat Completions route and its block mapping."""
 
     def register(self, app, router) -> None:

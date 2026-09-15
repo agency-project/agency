@@ -14,7 +14,7 @@ import time
 from contextlib import nullcontext
 from pathlib import PurePosixPath
 
-from .agharness_backend import AttemptResult
+from ..base import AttemptResult
 
 
 MAX_SESSION_BYTES = 64 * 1024 * 1024
@@ -275,7 +275,7 @@ class PtyExecution:
                 return False
 
     def close(self):
-        from ..agharness import cleanup_config_home
+        from ...agharness import cleanup_config_home
 
         with self._lock:
             if self._closed:
@@ -308,7 +308,7 @@ class PtyExecution:
                 self.handle.checkpoint_reattach()
 
     def run(self, prompt, *, keep_alive=False):
-        from ..ptrace.supervisor import agProxyPtrace
+        from ...ptrace.supervisor import agProxyPtrace
 
         phase = getattr(self.driver, "profile_span", lambda name: nullcontext())
         completed = False

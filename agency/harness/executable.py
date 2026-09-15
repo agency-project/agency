@@ -14,14 +14,14 @@ import shlex
 import shutil
 from pathlib import Path
 
-from .adapters.agharness_backend import agharness_backend
+from .adapters.base import HarnessAdapter
 
 
 HARNESS_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
 def external_binary(harness, config) -> str | None:
-    adapter = agharness_backend.for_config(harness, config)
+    adapter = HarnessAdapter.for_config(harness, config)
     default = adapter._DEFAULT_BINARY
     return (config.harness_adapter.binary_path or default) if default else None
 

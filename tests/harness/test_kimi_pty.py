@@ -9,9 +9,9 @@ from unittest.mock import Mock
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.pty_drivers import driver_for
-from agency.harness.adapters.pty_session import (
+from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+from agency.harness.adapters.pty.driver import driver_for
+from agency.harness.adapters.pty.execution import (
     restore_session,
     session_file_allowed,
     snapshot_session,
@@ -37,7 +37,7 @@ def runtime():
 @pytest.fixture
 def driver(runtime, tmp_path):
     return driver_for(
-        agharness_backend.for_config("kimi", runtime.agconfig), runtime, tmp_path, None, None, 4
+        HarnessAdapter.for_config("kimi", runtime.agconfig), runtime, tmp_path, None, None, 4
     )
 
 
@@ -81,7 +81,7 @@ def test_resume_passes_the_native_session_flag(runtime, tmp_path):
     payload = json.loads(blob)
     payload["files"]["session_index.jsonl"] = base64.b64encode(b"{}\n").decode()
     driver = driver_for(
-        agharness_backend.for_config("kimi", runtime.agconfig),
+        HarnessAdapter.for_config("kimi", runtime.agconfig),
         runtime,
         tmp_path,
         SESSION,
@@ -117,7 +117,7 @@ def test_restore_repoints_absolute_paths_at_the_new_root(runtime, tmp_path):
         }
     ).encode()
     driver_for(
-        agharness_backend.for_config("kimi", runtime.agconfig),
+        HarnessAdapter.for_config("kimi", runtime.agconfig),
         runtime,
         tmp_path,
         SESSION,

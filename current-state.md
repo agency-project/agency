@@ -92,13 +92,13 @@ Both are tested.
 
 ## 2. Kimi Code (done)
 
-Added as `agency/harness/adapters/kimi.py` — `KimiDriver` plus `_KimiBackend`.
+Added as `agency/harness/adapters/kimi.py` — `KimiDriver` plus `KimiAdapter`.
 All of its values were derived empirically against the real CLI, version
 0.42.0.
 
 - Provider is `type = "openai"`, i.e. plain Chat Completions. The formatting
   code that OpenCode already had was extracted into
-  `openai_protocol.ChatCompletionsBackend` and both harnesses now inherit it,
+  `openai_chat_completions.ChatCompletionsProtocol` and both harnesses now inherit it,
   rather than being copied.
 - Lifecycle hooks (`SessionStart`, `TurnStarted`, `Stop`, `Interrupt`,
   `StopFailure`, `SessionEnd`) plus the shared permission hook.

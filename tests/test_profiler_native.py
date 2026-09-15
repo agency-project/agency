@@ -232,11 +232,11 @@ def test_adapter_http_dispatch_reaches_real_profiler(engine, monkeypatch, tmp_pa
             pass
 
     classes = {
-        "native": "_NativeBackend",
-        "claude_code": "_ClaudeCodeBackend",
-        "codex": "_CodexBackend",
-        "opencode": "_OpencodeBackend",
-        "grok": "_GrokBackend",
+        "native": "NativeAdapter",
+        "claude_code": "ClaudeCodeAdapter",
+        "codex": "CodexAdapter",
+        "opencode": "OpenCodeAdapter",
+        "grok": "GrokAdapter",
     }
     module = importlib.import_module("agency.harness.adapters." + engine)
     config = agconfig(llmconfig(model="fixture-model"))

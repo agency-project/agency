@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime
+from agency.harness.adapters.base import AdapterRuntime
 from agency.harness.adapters.claude_code import ClaudeDriver
-from agency.harness.adapters.pty_session import PtyExecution
+from agency.harness.adapters.pty.execution import PtyExecution
 from agency.harness.ptrace.supervisor import ptrace_available
 
 pytestmark = pytest.mark.skipif(not ptrace_available(), reason="Linux ptrace required")

@@ -1,4 +1,4 @@
-"""Standalone Codex/Grok lifecycle observer; runs inside the sandbox."""
+"""Standalone lifecycle event observer shared by hook-based harnesses."""
 
 import json
 import os

@@ -11,9 +11,9 @@ from unittest.mock import Mock
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-from agency.harness.adapters.pty_drivers import driver_for
-from agency.harness.adapters.pty_session import PtyExecution
+from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+from agency.harness.adapters.pty.driver import driver_for
+from agency.harness.adapters.pty.execution import PtyExecution
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AGENCY_TEST_EXTERNAL_PTY") != "1",
@@ -97,7 +97,7 @@ def test_real_kimi_resumes_from_the_portable_session_blob(tmp_path):
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    adapter = agharness_backend.for_config("kimi", config)
+    adapter = HarnessAdapter.for_config("kimi", config)
 
     first_root = tmp_path / "first-state"
     first_root.mkdir()

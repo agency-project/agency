@@ -32,7 +32,7 @@ from ..configs.agconfig import (
     sandboxconfig,
 )
 from . import interaction_router, mcp_proxy, sandbox_mcp
-from .adapters.agharness_backend import AdapterRuntime, AttemptResult, agharness_backend
+from .adapters.base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
@@ -180,7 +180,7 @@ class _HarnessApiServer:
         self,
         host_uds_path: str,
         port: int,
-        harness_backend: agharness_backend,
+        harness_backend: HarnessAdapter,
         *,
         live_session: bool = False,
     ) -> None:
@@ -337,8 +337,8 @@ def _run_adapter_attempt(
     if not isinstance(attempt_token, str) or not attempt_token:
         return HarnessAttemptResult(ok=False, error_message="missing harness attempt token")
     try:
-        adapter = agharness_backend.for_config(request.harness, agconfig)
-        if type(adapter).run_daemon_attempt is agharness_backend.run_daemon_attempt:
+        adapter = HarnessAdapter.for_config(request.harness, agconfig)
+        if type(adapter).run_daemon_attempt is HarnessAdapter.run_daemon_attempt:
             return HarnessAttemptResult(
                 ok=False,
                 error_message=(
@@ -351,7 +351,7 @@ def _run_adapter_attempt(
         # filesystem facade; external CLIs launch directly in this process's
         # namespace. No host-side agent or skill object crosses this boundary.
         if run_pty_execution is None:
-            from .adapters.agharness_backend import _run_one_pty_execution
+            from .adapters.base import _run_one_pty_execution
 
             run_pty_execution = _run_one_pty_execution
         runtime = AdapterRuntime(
@@ -410,7 +410,7 @@ class HarnessManager:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._engine_name = engine_name
         self._persistent = bool(self._agconfig.sandbox.checkpoint_fast_resume)
-        harness_backend = agharness_backend.for_config(harness, self._agconfig)
+        harness_backend = HarnessAdapter.for_config(harness, self._agconfig)
         self._harness_api = _HarnessApiServer(
             host_uds_path, harness_api_port, harness_backend, live_session=self._persistent
         )

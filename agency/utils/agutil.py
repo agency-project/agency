@@ -493,7 +493,7 @@ def uds_listener_is_live(path: "str | None", thread) -> bool:
 
 # Fixed container-side mount point for agency_package_dir() below -- shared
 # between agsandbox.py (which bind-mounts it) and any in-container
-# entrypoint (agharness_backends/native.py's react-loop process, or a
+# entrypoint (adapters/native.py's react-loop process, or a
 # container-relocated agproxy_llm) that needs to know where to point
 # PYTHONPATH to import agency.
 AGENCY_PACKAGE_CONTAINER_MOUNT = "/opt/agency_pkg"

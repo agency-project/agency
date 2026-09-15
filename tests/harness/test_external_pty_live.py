@@ -92,8 +92,8 @@ class SyntheticBackend:
 def test_real_external_interrupt_acknowledgment_and_resumed_session(
     harness, mode, monkeypatch, tmp_path
 ):
-    from agency.harness.adapters.pty_drivers import PtyDriver
-    from agency.harness.adapters.pty_session import PtyExecution
+    from agency.harness.adapters.pty.driver import PtyDriver
+    from agency.harness.adapters.pty.execution import PtyExecution
 
     executions = []
     original_run = PtyExecution.run
@@ -261,8 +261,8 @@ def test_real_external_interrupt_acknowledgment_and_resumed_session(
 
 @pytest.mark.timeout(120)
 def test_opencode_terminal_process_tree_is_reaped_repeatedly(tmp_path):
-    from agency.harness.adapters.agharness_backend import AdapterRuntime, agharness_backend
-    from agency.harness.adapters.pty_drivers import driver_for
+    from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+    from agency.harness.adapters.pty.driver import driver_for
     from agency.harness.ptrace.supervisor import agProxyPtrace
 
     config = agconfig()
@@ -282,7 +282,7 @@ def test_opencode_terminal_process_tree_is_reaped_repeatedly(tmp_path):
         root = tmp_path / str(index)
         root.mkdir()
         driver = driver_for(
-            agharness_backend.for_config("opencode", config), runtime, root, None, None, None
+            HarnessAdapter.for_config("opencode", config), runtime, root, None, None, None
         )
         handle = agProxyPtrace(config, allow_initial_exec=True).launch(
             driver.argv,

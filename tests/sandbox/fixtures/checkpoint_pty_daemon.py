@@ -14,9 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.agharness_backend import AdapterRuntime
-from agency.harness.adapters.pty_session import PtyExecution
-from agency.harness.adapters.pty_drivers import PtyDriver
+from agency.harness.adapters.base import AdapterRuntime
+from agency.harness.adapters.pty.execution import PtyExecution
+from agency.harness.adapters.pty.driver import PtyDriver
 from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptResult
 
