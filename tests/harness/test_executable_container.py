@@ -24,7 +24,7 @@ from agency.engine.harness_daemon_launcher import ensure_harness_daemon
 from agency.harness.executable import (
     HARNESS_PATH,
     harness_installation_mounts,
-    prepare_harness_executable,
+    resolve_harness_binary,
 )
 from agency.sandbox.agsandbox import agSandbox
 from agency.utils.agutil import agharness_llm_gateway_dir
@@ -34,6 +34,33 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") != "1",
     reason="opt-in real Linux harness/container test",
 )
+
+
+def _prepare_local_probe(harness: str, binary_path: str) -> str:
+    """A script run inside the sandbox that exercises
+    prepare_harness_executable_local() and the real process launcher the
+    adapters use, the same way the daemon does on its first attempt."""
+    return f"""\
+from agency.configs.agconfig import agconfig, agentconfig, harnessadapterconfig
+from agency.harness.executable import prepare_harness_executable_local
+from agency.harness.ptrace.supervisor import agProxyPtrace
+
+config = agconfig(agentconfig(harness={harness!r}), harnessadapterconfig(binary_path={binary_path!r}))
+prepared = prepare_harness_executable_local({harness!r}, config)
+
+class StartupPolicy:
+    def check(self, agent, event):
+        return True
+
+handle = agProxyPtrace(agconfig(), allow_initial_exec=True).launch(
+    [prepared, "--version"], {{"PATH": {HARNESS_PATH!r}}},
+    cwd="/workspace", policy=StartupPolicy(), ag=None,
+)
+stdout, stderr, rc = handle.wait(timeout=30)
+print(stdout)
+print(stderr)
+raise SystemExit(rc)
+"""
 
 
 @pytest.mark.parametrize(
@@ -54,22 +81,27 @@ def test_real_installed_cli_launches_from_read_only_installation(harness, binary
             ),
         ),
     )
+    resolved = resolve_harness_binary(harness, config)
+    assert resolved == str(Path(host_binary).resolve())
+    host_version = subprocess.check_output([host_binary, "--version"], text=True).strip()
+
     sandbox = agSandbox(f"external-{harness}", agconfig=config)
     try:
-        prepared = prepare_harness_executable(sandbox, harness, config)
-        assert prepared == str(Path(host_binary).resolve())
-        out, rc = sandbox.exec(f"PATH={HARNESS_PATH} {shlex.quote(prepared)} --version", timeout=30)
-        assert rc == 0, out
-        host_version = subprocess.check_output([host_binary, "--version"], text=True).strip()
-        assert host_version in out
-        print(f"{harness}: {host_version}; executable={prepared}", flush=True)
-
         for source, destination, mode in harness_installation_mounts(config).values():
             assert source == destination and mode == "ro"
             out, rc = sandbox.exec(
                 f"touch {shlex.quote(destination + '/.agency-readonly-probe')}", workdir="/"
             )
             assert rc != 0 and "Read-only file system" in out, out
+
+        sandbox.write_file(
+            "/workspace/harness-startup-probe.py", _prepare_local_probe(harness, resolved)
+        )
+        out, rc = sandbox.exec(
+            "PYTHONPATH=/opt/agency_pkg python3 /workspace/harness-startup-probe.py", timeout=45
+        )
+        assert rc == 0 and host_version in out, out
+        print(f"{harness}: {host_version}; executable={resolved}", flush=True)
 
         # Use the real launcher and real daemon too, rather than checking a
         # hand-constructed docker run with mounts different from Agency's.
@@ -79,31 +111,6 @@ def test_real_installed_cli_launches_from_read_only_installation(harness, binary
         )
         with handle.client(timeout_s=5) as client:
             assert client.is_ready()
-
-        # Exercise the actual process launcher used by the adapters as well:
-        # in particular, Codex's Node launcher spawns its native child here.
-        probe = f"""\
-from agency.configs.agconfig import agconfig
-from agency.harness.ptrace.supervisor import agProxyPtrace
-
-class StartupPolicy:
-    def check(self, agent, event):
-        return True
-
-handle = agProxyPtrace(agconfig(), allow_initial_exec=True).launch(
-    [{prepared!r}, "--version"], {{"PATH": {HARNESS_PATH!r}}},
-    cwd="/workspace", policy=StartupPolicy(), ag=None,
-)
-stdout, stderr, rc = handle.wait(timeout=30)
-print(stdout)
-print(stderr)
-raise SystemExit(rc)
-"""
-        sandbox.write_file("/workspace/harness-startup-probe.py", probe)
-        out, rc = sandbox.exec(
-            "PYTHONPATH=/opt/agency_pkg python3 /workspace/harness-startup-probe.py", timeout=45
-        )
-        assert rc == 0 and host_version in out, out
     finally:
         sandbox.destroy()
 
@@ -118,8 +125,15 @@ def test_real_codex_reports_missing_image_node_runtime():
         _, rc = sandbox.exec(f"PATH={HARNESS_PATH} command -v node")
         if rc == 0:
             pytest.skip("base image already provides Node")
-        with pytest.raises(RuntimeError, match="node"):
-            prepare_harness_executable(sandbox, "codex", config)
+        resolved = resolve_harness_binary("codex", config)
+        assert resolved is not None
+        sandbox.write_file(
+            "/workspace/harness-startup-probe.py", _prepare_local_probe("codex", resolved)
+        )
+        out, rc = sandbox.exec(
+            "PYTHONPATH=/opt/agency_pkg python3 /workspace/harness-startup-probe.py", timeout=45
+        )
+        assert rc != 0 and "node" in out.lower(), out
     finally:
         sandbox.destroy()
 
@@ -139,12 +153,12 @@ def test_real_agent_harness_override_prepares_installation(harness):
     )
     # This intentionally leaves config.agent.harness at its native default.
     # No invocation/model request is made; only the public Agent's sandbox
-    # construction and actual executable startup are exercised.
+    # construction and host-side binary resolution are exercised.
     owner = Agent(harness=harness, agconfig=config)
     try:
         sandbox = owner._ensure_sandbox()
         assert sandbox.agconfig.agent.harness == harness
-        assert prepare_harness_executable(sandbox, harness, config)
+        assert resolve_harness_binary(harness, config)
     finally:
         if owner.sandbox is not None:
             owner.sandbox.destroy()

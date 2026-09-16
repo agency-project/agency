@@ -13,26 +13,17 @@ from agency.utils.agutil import _strip_thinking, _extract_thinking, sigterm_as_e
 def test_pinned_harness_python_fails_before_any_install(monkeypatch):
     from agency.utils import agutil
 
-    commands = []
+    def _missing(name):
+        raise ImportError(name)
 
-    class Sandbox:
-        def exec(self, command, **_kwargs):
-            commands.append(command)
-            return "missing", 1
-
+    monkeypatch.setattr("importlib.import_module", _missing)
     monkeypatch.setattr(
         agutil,
-        "_container_can_reach_pypi",
-        lambda *_args: pytest.fail("Network probe must not run for pinned runtime"),
+        "_can_reach_pypi_locally",
+        lambda *_args: pytest.fail("Network probe must not run for a refused install"),
     )
     with pytest.raises(RuntimeError, match="refusing package installation"):
-        agutil.ensure_python_packages_in_container(
-            Sandbox(),
-            ["cloudpickle"],
-            python_executable="/opt/e1a1-venv/bin/python",
-            install_missing=False,
-        )
-    assert commands == ['/opt/e1a1-venv/bin/python -c "import cloudpickle"']
+        agutil.ensure_python_packages_locally(["cloudpickle"], install_missing=False)
 
 
 def test_strip_thinking_removes_think_tag():

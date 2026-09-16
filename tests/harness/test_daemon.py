@@ -85,6 +85,8 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
     seen = []
     manager = HarnessManager.__new__(HarnessManager)
     manager._agconfig = agconfig()
+    manager._harness = "claude_code"
+    manager._bootstrapped = True
     manager._engine_name = "agent-1"
     manager._attempt_lock = threading.Lock()
     manager._current_attempt_token = None
@@ -219,6 +221,81 @@ def test_daemon_revokes_attempt_token_when_handler_raises():
 
     assert events == [("register", "attempt-one"), ("clear", "attempt-one")]
     assert manager._current_attempt_token is None
+
+
+def _adapter_request_manager(*, bootstrapped: bool):
+    """A HarnessManager stripped to just what _run_adapter_request() reads,
+    with a _harness_api fake that fails loudly if reached before bootstrap
+    should have already happened."""
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._agconfig = agconfig()
+    manager._harness = "codex"
+    manager._bootstrapped = bootstrapped
+    manager._current_attempt_token = "attempt-one"
+    manager._live_local_token = None
+    manager._persistent = False
+    manager._engine_name = "agent-1"
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("must not run before bootstrap completes")
+
+    manager._harness_api = type(
+        "HarnessApi",
+        (),
+        {
+            "base_url": "http://127.0.0.1:8766",
+            "resolve_model": (lambda self, token: "model") if bootstrapped else _unexpected,
+            "syscall_policy": (lambda self, token, **kw: object()) if bootstrapped else _unexpected,
+        },
+    )()
+    return manager
+
+
+def test_run_adapter_request_reports_bootstrap_failure_without_running_the_harness(monkeypatch):
+    manager = _adapter_request_manager(bootstrapped=False)
+    monkeypatch.setattr(
+        daemon,
+        "prepare_harness_executable_local",
+        lambda harness, config: (_ for _ in ()).throw(RuntimeError("codex executable missing")),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_run_adapter_attempt",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not run the harness")),
+    )
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"), harness="codex", attempt_token="attempt-one"
+    )
+
+    result = manager._run_adapter_request(request)
+
+    assert result.ok is False
+    assert "codex executable missing" in result.error_message
+    # Not sticky on failure -- a transient bootstrap problem (e.g. pip
+    # install briefly lacking network) should be retried on the next attempt.
+    assert manager._bootstrapped is False
+
+
+def test_run_adapter_request_skips_bootstrap_once_already_done(monkeypatch):
+    manager = _adapter_request_manager(bootstrapped=True)
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "prepare_harness_executable_local",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("bootstrap must not re-run")),
+    )
+    expected = HarnessAttemptResult(ok=True, final_text="done")
+    monkeypatch.setattr(
+        daemon, "_run_adapter_attempt", lambda *a, **kw: calls.append(a) or expected
+    )
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"), harness="codex", attempt_token="attempt-one"
+    )
+
+    result = manager._run_adapter_request(request)
+
+    assert result == expected
+    assert len(calls) == 1
 
 
 def test_harness_manager_returns_attempt_result_on_original_rpc():

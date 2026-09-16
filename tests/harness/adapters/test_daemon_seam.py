@@ -149,7 +149,7 @@ def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome
     if outcome == "registration_error":
         register.side_effect = RuntimeError("registration failed")
     monkeypatch.setattr(
-        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         "agency.harness.ptrace.supervisor.agProxyPtrace.launch", lambda *args, **kwargs: handle
@@ -172,7 +172,7 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     sandbox = _NativeSandbox()
     captured: dict = {}
     monkeypatch.setattr(
-        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
@@ -197,7 +197,7 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
     sandbox = _NativeSandbox()
     captured: dict = {}
     monkeypatch.setattr(
-        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(
         "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
@@ -232,7 +232,7 @@ def test_mcp_adapters_include_separate_sandbox_config(monkeypatch, backend_cls, 
     monkeypatch.setattr("shutil.which", lambda binary: f"/usr/bin/{binary}")
     monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
     monkeypatch.setattr(
-        "agency.utils.agutil.ensure_python_packages_in_container", lambda *args, **kwargs: None
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
     )
     runtime = replace(_runtime(sandbox=sandbox), has_sandbox_mcp_tools=has_sandbox_tools)
     if backend_cls is ClaudeCodeAdapter:

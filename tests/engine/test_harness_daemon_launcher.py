@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shlex
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -44,12 +43,6 @@ def _fake_sandbox(tmp_path, *namespaces) -> _FakeSandbox:
 
 def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeypatch, tmp_path):
     sandbox = _fake_sandbox(tmp_path, harnessadapterconfig(binary_path="/bin/claude"))
-    installed = []
-    monkeypatch.setattr(
-        launcher,
-        "ensure_python_packages_in_container",
-        lambda _sandbox, packages, **kwargs: installed.extend(packages),
-    )
     readiness = iter([False, True])
     monkeypatch.setattr(launcher, "_is_ready", lambda _handle, timeout_s=0.5: next(readiness))
 
@@ -71,12 +64,37 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert "--sandbox-uds /var/run/agency_llm_gateway/sandbox-agent.sock" in command
     assert "--harness claude_code" in command
     assert '"binary_path":"/bin/claude"' in command
+    assert f"> {launcher.AGENCY_LOGS_CONTAINER_MOUNT}/daemon-agent-1.log" in command
     assert workdir == "/workspace"
-    assert "cloudpickle" in installed
-    assert "pyte" in installed
 
 
-def test_pinned_sandbox_python_is_used_for_probe_and_daemon_without_install(monkeypatch, tmp_path):
+def test_ensure_harness_daemon_default_timeout_is_60s():
+    import inspect
+
+    assert inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 60.0
+
+
+def test_package_bootstrap_runs_before_the_daemon_module_is_ever_imported(monkeypatch, tmp_path):
+    """Importing agency.harness.daemon already needs most of these packages
+    transitively -- the bootstrap that installs them must run as its own
+    dependency-free command ahead of that import, not inside it."""
+    sandbox = _fake_sandbox(tmp_path, harnessadapterconfig(binary_path="/bin/claude"))
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
+
+    launcher.ensure_harness_daemon(
+        sandbox, "/tmp/host.sock", "agent-1", "claude_code", agconfig=sandbox.agconfig
+    )
+
+    command = sandbox.detached[0][0]
+    bootstrap_index = command.index("import importlib, socket, subprocess, sys")
+    daemon_index = command.index("-m agency.harness.daemon")
+    assert bootstrap_index < daemon_index
+    for pkg in launcher._REQUIRED_HARNESS_PACKAGES:
+        assert repr(pkg).strip("'\"") in command or pkg in command
+    assert " && exec " in command
+
+
+def test_package_bootstrap_refuses_install_when_harness_python_is_pinned(monkeypatch, tmp_path):
     from agency.configs.agconfig import sandboxconfig
 
     sandbox = _fake_sandbox(
@@ -84,11 +102,25 @@ def test_pinned_sandbox_python_is_used_for_probe_and_daemon_without_install(monk
         harnessadapterconfig(binary_path="/bin/claude"),
         sandboxconfig(harness_python_path="/opt/e1a1-venv/bin/python"),
     )
-    probes = []
-    monkeypatch.setattr(
-        launcher,
-        "ensure_python_packages_in_container",
-        lambda _sandbox, _packages, **kwargs: probes.append(kwargs),
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
+
+    launcher.ensure_harness_daemon(
+        sandbox, "/tmp/host.sock", "agent-1", "claude_code", agconfig=sandbox.agconfig
+    )
+
+    command = sandbox.detached[0][0]
+    assert "install_missing = False" in command
+
+
+def test_pinned_harness_python_path_is_passed_through_for_the_daemon_to_check_itself(
+    monkeypatch, tmp_path
+):
+    from agency.configs.agconfig import sandboxconfig
+
+    sandbox = _fake_sandbox(
+        tmp_path,
+        harnessadapterconfig(binary_path="/bin/claude"),
+        sandboxconfig(harness_python_path="/opt/e1a1-venv/bin/python"),
     )
     monkeypatch.setattr(launcher, "_is_ready", lambda _handle, timeout_s=0.5: True)
     launcher.ensure_harness_daemon(
@@ -99,14 +131,12 @@ def test_pinned_sandbox_python_is_used_for_probe_and_daemon_without_install(monk
         agconfig=sandbox.agconfig,
         timeout_s=1.0,
     )
-    assert probes == [
-        {
-            "timeout_s": 180,
-            "python_executable": "/opt/e1a1-venv/bin/python",
-            "install_missing": False,
-        }
-    ]
-    assert "exec /opt/e1a1-venv/bin/python -m agency.harness.daemon" in sandbox.detached[0][0]
+    command = sandbox.detached[0][0]
+    # The daemon reads this back out of its own --config-json to decide
+    # whether it may pip-install a missing package into itself (only when
+    # unpinned) once it handles its first attempt.
+    assert '"harness_python_path":"/opt/e1a1-venv/bin/python"' in command
+    assert "exec /opt/e1a1-venv/bin/python -m agency.harness.daemon" in command
 
 
 def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch, tmp_path):
@@ -171,8 +201,8 @@ def test_daemon_log_is_preclaimed_host_side_before_container_can_write_it(monkey
         timeout_s=1.0,
     )
 
-    log_path = launcher._host_daemon_log_path(sandbox)
-    assert log_path == tmp_path / "daemon.log"
+    log_path = launcher._host_daemon_log_path(sandbox, "agent-1")
+    assert log_path == tmp_path / "daemon-agent-1.log"
     assert log_path.exists()
     assert oct(log_path.stat().st_mode)[-3:] == "666"
 
@@ -186,7 +216,7 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
 
     assert launcher._daemon_config(config) == {
         "harness_adapter": {"binary_path": "/bin/claude"},
-        "sandbox": {"checkpoint_fast_resume": False},
+        "sandbox": {"checkpoint_fast_resume": False, "harness_python_path": None},
         "ptrace": {
             "syscalls": list(agconfig().ptrace.syscalls),
             "file_access": False,
@@ -197,28 +227,36 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
 
 
 @pytest.mark.parametrize("harness", ["claude_code", "codex", "grok", "opencode"])
-def test_all_external_harnesses_receive_prepared_path(monkeypatch, tmp_path, harness):
+def test_all_external_harnesses_receive_a_resolved_absolute_binary_path(
+    monkeypatch, tmp_path, harness
+):
+    # The install directory is bind-mounted at its original host path, which
+    # the daemon's own (deliberately narrow) PATH can't rediscover on its
+    # own -- a bare default binary name (no explicit binary_path configured)
+    # must come out resolved to an absolute path.
     sandbox = _fake_sandbox(tmp_path, agentconfig(harness=harness))
-    prepared = f"/host/install/{harness}/bin/cli"
-    prepare = Mock(return_value=prepared)
-    monkeypatch.setattr(launcher, "prepare_harness_executable", prepare)
-    monkeypatch.setattr(launcher, "ensure_python_packages_in_container", lambda *a, **kw: None)
     monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
     launcher.ensure_harness_daemon(
         sandbox, "/tmp/host.sock", "agent-1", harness, agconfig=sandbox.agconfig
     )
-    prepare.assert_called_once_with(sandbox, harness, sandbox.agconfig)
     command = shlex.split(sandbox.detached[0][0])
     config = json.loads(command[command.index("--config-json") + 1])
-    assert config["harness_adapter"]["binary_path"] == prepared
-    assert sandbox.agconfig.harness_adapter.binary_path is None
+    resolved = config["harness_adapter"]["binary_path"]
+    assert resolved is not None
+    assert resolved.startswith("/"), f"expected an absolute path, got {resolved!r}"
 
 
-def test_preparation_failure_prevents_daemon_launch(monkeypatch, tmp_path):
-    sandbox = _fake_sandbox(tmp_path)
-    monkeypatch.setattr(
-        launcher, "prepare_harness_executable", Mock(side_effect=RuntimeError("missing runtime"))
+def test_explicit_binary_path_is_resolved_the_same_way(monkeypatch, tmp_path):
+    configured = "/host/install/claude_code/bin/cli"
+    sandbox = _fake_sandbox(
+        tmp_path,
+        agentconfig(harness="claude_code"),
+        harnessadapterconfig(binary_path=configured),
     )
-    with pytest.raises(RuntimeError, match="missing runtime"):
-        launcher.ensure_harness_daemon(sandbox, "/tmp/host.sock", "agent-1", "codex")
-    assert not sandbox.detached
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
+    launcher.ensure_harness_daemon(
+        sandbox, "/tmp/host.sock", "agent-1", "claude_code", agconfig=sandbox.agconfig
+    )
+    command = shlex.split(sandbox.detached[0][0])
+    config = json.loads(command[command.index("--config-json") + 1])
+    assert config["harness_adapter"]["binary_path"] == configured

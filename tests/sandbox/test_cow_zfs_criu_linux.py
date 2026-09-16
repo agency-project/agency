@@ -228,13 +228,17 @@ def test_actual_agency_pty_accepts_commands_after_three_restores(sandbox, tmp_pa
     from agency.utils.agutil import new_uds_path
     from agency.engine.harness_daemon_launcher import DaemonHandle, _container_socket_path
 
-    from agency.utils.agutil import ensure_python_packages_in_container
-
-    ensure_python_packages_in_container(
-        sandbox,
-        ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle", "pyte"],
-        timeout_s=180,
+    packages = ["fastapi", "uvicorn", "openai", "httpx", "mcp", "pyseccomp", "cloudpickle", "pyte"]
+    sandbox.write_file(
+        "/workspace/_ensure_packages_probe.py",
+        "from agency.utils.agutil import ensure_python_packages_locally\n"
+        f"ensure_python_packages_locally({packages!r}, timeout_s=180)\n",
     )
+    _, rc = sandbox.exec(
+        f"PYTHONPATH={AGENCY_PACKAGE_CONTAINER_MOUNT} python3 /workspace/_ensure_packages_probe.py",
+        timeout=210,
+    )
+    assert rc == 0
     host_socket = new_uds_path("pty-test-host")
     control_socket = new_uds_path("pty-test-control")
     sandbox.write_file(

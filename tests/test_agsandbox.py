@@ -1679,67 +1679,104 @@ class TestAgSandboxAgencyPackageMount:
 
 
 # ---------------------------------------------------------------------------
-# agutil.ensure_python_packages_in_container -- resolves the dependency gap
-# a container-relocated agproxy_llm / full react-loop entrypoint (Phase 2b /
-# 3b) hits: the sandbox base image is a bare Python image and carries none
-# of httpx/pydantic/fastapi/uvicorn/openai.
+# agutil.ensure_python_packages_locally -- resolves the dependency gap a
+# container-relocated agproxy_llm / full react-loop entrypoint hits: the
+# sandbox base image is a bare Python image and carries none of
+# httpx/pydantic/fastapi/uvicorn/openai. Runs against the interpreter that
+# calls it, so exercising its real behavior means calling it from inside the
+# container via a small script, not from the host test process.
+#
+# Importing agency.utils.agutil at all pulls in the whole agency package's
+# own eager import chain (agent.py / orchestrator / engine.py -> most of
+# agency's real third-party dependencies, transitively) -- exactly the
+# precondition this function's one production call site (the native harness
+# adapter, deep inside an already-running daemon process) always has
+# satisfied already. A bare test container starts with none of that, so
+# each sandbox here bind-mounts this test process's own site-packages
+# read-only and puts it on the container's PYTHONPATH, standing in for "an
+# image whose baseline agency dependencies are already present" without a
+# slow from-scratch pip install. The package used as the "still genuinely
+# missing" test subject (a tiny real PyPI package, not one of agency's own
+# dependencies) is then the only thing these tests actually pip-install.
 # ---------------------------------------------------------------------------
 
+_MISSING_TEST_PACKAGE = "cowsay"  # a real, tiny PyPI package outside agency's own dependency set
 
-class TestEnsurePythonPackagesInContainer:
+
+def _cfg_with_host_site_packages(cfg=None):
+    import sysconfig
+
+    from agency.configs.agconfig import agconfig as agconfig_cls
+
+    cfg = cfg if cfg is not None else agconfig_cls()
+    cfg.sandbox.add_mount(
+        "host_site_packages", sysconfig.get_paths()["purelib"], "/opt/host_site_packages", "ro"
+    )
+    return cfg
+
+
+def _run_ensure_packages_locally(sb, packages, *, timeout_s=180, install_missing=True):
+    from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+
+    script = (
+        "from agency.utils.agutil import ensure_python_packages_locally\n"
+        f"ensure_python_packages_locally({packages!r}, timeout_s={timeout_s!r}, "
+        f"install_missing={install_missing!r})\n"
+    )
+    sb.write_file("/workspace/_ensure_packages_probe.py", script)
+    return sb.exec(
+        f"PYTHONPATH={AGENCY_PACKAGE_CONTAINER_MOUNT}:/opt/host_site_packages "
+        "python3 /workspace/_ensure_packages_probe.py",
+        timeout=timeout_s + 30,
+    )
+
+
+class TestEnsurePythonPackagesLocally:
     @docker
     def test_installs_a_missing_package(self):
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        sb = _make_sandbox()
+        sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
-            _, rc = sb.exec('python3 -c "import fastapi"')
-            assert rc != 0, "fastapi must NOT already be present -- test assumes the gap"
+            _, rc = sb.exec(f'python3 -c "import {_MISSING_TEST_PACKAGE}"')
+            assert rc != 0, (
+                f"{_MISSING_TEST_PACKAGE} must NOT already be present -- test assumes the gap"
+            )
 
-            ensure_python_packages_in_container(sb, ["fastapi"], timeout_s=120)
+            _, rc = _run_ensure_packages_locally(sb, [_MISSING_TEST_PACKAGE], timeout_s=120)
+            assert rc == 0
 
-            _, rc = sb.exec('python3 -c "import fastapi"')
-            assert rc == 0, "fastapi must be importable after ensure_python_packages_in_container"
+            _, rc = sb.exec(f'python3 -c "import {_MISSING_TEST_PACKAGE}"')
+            assert rc == 0, (
+                f"{_MISSING_TEST_PACKAGE} must be importable after ensure_python_packages_locally"
+            )
         finally:
             sb.destroy()
 
     @docker
     def test_noop_when_already_present(self):
         """An already-importable package must not trigger any pip install at
-        all -- verified by making pip3 unusable and confirming that doesn't
-        matter.
-
-        Uses a stdlib module rather than a third-party one. This test used to
-        assert httpx was "confirmed present in the base image", which was true
-        only of the old purpose-built sandbox image; against a stock Python
-        base it fails on its own premise rather than on the behaviour it is
-        supposed to be testing. A stdlib import is present in every image, so
-        the test now depends on nothing but the contract.
-        """
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        sb = _make_sandbox()
+        all -- verified by making pip unusable and confirming that doesn't
+        matter. Uses a stdlib module, present in every image."""
+        sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
             _, rc = sb.exec('python3 -c "import json"')
             assert rc == 0, "stdlib import must work -- test assumes this baseline"
 
-            # Break pip3 so any real install attempt would fail loudly.
+            # Break pip so any real install attempt would fail loudly.
             sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
 
-            ensure_python_packages_in_container(sb, ["json"], timeout_s=30)  # must not raise
+            _, rc = _run_ensure_packages_locally(sb, ["json"], timeout_s=30)
+            assert rc == 0
         finally:
             sb.destroy()
 
     @docker
     def test_raises_on_a_nonexistent_package(self):
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        sb = _make_sandbox()
+        sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
-            with pytest.raises(RuntimeError):
-                ensure_python_packages_in_container(
-                    sb, ["this_package_definitely_does_not_exist_xyz"], timeout_s=30
-                )
+            _, rc = _run_ensure_packages_locally(
+                sb, ["this_package_definitely_does_not_exist_xyz"], timeout_s=30
+            )
+            assert rc != 0
         finally:
             sb.destroy()
 
@@ -1750,18 +1787,15 @@ class TestEnsurePythonPackagesInContainer:
         Without the probe, pip's own failure is "Could not find a version
         that satisfies the requirement X (from versions: none)", which reads
         like a bad package name rather than a deliberately isolated sandbox.
-        The harness calls this on every launch, so that message would surface
+        The daemon calls this on every launch, so that message would surface
         as every agent failing to start for no visible reason.
         """
-        from agency.configs.agconfig import agconfig as agconfig_cls
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        cfg = agconfig_cls()
+        cfg = _cfg_with_host_site_packages()
         cfg.sandbox.flags = ["--network", "none"]
         sb = _make_sandbox(agconfig=cfg)
         try:
-            with pytest.raises(RuntimeError, match="no outbound network"):
-                ensure_python_packages_in_container(sb, ["fastapi"], timeout_s=60)
+            out, rc = _run_ensure_packages_locally(sb, [_MISSING_TEST_PACKAGE], timeout_s=60)
+            assert rc != 0 and "no outbound network" in out
         finally:
             sb.destroy()
 
@@ -1771,18 +1805,16 @@ class TestEnsurePythonPackagesInContainer:
         everything -- this is what makes a --network none sandbox workable at
         all, rather than the probe simply moving the failure earlier.
 
-        pip3 is broken here too, so reaching either the probe or the install
+        pip is broken here too, so reaching either the probe or the install
         would fail rather than silently pass.
         """
-        from agency.configs.agconfig import agconfig as agconfig_cls
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        cfg = agconfig_cls()
+        cfg = _cfg_with_host_site_packages()
         cfg.sandbox.flags = ["--network", "none"]
         sb = _make_sandbox(agconfig=cfg)
         try:
             sb.exec("mv /usr/local/bin/pip3 /usr/local/bin/pip3.disabled")
-            ensure_python_packages_in_container(sb, ["json", "os"], timeout_s=30)
+            _, rc = _run_ensure_packages_locally(sb, ["json", "os"], timeout_s=30)
+            assert rc == 0
         finally:
             sb.destroy()
 
@@ -1790,25 +1822,32 @@ class TestEnsurePythonPackagesInContainer:
     def test_probe_reports_reachable_with_network(self):
         """The probe must not be a blanket "always unreachable" -- otherwise
         the raise above would fire on every ordinary networked sandbox."""
-        from agency.utils.agutil import _container_can_reach_pypi
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
 
-        sb = _make_sandbox()
+        sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
-            assert _container_can_reach_pypi(sb) is True
+            script = (
+                "from agency.utils.agutil import _can_reach_pypi_locally\n"
+                "raise SystemExit(0 if _can_reach_pypi_locally() else 1)\n"
+            )
+            sb.write_file("/workspace/_reach_pypi_probe.py", script)
+            _, rc = sb.exec(
+                f"PYTHONPATH={AGENCY_PACKAGE_CONTAINER_MOUNT}:/opt/host_site_packages "
+                "python3 /workspace/_reach_pypi_probe.py"
+            )
+            assert rc == 0
         finally:
             sb.destroy()
 
-    def test_probe_is_false_when_exec_raises(self):
-        """A backend that raises rather than returning a non-zero code must
-        read as unreachable, not propagate -- the caller turns this into its
-        own error message."""
-        from agency.utils.agutil import _container_can_reach_pypi
+    def test_probe_is_false_when_connection_raises(self):
+        """A connection failure must read as unreachable, not propagate --
+        the caller turns this into its own error message."""
+        from unittest.mock import patch
 
-        class _Exploding:
-            def exec(self, *args, **kwargs):
-                raise OSError("daemon gone")
+        from agency.utils.agutil import _can_reach_pypi_locally
 
-        assert _container_can_reach_pypi(_Exploding()) is False
+        with patch("socket.create_connection", side_effect=OSError("network unreachable")):
+            assert _can_reach_pypi_locally() is False
 
     @docker
     def test_installs_only_the_missing_subset(self):
@@ -1817,15 +1856,16 @@ class TestEnsurePythonPackagesInContainer:
         importable afterward), plus the noop-when-present test above
         already covers the "don't touch what's already there" contract
         directly."""
-        from agency.utils.agutil import ensure_python_packages_in_container
-
-        sb = _make_sandbox()
+        sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
-            ensure_python_packages_in_container(sb, ["httpx", "uvicorn"], timeout_s=120)
+            _, rc = _run_ensure_packages_locally(
+                sb, ["httpx", _MISSING_TEST_PACKAGE], timeout_s=120
+            )
+            assert rc == 0
             _, rc_httpx = sb.exec('python3 -c "import httpx"')
-            _, rc_uvicorn = sb.exec('python3 -c "import uvicorn"')
+            _, rc_missing = sb.exec(f'python3 -c "import {_MISSING_TEST_PACKAGE}"')
             assert rc_httpx == 0
-            assert rc_uvicorn == 0
+            assert rc_missing == 0
         finally:
             sb.destroy()
 

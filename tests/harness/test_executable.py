@@ -32,7 +32,7 @@ def test_native_does_not_discover_or_mount_external_files(monkeypatch):
     monkeypatch.setattr(executable.shutil, "which", Mock(side_effect=AssertionError("lookup")))
     config = config_for("native")
     assert executable.harness_installation_mounts(config) == {}
-    assert executable.prepare_harness_executable(None, "native", config) is None
+    assert executable.resolve_harness_binary("native", config) is None
 
 
 def test_mounts_complete_npm_tree_including_hoisted_native_package(monkeypatch, tmp_path):
@@ -94,14 +94,13 @@ def test_external_package_symlinks_keep_targets_mounted(monkeypatch, tmp_path):
 
 
 def test_missing_host_installation_allows_image_provided_cli(monkeypatch):
+    # resolve_harness_binary() only looks host-side -- an image-provided CLI
+    # with no host installation at all is found later, daemon-side, by
+    # prepare_harness_executable_local()'s own PATH fallback.
     monkeypatch.setattr(executable.shutil, "which", lambda name: None)
     config = config_for()
     assert executable.harness_installation_mounts(config) == {}
-    sandbox = Mock()
-    sandbox.exec.side_effect = [("/image/bin/claude\n", 0), ("", 0), ("1.0", 0)]
-    assert (
-        executable.prepare_harness_executable(sandbox, "claude_code", config) == "/image/bin/claude"
-    )
+    assert executable.resolve_harness_binary("claude_code", config) is None
 
 
 def test_prepared_host_symlink_resolves_to_mounted_package(monkeypatch, tmp_path):
@@ -109,52 +108,60 @@ def test_prepared_host_symlink_resolves_to_mounted_package(monkeypatch, tmp_path
     entry = tmp_path / "cli"
     entry.symlink_to(binary)
     monkeypatch.setattr(executable.shutil, "which", lambda name: str(entry))
-    sandbox = Mock()
-    sandbox.exec.side_effect = [("", 1), ("", 0), ("codex-cli 0.147.0", 0)]
-    assert executable.prepare_harness_executable(sandbox, "codex", config_for("codex")) == str(
-        binary
-    )
-    assert "--version" in sandbox.exec.call_args.args[0]
-    assert f"PATH={executable.HARNESS_PATH}" in sandbox.exec.call_args.args[0]
+    assert executable.resolve_harness_binary("codex", config_for("codex")) == str(binary)
 
 
-def test_prepare_rejects_codex_versions_other_than_0_147_0(monkeypatch, tmp_path):
-    """0.154.0 hangs waiting for native prompt acknowledgment on large
-    bracketed pastes (see executable.py); fail closed at resolution time
-    instead of a confusing mid-run submit timeout."""
+def test_prepare_local_validates_the_resolved_binary_runs(monkeypatch, tmp_path):
     binary = install(tmp_path / "app" / "bin" / "cli")
-    monkeypatch.setattr(executable.shutil, "which", lambda name: str(binary))
-    sandbox = Mock()
-    sandbox.exec.side_effect = [("", 1), ("", 0), ("codex-cli 0.154.0", 0)]
+    config = config_for("codex", str(binary))
+    monkeypatch.setattr(
+        executable.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="codex-cli 0.147.0", stderr=""),
+    )
+    assert executable.prepare_harness_executable_local("codex", config) == str(binary)
+
+
+def test_prepare_local_rejects_codex_versions_other_than_0_147_0(monkeypatch, tmp_path):
+    """0.154.0 hangs waiting for native prompt acknowledgment on large
+    bracketed pastes (see executable.py); fail closed instead of a
+    confusing mid-run submit timeout."""
+    binary = install(tmp_path / "app" / "bin" / "cli")
+    config = config_for("codex", str(binary))
+    monkeypatch.setattr(
+        executable.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout="codex-cli 0.154.0", stderr=""),
+    )
     with pytest.raises(RuntimeError, match="expected"):
-        executable.prepare_harness_executable(sandbox, "codex", config_for("codex"))
+        executable.prepare_harness_executable_local("codex", config)
 
 
-def test_missing_host_and_container_executable_fails(monkeypatch):
+def test_missing_host_installation_resolves_to_none(monkeypatch):
     monkeypatch.setattr(executable.shutil, "which", lambda name: None)
-    sandbox = Mock()
-    sandbox.exec.return_value = ("", 1)
-    with pytest.raises(FileNotFoundError, match="absent from the sandbox and host PATH"):
-        executable.prepare_harness_executable(sandbox, "grok", config_for("grok"))
+    assert executable.resolve_harness_binary("grok", config_for("grok")) is None
 
 
-def test_missing_mount_fails_before_launch(monkeypatch, tmp_path):
-    binary = install(tmp_path / "app" / "cli")
-    monkeypatch.setattr(executable.shutil, "which", lambda name: str(binary))
-    sandbox = Mock()
-    sandbox.exec.return_value = ("", 1)
+def test_missing_mount_fails_before_launch(tmp_path):
+    missing = tmp_path / "not-there" / "cli"
+    config = config_for("grok", str(missing))
     with pytest.raises(FileNotFoundError, match="before container creation"):
-        executable.prepare_harness_executable(sandbox, "grok", config_for("grok"))
+        executable.prepare_harness_executable_local("grok", config)
 
 
 @pytest.mark.parametrize(
     "error", ["node: No such file", "Missing optional dependency", "libc.so: not found"]
 )
-def test_executable_file_with_missing_runtime_dependencies_fails(error):
-    sandbox = Mock()
-    sandbox.exec.side_effect = [("/app/cli", 0), ("", 0), (error, 127)]
+def test_prepare_local_with_missing_runtime_dependencies_fails(monkeypatch, tmp_path, error):
+    binary = install(tmp_path / "app" / "cli")
+    config = config_for("codex", str(binary))
+    monkeypatch.setattr(
+        executable.subprocess,
+        "run",
+        lambda *a, **kw: SimpleNamespace(returncode=127, stdout="", stderr=error),
+    )
     with pytest.raises(RuntimeError, match=error):
-        executable.prepare_harness_executable(sandbox, "codex", config_for("codex"))
+        executable.prepare_harness_executable_local("codex", config)
 
 
 def test_does_not_mount_entire_system_prefix(monkeypatch):

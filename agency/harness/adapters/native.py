@@ -80,16 +80,11 @@ class NativeAdapter(HarnessAdapter):
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
 
-        from ...utils.agutil import (
-            AGENCY_PACKAGE_CONTAINER_MOUNT,
-            ensure_python_packages_in_container,
-        )
+        from ...utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT, ensure_python_packages_locally
 
         sandbox = runtime.sandbox
         assert sandbox is not None
-        ensure_python_packages_in_container(
-            sandbox, ["httpx", "httpx2", "mcp", "html2text"], timeout_s=180
-        )
+        ensure_python_packages_locally(["httpx", "httpx2", "mcp", "html2text"], timeout_s=180)
 
         # Fresh scratch space per ATTEMPT, never reused across a
         # structured-output retry: session continuity across attempts flows

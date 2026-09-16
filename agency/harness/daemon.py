@@ -35,10 +35,28 @@ from . import interaction_router, mcp_proxy, sandbox_mcp
 from .adapters.base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
+from .executable import prepare_harness_executable_local
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import HarnessInteractionServer
 
 _HARNESS_API_PORT = 8766
+
+# Checked (and installed, if the harness Python isn't pinned) by a
+# dependency-free pre-exec step *before* this module is ever imported -- see
+# `_package_bootstrap_command()` in `engine/harness_daemon_launcher.py`.
+# Importing this module already needs all of these transitively (fastapi/
+# uvicorn directly, the rest via `agency`'s own package `__init__`), so by
+# the time any code here runs, they're already guaranteed present.
+_REQUIRED_HARNESS_PACKAGES = (
+    "fastapi",
+    "uvicorn",
+    "openai",
+    "httpx",
+    "mcp",
+    "pyseccomp",
+    "cloudpickle",
+    "pyte",
+)
 
 # Backs _HostSyscallPolicy's fire-and-forget admission logging (see its
 # docstring). Module-level and shared for the daemon process's whole life --
@@ -409,6 +427,8 @@ class HarnessManager:
     ) -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
         self._engine_name = engine_name
+        self._harness = harness
+        self._bootstrapped = False
         self._persistent = bool(self._agconfig.sandbox.checkpoint_fast_resume)
         harness_backend = HarnessAdapter.for_config(harness, self._agconfig)
         self._harness_api = _HarnessApiServer(
@@ -632,6 +652,13 @@ class HarnessManager:
             return HarnessAttemptResult(ok=False, error_message="no active harness attempt token")
         local_token = getattr(self, "_live_local_token", None) or token
         try:
+            if not self._bootstrapped:
+                # Runs once, on the first real attempt, so a failure here is
+                # reported the exact same way any other attempt failure is:
+                # caught below and returned as this request's
+                # HarnessAttemptResult.
+                prepare_harness_executable_local(self._harness, self._agconfig)
+                self._bootstrapped = True
             arguments = (
                 request,
                 self._agconfig,

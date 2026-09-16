@@ -74,6 +74,8 @@ def test_restored_cli_token_maps_to_current_host_attempt():
 def test_persistent_adapter_uses_the_restored_process_token(monkeypatch):
     manager = HarnessManager.__new__(HarnessManager)
     manager._agconfig = agconfig()
+    manager._harness = "codex"
+    manager._bootstrapped = True
     manager._engine_name = "agent-1"
     manager._persistent = True
     manager._current_attempt_token = "host-attempt-2"

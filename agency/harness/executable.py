@@ -1,17 +1,23 @@
-"""Host-side discovery and read-only installation mounts for external CLIs.
+"""Host-side discovery and read-only installation mounts for external CLIs,
+plus the daemon-local startup check for the resolved binary.
 
 Mounts are chosen before container creation. Keeping installation directories at
 their original absolute paths preserves package-relative lookups and symlinks;
 the daemon receives a path, never responsibility for copying host files.
 System interpreters and shared libraries belong in the sandbox image.
+
+`resolve_harness_binary()` finds the binary's real absolute path from the
+host, ahead of the daemon's launch. `prepare_harness_executable_local()`
+validates that resolved path from inside the daemon itself: file exists, is
+executable, actually runs.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-import shlex
 import shutil
+import subprocess
 from pathlib import Path
 
 from .adapters.base import HarnessAdapter
@@ -89,39 +95,53 @@ def harness_installation_mounts(config) -> dict[str, tuple[str, str, str]]:
     return mounts
 
 
-def prepare_harness_executable(sandbox, harness, config) -> str | None:
-    """Return a sandbox executable after testing its real startup dependencies."""
+def resolve_harness_binary(harness, config) -> str | None:
+    """Find the harness binary's real absolute path via a host-side
+    `shutil.which()`: its install directory is mounted at its original host
+    path, so this is how a host-mounted binary is found. Returns None
+    (rather than raising) when the host doesn't have it -- an
+    image-provided binary needs no host installation at all, and
+    prepare_harness_executable_local() finds those on its own from inside
+    the sandbox."""
     binary = external_binary(harness, config)
     if binary is None:
         return None
 
-    out, rc = sandbox.exec(f"command -v -- {shlex.quote(binary)}", workdir="/")
-    if rc == 0 and out.strip():
-        resolved = str(Path("/") / out.strip())
-    else:
-        host_path = shutil.which(binary)
-        if host_path is None:
-            raise FileNotFoundError(
-                f"{harness} executable {binary!r} is absent from the sandbox and host PATH"
-            )
-        resolved = str(Path(host_path).resolve(strict=True))
+    host_path = shutil.which(binary)
+    if host_path is None:
+        return None
+    return str(Path(host_path).resolve(strict=True))
 
-    path = shlex.quote(resolved)
-    out, rc = sandbox.exec(f"test -f {path} && test -x {path}", workdir="/")
-    if rc != 0:
+
+def prepare_harness_executable_local(harness: str, config) -> "str | None":
+    """Validate the harness binary from inside the sandbox: file exists, is
+    executable, actually runs. `config.harness_adapter.binary_path` is
+    expected to already be an absolute path resolved by
+    resolve_harness_binary(); a bare shutil.which() here is only a
+    defensive fallback for the rare case that never happened."""
+    binary = external_binary(harness, config)
+    if binary is None:
+        return None
+
+    resolved = binary if Path(binary).is_absolute() else shutil.which(binary)
+    if resolved is None:
+        raise FileNotFoundError(f"{harness} executable {binary!r} is absent from PATH")
+    resolved_path = Path(resolved)
+    if not (resolved_path.is_file() and os.access(resolved_path, os.X_OK)):
         raise FileNotFoundError(
-            f"{harness} executable {resolved!r} is not executable inside the sandbox. "
-            "Create the sandbox with this harness and binary_path configured so its "
-            "installation directory is mounted before container creation."
+            f"{harness} executable {resolved!r} is not executable. Create the sandbox "
+            "with this harness and binary_path configured so its installation "
+            "directory is mounted before container creation."
         )
-    # Use the same PATH as adapter launches. Existence alone misses an absent
-    # Node interpreter, npm platform package, or ELF shared library.
-    out, rc = sandbox.exec(f"PATH={HARNESS_PATH} {path} --version", workdir="/", timeout=30)
-    if rc != 0:
+    resolved = str(resolved_path.resolve(strict=True))
+
+    proc = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=30)
+    out = proc.stdout + proc.stderr
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"{harness} executable {resolved!r} cannot start inside the sandbox "
-            f"(exit {rc}). Its complete installation must be mounted and the image "
-            f"must provide its system interpreter and shared libraries. Output: {out[-2000:]}"
+            f"{harness} executable {resolved!r} cannot start (exit {proc.returncode}). "
+            "Its complete installation must provide its system interpreter and shared "
+            f"libraries. Output: {out[-2000:]}"
         )
     if harness == "codex" and "0.147.0" not in out:
         # 0.154.0 hangs waiting for native prompt acknowledgment on large

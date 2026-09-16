@@ -518,69 +518,63 @@ def agency_package_dir():
     return Path(_agency_pkg.__file__).resolve().parent.parent
 
 
-def _container_can_reach_pypi(sandbox, timeout_s: int = 30) -> bool:
-    """Whether the container has outbound network to a package index."""
-    probe = (
-        'python3 -c "import socket; socket.setdefaulttimeout(5); '
-        "socket.create_connection(('pypi.org', 443))\""
-    )
+def _can_reach_pypi_locally(timeout_s: float = 30) -> bool:
+    """Whether this process has outbound network to a package index."""
+    import socket
+
     try:
-        return sandbox.exec(probe, timeout=timeout_s)[1] == 0
-    except Exception:
+        with socket.create_connection(("pypi.org", 443), timeout=timeout_s):
+            return True
+    except OSError:
         return False
 
 
-def _is_importable(sandbox, executable: str, pkg: str, *, attempts: int = 1) -> bool:
-    for attempt in range(attempts):
-        if sandbox.exec(f'{executable} -c "import {pkg}"', timeout=30)[1] == 0:
-            return True
-        if attempt < attempts - 1:
-            time.sleep(1.0)
-    return False
-
-
-def ensure_python_packages_in_container(
-    sandbox,
+def ensure_python_packages_locally(
     packages,
     *,
     timeout_s: int = 180,
-    python_executable: str = "python3",
     install_missing: bool = True,
 ) -> None:
-    """Ensure each of `packages` (import names) is importable inside
-    `sandbox`'s container, `pip3 install`-ing any missing after checking
-    real importability (not just `pip list` presence). Raises RuntimeError
-    if pip itself fails."""
-    import shlex
+    """Ensure each of `packages` (import names) is importable in this
+    process, `pip install`-ing any missing after checking real importability
+    (not just `pip list` presence). Raises RuntimeError if a package is
+    genuinely missing and either installation is refused or pip fails."""
+    import importlib
+    import subprocess
+    import sys
 
-    executable = shlex.quote(python_executable)
-    retries = 3 if install_missing else 1
-    missing = [
-        pkg for pkg in packages if not _is_importable(sandbox, executable, pkg, attempts=retries)
-    ]
+    missing = []
+    for pkg in packages:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            missing.append(pkg)
     if not missing:
         return
 
     if not install_missing:
         raise RuntimeError(
-            f"Pinned sandbox harness Python {python_executable} lacks {missing}; "
-            "refusing package installation during an experiment"
+            f"Pinned harness Python lacks {missing}; refusing package installation "
+            "during an experiment"
         )
 
-    if not _container_can_reach_pypi(sandbox):
+    if not _can_reach_pypi_locally():
         raise RuntimeError(
-            f"cannot install {missing} inside the container: no outbound network "
-            "(probed pypi.org:443). Either give the sandbox network access, or bake "
-            "these packages into the base image. A sandbox started with "
-            "sandboxconfig.flags=['--network', 'none'] is the usual cause; a private "
-            "package index on an isolated network would also probe as unreachable."
+            f"cannot install {missing}: no outbound network (probed pypi.org:443). "
+            "Either give the sandbox network access, or bake these packages into the "
+            "base image. A sandbox started with sandboxconfig.flags=['--network', "
+            "'none'] is the usual cause; a private package index on an isolated "
+            "network would also probe as unreachable."
         )
 
-    installer = "pip3" if python_executable == "python3" else f"{executable} -m pip"
-    install_cmd = installer + " install --quiet " + " ".join(shlex.quote(p) for p in missing)
-    out, rc = sandbox.exec(install_cmd, timeout=timeout_s)
-    if rc != 0:
-        raise RuntimeError(f"failed to install {missing} inside container: {out}")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", *missing],
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"failed to install {missing}: {proc.stdout}{proc.stderr}")
 
 
 # ---------------------------------------------------------------------------
