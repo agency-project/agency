@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "openai",
     "httpx",
+    "httpx2",
     "html2text",
     "pymupdf",
     "cloudpickle",
