@@ -35,6 +35,8 @@ class GrokDriver(_HookPtyDriver):
         )
         self.env["GROK_HOME"] = str(self.root)
         self.argv += ["--no-alt-screen", "--always-approve", "--no-memory", "--no-plan"]
+        if not adapter.agconfig.harness_adapter.allow_subagents:
+            self.argv += ["--no-subagents"]
         if max_steps is not None:
             self.argv += ["--max-turns", str(max_steps)]
         if self.session_id:

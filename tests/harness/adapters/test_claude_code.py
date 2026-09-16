@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency.configs.agconfig import agconfig, llmconfig, sandboxconfig
+from agency.configs.agconfig import agconfig, harnessadapterconfig, llmconfig, sandboxconfig
 from agency.agdata import agdata
 from agency.agent import agent
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter, claude_code_available
@@ -50,6 +50,27 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
     }
     assert not (config_home / "agency_lifecycle.py").exists()
     assert (config_home / "agency-turn.json").exists()
+
+
+def test_native_launch_disallows_subagents_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr("agency.harness.agharness.materialize_config_home", lambda *a: tmp_path)
+    config = agconfig()
+    runtime = AdapterRuntime(
+        config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
+    )
+    argv, _ = ClaudeCodeAdapter(config).prepare_pty(runtime, tmp_path)
+    idx = argv.index("--disallowedTools")
+    assert argv[idx + 1] == "Agent"
+
+
+def test_native_launch_omits_disallowed_tools_when_subagents_allowed(tmp_path, monkeypatch):
+    monkeypatch.setattr("agency.harness.agharness.materialize_config_home", lambda *a: tmp_path)
+    config = agconfig(harnessadapterconfig(allow_subagents=True))
+    runtime = AdapterRuntime(
+        config, "test-model", "agent", "http://daemon", "attempt-key", MagicMock()
+    )
+    argv, _ = ClaudeCodeAdapter(config).prepare_pty(runtime, tmp_path)
+    assert "--disallowedTools" not in argv
 
 
 def test_native_launch_restores_conversation_before_resuming(tmp_path, monkeypatch):

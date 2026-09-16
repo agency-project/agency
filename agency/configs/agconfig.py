@@ -282,7 +282,7 @@ class harnessadapterconfig(confignamespace):
 
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None
-    mediation_mode: str = "auto"  # ptrace | native_hooks | auto
+    allow_subagents: bool = False
 
 
 @dataclass(slots=True)

@@ -513,6 +513,8 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 "--model",
                 runtime.model,
             ]
+            if not self.agconfig.harness_adapter.allow_subagents:
+                argv += ["--disallowedTools", "Agent"]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
             return argv, envp
