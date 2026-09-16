@@ -210,14 +210,28 @@ def _unknown_block_to_converse(b: dict) -> dict:
 def _agency_messages_to_converse(messages: list[dict]) -> "tuple[str | None, list[dict]]":
     system_parts: list[str] = []
     out: list[dict] = []
+    conversation_started = False
 
     for m in messages:
         role = m.get("role")
         blocks = m.get("blocks") or []
+        if role != "system":
+            conversation_started = True
         if role == "system":
             text = "".join(b["text"] for b in blocks if b["type"] == "text")
-            if text:
+            if not text:
+                continue
+            if not conversation_started:
                 system_parts.append(text)
+            else:
+                print(
+                    "[bedrock] WARNING: harness emitted a mid-conversation "
+                    "system-role message -- not valid per the Converse API "
+                    "(system must be the top-level `system` parameter, never a "
+                    "`messages` entry); sending it as a `user` message at its "
+                    "original position instead"
+                )
+                out.append({"role": "user", "content": [{"text": text}]})
         elif role == "user":
             content = []
             for b in blocks:

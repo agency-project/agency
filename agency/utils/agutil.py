@@ -530,6 +530,15 @@ def _container_can_reach_pypi(sandbox, timeout_s: int = 30) -> bool:
         return False
 
 
+def _is_importable(sandbox, executable: str, pkg: str, *, attempts: int = 1) -> bool:
+    for attempt in range(attempts):
+        if sandbox.exec(f'{executable} -c "import {pkg}"', timeout=30)[1] == 0:
+            return True
+        if attempt < attempts - 1:
+            time.sleep(1.0)
+    return False
+
+
 def ensure_python_packages_in_container(
     sandbox,
     packages,
@@ -545,10 +554,9 @@ def ensure_python_packages_in_container(
     import shlex
 
     executable = shlex.quote(python_executable)
+    retries = 3 if install_missing else 1
     missing = [
-        pkg
-        for pkg in packages
-        if sandbox.exec(f'{executable} -c "import {pkg}"', timeout=30)[1] != 0
+        pkg for pkg in packages if not _is_importable(sandbox, executable, pkg, attempts=retries)
     ]
     if not missing:
         return

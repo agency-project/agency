@@ -251,6 +251,24 @@ class TestAgencyMessagesToAnthropic:
         )
         assert system is None
 
+    def test_mid_conversation_system_message_becomes_user_message_in_place(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("system", "You are helpful."),
+                _text_msg("user", "hi"),
+                _text_msg("assistant", "hello"),
+                _text_msg("system", "reminder: be concise"),
+                _text_msg("user", "ok"),
+            ]
+        )
+        assert system == "You are helpful."
+        assert msgs == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "user", "content": "reminder: be concise"},
+            {"role": "user", "content": "ok"},
+        ]
+
     def test_assistant_text_citations_reconstructed(self):
         _, msgs = _agency_messages_to_anthropic(
             [

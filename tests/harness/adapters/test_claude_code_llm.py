@@ -267,7 +267,7 @@ def test_harness_to_agency_tool_choice_none():
     assert agency["tool_choice"] == "none"
 
 
-def test_harness_to_agency_mid_array_system_message_folded():
+def test_harness_to_agency_mid_array_system_message_kept_in_place():
     body = {
         "model": "m",
         "system": "top level",
@@ -277,10 +277,11 @@ def test_harness_to_agency_mid_array_system_message_folded():
         ],
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["messages"][0] == {
-        "role": "system",
-        "blocks": [_text_block("top level\n\nmid array")],
-    }
+    assert agency["messages"] == [
+        {"role": "system", "blocks": [_text_block("top level")]},
+        {"role": "system", "blocks": [_text_block("mid array")]},
+        {"role": "user", "blocks": [_text_block("hi")]},
+    ]
 
 
 def test_agency_to_harness_text_citations_reconstructed():

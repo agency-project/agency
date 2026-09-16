@@ -543,9 +543,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
             if not token or not router.validate_token(token):
                 return _auth_error()
             body = await request.json()
-            warning = _mid_array_system_warning(body)
-            if warning:
-                router.log_warning(token, warning)
             model = router.resolve_model(token)
             if _is_session_title_request(body):
                 title_text = '{"title":"Agency session"}'
@@ -607,7 +604,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
         messages: "list[dict]" = []
         system_text = _anthropic_system_to_text(raw_request.get("system"))
-        extra_system_parts: "list[str]" = []
 
         for m in raw_request.get("messages", []):
             role = m.get("role")
@@ -615,7 +611,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
             if role == "system":
                 extra_text = _anthropic_system_to_text(content)
                 if extra_text:
-                    extra_system_parts.append(extra_text)
+                    messages.append(
+                        {
+                            "role": "system",
+                            "blocks": [{"type": "text", "index": 0, "text": extra_text}],
+                        }
+                    )
                 continue
             if isinstance(content, str):
                 messages.append(
@@ -694,17 +695,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
                         )
                 messages.append({"role": "assistant", "blocks": blocks})
 
-        combined_system = (
-            "\n\n".join([system_text] + extra_system_parts)
-            if system_text
-            else "\n\n".join(extra_system_parts)
-        )
-        if combined_system:
+        if system_text:
             messages.insert(
                 0,
                 {
                     "role": "system",
-                    "blocks": [{"type": "text", "index": 0, "text": combined_system}],
+                    "blocks": [{"type": "text", "index": 0, "text": system_text}],
                 },
             )
 
@@ -885,18 +881,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
             )
             yield _sse("message_stop", {"type": "message_stop"})
             return
-
-
-def _mid_array_system_warning(body: dict) -> "str | None":
-    n = sum(1 for m in body.get("messages", []) if m.get("role") == "system")
-    if not n:
-        return None
-    return (
-        f"harness emitted {n} mid-conversation system-role message(s) in its "
-        "/v1/messages request -- not valid per the Anthropic Messages API "
-        "(system must be the top-level `system` field, never a `messages` "
-        "entry); folding into the leading system message before forwarding"
-    )
 
 
 __all__ = ["ClaudeCodeAdapter", "claude_code_available"]
