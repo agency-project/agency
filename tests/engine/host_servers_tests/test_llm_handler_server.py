@@ -438,13 +438,109 @@ def test_payload_hash_distinguishes_different_tool_results():
     assert mod._payload_hash(a) != mod._payload_hash(b)
 
 
-def test_payload_hash_falls_back_to_whole_payload_for_other_block_types():
-    """text/thinking/metadata blocks have no id-like stable identity field --
-    unaffected by this change, still hashed on full content as before."""
-    a = {"role": "assistant", "type": "text", "index": 0, "text": "hi"}
-    b = {"role": "assistant", "type": "text", "index": 0, "text": "bye"}
+def test_payload_hash_treats_native_and_resent_text_as_the_same_message():
+    """A text block gets logged once in its rich response shape (ts_start/
+    ts_end/id/etc.) and again in the reduced shape it takes when the same
+    message is resent inside a later request's history (role/type/text/
+    index only, often a different index) -- these must hash identically so
+    the resent copy doesn't get double-logged, corrupting replay."""
+    rich = {
+        "role": "assistant",
+        "type": "text",
+        "index": -1,
+        "text": "Let me look.",
+        "ts_start": 1.0,
+        "ts_end": 1.5,
+    }
+    resent = {"role": "assistant", "type": "text", "index": 0, "text": "Let me look."}
+    assert mod._payload_hash(rich) == mod._payload_hash(resent)
+
+
+def test_payload_hash_falls_back_to_whole_payload_for_metadata_blocks():
+    """metadata has no id-like stable identity field and is never resent
+    inside a later request, so it is still hashed on full content."""
+    a = {"role": "assistant", "type": "metadata", "index": 2**31 - 1, "stop_reason": "stop"}
+    b = {"role": "assistant", "type": "metadata", "index": 2**31 - 1, "stop_reason": "tool_use"}
     assert mod._payload_hash(a) != mod._payload_hash(b)
     assert mod._payload_hash(a) == mod._payload_hash(dict(a))
+
+
+# ---------------------------------------------------------------------------
+# _new_transcript_payloads across turns -- the resent-text bug end to end
+# ---------------------------------------------------------------------------
+
+
+def test_resent_response_text_does_not_reappear_as_new_content():
+    """Two consecutive turns, shaped the way native_harness actually resends
+    history: turn 2's request includes turn 1's own answer back as an
+    assistant message. Before the fix, that resent text was not recognized
+    as a duplicate and was logged again as "new" -- landing in turn 2's own
+    recorded group at the same index as turn 2's real tool_use call. A
+    replayer merges same-index blocks together, so the tool_use turned into
+    a text block carrying its name and no arguments, and the call never
+    fired."""
+    server, _ = _make_server()
+    turn1_request = {
+        "messages": [
+            {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "Find the bug"}]}
+        ]
+    }
+    turn1_response = {
+        "role": "assistant",
+        "blocks": [
+            {"type": "text", "index": -1, "text": "Let me look.", "ts_start": 1.0, "ts_end": 1.5},
+            {"type": "tool_use", "index": 0, "id": "call_1", "name": "glob", "arguments": "{}"},
+            {"type": "metadata", "index": 2**31 - 1, "stop_reason": "tool_use"},
+        ],
+    }
+    first = server._new_transcript_payloads(turn1_request, turn1_response)
+    assert len(first) == 4  # the user prompt, plus all three response blocks
+
+    turn2_request = {
+        "messages": [
+            {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "Find the bug"}]},
+            {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "Let me look."}]},
+            {
+                "role": "tool",
+                "blocks": [
+                    {"type": "tool_result", "index": 0, "tool_call_id": "call_1", "text": "a.py"}
+                ],
+            },
+        ]
+    }
+    turn2_response = {
+        "role": "assistant",
+        "blocks": [
+            {"type": "text", "index": -1, "text": "Found it.", "ts_start": 2.0, "ts_end": 2.5},
+            {
+                "type": "tool_use",
+                "index": 0,
+                "id": "call_2",
+                "name": "read",
+                "arguments": '{"path": "a.py"}',
+            },
+            # Distinct from turn 1's metadata (usage differs) -- otherwise it dedups too,
+            # for the unrelated, correct reason that it would be byte-identical.
+            {
+                "type": "metadata",
+                "index": 2**31 - 1,
+                "stop_reason": "tool_use",
+                "usage": {"total_tokens": 2},
+            },
+        ],
+    }
+    second = server._new_transcript_payloads(turn2_request, turn2_response)
+
+    # Only what's genuinely new this turn: the tool result and this turn's own three
+    # response blocks -- not turn 1's text, resent as history.
+    assert [p["type"] for p in second] == ["tool_result", "text", "tool_use", "metadata"]
+    assert second[1]["text"] == "Found it."
+    # Exactly one *assistant* block at index 0: the real tool_use call. The resent text
+    # was also role=assistant, index 0 (reduced shape) -- that's the actual collision a
+    # replayer hits, once role=tool content is filtered out downstream.
+    assistant_index_zero = [p for p in second if p["role"] == "assistant" and p.get("index") == 0]
+    assert len(assistant_index_zero) == 1
+    assert assistant_index_zero[0]["type"] == "tool_use"
 
 
 # ---------------------------------------------------------------------------

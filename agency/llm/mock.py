@@ -54,7 +54,12 @@ def _load_replay_exchanges(db_path: str) -> "list[list[dict]]":
         if call_label != current_label:
             exchanges.append([])
             current_label = call_label
-        exchanges[-1].append(json.loads(payload_json))
+        payload = json.loads(payload_json)
+        # Only the assistant's own blocks belong in a replayed message, not the recorded
+        # prompt/tool-result blocks. `None` keeps the hand-written test fixtures working.
+        if payload.get("role") not in (None, "assistant"):
+            continue
+        exchanges[-1].append(payload)
     return exchanges
 
 

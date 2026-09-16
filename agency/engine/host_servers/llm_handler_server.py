@@ -79,6 +79,11 @@ def _payload_hash(payload: dict) -> str:
         identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
     elif block_type == "tool_result" and payload.get("tool_call_id"):
         identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
+    elif block_type in ("text", "thinking"):
+        # Same reduced-shape problem as tool_use/tool_result: when a response's text is sent
+        # back in a later request, it has fewer keys than the original, so it double-logs and
+        # corrupts replay otherwise.
+        identity = {"role": role, "type": block_type, "text": payload.get("text")}
     else:
         identity = payload
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()

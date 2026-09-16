@@ -184,6 +184,37 @@ class TestReplayOrderingAndDispatch:
         second = backend.dispatch({"messages": []})
         assert second["stop_reason"] == "tool_use"
 
+    def test_only_assistant_blocks_are_replayed(self, tmp_path):
+        """A recorded group can hold a `role: "user"` prompt block or a
+        `role: "tool"` result alongside the response -- the recorder logs
+        whatever is new in the request as well as the response. Replaying
+        those back as if the model said them means the tool call in the
+        group never runs."""
+        db_path = tmp_path / "agent_x_data.sqlite3"
+        logger = _make_source_db(db_path)
+        logger.record_final_transcript(
+            "call1",
+            type="llm_block",
+            payloads=[
+                {"role": "user", "type": "text", "index": 0, "text": "Find the bug"},
+                {"role": "tool", "type": "tool_result", "index": 0, "text": "a.py"},
+                {
+                    "role": "assistant",
+                    "type": "tool_use",
+                    "index": 0,
+                    "id": "call_1",
+                    "name": "read",
+                },
+            ],
+        )
+        logger.stop()
+
+        backend = _mock_backend(db_path)
+        result = backend.dispatch({"messages": []})
+        assert result["message"]["blocks"] == [
+            {"role": "assistant", "type": "tool_use", "index": 0, "id": "call_1", "name": "read"}
+        ]
+
 
 class TestDispatchStream:
     def test_streams_reconstructable_text_deltas(self, tmp_path):
