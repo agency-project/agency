@@ -46,7 +46,12 @@ jobs:
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
           CODEX_RELEASE=0.147.0 CODEX_NON_INTERACTIVE=true bash -c "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
-          curl -fsSL https://opencode.ai/install | bash
+          # Pinned, not "latest": an unpinned install resolves its version via
+          # an unauthenticated api.github.com call, which a shared Actions
+          # runner IP can hit already rate-limited (60 req/hour), failing the
+          # whole step with "Failed to fetch version information" independent
+          # of anything in this repo.
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.31
           curl -fsSL https://x.ai/cli/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
