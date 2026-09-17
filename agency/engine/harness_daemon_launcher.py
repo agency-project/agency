@@ -264,10 +264,15 @@ def ensure_harness_daemon(
     # `exec > log 2>&1` (redirecting the launch shell's own fds) rather than
     # a trailing `> log 2>&1` on one command -- the bootstrap step must land
     # in the same log a ready-timeout tails, and it runs as its own command
-    # ahead of the final `exec` into the daemon module.
+    # ahead of the final `exec` into the daemon module. `export` (not a bare
+    # assignment) is what makes PYTHONPATH -- a variable that, unlike PATH,
+    # doesn't already exist in the environment -- actually inherited by the
+    # bootstrap and daemon child processes: a plain `VAR=val` before a
+    # redirect-only `exec` persists it only as a shell variable, per POSIX,
+    # not into the process environment new child processes read from.
     command = (
-        f"PATH={HARNESS_PATH} "
-        f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)} "
+        f"export PATH={HARNESS_PATH} "
+        f"PYTHONPATH={shlex.quote(AGENCY_PACKAGE_CONTAINER_MOUNT)}; "
         f"exec > {shlex.quote(log_path)} 2>&1; "
         f"{bootstrap} && {daemon_cmd}"
     )

@@ -68,6 +68,33 @@ def test_ensure_harness_daemon_launches_module_with_gateway_socket_paths(monkeyp
     assert workdir == "/workspace"
 
 
+def test_pythonpath_is_exported_not_just_assigned(monkeypatch, tmp_path):
+    """A bare `PYTHONPATH=val exec > log 2>&1` (no `export`) only persists it
+    as a shell variable, per POSIX -- child processes (the bootstrap script,
+    then the daemon itself) never see it in their own environment and
+    `agency` becomes unimportable. Confirmed against a real container: PATH
+    survived because it already existed in the environment before this
+    reassignment, but a brand-new PYTHONPATH did not, until `export` was
+    added. See ensure_harness_daemon's command-construction comment."""
+    sandbox = _fake_sandbox(tmp_path, harnessadapterconfig(binary_path="/bin/claude"))
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
+
+    launcher.ensure_harness_daemon(
+        sandbox, "/tmp/host.sock", "agent-1", "claude_code", agconfig=sandbox.agconfig
+    )
+
+    command = sandbox.detached[0][0]
+    assert "export PATH=" in command
+    assert "PYTHONPATH=" in command
+    export_idx = command.index("export PATH=")
+    pythonpath_idx = command.index("PYTHONPATH=")
+    semicolon_idx = command.index(";")
+    assert export_idx < pythonpath_idx < semicolon_idx, (
+        "PYTHONPATH must be part of the same `export` statement as PATH, "
+        "before the first statement-ending ';'"
+    )
+
+
 def test_ensure_harness_daemon_default_timeout_is_60s():
     import inspect
 
