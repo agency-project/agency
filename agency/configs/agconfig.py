@@ -109,7 +109,7 @@ class llmconfig(confignamespace):
     aws_profile: "str | None" = None
     aws_region: "str | None" = None
     model_listing_timeout_seconds: float = 10.0
-    default_max_tokens: int = 128000
+    default_max_tokens: int = 32000
     max_retries: int = 12
     idle_timeout: float = 900.0  # seconds to wait for first chunk
     stream_timeout: float = 1200.0  # seconds to wait between chunks mid-stream

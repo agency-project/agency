@@ -38,7 +38,7 @@ class ReplyBackend:
         self.requests = []
 
     def fetch_context_limit(self):
-        return 128000
+        return 32000
 
     def build_kwargs(self, messages, tools):
         return {"messages": messages, "tools": tools}

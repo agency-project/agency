@@ -780,10 +780,10 @@ class TestFormatContextAgencyToBackend:
         backend._format_context_agency_to_backend({"messages": original_messages})
         assert original_messages == [_text_msg("user", "ping")]
 
-    def test_max_tokens_defaults_to_128000_when_omitted(self):
+    def test_max_tokens_defaults_to_32000_when_omitted(self):
         backend = _AnthropicBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend({"messages": [_text_msg("user", "x")]})
-        assert kwargs["max_tokens"] == 128000
+        assert kwargs["max_tokens"] == 32000
 
     def test_extra_body_without_top_k_is_ignored(self):
         backend = _AnthropicBackend(_cfg(model="m", extra_body={"repetition_penalty": 1.1}))
