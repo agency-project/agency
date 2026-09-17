@@ -78,11 +78,11 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
         {
             "sequence": 8,
             "type": "message",
-            "role": "system",
+            "role": "user",
             "content": (
-                "Note: the previous skill call failed. Its sandbox workspace changes "
+                "<system>\nNote: the previous skill call failed. Its sandbox workspace changes "
                 "have been discarded and the workspace has been reverted to the last "
-                "successful checkpoint."
+                "successful checkpoint.</system>"
             ),
             "source": "context_notice",
         },

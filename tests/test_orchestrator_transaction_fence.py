@@ -147,7 +147,7 @@ def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkey
     notice = output_context.retained_messages[1]
     assert notice["sequence"] == 6
     assert notice["type"] == "message"
-    assert notice["role"] == "system"
+    assert notice["role"] == "user"
     assert notice["source"] == "context_notice"
     assert "previous skill call failed" in notice["content"]
     assert "workspace changes have been discarded" in notice["content"]
