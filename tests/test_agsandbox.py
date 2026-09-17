@@ -1703,14 +1703,38 @@ class TestAgSandboxAgencyPackageMount:
 _MISSING_TEST_PACKAGE = "cowsay"  # a real, tiny PyPI package outside agency's own dependency set
 
 
-def _cfg_with_host_site_packages(cfg=None):
-    import sysconfig
+_dereferenced_site_packages_dir = None
 
+
+def _dereferenced_site_packages() -> str:
+    """This process's site-packages, with every symlink resolved to a real
+    file. uv (this repo's own venv, and CI's) hardlinks or symlinks in
+    packages from its cache depending on whether the venv and cache happen
+    to share a filesystem in a given environment -- a symlink's target isn't
+    reachable once only site-packages itself is bind-mounted into a
+    container, so a package uv happened to symlink (rather than hardlink)
+    imports fine on one machine and fails on another for a reason with
+    nothing to do with the package itself. Copied once per test session
+    (cached), not per test -- site-packages can be a couple hundred MB."""
+    global _dereferenced_site_packages_dir
+    if _dereferenced_site_packages_dir is None:
+        import shutil
+        import sysconfig
+        import tempfile
+
+        src = sysconfig.get_paths()["purelib"]
+        dst = tempfile.mkdtemp(prefix="agency-test-site-packages-")
+        shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=False)
+        _dereferenced_site_packages_dir = dst
+    return _dereferenced_site_packages_dir
+
+
+def _cfg_with_host_site_packages(cfg=None):
     from agency.configs.agconfig import agconfig as agconfig_cls
 
     cfg = cfg if cfg is not None else agconfig_cls()
     cfg.sandbox.add_mount(
-        "host_site_packages", sysconfig.get_paths()["purelib"], "/opt/host_site_packages", "ro"
+        "host_site_packages", _dereferenced_site_packages(), "/opt/host_site_packages", "ro"
     )
     return cfg
 
