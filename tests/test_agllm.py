@@ -119,6 +119,68 @@ def test_build_llm_kwargs_explicit_max_completion_tokens_not_overridden():
     assert kw["max_completion_tokens"] == 512
 
 
+def _sys_msg(text):
+    return {"role": "system", "blocks": [{"type": "text", "index": 0, "text": text}]}
+
+
+def _msg(role, text):
+    return {"role": role, "blocks": [{"type": "text", "index": 0, "text": text}]}
+
+
+def test_build_llm_kwargs_leading_system_message_stays_system(capsys):
+    """The wire schema itself allows role:"system" anywhere, but not every
+    server's own chat template does -- Qwen3's (via
+    transformers.apply_chat_template inside vLLM) rejects a non-leading one
+    outright. Matches anthropic.py's/bedrock.py's own handling: only a
+    *leading* system message is exempt."""
+    kw = build_llm_kwargs(
+        _cfg(),
+        [_sys_msg("You are helpful."), _msg("user", "hi")],
+        None,
+    )
+    assert kw["messages"][0] == {"role": "system", "content": "You are helpful."}
+    assert kw["messages"][1] == {"role": "user", "content": "hi"}
+    assert "mid-conversation" not in capsys.readouterr().out
+
+
+def test_build_llm_kwargs_mid_conversation_system_message_becomes_user(capsys):
+    kw = build_llm_kwargs(
+        _cfg(),
+        [
+            _sys_msg("You are helpful."),
+            _msg("user", "hi"),
+            _msg("assistant", "hello"),
+            _sys_msg("reminder: be concise"),
+            _msg("user", "ok"),
+        ],
+        None,
+    )
+    assert kw["messages"] == [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "reminder: be concise"},
+        {"role": "user", "content": "ok"},
+    ]
+    assert "mid-conversation" in capsys.readouterr().out
+
+
+def test_build_llm_kwargs_empty_mid_conversation_system_message_dropped():
+    kw = build_llm_kwargs(
+        _cfg(),
+        [
+            _msg("user", "hi"),
+            {"role": "system", "blocks": []},
+            _msg("user", "ok"),
+        ],
+        None,
+    )
+    assert kw["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "user", "content": "ok"},
+    ]
+
+
 def test_build_llm_kwargs_unknown_params_not_forwarded():
     """build_kwargs only forwards the known OpenAI-style generation params --
     other agconfig fields (provider selection, transport config, ...) don't

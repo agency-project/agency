@@ -240,9 +240,12 @@ class agllm:
             "guided_regex",
         }
         wire_messages: list[dict] = []
+        conversation_started = False
         for m in messages:
             role = m["role"]
             blocks = m.get("blocks") or []
+            if role != "system":
+                conversation_started = True
             if role == "assistant":
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 tool_calls = [
@@ -272,6 +275,24 @@ class agllm:
                     "tool_call_id": result_block.get("tool_call_id", "") if result_block else "",
                     "content": result_block.get("text", "") if result_block else "",
                 }
+            elif role == "system" and conversation_started:
+                # The wire schema itself allows role:"system" anywhere in the
+                # array, but not every server's own chat template does --
+                # Qwen3's (via transformers.apply_chat_template inside vLLM)
+                # rejects a non-leading one outright ("System message must be
+                # at the beginning"). Matches anthropic.py's/bedrock.py's own
+                # handling of the same mid-conversation system message.
+                text = "".join(b["text"] for b in blocks if b["type"] == "text")
+                if not text:
+                    continue
+                print(
+                    "[agllm] WARNING: harness emitted a mid-conversation "
+                    "system-role message -- sending it as a `user` message at "
+                    "its original position instead, since not every "
+                    "OpenAI-compatible server's chat template tolerates "
+                    'role:"system" outside the first message'
+                )
+                wire_msg = {"role": "user", "content": text}
             else:
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 wire_msg = {"role": role, "content": text}
