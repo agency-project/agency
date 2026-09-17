@@ -1880,13 +1880,23 @@ class TestEnsurePythonPackagesLocally:
         importable afterward), plus the noop-when-present test above
         already covers the "don't touch what's already there" contract
         directly."""
+        from agency.utils.agutil import AGENCY_PACKAGE_CONTAINER_MOUNT
+
         sb = _make_sandbox(agconfig=_cfg_with_host_site_packages())
         try:
             _, rc = _run_ensure_packages_locally(
                 sb, ["httpx", _MISSING_TEST_PACKAGE], timeout_s=120
             )
             assert rc == 0
-            _, rc_httpx = sb.exec('python3 -c "import httpx"')
+            # httpx is only ever reachable via the mounted host site-packages
+            # (it's never actually pip-installed into the container -- that's
+            # the whole point of this test), so this check needs the same
+            # PYTHONPATH _run_ensure_packages_locally used, unlike the
+            # genuinely-pip-installed _MISSING_TEST_PACKAGE check below.
+            _, rc_httpx = sb.exec(
+                f"PYTHONPATH={AGENCY_PACKAGE_CONTAINER_MOUNT}:/opt/host_site_packages "
+                'python3 -c "import httpx"'
+            )
             _, rc_missing = sb.exec(f'python3 -c "import {_MISSING_TEST_PACKAGE}"')
             assert rc_httpx == 0
             assert rc_missing == 0
