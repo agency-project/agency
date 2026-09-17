@@ -46,6 +46,13 @@ def test_detach_reattach_keeps_processes_stopped_until_policy_is_bound(tmp_path)
         wait_for(lambda: "READY>" in handle.terminal_output())
         handle.write_terminal(b"stty -echo; TOKEN=$RANDOM; sleep 60 &\r")
         wait_for(lambda: len(handle.pids()) >= 2)
+        # `sleep 60 &` forking is only proof `stty -echo` has *run* (it's
+        # earlier in the same sequential command line) -- it's not proof the
+        # tty driver has settled into non-echoing before the loop below
+        # starts typing into it. A brief buffer here avoids the first
+        # cycle's write occasionally getting echoed back and tripping the
+        # "still stopped" assertion below.
+        time.sleep(0.2)
         root = handle.root_pid
         for cycle in range(3):
             handle.checkpoint_detach()
@@ -61,7 +68,7 @@ def test_detach_reattach_keeps_processes_stopped_until_policy_is_bound(tmp_path)
             )
             handle.checkpoint_reattach()
             assert all(int(task_status(pid)["TracerPid"]) != 0 for pid in pids)
-            time.sleep(0.1)
+            time.sleep(0.3)  # margin against a loaded CI runner, same reasoning as above
             assert marker + "=" not in handle.terminal_output()
             handle.resume()
             wait_for(lambda: marker + "=" in handle.terminal_output())
