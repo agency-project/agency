@@ -239,12 +239,25 @@ class agllm:
             "guided_json",
             "guided_regex",
         }
+        # OpenAI's Responses API added "developer" as a companion/successor to
+        # "system" -- a harness built against that API (codex.py's generic
+        # role-passthrough for its own "message" items) can emit either.
+        # Chat-template validation that checks "system message must be at the
+        # beginning" treats the two as the same class: a leading `system` at
+        # index 0 plus a `developer` at index 1 still trips it, since it's a
+        # *second* system-class message, not literally about the word
+        # "system". Only the first system-class message encountered (whatever
+        # its exact role name) may keep it; anything after becomes a `user`
+        # message at its original position.
+        _SYSTEM_CLASS_ROLES = {"system", "developer"}
         wire_messages: list[dict] = []
         conversation_started = False
+        system_class_used = False
         for m in messages:
             role = m["role"]
             blocks = m.get("blocks") or []
-            if role != "system":
+            is_system_class = role in _SYSTEM_CLASS_ROLES
+            if not is_system_class:
                 conversation_started = True
             if role == "assistant":
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
@@ -275,25 +288,29 @@ class agllm:
                     "tool_call_id": result_block.get("tool_call_id", "") if result_block else "",
                     "content": result_block.get("text", "") if result_block else "",
                 }
-            elif role == "system" and conversation_started:
-                # The wire schema itself allows role:"system" anywhere in the
+            elif is_system_class and (conversation_started or system_class_used):
+                # The wire schema itself allows this role anywhere in the
                 # array, but not every server's own chat template does --
                 # Qwen3's (via transformers.apply_chat_template inside vLLM)
-                # rejects a non-leading one outright ("System message must be
-                # at the beginning"). Matches anthropic.py's/bedrock.py's own
-                # handling of the same mid-conversation system message.
+                # rejects a second system-class message outright ("System
+                # message must be at the beginning"), even one that's itself
+                # still ahead of the real conversation. Matches
+                # anthropic.py's/bedrock.py's own handling of a
+                # mid-conversation system message.
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 if not text:
                     continue
                 print(
-                    "[agllm] WARNING: harness emitted a mid-conversation "
-                    "system-role message -- sending it as a `user` message at "
-                    "its original position instead, since not every "
-                    "OpenAI-compatible server's chat template tolerates "
-                    'role:"system" outside the first message'
+                    f"[agllm] WARNING: harness emitted a second system-class "
+                    f'(role:"{role}") message -- sending it as a `user` message '
+                    "at its original position instead, since not every "
+                    "OpenAI-compatible server's chat template tolerates more "
+                    "than one"
                 )
                 wire_msg = {"role": "user", "content": text}
             else:
+                if is_system_class:
+                    system_class_used = True
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 wire_msg = {"role": role, "content": text}
             wire_messages.append(wire_msg)

@@ -162,7 +162,7 @@ def test_build_llm_kwargs_mid_conversation_system_message_becomes_user(capsys):
         {"role": "user", "content": "reminder: be concise"},
         {"role": "user", "content": "ok"},
     ]
-    assert "mid-conversation" in capsys.readouterr().out
+    assert "second system-class" in capsys.readouterr().out
 
 
 def test_build_llm_kwargs_empty_mid_conversation_system_message_dropped():
@@ -179,6 +179,32 @@ def test_build_llm_kwargs_empty_mid_conversation_system_message_dropped():
         {"role": "user", "content": "hi"},
         {"role": "user", "content": "ok"},
     ]
+
+
+def test_build_llm_kwargs_leading_developer_after_system_becomes_user(capsys):
+    """Reproduces a real vLLM/Qwen3 failure: codex.py's generic role
+    passthrough emits a separate role:"developer" message (OpenAI's
+    Responses API companion to "system") right after the leading system
+    message, both still ahead of any real turn. Qwen3's chat template
+    rejects it as a *second* system-class message ("System message must be
+    at the beginning") even though it's not "mid-conversation" in the
+    human sense -- only the very first system-class message may keep its
+    role, regardless of what comes between it and the real conversation."""
+    kw = build_llm_kwargs(
+        _cfg(),
+        [
+            _sys_msg("You are Codex."),
+            _msg("developer", "Some developer-level instructions."),
+            _msg("user", "do X"),
+        ],
+        None,
+    )
+    assert kw["messages"] == [
+        {"role": "system", "content": "You are Codex."},
+        {"role": "user", "content": "Some developer-level instructions."},
+        {"role": "user", "content": "do X"},
+    ]
+    assert "second system-class" in capsys.readouterr().out
 
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():
