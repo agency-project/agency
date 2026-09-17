@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import uuid
 
 from fastapi import Request
@@ -17,7 +18,13 @@ from .base import AdapterRuntime, AttemptResult, HarnessAdapter
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
-_DEFAULT_TIMEOUT_S = 600
+# An idle deadline, not a flat one: reset whenever the react loop's progress
+# checkpoint advances (see react_loop.py's _write_progress), the same
+# activity-driven contract the PTY-based harnesses use. A genuinely slow but
+# progressing run is never punished for its total wall-clock time; only
+# actual silence for this long ends the attempt.
+_DEFAULT_TIMEOUT_S = 300
+_PROGRESS_POLL_INTERVAL_S = 1.0
 
 _STOP_REASON_TO_OPENAI = {
     "end_turn": "stop",
@@ -94,6 +101,7 @@ class NativeAdapter(HarnessAdapter):
             runtime.engine_name, sandbox, uuid.uuid4().hex
         )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
+        progress_path = f"{scratch_dir}/progress.json"
         handle = None
         try:
             if resume_session_id and prior_session_blob is not None:
@@ -117,7 +125,7 @@ class NativeAdapter(HarnessAdapter):
                 "--model",
                 runtime.model or "",
                 "--max-steps",
-                str(20 if max_steps is None else max_steps),
+                str(runtime.agconfig.skill.react_max_steps if max_steps is None else max_steps),
                 "--output-format",
                 "json",
                 "--bridge-base-url",
@@ -130,6 +138,8 @@ class NativeAdapter(HarnessAdapter):
                 scratch_dir,
                 "--offload-dir",
                 offload_dir,
+                "--progress-file",
+                progress_path,
             ]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
@@ -154,7 +164,22 @@ class NativeAdapter(HarnessAdapter):
                 ag=None,
             )
             runtime.register_control_handle(handle)
-            stdout, stderr, rc = handle.wait(timeout=_DEFAULT_TIMEOUT_S)
+            deadline = time.monotonic() + _DEFAULT_TIMEOUT_S
+            last_progress_mtime = None
+            while handle.returncode is None:
+                now = time.monotonic()
+                if now > deadline:
+                    return self._partial_result_from_progress(sandbox, progress_path)
+                try:
+                    mtime = os.stat(progress_path).st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and mtime != last_progress_mtime:
+                    last_progress_mtime = mtime
+                    deadline = now + _DEFAULT_TIMEOUT_S
+                time.sleep(_PROGRESS_POLL_INTERVAL_S)
+            # Already finished -- drains the fully-buffered stdout/stderr.
+            stdout, stderr, rc = handle.wait()
 
             if rc != 0:
                 return AttemptResult(
@@ -185,11 +210,33 @@ class NativeAdapter(HarnessAdapter):
         finally:
             try:
                 if handle is not None:
-                    # wait() returning -1 leaves the timed-out process alive.
-                    # Reap it before deleting files it may still be using.
+                    # Idling out on the progress deadline returns while the
+                    # process is still running. Reap it before deleting files
+                    # it may still be using.
                     handle.close()
             finally:
                 agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
+
+    @staticmethod
+    def _partial_result_from_progress(sandbox, progress_path: str) -> AttemptResult:
+        """The react loop idled past its deadline with no completion signal.
+        Recover whatever it last checkpointed instead of failing an attempt
+        that may still be genuinely working -- mirrors the PTY-based
+        harnesses' own timeout-as-completion fallback (see
+        `harness/adapters/pty/execution.py`), since the underlying reason is
+        the same: a step-driven completion signal that can arrive late (or
+        not at all) is not evidence the run itself failed.
+        """
+        try:
+            progress = json.loads(sandbox.read_file_bytes(progress_path))
+        except Exception:  # noqa: S110 - no checkpoint yet is not an error
+            progress = {}
+        return AttemptResult(
+            ok=True,
+            final_text=progress.get("final_text", ""),
+            input_tokens=progress.get("total_input_tokens", 0),
+            output_tokens=progress.get("total_output_tokens", 0),
+        )
 
     def register(self, app, router) -> None:
         from fastapi.responses import JSONResponse, StreamingResponse

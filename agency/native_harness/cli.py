@@ -50,7 +50,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-p", "--prompt", required=True, help="The task prompt for this turn.")
     p.add_argument("--model", required=True)
     p.add_argument("--system", default=None, help="System prompt (only used for a fresh session).")
-    p.add_argument("--max-steps", type=int, default=20)
+    p.add_argument("--max-steps", type=int, default=4096)
     p.add_argument(
         "--output-format", choices=["json"], default="json", help="Only 'json' is supported today."
     )
@@ -72,6 +72,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '{"type": "http", "url": "...", "headers": {...}}}}',
     )
     p.add_argument("--offload-dir", default=_DEFAULT_OFFLOAD_DIR)
+    p.add_argument(
+        "--progress-file",
+        default=None,
+        help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
+        "liveness and recover a partial answer from if it gives up waiting.",
+    )
     return p
 
 
@@ -123,6 +129,7 @@ def main(argv: "list[str] | None" = None) -> int:
         context_limit=context_limit,
         max_steps=args.max_steps,
         offload_dir=args.offload_dir,
+        progress_path=args.progress_file,
     )
 
     if result.status != "done":

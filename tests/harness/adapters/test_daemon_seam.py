@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -12,6 +14,7 @@ from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 from agency.harness.adapters.codex import CodexAdapter
 from agency.harness.adapters.grok import GrokAdapter
+from agency.harness.adapters import native as native_module
 from agency.harness.adapters.native import NativeAdapter
 from agency.harness.adapters.opencode import OpenCodeAdapter
 
@@ -138,10 +141,12 @@ def _native_launch(captured: dict, stdout: str):
     return launch
 
 
-@pytest.mark.parametrize("outcome", ["timeout", "wait_error", "registration_error"])
+@pytest.mark.parametrize("outcome", ["nonzero_exit", "wait_error", "registration_error"])
 def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome):
     sandbox = _NativeSandbox()
-    handle = MagicMock()
+    # An already-exited process (returncode set) so the idle-deadline poll
+    # loop is skipped and wait() runs immediately, same as before.
+    handle = MagicMock(returncode=-1)
     handle.wait.return_value = ("", "", -1)
     if outcome == "wait_error":
         handle.wait.side_effect = RuntimeError("wait failed")
@@ -161,11 +166,128 @@ def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome
     monkeypatch.setattr("agency.harness.agharness.cleanup_config_home_in_container", cleanup)
     runtime = replace(_runtime(sandbox=sandbox), register_control_handle=register)
     kwargs = dict(prompt="work", resume_session_id=None, prior_session_blob=None, max_steps=1)
-    if outcome == "timeout":
+    if outcome == "nonzero_exit":
         assert not NativeAdapter(agconfig()).run_daemon_attempt(runtime, **kwargs).ok
     else:
         with pytest.raises(RuntimeError, match="failed"):
             NativeAdapter(agconfig()).run_daemon_attempt(runtime, **kwargs)
+
+
+def test_native_idle_deadline_returns_empty_success_with_no_progress_checkpoint(monkeypatch):
+    """A process that never exits and never even reaches its first progress
+    checkpoint still ends the attempt as a (empty) success once idle, never
+    a failure -- mirrors the PTY-based harnesses' timeout-as-completion
+    fallback (see pty/execution.py)."""
+    monkeypatch.setattr(native_module, "_DEFAULT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_module, "_PROGRESS_POLL_INTERVAL_S", 0.01)
+    sandbox = _NativeSandbox()
+    handle = MagicMock(returncode=None)  # never exits within the test
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch", lambda *args, **kwargs: handle
+    )
+    monkeypatch.setattr(
+        "agency.harness.agharness.cleanup_config_home_in_container", lambda *args: None
+    )
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
+        _runtime(sandbox=sandbox),
+        prompt="work",
+        resume_session_id=None,
+        prior_session_blob=None,
+        max_steps=1,
+    )
+    assert result.ok
+    assert result.final_text == ""
+    handle.close.assert_called_once_with()
+
+
+def test_native_idle_deadline_recovers_partial_output_from_progress_checkpoint(monkeypatch):
+    monkeypatch.setattr(native_module, "_DEFAULT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_module, "_PROGRESS_POLL_INTERVAL_S", 0.01)
+    sandbox = _NativeSandbox()
+    captured = {}
+
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+        captured["progress_path"] = argv[argv.index("--progress-file") + 1]
+        sandbox.files[captured["progress_path"]] = json.dumps(
+            {
+                "final_text": "partial answer from step 3",
+                "total_input_tokens": 120,
+                "total_output_tokens": 40,
+            }
+        )
+        return MagicMock(returncode=None)  # never exits within the test
+
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+    monkeypatch.setattr(
+        "agency.harness.agharness.cleanup_config_home_in_container", lambda *args: None
+    )
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
+        _runtime(sandbox=sandbox),
+        prompt="work",
+        resume_session_id=None,
+        prior_session_blob=None,
+        max_steps=1,
+    )
+    assert result.ok
+    assert result.final_text == "partial answer from step 3"
+    assert result.input_tokens == 120
+    assert result.output_tokens == 40
+
+
+def test_native_idle_deadline_resets_on_progress_and_still_reaches_real_completion(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(native_module, "_DEFAULT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(native_module, "_PROGRESS_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setattr(
+        "agency.harness.agharness.materialize_config_home_in_container",
+        lambda *args: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "agency.harness.agharness.cleanup_config_home_in_container", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+    )
+    sandbox = _NativeSandbox()
+    handle = MagicMock(returncode=None)
+    handle.wait.return_value = (
+        json.dumps({"result": "finished for real", "usage": {}, "session_id": None}),
+        "",
+        0,
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch", lambda *args, **kwargs: handle
+    )
+    progress_path = str(tmp_path / "progress.json")
+
+    def advance_progress_then_finish():
+        for _ in range(3):
+            time.sleep(0.08)  # well under the 0.2s deadline window
+            Path(progress_path).write_text("{}")
+        time.sleep(0.08)
+        handle.returncode = 0
+
+    thread = threading.Thread(target=advance_progress_then_finish)
+    thread.start()
+    try:
+        result = NativeAdapter(agconfig()).run_daemon_attempt(
+            _runtime(sandbox=sandbox),
+            prompt="work",
+            resume_session_id=None,
+            prior_session_blob=None,
+            max_steps=1,
+        )
+    finally:
+        thread.join(timeout=2)
+    assert result.ok
+    assert result.final_text == "finished for real"
 
 
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):
@@ -193,7 +315,7 @@ def test_native_adapter_launches_through_typed_runtime(monkeypatch):
     assert argv[argv.index("--max-steps") + 1] == "4"
 
 
-def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch):
+def test_native_adapter_falls_back_to_configured_react_max_steps_when_none(monkeypatch):
     sandbox = _NativeSandbox()
     captured: dict = {}
     monkeypatch.setattr(
@@ -203,9 +325,10 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
         "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
         _native_launch(captured, json.dumps({"result": "native-ok", "usage": {}})),
     )
+    runtime = _runtime(sandbox=sandbox)
 
     result = NativeAdapter(agconfig()).run_daemon_attempt(
-        _runtime(sandbox=sandbox),
+        runtime,
         prompt="do the thing",
         resume_session_id=None,
         prior_session_blob=None,
@@ -214,7 +337,7 @@ def test_native_adapter_uses_existing_default_when_max_steps_is_none(monkeypatch
 
     assert result.ok
     argv = captured["argv"]
-    assert argv[argv.index("--max-steps") + 1] == "20"
+    assert argv[argv.index("--max-steps") + 1] == str(runtime.agconfig.skill.react_max_steps)
 
 
 @pytest.mark.parametrize("backend_cls", [NativeAdapter, ClaudeCodeAdapter])

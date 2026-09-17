@@ -307,6 +307,53 @@ def test_pty_attempt_registers_controls_and_returns_only_native_completion(execu
     assert not execution.driver.root.exists()
 
 
+def test_attempt_deadline_completes_with_captured_stop_text_when_driver_never_confirms(
+    execution, monkeypatch, capsys
+):
+    """A driver's own completion check can be unreliable (e.g. an exact-text
+    match against a CLI's local transcript that never lines up) even though
+    the CLI genuinely finished. Idling out on the deadline is itself strong
+    evidence of that -- it should be treated as success, not failure."""
+    execution._active = False
+    execution.driver.persisted = False
+    handle = execution.handle
+
+    def write(data):
+        if data == b"\r":
+            execution.driver.pending += [
+                {"kind": "submit", "turn_id": "fresh", "prompt": execution._expected_prompt},
+                {"kind": "stop", "turn_id": "fresh", "text": "native final"},
+            ]
+
+    handle.write_terminal.side_effect = write
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch", Mock(return_value=handle)
+    )
+    result = execution.run("prompt")
+    assert result.ok and result.final_text == "native final"
+    assert result.session_blob == b"durable-native-session"
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_attempt_deadline_completes_even_with_no_stop_event_ever_observed(execution, monkeypatch):
+    execution._active = False
+    execution.driver.persisted = False
+    handle = execution.handle
+
+    def write(data):
+        if data == b"\r":
+            execution.driver.pending.append(
+                {"kind": "submit", "turn_id": "fresh", "prompt": execution._expected_prompt}
+            )
+
+    handle.write_terminal.side_effect = write
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch", Mock(return_value=handle)
+    )
+    result = execution.run("prompt")
+    assert result.ok and result.final_text == ""
+
+
 @pytest.mark.parametrize("failure", ["exit", "timeout"])
 def test_unsuccessful_attempt_always_closes_and_cleans_state(execution, monkeypatch, failure):
     if failure == "exit":

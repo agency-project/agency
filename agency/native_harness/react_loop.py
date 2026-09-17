@@ -16,6 +16,7 @@ external harness goes through. There is no separate "checkpoint" concept."""
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -29,7 +30,40 @@ if TYPE_CHECKING:
     from .llm_client import LLMClient
     from .mcp_client import McpToolset
 
-_DEFAULT_MAX_STEPS = 20
+_DEFAULT_MAX_STEPS = 4096
+
+
+def _write_progress(
+    progress_path: "str | None",
+    messages: list,
+    total_input_tokens: int,
+    total_output_tokens: int,
+    turn_count: int,
+) -> None:
+    """Best-effort checkpoint a host-side caller can poll for liveness and,
+    if it gives up waiting, recover a partial answer from -- mtime is the
+    activity signal, `final_text` is whatever the loop last actually said.
+    Never lets a checkpoint failure interrupt the loop it's observing."""
+    if progress_path is None:
+        return
+    final_text = ""
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("content"):
+            final_text = message["content"]
+            break
+    payload = {
+        "turn_count": turn_count,
+        "final_text": final_text,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+    }
+    try:
+        tmp_path = f"{progress_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, progress_path)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -54,6 +88,7 @@ def run_react_loop(
     context_limit: "int | None" = None,
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
+    progress_path: "str | None" = None,
 ) -> ReactLoopResult:
     messages = list(messages)
     total_input_tokens = 0
@@ -101,6 +136,9 @@ def run_react_loop(
                     total_output_tokens=total_output_tokens,
                     turn_count=step + 1,
                 )
+            _write_progress(
+                progress_path, messages, total_input_tokens, total_output_tokens, step + 1
+            )
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]

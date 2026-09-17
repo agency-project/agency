@@ -70,7 +70,7 @@ class PtyDriver:
     confirm_interrupt = False
     INPUT_TIMEOUT = 60.0
     START_TIMEOUT = 45.0
-    ATTEMPT_TIMEOUT = 600.0
+    ATTEMPT_TIMEOUT = 300.0
     # Whether terminal output alone should extend the attempt deadline.
     activity_extends_deadline = False
 

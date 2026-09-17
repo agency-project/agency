@@ -25,7 +25,7 @@ def claude_code_available() -> bool:
     return shutil.which("claude") is not None
 
 
-_DEFAULT_TIMEOUT_S = 600
+_DEFAULT_TIMEOUT_S = 300
 
 
 # -- Native session continuity ----------------------------------------------
@@ -211,12 +211,13 @@ def _sse(event_type: str, data: dict) -> str:
 
 
 class ClaudeDriver(PtyDriver):
-    """Claude Code: Agency-assigned turn identity, transcript-reconciled completion.
+    """Claude Code: Agency-assigned turn identity, hook-driven completion.
 
     Claude does not report a turn identity of its own, so this driver commits
-    one to `agency-turn.json` and the lifecycle hook stamps events with it. Its
-    Stop hook is likewise not sufficient evidence of completion: the persisted
-    transcript must also show the submitted prompt and the final message.
+    one to `agency-turn.json` and the lifecycle hook stamps events with it.
+    Once a Stop event carries that turn_id, the turn is done; the transcript
+    is only consulted afterward, to pull usage totals and a resumable
+    session snapshot.
     """
 
     name = "claude"
@@ -229,7 +230,6 @@ class ClaudeDriver(PtyDriver):
         self.started = False
         self._prior_blob = blob
         self._expected_prompt = None
-        self._submission_offset = 0
         self._attempt_offset = None
         self._snapshot = None
         self._interrupt_offset = 0
@@ -299,9 +299,8 @@ class ClaudeDriver(PtyDriver):
 
     def begin_turn(self, prompt):
         self._expected_prompt = prompt
-        self._submission_offset = len(self._transcript())
         if self._attempt_offset is None:
-            self._attempt_offset = self._submission_offset
+            self._attempt_offset = len(self._transcript())
         turn_id = uuid.uuid4().hex
         state = self.root / "agency-turn.json"
         temporary = state.with_suffix(".tmp")
@@ -358,25 +357,8 @@ class ClaudeDriver(PtyDriver):
 
     def completed(self, event):
         super().completed(event)
-        blob = self._transcript()
-        submitted = False
-        for row in self._rows(blob[self._submission_offset :]):
-            text = self._text(row)
-            if row.get("type") == "user" and text == self._expected_prompt:
-                submitted = True
-            if not submitted:
-                continue
-            if event["text"] == "":
-                # Claude can finish after tool output without persisting a final
-                # assistant message. Its durable turn marker closes that
-                # transcript after the Stop hook has returned.
-                if row.get("type") == "system" and row.get("subtype") == "turn_duration":
-                    self._record_usage(blob, event)
-                    return True
-            elif row.get("type") == "assistant" and text == event["text"]:
-                self._record_usage(blob, event)
-                return True
-        return False
+        self._record_usage(self._transcript(), event)
+        return True
 
     def _record_usage(self, blob, event):
         self._snapshot = blob
