@@ -168,6 +168,7 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
             self.active_token = None
             self.host_mcp_server = SimpleNamespace(collected_output=lambda: {})
             self.llm_handler_server = SimpleNamespace(get_main_transcript=lambda _needle: [])
+            self.interaction_server = SimpleNamespace(last_bootstrap_ping_ts=None)
             managers.append(self)
 
         def start(self) -> str:
@@ -197,8 +198,10 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
 
     client = FakeSandboxClient()
 
-    def ensure_daemon(_sandbox, _host_path, _engine_name, _harness, *, agconfig):
-        del agconfig
+    def ensure_daemon(
+        _sandbox, _host_path, _engine_name, _harness, *, agconfig, progress_source=None
+    ):
+        del agconfig, progress_source
         return SimpleNamespace(client=lambda timeout_s=None: client)
 
     monkeypatch.setattr(engine_module, "HostServerManager", FakeHostServerManager)
