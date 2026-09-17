@@ -32,6 +32,24 @@ def _run_one_pty_execution(_key: object, factory: Callable[[], object], prompt: 
     return factory().run(prompt)
 
 
+def fetch_context_limit(
+    harness_base_url: str, token: str, *, timeout_s: float = 10.0
+) -> "int | None":
+    import httpx
+
+    try:
+        resp = httpx.post(
+            f"{harness_base_url}/internal/context_limit",
+            json={"token": token},
+            timeout=timeout_s,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("context_limit")
+    except Exception:
+        return None
+
+
 @dataclass
 class AttemptResult:
     """Normalized result of one harness CLI invocation."""

@@ -6,7 +6,7 @@ import shutil
 
 from fastapi import Request
 
-from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
 from .openai_chat_completions import ChatCompletionsProtocol
@@ -31,7 +31,11 @@ class GrokDriver(_HookPtyDriver):
 
     def _configure(self, adapter, runtime, max_steps):
         adapter._write_grok_config(
-            self.root, runtime.harness_base_url, runtime.token, runtime.model or "default"
+            self.root,
+            runtime.harness_base_url,
+            runtime.token,
+            runtime.model or "default",
+            context_limit=fetch_context_limit(runtime.harness_base_url, runtime.token),
         )
         self.env["GROK_HOME"] = str(self.root)
         self.argv += ["--no-alt-screen", "--always-approve", "--no-memory", "--no-plan"]
@@ -155,7 +159,15 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
             max_steps=max_steps,
         )
 
-    def _write_grok_config(self, config_home, base_url: str, token: str, model: str) -> None:
+    def _write_grok_config(
+        self,
+        config_home,
+        base_url: str,
+        token: str,
+        model: str,
+        *,
+        context_limit: "int | None" = None,
+    ) -> None:
         # config.toml, per docs.x.ai/build's configuration guide: a
         # [model.<name>] block with base_url/api_key/api_backend, and a
         # [models] table selecting the default model -- api_backend =
@@ -171,6 +183,11 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
             f"api_key = {_toml_string(token)}\n"
             f'api_backend = "chat_completions"\n'
         )
+        if context_limit is not None:
+            # Omitting this for an unrecognized model leaves Grok assuming
+            # 200,000 tokens (per its own docs), which can be far off from
+            # what the actual proxied backend supports.
+            config_toml += f"context_window = {int(context_limit)}\n"
         (config_home / "config.toml").write_text(config_toml)
 
     def register(self, app, router) -> None:

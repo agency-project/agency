@@ -19,7 +19,7 @@ import shutil
 import time
 from pathlib import Path, PurePosixPath
 
-from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .openai_chat_completions import ChatCompletionsProtocol
 from .pty.driver import PtyDriver, run_pty_attempt
 from .pty.execution import MAX_SESSION_BYTES, restore_session, snapshot_session
@@ -110,6 +110,7 @@ class KimiDriver(PtyDriver):
             runtime.model or "default",
             max_steps,
             self._hook_commands(),
+            context_limit=fetch_context_limit(runtime.harness_base_url, runtime.token),
         )
         # KIMI_CODE_HOME relocates config, sessions, and credentials together,
         # so the attempt's whole footprint stays inside its isolated root.
@@ -321,7 +322,9 @@ class KimiAdapter(ChatCompletionsProtocol, HarnessAdapter):
             max_steps=max_steps,
         )
 
-    def _write_kimi_config(self, config_home, base_url, token, model, max_steps, hooks):
+    def _write_kimi_config(
+        self, config_home, base_url, token, model, max_steps, hooks, *, context_limit=None
+    ):
         # type = "openai" is Kimi's OpenAI Chat Completions protocol, which
         # agproxy_llm already serves unchanged -- the same passthrough route
         # grok and opencode use, with no translation layer.
@@ -344,7 +347,11 @@ class KimiAdapter(ChatCompletionsProtocol, HarnessAdapter):
             f"[models.{alias}]",
             f'provider = "{_PROVIDER}"',
             f"model = {alias}",
-            "max_context_size = 200000",
+            # A real, per-model value when the host can supply one -- unlike
+            # codex/grok/opencode this field already existed here, but it was
+            # a static guess, wrong in either direction for whatever model is
+            # actually proxied behind agency.
+            f"max_context_size = {int(context_limit) if context_limit is not None else 200000}",
             'capabilities = ["tool_use"]',
         ]
         if max_steps is not None:

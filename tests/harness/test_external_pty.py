@@ -64,6 +64,61 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
         assert "chat.message" in (tmp_path / "plugin/agpolicy_plugin.js").read_text()
 
 
+@pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
+def test_context_limit_is_written_into_config_when_lookup_succeeds(
+    name, runtime, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        f"agency.harness.adapters.{name}.fetch_context_limit", lambda *a, **k: 42_000
+    )
+    driver_for(HarnessAdapter.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, 4)
+    if name == "codex":
+        config = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert config["model_context_window"] == 42_000
+    elif name == "grok":
+        config = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert config["model"]["agency-proxy"]["context_window"] == 42_000
+    else:
+        config = json.loads((tmp_path / "opencode.json").read_text())
+        assert config["provider"]["agency-proxy"]["models"][runtime.model]["limit"] == {
+            "context": 42_000,
+            # 42_000 is too small a window for the 10% share to beat the
+            # flat default floor -- see the dedicated large-window test for
+            # the branch where it actually scales.
+            "output": runtime.agconfig.llm.default_max_tokens,
+        }
+
+
+def test_opencode_output_reservation_scales_with_a_large_context_window(
+    runtime, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "agency.harness.adapters.opencode.fetch_context_limit", lambda *a, **k: 500_000
+    )
+    driver_for(
+        HarnessAdapter.for_config("opencode", runtime.agconfig), runtime, tmp_path, None, None, 4
+    )
+    config = json.loads((tmp_path / "opencode.json").read_text())
+    limit = config["provider"]["agency-proxy"]["models"][runtime.model]["limit"]
+    assert limit["context"] == 500_000
+    assert limit["output"] == max(runtime.agconfig.llm.default_max_tokens, 50_000)
+
+
+@pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
+def test_no_context_limit_field_when_lookup_fails(name, runtime, tmp_path, monkeypatch):
+    monkeypatch.setattr(f"agency.harness.adapters.{name}.fetch_context_limit", lambda *a, **k: None)
+    driver_for(HarnessAdapter.for_config(name, runtime.agconfig), runtime, tmp_path, None, None, 4)
+    if name == "codex":
+        config = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert "model_context_window" not in config
+    elif name == "grok":
+        config = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert "context_window" not in config["model"]["agency-proxy"]
+    else:
+        config = json.loads((tmp_path / "opencode.json").read_text())
+        assert "limit" not in config["provider"]["agency-proxy"]["models"][runtime.model]
+
+
 def test_codex_registers_attempt_local_sandbox_mcp(runtime, tmp_path):
     runtime = replace(runtime, has_sandbox_mcp_tools=True)
     driver_for(

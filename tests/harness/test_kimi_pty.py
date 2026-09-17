@@ -65,6 +65,20 @@ def test_launch_is_interactive_and_isolated(driver, runtime, tmp_path):
     assert config["loop_control"]["max_steps_per_turn"] == 4
     events = {hook["event"] for hook in config["hooks"]}
     assert {"SessionStart", "TurnStarted", "Stop", "Interrupt", "PreToolUse"} <= events
+    # No live context-limit lookup succeeds against this fake harness_base_url,
+    # so this falls back to Kimi's own historical static default.
+    assert config["models"]["a-model"]["max_context_size"] == 200_000
+
+
+def test_max_context_size_uses_the_real_context_limit_when_available(
+    runtime, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("agency.harness.adapters.kimi.fetch_context_limit", lambda *a, **k: 64_000)
+    driver_for(
+        HarnessAdapter.for_config("kimi", runtime.agconfig), runtime, tmp_path, None, None, 4
+    )
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["models"]["a-model"]["max_context_size"] == 64_000
 
 
 def test_resume_passes_the_native_session_flag(runtime, tmp_path):

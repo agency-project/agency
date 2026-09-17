@@ -8,7 +8,7 @@ import sqlite3
 from .pty.execution import MAX_SESSION_BYTES
 import shutil
 
-from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .openai_chat_completions import ChatCompletionsProtocol
 from .pty.driver import PtyDriver, run_pty_attempt
 
@@ -30,6 +30,7 @@ class OpencodeDriver(PtyDriver):
             runtime.model or "default",
             plugin,
             max_steps,
+            context_limit=fetch_context_limit(runtime.harness_base_url, runtime.token),
         )
         self.env.update(
             OPENCODE_CONFIG=str(self.root / "opencode.json"),
@@ -126,14 +127,36 @@ class OpenCodeAdapter(ChatCompletionsProtocol, HarnessAdapter):
         model: str,
         plugin_path,
         max_steps: "int | None",
+        *,
+        context_limit: "int | None" = None,
     ) -> None:
+        model_entry = {"name": model}
+        if context_limit is not None:
+            # Without this, OpenCode has no idea how much context an
+            # unrecognized (agency-proxied) model actually has -- per
+            # opencode.ai/docs/providers, `limit.context` is exactly the
+            # field its own compaction reasons about "how much context you
+            # have left" against. `limit.output` is a separate concept
+            # (max generated tokens, not context window) that OpenCode
+            # nonetheless requires alongside `limit.context` -- config
+            # validation rejects one without the other and the CLI refuses
+            # to start at all. A flat default_max_tokens reservation is too
+            # small a share of a genuinely large context window (leaves
+            # compaction too little headroom relative to how much history
+            # such a model can actually hold), so scale it with the window,
+            # floored at the same default agllm.py falls back to elsewhere.
+            output_reservation = max(self.agconfig.llm.default_max_tokens, int(0.1 * context_limit))
+            model_entry["limit"] = {
+                "context": int(context_limit),
+                "output": output_reservation,
+            }
         config = {
             "provider": {
                 self._PROVIDER_NAME: {
                     "npm": "@ai-sdk/openai-compatible",
                     "name": "Agency Proxy",
                     "options": {"baseURL": f"{base_url}/v1", "apiKey": token},
-                    "models": {model: {"name": model}},
+                    "models": {model: model_entry},
                 }
             },
             "model": f"{self._PROVIDER_NAME}/{model}",

@@ -10,7 +10,7 @@ from functools import partial
 
 from fastapi import Request
 
-from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
 from .pty.execution import stream_response
@@ -207,6 +207,7 @@ class CodexDriver(_HookPtyDriver):
             runtime.harness_base_url,
             runtime.model or "default",
             has_sandbox_mcp_tools=runtime.has_sandbox_mcp_tools,
+            context_limit=fetch_context_limit(runtime.harness_base_url, runtime.token),
         )
         with (self.root / "config.toml").open("a") as config:
             config.write('\n[projects."/workspace"]\ntrust_level = "trusted"\n')
@@ -309,10 +310,16 @@ class CodexAdapter(HarnessAdapter):
         model: str,
         *,
         has_sandbox_mcp_tools: bool = False,
+        context_limit: "int | None" = None,
     ) -> None:
-        toml_text = (
-            f'model = "{model}"\n'
-            f'model_provider = "{self._PROVIDER_NAME}"\n'
+        toml_text = f'model = "{model}"\nmodel_provider = "{self._PROVIDER_NAME}"\n'
+        if context_limit is not None:
+            # Codex only knows the context window for its own house models --
+            # for a name it doesn't recognize (any model proxied behind
+            # agency), it silently assumes some default that can be far off
+            # from what the actual backend supports. This is the real number.
+            toml_text += f"model_context_window = {int(context_limit)}\n"
+        toml_text += (
             f"\n"
             f"[model_providers.{self._PROVIDER_NAME}]\n"
             f'name = "Agency Proxy"\n'

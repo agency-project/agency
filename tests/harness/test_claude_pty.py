@@ -119,3 +119,60 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
         if execution.handle is not None:
             execution.handle.kill()
         worker.join(5)
+
+
+@pytest.mark.parametrize(
+    "context_limit,expected_window",
+    [
+        (32_000, None),  # 28.8k after margin -- still below the flag's 100k floor
+        (100_000, None),  # 90k after margin -- just below the floor
+        (500_000, 450_000),
+        (1_000_000, 900_000),
+        (2_000_000, None),  # 1.8M after margin -- still above the flag's 1M ceiling
+    ],
+)
+def test_autocompact_uses_a_safety_margin_and_claudes_accepted_range(
+    tmp_path, monkeypatch, context_limit, expected_window
+):
+    (tmp_path / "events").mkdir()
+    monkeypatch.setattr(
+        "agency.harness.adapters.claude_code.fetch_context_limit", lambda *a, **k: context_limit
+    )
+    adapter = SimpleNamespace(
+        agconfig=agconfig(),
+        prepare_pty=lambda *args, **kwargs: (["claude"], {}),
+    )
+    runtime = AdapterRuntime(
+        agconfig(),
+        "model",
+        "engine",
+        "http://127.0.0.1:8766",
+        "token",
+        SimpleNamespace(check=lambda *args: True),
+    )
+    driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
+    if expected_window is None:
+        assert "--autocompact" not in driver.argv
+    else:
+        assert driver.argv[driver.argv.index("--autocompact") + 1] == str(expected_window)
+
+
+def test_no_autocompact_flag_when_context_limit_lookup_fails(tmp_path, monkeypatch):
+    (tmp_path / "events").mkdir()
+    monkeypatch.setattr(
+        "agency.harness.adapters.claude_code.fetch_context_limit", lambda *a, **k: None
+    )
+    adapter = SimpleNamespace(
+        agconfig=agconfig(),
+        prepare_pty=lambda *args, **kwargs: (["claude"], {}),
+    )
+    runtime = AdapterRuntime(
+        agconfig(),
+        "model",
+        "engine",
+        "http://127.0.0.1:8766",
+        "token",
+        SimpleNamespace(check=lambda *args: True),
+    )
+    driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
+    assert "--autocompact" not in driver.argv

@@ -488,9 +488,29 @@ def test_agency_stream_to_harness_text_stream():
     text_deltas = [d for t, d in events if t == "content_block_delta"]
     assert "".join(d["delta"]["text"] for d in text_deltas) == "Hello"
 
+    # Claude Code's own auto-compact tracking reads this straight off
+    # message_start -- if it's always 0, compaction can never trigger no
+    # matter how large the real conversation actually is.
+    message_start = next(d for t, d in events if t == "message_start")
+    assert message_start["message"]["usage"]["input_tokens"] == 7
+
     message_delta = next(d for t, d in events if t == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
     assert message_delta["usage"]["output_tokens"] == 2
+
+
+def test_agency_stream_to_harness_defaults_input_tokens_when_usage_missing():
+    stream = [
+        {
+            "type": "done",
+            "message": {"role": "assistant", "blocks": [_text_block("hi")]},
+            "stop_reason": "stop",
+        }
+    ]
+    frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "claude-x"))
+    events = _parse_sse(frames)
+    message_start = next(d for t, d in events if t == "message_start")
+    assert message_start["message"]["usage"]["input_tokens"] == 0
 
 
 def test_agency_stream_discards_draft_text_replaced_by_redirect():

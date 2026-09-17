@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi import Request
 
-from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
@@ -26,6 +26,22 @@ def claude_code_available() -> bool:
 
 
 _DEFAULT_TIMEOUT_S = 300
+
+# --autocompact only accepts this range (per `claude --help`); a model with a
+# real window outside it can't be told via this flag at all, so Claude Code
+# is left on its own "auto" default for those rather than passed a value it
+# would reject.
+_AUTOCOMPACT_MIN_TOKENS = 100_000
+_AUTOCOMPACT_MAX_TOKENS = 1_000_000
+# --autocompact directly sets Claude Code's *effective* window (confirmed
+# against the CLI's own bundled strings: it feeds straight into the
+# used-tokens-vs-window comparison, not a separate trigger threshold below a
+# still-real max the way codex's model_context_window/
+# model_auto_compact_token_limit split works). Compacting at the exact real
+# limit would leave no headroom for the compaction call itself plus the next
+# turn's overhead, so shave the same margin native_harness/compaction.py's
+# own COMPACT_THRESHOLD already uses before handing the number over.
+_AUTOCOMPACT_SAFETY_MARGIN = 0.9
 
 
 # -- Native session continuity ----------------------------------------------
@@ -252,6 +268,15 @@ class ClaudeDriver(PtyDriver):
         )
         if max_steps is not None:
             self.argv += ["--max-turns", str(max_steps)]
+        context_limit = fetch_context_limit(runtime.harness_base_url, runtime.token)
+        if context_limit is not None:
+            # Otherwise Claude Code's own auto-compaction is sized for
+            # whatever model name it thinks it's talking to, not the real
+            # (possibly much smaller) window of the model actually proxied
+            # behind agency.
+            autocompact_window = int(context_limit * _AUTOCOMPACT_SAFETY_MARGIN)
+            if _AUTOCOMPACT_MIN_TOKENS <= autocompact_window <= _AUTOCOMPACT_MAX_TOKENS:
+                self.argv += ["--autocompact", str(autocompact_window)]
 
     def _transcript(self):
         if self.session_id is None:
@@ -730,6 +755,21 @@ class ClaudeCodeAdapter(HarnessAdapter):
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
         request_id = f"msg_{uuid.uuid4().hex}"
+        # Draft deltas can be superseded by an in-flight redirect. Anthropic
+        # SSE cannot retract text already sent to Claude; emit only the
+        # authoritative message after the checkpoint -- materializing here
+        # (never more than the single "done" item in practice; register()
+        # already filters the live stream down to that before calling this)
+        # also means the real usage is known before message_start is built,
+        # instead of only after -- the real API reports input_tokens there
+        # immediately, and Claude Code's own auto-compact tracking reads it
+        # from exactly that field. Hardcoding it to 0 (as this used to) means
+        # Claude Code always computes zero tokens used and can never trigger
+        # compaction on its own, no matter how large the real conversation is.
+        items = [item for item in agency_stream if item["type"] != "delta"]
+        final_usage = {}
+        for item in items:
+            final_usage = item.get("usage") or {}
         yield _sse(
             "message_start",
             {
@@ -742,17 +782,15 @@ class ClaudeCodeAdapter(HarnessAdapter):
                     "model": model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": final_usage.get("prompt_tokens", 0),
+                        "output_tokens": 0,
+                    },
                 },
             },
         )
         next_index = 0
-        for item in agency_stream:
-            if item["type"] == "delta":
-                # Draft deltas can be superseded by an in-flight redirect.
-                # Anthropic SSE cannot retract text already sent to Claude;
-                # emit only the authoritative message after the checkpoint.
-                continue
+        for item in items:
             for b in item["message"].get("blocks", []):
                 idx = next_index
                 next_index += 1
