@@ -289,6 +289,8 @@ class agllm:
                 "[agllm] WARNING: llm_config['max_tokens'] is deprecated; use 'max_completion_tokens' instead."
             )
             kwargs.setdefault("max_completion_tokens", self.agconfig.llm.max_tokens)
+        if "max_completion_tokens" not in kwargs:
+            kwargs["max_completion_tokens"] = self.agconfig.llm.default_max_tokens
         _extra_body: dict = dict(self.agconfig.llm.extra_body or {})
         for _p in _EXTRA_BODY_GEN_PARAMS:
             val = getattr(self.agconfig.llm, _p)

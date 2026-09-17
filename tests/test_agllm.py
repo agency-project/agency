@@ -100,6 +100,25 @@ def test_build_llm_kwargs_max_completion_tokens_wins_when_both_present(capsys):
     assert "deprecated" in capsys.readouterr().out
 
 
+def test_build_llm_kwargs_falls_back_to_default_max_tokens_when_unset():
+    """An OpenAI-compatible server has no server-side default the way
+    Anthropic's/Bedrock's native APIs do -- litellm itself falls back to a
+    hardcoded 4096 whenever a request omits this, silently truncating any
+    model capable of more. agconfig's own default_max_tokens must always be
+    sent explicitly instead of leaving it up to the backend in front of us."""
+    cfg = _cfg(model="m")
+    assert cfg.llm.max_completion_tokens is None
+    assert cfg.llm.max_tokens is None
+    kw = build_llm_kwargs(cfg, [], None)
+    assert kw["max_completion_tokens"] == cfg.llm.default_max_tokens
+
+
+def test_build_llm_kwargs_explicit_max_completion_tokens_not_overridden():
+    cfg = _cfg(model="m", max_completion_tokens=512)
+    kw = build_llm_kwargs(cfg, [], None)
+    assert kw["max_completion_tokens"] == 512
+
+
 def test_build_llm_kwargs_unknown_params_not_forwarded():
     """build_kwargs only forwards the known OpenAI-style generation params --
     other agconfig fields (provider selection, transport config, ...) don't
