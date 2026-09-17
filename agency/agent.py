@@ -343,10 +343,10 @@ class agent:
             {
                 "sequence": sequence,
                 "type": "message",
-                "role": "system",
-                "content": "Note: the previous skill call failed. Its sandbox workspace "
+                "role": "user",
+                "content": "<system>\nNote: the previous skill call failed. Its sandbox workspace "
                 "changes have been discarded and the workspace has been reverted "
-                "to the last successful checkpoint.",
+                "to the last successful checkpoint.</system>",
                 "source": "context_notice",
             }
         )
