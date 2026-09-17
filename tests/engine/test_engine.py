@@ -196,6 +196,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.host_mcp_server = SimpleNamespace(
                 collected_output=lambda: next(collected_iter) if collected_iter is not None else {}
             )
+            self.interaction_server = SimpleNamespace(last_bootstrap_ping_ts=None)
             holder["manager"] = self
 
         def start(self) -> str:
@@ -248,7 +249,9 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
     client = _FakeClient()
     holder["client"] = client
 
-    def fake_ensure_harness_daemon(sandbox, host_uds_path, engine_name, harness, agconfig):
+    def fake_ensure_harness_daemon(
+        sandbox, host_uds_path, engine_name, harness, agconfig, progress_source=None
+    ):
         holder["daemon_sandbox"] = sandbox
 
         def client_for_attempt(timeout_s=300.0):

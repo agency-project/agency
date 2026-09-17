@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shlex
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -95,10 +97,12 @@ def test_pythonpath_is_exported_not_just_assigned(monkeypatch, tmp_path):
     )
 
 
-def test_ensure_harness_daemon_default_timeout_is_60s():
+def test_ensure_harness_daemon_default_timeout_is_120s():
     import inspect
 
-    assert inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 60.0
+    assert (
+        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 120.0
+    )
 
 
 def test_package_bootstrap_runs_before_the_daemon_module_is_ever_imported(monkeypatch, tmp_path):
@@ -113,7 +117,7 @@ def test_package_bootstrap_runs_before_the_daemon_module_is_ever_imported(monkey
     )
 
     command = sandbox.detached[0][0]
-    bootstrap_index = command.index("import importlib, socket, subprocess, sys")
+    bootstrap_index = command.index("import http.client, importlib, json, socket, subprocess, sys")
     daemon_index = command.index("-m agency.harness.daemon")
     assert bootstrap_index < daemon_index
     for pkg in launcher._REQUIRED_HARNESS_PACKAGES:
@@ -185,6 +189,60 @@ def test_ensure_harness_daemon_waits_for_readiness_before_returning(monkeypatch,
     )
 
     assert len(probes) == 3
+
+
+def test_ensure_harness_daemon_resets_deadline_on_fresh_progress_ping(monkeypatch, tmp_path):
+    """A slow-but-still-progressing bootstrap (still pinging /record_event)
+    must not time out just because total elapsed time exceeds timeout_s --
+    only genuine silence for a full timeout_s window should. See
+    ensure_harness_daemon's own docstring on `progress_source`."""
+    sandbox = _fake_sandbox(tmp_path)
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: False)
+
+    progress = SimpleNamespace(last_bootstrap_ping_ts=None)
+
+    def ping_after_a_bit():
+        time.sleep(0.15)
+        progress.last_bootstrap_ping_ts = time.monotonic()
+
+    thread = threading.Thread(target=ping_after_a_bit)
+    thread.start()
+    start = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError):
+            launcher.ensure_harness_daemon(
+                sandbox,
+                "/tmp/host.sock",
+                "agent-1",
+                "claude_code",
+                timeout_s=0.2,
+                progress_source=progress,
+            )
+        elapsed = time.monotonic() - start
+    finally:
+        thread.join()
+    # Without the reset this would time out at ~0.2s; the ping at ~0.15s
+    # should push the deadline out to ~0.35s instead.
+    assert elapsed > 0.3
+
+
+def test_ensure_harness_daemon_ignores_progress_source_with_no_ping_yet(monkeypatch, tmp_path):
+    sandbox = _fake_sandbox(tmp_path)
+    monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: False)
+    progress = SimpleNamespace(last_bootstrap_ping_ts=None)
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError):
+        launcher.ensure_harness_daemon(
+            sandbox,
+            "/tmp/host.sock",
+            "agent-1",
+            "claude_code",
+            timeout_s=0.15,
+            progress_source=progress,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.3
 
 
 def test_duplicate_ensure_reuses_ready_daemon_without_relaunching(monkeypatch, tmp_path):

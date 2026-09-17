@@ -264,6 +264,7 @@ class AgentEngine:
                     engine_name,
                     self._agent.harness,
                     agconfig=self.agconfig,
+                    progress_source=manager.interaction_server,
                 )
 
             # Sync current pause state to the daemon before this attempt

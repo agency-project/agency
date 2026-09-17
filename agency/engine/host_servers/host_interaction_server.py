@@ -63,6 +63,12 @@ class HostInteractionServer:
         # a denied call never really runs, so it has nothing to complete.
         self._pending_calls: "dict[str, tuple]" = {}
         self._pending_calls_lock = threading.Lock()
+        # Set by record_event() whenever a "harness_bootstrap_progress" event
+        # arrives -- ensure_harness_daemon()'s readiness wait reads this to
+        # reset its own deadline on every fresh ping, rather than needing the
+        # daemon's own /health to come up before the host can tell bootstrap
+        # is still making progress (vs. genuinely hung).
+        self.last_bootstrap_ping_ts: "float | None" = None
         # Spans a caller opened via record_span(span_id=..., end_ts=None) and
         # has not yet closed. Generic -- any reporter (this class's own
         # admission/completion boundaries, or a harness reporting its own
@@ -400,6 +406,8 @@ class HostInteractionServer:
         print_to_terminal: bool = True,
         flush: bool = False,
     ) -> None:
+        if type == "harness_bootstrap_progress":
+            self.last_bootstrap_ping_ts = time.monotonic()
         self._data_logger.record_event(
             type,
             payload,

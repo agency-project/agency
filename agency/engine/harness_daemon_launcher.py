@@ -46,6 +46,7 @@ from .clients import HarnessInteractionClient
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
+    from .host_servers.host_interaction_server import HostInteractionServer
     from ..sandbox.agsandbox import agSandbox
 
 _CONTAINER_GATEWAY_DIR = AGENCY_LLM_GATEWAY_CONTAINER_MOUNT
@@ -112,7 +113,12 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
 
 
 def _package_bootstrap_command(
-    harness_python: str, packages: "tuple[str, ...]", install_missing: bool
+    harness_python: str,
+    packages: "tuple[str, ...]",
+    install_missing: bool,
+    *,
+    engine_name: str,
+    container_host_uds_path: str,
 ) -> str:
     """A dependency-free (no `agency` import) check-and-pip-install, run
     ahead of `exec`'ing into `agency.harness.daemon` itself -- see this
@@ -121,11 +127,47 @@ def _package_bootstrap_command(
     exactly; that version is for call sites already deep inside a running
     agency process (e.g. the native harness adapter), where importing
     `agency` is already a given.
+
+    Pings the host's existing `/record_event` over `--host-uds` at each
+    step (pure stdlib HTTP-over-AF_UNIX -- no `httpx`, since nothing from
+    `agency` is importable yet either): both to print a live "still
+    booting, here's what" line in place of the old silent wait (previously
+    visible only via the daemon log's tail, and only after a timeout), and
+    so `ensure_harness_daemon()`'s own wait loop can reset its deadline on
+    each fresh ping -- the daemon can now genuinely take however long a
+    cold pip install takes, capped by silence, not by a fixed total.
     """
     script = (
-        "import importlib, socket, subprocess, sys\n"
+        "import http.client, importlib, json, socket, subprocess, sys\n"
+        f"ENGINE = {engine_name!r}\n"
+        f"HOST_UDS = {container_host_uds_path!r}\n"
+        "\n"
+        "class _UDSConnection(http.client.HTTPConnection):\n"
+        "    def connect(self):\n"
+        "        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "        self.sock.settimeout(self.timeout)\n"
+        "        self.sock.connect(HOST_UDS)\n"
+        "\n"
+        "def ping(step, ok=True):\n"
+        "    mark = '▶' if ok is None else ('✓' if ok else '✗')\n"
+        "    body = json.dumps({\n"
+        "        'type': 'harness_bootstrap_progress',\n"
+        "        'payload': {'engine': ENGINE, 'step': step, 'ok': ok},\n"
+        "        'term_message': f'[{ENGINE}] BOOT {mark}   {step}',\n"
+        "        'print_to_terminal': True,\n"
+        "    }).encode()\n"
+        "    try:\n"
+        "        conn = _UDSConnection('localhost', timeout=3)\n"
+        "        conn.request('POST', '/record_event', body=body, "
+        "headers={'Content-Type': 'application/json'})\n"
+        "        conn.getresponse().read()\n"
+        "        conn.close()\n"
+        "    except Exception:\n"
+        "        pass  # best-effort -- a ping failing must never abort bootstrap\n"
+        "\n"
         f"packages = {packages!r}\n"
         f"install_missing = {install_missing!r}\n"
+        "ping('checking required packages', ok=None)\n"
         "missing = []\n"
         "for pkg in packages:\n"
         "    try:\n"
@@ -133,17 +175,29 @@ def _package_bootstrap_command(
         "    except ImportError:\n"
         "        missing.append(pkg)\n"
         "if not missing:\n"
+        "    ping('all required packages already present')\n"
+        "    ping('starting harness daemon', ok=None)\n"
         "    raise SystemExit(0)\n"
         "if not install_missing:\n"
-        "    sys.exit(f'Pinned harness Python lacks {missing}; refusing package "
-        "installation during an experiment')\n"
+        "    msg = f'Pinned harness Python lacks {missing}; refusing package "
+        "installation during an experiment'\n"
+        "    ping(msg, ok=False)\n"
+        "    sys.exit(msg)\n"
+        f"ping(f'installing missing packages: {{missing}}', ok=None)\n"
         "try:\n"
         "    with socket.create_connection(('pypi.org', 443), timeout=30):\n"
         "        pass\n"
         "except OSError:\n"
-        "    sys.exit(f'cannot install {missing}: no outbound network (probed pypi.org:443)')\n"
-        "sys.exit(subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', "
-        "*missing], timeout=180).returncode)\n"
+        "    msg = f'cannot install {missing}: no outbound network (probed pypi.org:443)'\n"
+        "    ping(msg, ok=False)\n"
+        "    sys.exit(msg)\n"
+        "proc = subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet', "
+        "*missing], timeout=180)\n"
+        "if proc.returncode != 0:\n"
+        "    ping(f'failed to install {missing}', ok=False)\n"
+        "    sys.exit(proc.returncode)\n"
+        "ping(f'installed: {missing}')\n"
+        "ping('starting harness daemon', ok=None)\n"
     )
     return f"{shlex.quote(harness_python)} -c {shlex.quote(script)}"
 
@@ -202,9 +256,18 @@ def ensure_harness_daemon(
     harness: str,
     *,
     agconfig: "agconfig_cls | None" = None,
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
+    progress_source: "HostInteractionServer | None" = None,
 ) -> DaemonHandle:
-    """Ensure one ready Harness Manager exists for this engine and sandbox."""
+    """Ensure one ready Harness Manager exists for this engine and sandbox.
+
+    `progress_source`, when given, is this engine's own host-side
+    `HostInteractionServer` -- the same process the bootstrap's `/record_event`
+    pings land on, so no network round trip is needed to observe them. Each
+    fresh ping resets the wait deadline to `timeout_s` from *now*, so a
+    genuinely slow-but-progressing cold pip install isn't penalized by a
+    fixed total; only actual silence (a hung or crashed bootstrap) times out.
+    """
     config = agconfig if agconfig is not None else sandbox.agconfig
     handles = getattr(sandbox, "_agency_harness_daemon_handles", None)
     if handles is None:
@@ -251,7 +314,11 @@ def ensure_harness_daemon(
         _preclaim_host_daemon_log(sandbox, engine_name)
 
     bootstrap = _package_bootstrap_command(
-        harness_python, _REQUIRED_HARNESS_PACKAGES, config.sandbox.harness_python_path is None
+        harness_python,
+        _REQUIRED_HARNESS_PACKAGES,
+        config.sandbox.harness_python_path is None,
+        engine_name=engine_name,
+        container_host_uds_path=handle.container_host_uds_path,
     )
     daemon_cmd = (
         f"exec {shlex.quote(harness_python)} -m agency.harness.daemon "
@@ -280,11 +347,17 @@ def ensure_harness_daemon(
     sandbox.exec_detached(command, workdir="/workspace")
 
     deadline = time.monotonic() + timeout_s
+    last_seen_ping_ts = None
     while time.monotonic() < deadline:
         if _is_ready(handle):
             _register_daemon(sandbox, handle)
             handles[engine_name] = handle
             return handle
+        if progress_source is not None:
+            ping_ts = progress_source.last_bootstrap_ping_ts
+            if ping_ts is not None and ping_ts != last_seen_ping_ts:
+                last_seen_ping_ts = ping_ts
+                deadline = time.monotonic() + timeout_s
         time.sleep(0.05)
 
     try:

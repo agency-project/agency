@@ -418,6 +418,24 @@ def test_record_event_forwards_term_message_and_flush():
     ]
 
 
+def test_record_event_tracks_bootstrap_progress_pings():
+    """ensure_harness_daemon()'s wait loop reads this directly (same host
+    process, no network needed) to reset its deadline on each fresh ping
+    from the sandbox-side bootstrap script."""
+    server = _make_server(data_logger=_FakeDataLogger())
+    assert server.last_bootstrap_ping_ts is None
+
+    server.record_event("harness_bootstrap_progress", {"engine": "agent-1", "step": "x"})
+
+    assert server.last_bootstrap_ping_ts is not None
+
+
+def test_record_event_leaves_ping_timestamp_alone_for_other_event_types():
+    server = _make_server(data_logger=_FakeDataLogger())
+    server.record_event("agent_state", {"state": "agent_idle"})
+    assert server.last_bootstrap_ping_ts is None
+
+
 def test_record_span_delegates_to_data_logger():
     logger = _FakeDataLogger()
     server = _make_server(data_logger=logger)
