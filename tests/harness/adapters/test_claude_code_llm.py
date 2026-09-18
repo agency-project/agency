@@ -193,6 +193,98 @@ def test_harness_to_agency_tools_and_tool_choice():
     assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
 
 
+def test_harness_to_agency_tool_schema_drops_dollar_schema_key():
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "get weather",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    agency = _backend()._format_context_harness_to_agency(body)
+    assert agency["tools"][0]["function"]["parameters"] == {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+    }
+
+
+def test_harness_to_agency_tool_schema_drops_noop_property_names():
+    # A bare {"type": "string"} propertyNames constrains nothing beyond what
+    # JSON already guarantees (object keys are always strings) -- some
+    # backends' tool-calling structured-output compilers can't parse it at
+    # all (see claude_code.py's _strip_unsupported_schema_keywords), so it's
+    # safe to drop wherever it's this specific no-op shape.
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "ask",
+                "description": "ask",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "answers": {
+                            "type": "object",
+                            "propertyNames": {"type": "string"},
+                            "additionalProperties": {"type": "string"},
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    agency = _backend()._format_context_harness_to_agency(body)
+    assert agency["tools"][0]["function"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "answers": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            }
+        },
+    }
+
+
+def test_harness_to_agency_tool_schema_keeps_real_property_names_constraint():
+    # A propertyNames with a real constraint (here, an enum of allowed keys)
+    # is not a no-op -- dropping it would silently tell the model less than
+    # the tool actually requires, so it must survive translation untouched.
+    real_property_names = {"enum": ["read", "write"]}
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "name": "ask",
+                "description": "ask",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "perms": {
+                            "type": "object",
+                            "propertyNames": real_property_names,
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    agency = _backend()._format_context_harness_to_agency(body)
+    assert (
+        agency["tools"][0]["function"]["parameters"]["properties"]["perms"]["propertyNames"]
+        == real_property_names
+    )
+
+
 def test_harness_to_agency_unrecognized_user_content_block_preserved():
     body = {
         "model": "m",

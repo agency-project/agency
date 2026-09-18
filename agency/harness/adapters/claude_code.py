@@ -140,6 +140,36 @@ def _is_session_title_request(raw_request: dict) -> bool:
     )
 
 
+# Values for `propertyNames` that add no constraint beyond what JSON already
+# guarantees (object keys are always strings) -- safe to drop, since removing
+# them can't change what's actually valid or what the model is told about it.
+_NOOP_PROPERTY_NAMES_SCHEMAS = ({"type": "string"}, {}, True)
+
+
+def _strip_unsupported_schema_keywords(schema):
+    """Recursively drop JSON-Schema keywords some backends' tool-calling
+    structured-output compilers can't parse -- but only where dropping them
+    can't change what's actually valid. `$schema` is pure dialect metadata,
+    never affecting validation, so it's always dropped. `propertyNames` is
+    dropped only when it's a no-op (see _NOOP_PROPERTY_NAMES_SCHEMAS); a real
+    constraint (e.g. an enum/pattern restricting which keys are allowed) is
+    left in place, since stripping it would silently relax what the model is
+    told is valid. Found via a live gemma-4-31b failure: Claude Code's
+    AskUserQuestion tool has `propertyNames: {"type": "string"}` on two
+    fields, and that alone made the backend return an empty, zero-token
+    "success" response instead of generating anything -- for every tool call
+    request, since Claude Code always sends its full built-in tool set.
+    """
+    if isinstance(schema, dict):
+        schema = {k: v for k, v in schema.items() if k != "$schema"}
+        if schema.get("propertyNames") in _NOOP_PROPERTY_NAMES_SCHEMAS:
+            schema = {k: v for k, v in schema.items() if k != "propertyNames"}
+        return {k: _strip_unsupported_schema_keywords(v) for k, v in schema.items()}
+    if isinstance(schema, list):
+        return [_strip_unsupported_schema_keywords(v) for v in schema]
+    return schema
+
+
 def _anthropic_tools_to_agency(tools) -> "list[dict] | None":
     if not tools:
         return None
@@ -149,7 +179,8 @@ def _anthropic_tools_to_agency(tools) -> "list[dict] | None":
             "function": {
                 "name": t.get("name", ""),
                 "description": t.get("description", ""),
-                "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+                "parameters": _strip_unsupported_schema_keywords(t.get("input_schema"))
+                or {"type": "object", "properties": {}},
             },
         }
         for t in tools
