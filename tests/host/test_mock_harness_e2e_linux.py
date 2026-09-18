@@ -4,6 +4,7 @@ Run with AGENCY_HOST_MOCK_E2E=1 and AGENCY_TEST_HARNESS_IMAGE set to an
 image containing all six CLI harnesses. No model credentials are required.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,28 +30,41 @@ HARNESSES = ("native", "claude_code", "codex", "grok", "opencode", "kimi")
 ANSWER = "MOCK_E2E_OK"
 
 
+def _response_chain(payloads: "list[dict]") -> "list[tuple[str, dict]]":
+    """Hash each block deterministically for storage -- the mock backend
+    (agency/llm/mock.py) only ever reads an exchange's response chain, so
+    this fixture never needs a prompt chain at all."""
+    return [
+        (hashlib.sha256(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest(), p)
+        for p in payloads
+    ]
+
+
 def _write_replay(path: Path) -> None:
     logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(path))))
     logger.start()
     try:
         for index in range(8):
-            logger.record_final_transcript(
+            logger.record_llm_exchange(
                 f"mock-e2e-{index}",
-                type="llm_block",
-                payloads=[
-                    {"type": "text", "index": 0, "text": ANSWER},
-                    {
-                        "type": "metadata",
-                        "index": 2**31 - 1,
-                        "usage": {
-                            "prompt_tokens": 10,
-                            "completion_tokens": 3,
-                            "total_tokens": 13,
+                exchange_type="llm_block",
+                prompt_chain=[],
+                response_chain=_response_chain(
+                    [
+                        {"type": "text", "index": 0, "text": ANSWER},
+                        {
+                            "type": "metadata",
+                            "index": 2**31 - 1,
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 3,
+                                "total_tokens": 13,
+                            },
+                            "stop_reason": "stop",
+                            "data": [],
                         },
-                        "stop_reason": "stop",
-                        "data": [],
-                    },
-                ],
+                    ]
+                ),
             )
     finally:
         logger.stop()

@@ -779,6 +779,26 @@ function buildHistoryHtml(agname) {
           );
         }
       }
+
+    } else if (role === 'tool_schema' && state.fullLogsEnabled) {
+      // Everything in the request besides messages -- tool definitions,
+      // tool_choice, and any field this build doesn't have a name for yet
+      // (see llm_handler_server._prompt_chain). Debug-only, same tier as
+      // 'system'/'metadata' above: real content, but noisy for the default
+      // view and never something the model said.
+      for (const b of blocks) {
+        if (b.type === 'tool_definition') {
+          frags.push(
+            `<div class="msg-metadata">${tsHtml}<span class="role-tool-call">◇ tool schema ${esc(b.name || '?')}</span>\n` +
+            `<span class="dim">${esc(JSON.stringify(b.parameters ?? {}))}</span></div>`
+          );
+        } else if (b.type === 'tool_choice' || b.type === 'request_extra') {
+          frags.push(
+            `<div class="msg-metadata">${tsHtml}<span class="role-tool-call">◇ ${esc(b.type.replace('_', ' '))}</span>\n` +
+            `<span class="dim">${esc(JSON.stringify(b.value))}</span></div>`
+          );
+        }
+      }
     }
   }
   // Anything buffered past the last known message (e.g. arrived in the gap

@@ -242,7 +242,6 @@ class AgentEngine:
             resource_pool,
             is_cancelled=is_cancelled,
             request_id=request_id,
-            recent_transcript=context.recent_transcript,
         )
         with self._services_lock:
             self._host_server_manager = manager

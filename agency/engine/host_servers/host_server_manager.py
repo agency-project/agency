@@ -76,7 +76,6 @@ class HostServerManager:
         *,
         is_cancelled: "Callable[[], bool] | None" = None,
         request_id: "str | None" = None,
-        recent_transcript: "list[dict] | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
@@ -90,7 +89,6 @@ class HostServerManager:
             parent_context=agprof.current_span_context(),
             request_id=request_id,
             skill_name=skill.name,
-            recent_transcript=recent_transcript,
         )
         self._interaction_server = HostInteractionServer(
             skill,

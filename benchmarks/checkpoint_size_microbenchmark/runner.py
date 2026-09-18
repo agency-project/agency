@@ -446,10 +446,28 @@ def extract_payload_result(database: Path, summary: str = "") -> dict | None:
         r"(?:^|\n)([0-9a-f]{64}|NONE)\s+/testbed/\.agency-checkpoint-payload\.bin"
     )
     with sqlite3.connect(database) as connection:
-        rows = connection.execute(
-            "SELECT type, payload FROM events WHERE type IN ('tool_result', 'llm_block') "
-            "ORDER BY timestamp"
-        ).fetchall()
+        rows = [
+            ("tool_result", payload)
+            for (payload,) in connection.execute(
+                "SELECT payload FROM events WHERE type = 'tool_result' ORDER BY timestamp"
+            ).fetchall()
+        ]
+        # llm_block content (agdatalogger.py's content-addressable transcript
+        # schema) no longer lives in `events` -- each exchange's full prompt
+        # and response chains are joined back from exchanges/exchange_chain/
+        # blocks instead. Both chains are read (not just response), matching
+        # this function's pre-migration behavior of scanning every llm_block
+        # payload ever logged, prompt-side or response-side.
+        rows += [
+            ("llm_block", payload)
+            for (payload,) in connection.execute(
+                "SELECT b.payload FROM exchanges e "
+                "JOIN exchange_chain ec ON ec.call_label = e.call_label "
+                "JOIN blocks b ON b.hash = ec.hash "
+                "WHERE e.type = 'llm_block' "
+                "ORDER BY e.timestamp, ec.kind, ec.seq"
+            ).fetchall()
+        ]
     texts = [summary] if summary else []
     for event_type, payload in rows:
         decoded = json.loads(payload)

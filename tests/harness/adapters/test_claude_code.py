@@ -144,12 +144,18 @@ def _run_live(owner, skill, value):
 def _assert_host_llm_exchange(owner):
     # Successful, request-tagged usage in the host logger proves the CLI used
     # Agency's model gateway instead of answering through its own credentials.
+    # llm_block content lives in agdatalogger.py's content-addressable
+    # exchanges/exchange_chain/blocks tables, not `events` -- see
+    # llm_handler_server._finalize_success/record_llm_exchange.
     owner.data_logger.flush()
     with sqlite3.connect(owner.data_logger.db_path) as connection:
         blocks = [
             json.loads(row[0])
             for row in connection.execute(
-                "SELECT payload FROM events WHERE type = 'llm_block' AND name = ?",
+                "SELECT b.payload FROM exchanges e "
+                "JOIN exchange_chain ec ON ec.call_label = e.call_label "
+                "JOIN blocks b ON b.hash = ec.hash "
+                "WHERE e.type = 'llm_block' AND e.name = ?",
                 (str(owner.agname),),
             )
         ]
