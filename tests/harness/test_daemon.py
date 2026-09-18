@@ -49,6 +49,106 @@ def test_render_attempt_prompt_keeps_output_instruction_when_resuming():
     assert daemon._render_attempt_prompt(request) == "user turn\n\noutput instruction"
 
 
+class _FakePingClient:
+    """Records every POST made through it in the shared `posted` list --
+    stands in for httpx.Client so _ping_daemon_lifecycle's tests don't need
+    a real UDS listener."""
+
+    def __init__(self, posted, *, raise_on_post=False, **_kwargs):
+        self._posted = posted
+        self._raise_on_post = raise_on_post
+
+    def post(self, path, json):
+        if self._raise_on_post:
+            raise ConnectionError("daemon-side socket already gone")
+        self._posted.append((path, json))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def test_ping_daemon_lifecycle_posts_a_started_event(monkeypatch):
+    posted = []
+    monkeypatch.setattr(daemon.httpx, "Client", lambda **kw: _FakePingClient(posted, **kw))
+    daemon._ping_daemon_lifecycle("/tmp/fake.sock", "harness_daemon_started", "agent-1")
+
+    assert len(posted) == 1
+    path, body = posted[0]
+    assert path == "/record_event"
+    assert body["type"] == "harness_daemon_started"
+    assert body["payload"]["engine"] == "agent-1"
+    assert "reason" not in body["payload"]
+    assert body["term_message"] == "[agent-1] DAEMON started"
+
+
+def test_ping_daemon_lifecycle_posts_an_exiting_event_with_its_reason(monkeypatch):
+    posted = []
+    monkeypatch.setattr(daemon.httpx, "Client", lambda **kw: _FakePingClient(posted, **kw))
+    daemon._ping_daemon_lifecycle(
+        "/tmp/fake.sock", "harness_daemon_exiting", "agent-1", reason="signal 15"
+    )
+
+    assert len(posted) == 1
+    _path, body = posted[0]
+    assert body["type"] == "harness_daemon_exiting"
+    assert body["payload"]["reason"] == "signal 15"
+    assert body["term_message"] == "[agent-1] DAEMON exiting: signal 15"
+
+
+def test_ping_daemon_lifecycle_never_raises_when_the_post_fails(monkeypatch):
+    monkeypatch.setattr(
+        daemon.httpx, "Client", lambda **kw: _FakePingClient([], raise_on_post=True, **kw)
+    )
+    daemon._ping_daemon_lifecycle("/tmp/fake.sock", "harness_daemon_started", "agent-1")
+
+
+@pytest.mark.parametrize(
+    "event_type,label",
+    [
+        ("harness_daemon_setting_up_env", "setting up env"),
+        ("harness_daemon_starting", "starting"),
+        ("harness_daemon_dispatching_attempt", "dispatching attempt"),
+        ("harness_daemon_attempt_completed", "attempt completed"),
+        ("harness_daemon_signal_received", "signal received"),
+    ],
+)
+def test_ping_daemon_lifecycle_derives_a_readable_label_from_any_event_type(
+    monkeypatch, event_type, label
+):
+    posted = []
+    monkeypatch.setattr(daemon.httpx, "Client", lambda **kw: _FakePingClient(posted, **kw))
+    daemon._ping_daemon_lifecycle("/tmp/fake.sock", event_type, "agent-1")
+
+    assert len(posted) == 1
+    _path, body = posted[0]
+    assert body["type"] == event_type
+    assert body["term_message"] == f"[agent-1] DAEMON {label}"
+
+
+def test_ping_daemon_lifecycle_passes_extra_fields_into_the_payload_only(monkeypatch):
+    posted = []
+    monkeypatch.setattr(daemon.httpx, "Client", lambda **kw: _FakePingClient(posted, **kw))
+    daemon._ping_daemon_lifecycle(
+        "/tmp/fake.sock",
+        "harness_daemon_attempt_completed",
+        "agent-1",
+        request_id="req-1",
+        ok=False,
+        error="boom",
+    )
+
+    assert len(posted) == 1
+    _path, body = posted[0]
+    assert body["payload"]["request_id"] == "req-1"
+    assert body["payload"]["ok"] is False
+    assert body["payload"]["error"] == "boom"
+    # Extra fields don't leak into the printed line -- only `reason` does.
+    assert body["term_message"] == "[agent-1] DAEMON attempt completed"
+
+
 @pytest.mark.parametrize("sandbox_payload", [None, "serialized-tools"])
 def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_payload):
     seen = {}
@@ -184,6 +284,101 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
         ("clear", "attempt-one"),
     ]
     assert manager._current_attempt_token is None
+
+
+def test_daemon_dispatch_pings_dispatching_then_completed(monkeypatch):
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"),
+        harness="claude_code",
+        request_id="req-1",
+        attempt_token="attempt-one",
+    )
+    expected = HarnessAttemptResult(ok=True, final_text="done")
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._agconfig = agconfig()
+    manager._harness = "claude_code"
+    manager._bootstrapped = True
+    manager._engine_name = "agent-1"
+    manager._host_uds_path = "/tmp/fake-host.sock"
+    manager._attempt_lock = threading.Lock()
+    manager._current_attempt_token = None
+    manager._control_lock = threading.Lock()
+    manager._current_control_handle = None
+    manager._agent_paused = False
+    manager._persistent = False
+    manager._live_control_handle = None
+    manager._harness_api = type(
+        "HarnessApi",
+        (),
+        {
+            "register_attempt_token": lambda self, token: None,
+            "clear_attempt_token": lambda self, token: True,
+        },
+    )()
+    manager._attempt_handler = lambda _request: expected
+
+    pings = []
+    monkeypatch.setattr(
+        daemon,
+        "_ping_daemon_lifecycle",
+        lambda uds, event_type, engine, **extra: pings.append((uds, event_type, engine, extra)),
+    )
+
+    assert manager._dispatch_attempt(request) is expected
+    assert [p[1] for p in pings] == [
+        "harness_daemon_dispatching_attempt",
+        "harness_daemon_attempt_completed",
+    ]
+    for uds, _event_type, engine, _extra in pings:
+        assert uds == "/tmp/fake-host.sock"
+        assert engine == "agent-1"
+    assert pings[0][3] == {"request_id": "req-1"}
+    assert pings[1][3] == {"request_id": "req-1", "ok": True, "error": None}
+
+
+def test_daemon_dispatch_does_not_ping_completed_when_the_handler_raises(monkeypatch):
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user"),
+        harness="claude_code",
+        attempt_token="attempt-one",
+    )
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._agconfig = agconfig()
+    manager._harness = "claude_code"
+    manager._engine_name = "agent-1"
+    manager._host_uds_path = "/tmp/fake-host.sock"
+    manager._attempt_lock = threading.Lock()
+    manager._current_attempt_token = None
+    manager._control_lock = threading.Lock()
+    manager._current_control_handle = None
+    manager._agent_paused = False
+    manager._persistent = False
+    manager._live_control_handle = None
+    manager._harness_api = type(
+        "HarnessApi",
+        (),
+        {
+            "register_attempt_token": lambda self, token: None,
+            "clear_attempt_token": lambda self, token: True,
+        },
+    )()
+
+    def fail(_request):
+        raise RuntimeError("boom")
+
+    manager._attempt_handler = fail
+
+    pings = []
+    monkeypatch.setattr(
+        daemon,
+        "_ping_daemon_lifecycle",
+        lambda uds, event_type, engine, **extra: pings.append(event_type),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        manager._dispatch_attempt(request)
+
+    assert pings == ["harness_daemon_dispatching_attempt"]
 
 
 def test_daemon_rejects_missing_attempt_token_without_registering():
@@ -326,6 +521,30 @@ def test_run_adapter_request_skips_bootstrap_once_already_done(monkeypatch):
 
     assert result == expected
     assert len(calls) == 1
+
+
+def test_harness_manager_start_pings_starting_before_bringing_up_servers(monkeypatch):
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._engine_name = "agent-1"
+    manager._host_uds_path = "/tmp/fake-host.sock"
+    calls = []
+    manager._harness_api = type("HarnessApi", (), {"start": lambda self: calls.append("api")})()
+    manager._interaction_server = type(
+        "InteractionServer", (), {"start": lambda self: calls.append("interaction") or "started"}
+    )()
+
+    monkeypatch.setattr(
+        daemon,
+        "_ping_daemon_lifecycle",
+        lambda uds, event_type, engine, **extra: calls.append(("ping", event_type, uds, engine)),
+    )
+
+    assert manager.start() == "started"
+    assert calls == [
+        ("ping", "harness_daemon_starting", "/tmp/fake-host.sock", "agent-1"),
+        "api",
+        "interaction",
+    ]
 
 
 def test_harness_manager_returns_attempt_result_on_original_rpc():

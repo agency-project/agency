@@ -23,6 +23,11 @@ if TYPE_CHECKING:
     from ..agskill import agskill
     from ..agtool import agtool
     from .clients import HarnessInteractionClient
+    from .harness_daemon_launcher import DaemonHandle
+
+_HEALTH_CHECK_INTERVAL_S = 30.0
+_HEALTH_CHECK_TIMEOUT_S = 10.0
+_HEALTH_CHECK_FAILURE_LIMIT = 3
 
 
 class AgentEngine:
@@ -33,6 +38,7 @@ class AgentEngine:
         self.agconfig: "agconfig_cls" = agent.agconfig.clone()
         self._host_server_manager: "HostServerManager | None" = None
         self._sandbox_interaction_client: "HarnessInteractionClient | None" = None
+        self._daemon_handle: "DaemonHandle | None" = None
         self._services_lock = threading.RLock()
         self._services_closed = True
         self._request_id: "str | None" = None
@@ -69,6 +75,7 @@ class AgentEngine:
                     manager_error = exc
                 else:
                     self._host_server_manager = None
+            self._daemon_handle = None
             self._services_closed = (
                 self._sandbox_interaction_client is None and self._host_server_manager is None
             )
@@ -266,6 +273,7 @@ class AgentEngine:
                     agconfig=self.agconfig,
                     progress_source=manager.interaction_server,
                 )
+            self._daemon_handle = handle
 
             # Sync current pause state to the daemon before this attempt
             # starts -- closes the race where pause() was requested before
@@ -491,9 +499,66 @@ class AgentEngine:
                 else False,
                 syscall_hooked_names=hooked_syscall_names,
             )
-            return client.run_harness_attempt(request)
+            return self._run_attempt_with_watchdog(client, request)
         finally:
             manager.clear_attempt_token(attempt_token)
+
+    def _run_attempt_with_watchdog(
+        self, client: "HarnessInteractionClient", request: HarnessAttemptRequest
+    ) -> HarnessAttemptResult:
+        """Run the attempt RPC on a background thread, unbounded exactly as
+        before (a real, safe-boundary pause can legitimately run far longer
+        than any fixed timeout on the RPC itself) -- but while it's in
+        flight, periodically ping the daemon's own /health endpoint on a
+        separate, short-timeout connection. A daemon that's merely busy or
+        paused still answers /health immediately; one that's died (crashed,
+        killed, or otherwise gone) won't. After enough consecutive health
+        check failures, give up waiting and report the attempt as failed
+        instead of blocking forever on a connection nothing will ever answer.
+
+        The abandoned background thread (still blocked on the dead
+        connection) is left to leak until the process exits -- there's no
+        way to safely force-cancel an in-flight blocking socket read from
+        another thread, and this path should be rare.
+        """
+        handle = self._daemon_handle
+        outcome: "list[HarnessAttemptResult | BaseException]" = []
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                outcome.append(client.run_harness_attempt(request))
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+                outcome.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, name="harness-attempt-rpc", daemon=True).start()
+
+        consecutive_failures = 0
+        while not done.wait(_HEALTH_CHECK_INTERVAL_S):
+            if handle is None:
+                continue
+            try:
+                with handle.client(timeout_s=_HEALTH_CHECK_TIMEOUT_S) as health_client:
+                    health_client.is_ready()
+                consecutive_failures = 0
+            except Exception:
+                consecutive_failures += 1
+                if consecutive_failures >= _HEALTH_CHECK_FAILURE_LIMIT:
+                    return HarnessAttemptResult(
+                        ok=False,
+                        error_message=(
+                            "harness daemon stopped responding to health checks after "
+                            f"{consecutive_failures * _HEALTH_CHECK_INTERVAL_S:.0f}s -- "
+                            "attempt abandoned"
+                        ),
+                    )
+
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def _missing_output_fields(self, skill: "agskill") -> "list[str]":
         if (

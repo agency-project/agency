@@ -15,12 +15,14 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Callable
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -430,6 +432,7 @@ class HarnessManager:
         harness_api_port: int = _HARNESS_API_PORT,
     ) -> None:
         self._agconfig = agconfig if agconfig is not None else agconfig_cls()
+        self._host_uds_path = host_uds_path
         self._engine_name = engine_name
         self._harness = harness
         self._bootstrapped = False
@@ -631,15 +634,22 @@ class HarnessManager:
                 self._current_request_id = request.request_id
                 self._current_request_cancelled = False
                 self._redirect_handler = None
+            _ping_daemon_lifecycle(
+                getattr(self, "_host_uds_path", ""),
+                "harness_daemon_dispatching_attempt",
+                getattr(self, "_engine_name", ""),
+                request_id=request.request_id,
+            )
             try:
                 if request.sandbox_mcp_tools_b64 is not None:
-                    return asyncio.run_coroutine_threadsafe(
+                    result = asyncio.run_coroutine_threadsafe(
                         self._harness_api.run_sandbox_attempt(
                             request, self._attempt_handler, local_token=local_token
                         ),
                         self._harness_api._loop,
                     ).result()
-                return self._attempt_handler(request)
+                else:
+                    result = self._attempt_handler(request)
             finally:
                 self._clear_control_handle()
                 self._current_attempt_token = None
@@ -649,6 +659,19 @@ class HarnessManager:
                     and getattr(self, "_live_local_token", None) is None
                 ):
                     self._live_local_token = local_token
+            # Fires only once an actual result exists -- an attempt_handler
+            # exception propagates straight through the finally above
+            # instead of reaching here, so this never claims "completed" for
+            # a request that actually failed to even return.
+            _ping_daemon_lifecycle(
+                getattr(self, "_host_uds_path", ""),
+                "harness_daemon_attempt_completed",
+                getattr(self, "_engine_name", ""),
+                request_id=request.request_id,
+                ok=result.ok,
+                error=result.error_message or None,
+            )
+            return result
 
     def _run_adapter_request(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = self._current_attempt_token
@@ -691,6 +714,11 @@ class HarnessManager:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")
 
     def start(self) -> str:
+        _ping_daemon_lifecycle(
+            getattr(self, "_host_uds_path", ""),
+            "harness_daemon_starting",
+            getattr(self, "_engine_name", ""),
+        )
         self._harness_api.start()
         try:
             return self._interaction_server.start()
@@ -715,8 +743,59 @@ def _parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _ping_daemon_lifecycle(
+    host_uds_path: str,
+    event_type: str,
+    engine_name: str,
+    *,
+    reason: "str | None" = None,
+    **extra,
+) -> None:
+    """Best-effort /record_event ping marking one state change in this
+    daemon PROCESS's own lifecycle (env setup, harness startup/readiness,
+    each attempt's dispatch/completion, the teardown signal arriving, the
+    final exit) -- distinct from the harness:* spans in pty/execution.py,
+    which describe one attempt's CLI subprocess lifecycle, not this
+    long-lived daemon's. Previously there was no signal anywhere for any of
+    this, so a daemon that died mid-attempt (observed live: three
+    claude_code daemons vanished with no crash trace) left nothing to
+    explain it after the fact -- not even which of these states it was in.
+    A ping failing must never affect the daemon's own lifecycle -- same
+    philosophy as the pre-exec bootstrap pings this mirrors (see
+    harness_daemon_launcher.py's _package_bootstrap_command).
+
+    `event_type` is conventionally ``"harness_daemon_<state>"``; the
+    ``<state>`` part becomes the printed label (underscores -> spaces).
+    `reason` is folded into both the payload and the printed line; any other
+    keyword becomes an extra payload field only (e.g. ``ok=``, ``error=``).
+    """
+    label = event_type.removeprefix("harness_daemon_").replace("_", " ")
+    term_message = f"[{engine_name}] DAEMON {label}" + (f": {reason}" if reason else "")
+    payload = {"engine": engine_name, "pid": os.getpid(), **extra}
+    if reason is not None:
+        payload["reason"] = reason
+    try:
+        with httpx.Client(
+            transport=httpx.HTTPTransport(uds=host_uds_path),
+            base_url="http://agency-host",
+            timeout=3,
+        ) as client:
+            client.post(
+                "/record_event",
+                json={
+                    "type": event_type,
+                    "payload": payload,
+                    "term_message": term_message,
+                    "print_to_terminal": True,
+                },
+            )
+    except Exception:  # noqa: S110 - best-effort ping, never the daemon's own outcome
+        pass
+
+
 def main(argv: "list[str] | None" = None) -> None:
     args = _parse_args(argv)
+    _ping_daemon_lifecycle(args.host_uds, "harness_daemon_setting_up_env", args.engine_name)
     payload = json.loads(args.config_json)
     manager = HarnessManager(
         args.sandbox_uds,
@@ -731,16 +810,34 @@ def main(argv: "list[str] | None" = None) -> None:
         harness_api_port=args.harness_api_port,
     )
     stopped = threading.Event()
+    received_signal: "list[int]" = []
 
-    def _stop(_signum, _frame) -> None:
+    def _stop(signum, _frame) -> None:
+        received_signal.append(signum)
+        _ping_daemon_lifecycle(
+            args.host_uds,
+            "harness_daemon_signal_received",
+            args.engine_name,
+            reason=f"signal {signum}",
+        )
         stopped.set()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     manager.start()
+    _ping_daemon_lifecycle(args.host_uds, "harness_daemon_started", args.engine_name)
     try:
         stopped.wait()
     finally:
+        exc = sys.exc_info()[1]
+        reason = (
+            f"{type(exc).__name__}: {exc}"
+            if exc is not None
+            else (f"signal {received_signal[0]}" if received_signal else "stopped")
+        )
+        _ping_daemon_lifecycle(
+            args.host_uds, "harness_daemon_exiting", args.engine_name, reason=reason
+        )
         manager.stop()
 
 

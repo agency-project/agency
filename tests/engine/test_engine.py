@@ -1181,6 +1181,113 @@ def test_run_attempt_clears_its_token_when_the_rpc_raises():
     assert active == []
 
 
+def test_watchdog_returns_the_real_result_once_the_slow_rpc_finishes(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(mod, "_HEALTH_CHECK_INTERVAL_S", 0.02)
+    monkeypatch.setattr(mod, "_HEALTH_CHECK_FAILURE_LIMIT", 3)
+    engine = AgentEngine(_FakeAgent())
+    expected = HarnessAttemptResult(ok=True, final_text="finally done")
+    release = threading.Event()
+
+    class Client:
+        @staticmethod
+        def run_harness_attempt(_request):
+            release.wait(5)
+            return expected
+
+    class HealthClient:
+        def is_ready(self):
+            return True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class Handle:
+        @staticmethod
+        def client(timeout_s=None):
+            del timeout_s
+            return HealthClient()
+
+    engine._daemon_handle = Handle()
+    try:
+        result_holder = []
+        worker = threading.Thread(
+            target=lambda: result_holder.append(
+                engine._run_attempt_with_watchdog(Client(), SimpleNamespace())
+            )
+        )
+        worker.start()
+        # A few health-check cycles elapse (all "healthy") before the RPC finishes.
+        time.sleep(0.1)
+        release.set()
+        worker.join(5)
+    finally:
+        release.set()
+
+    assert result_holder == [expected]
+
+
+def test_watchdog_gives_up_after_consecutive_health_check_failures(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(mod, "_HEALTH_CHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(mod, "_HEALTH_CHECK_FAILURE_LIMIT", 3)
+    engine = AgentEngine(_FakeAgent())
+    never_returns = threading.Event()
+
+    class Client:
+        @staticmethod
+        def run_harness_attempt(_request):
+            never_returns.wait(5)
+            return HarnessAttemptResult(ok=True, final_text="too late")
+
+    class DeadHealthClient:
+        def is_ready(self):
+            raise ConnectionError("daemon unreachable")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class Handle:
+        @staticmethod
+        def client(timeout_s=None):
+            del timeout_s
+            return DeadHealthClient()
+
+    engine._daemon_handle = Handle()
+    try:
+        result = engine._run_attempt_with_watchdog(Client(), SimpleNamespace())
+    finally:
+        never_returns.set()
+
+    assert result.ok is False
+    assert "health check" in result.error_message
+
+
+def test_watchdog_never_health_checks_without_a_daemon_handle(monkeypatch):
+    monkeypatch.setattr(mod, "_HEALTH_CHECK_INTERVAL_S", 0.01)
+    engine = AgentEngine(_FakeAgent())
+    expected = HarnessAttemptResult(ok=True, final_text="no handle needed")
+
+    class Client:
+        @staticmethod
+        def run_harness_attempt(_request):
+            return expected
+
+    engine._daemon_handle = None
+    result = engine._run_attempt_with_watchdog(Client(), SimpleNamespace())
+
+    assert result is expected
+
+
 # ---------------------------------------------------------------------------
 # _build_execution_result
 # ---------------------------------------------------------------------------
