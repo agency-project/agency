@@ -706,8 +706,19 @@ def test_paused_time_does_not_consume_native_ack_deadline(execution, monkeypatch
     monkeypatch.setattr(
         pty_execution, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
     )
-    execution.handle.is_paused.side_effect = lambda: clock.now < 0.2
-    execution._wait_until(lambda: clock.now >= 0.225, "resumed acknowledgment")
+    # Scaled to the poll interval (not fixed literals) so the simulated pause
+    # still spans several poll cycles -- the point being tested is that each
+    # cycle's compensation keeps pace with elapsed time, regardless of how
+    # coarse or fine that cycle is. The deadline needs enough margin over a
+    # single poll step to absorb the one-step lag at the exact instant the
+    # pause ends (compensation for that final paused step only lands once
+    # is_paused() is next read as true, i.e. before the transition, so a
+    # deadline no wider than one step would spuriously fire right at it).
+    step = execution.POLL_INTERVAL_S
+    execution.INPUT_TIMEOUT = 3 * step
+    pause_until = 8 * step
+    execution.handle.is_paused.side_effect = lambda: clock.now < pause_until
+    execution._wait_until(lambda: clock.now >= pause_until + step, "resumed acknowledgment")
     assert clock.now > execution.INPUT_TIMEOUT
 
 

@@ -130,6 +130,7 @@ class PtyExecution:
     INPUT_TIMEOUT = 60.0
     START_TIMEOUT = 45.0
     ATTEMPT_TIMEOUT = 300.0
+    POLL_INTERVAL_S = 0.2
 
     def __init__(self, driver, runtime, *, cleanup_callbacks=()):
         self.driver = driver
@@ -209,7 +210,7 @@ class PtyExecution:
             self._check_alive()
             if now >= deadline:
                 raise RuntimeError(f"{self.driver.name} timed out waiting for {description}")
-            time.sleep(0.025)
+            time.sleep(self.POLL_INTERVAL_S)
 
     def _submit(self, text, label):
         self.validate_prompt(text)
@@ -398,7 +399,7 @@ class PtyExecution:
                                 input_tokens=stop.get("input_tokens", 0),
                                 output_tokens=stop.get("output_tokens", 0),
                             )
-                    time.sleep(0.025)
+                    time.sleep(self.POLL_INTERVAL_S)
         finally:
             with self._lock:
                 self._active = False

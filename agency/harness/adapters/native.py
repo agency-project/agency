@@ -25,6 +25,9 @@ from ..executable import HARNESS_PATH
 # actual silence for this long ends the attempt.
 _DEFAULT_TIMEOUT_S = 300
 _PROGRESS_POLL_INTERVAL_S = 1.0
+# Bound on reaping an already-exited process tree, matching
+# agProxyPtraceHandle.close()'s own kill()-then-join(timeout=10) sequence.
+_REAP_TIMEOUT_S = 10.0
 
 _STOP_REASON_TO_OPENAI = {
     "end_turn": "stop",
@@ -178,8 +181,16 @@ class NativeAdapter(HarnessAdapter):
                     last_progress_mtime = mtime
                     deadline = now + _DEFAULT_TIMEOUT_S
                 time.sleep(_PROGRESS_POLL_INTERVAL_S)
-            # Already finished -- drains the fully-buffered stdout/stderr.
-            stdout, stderr, rc = handle.wait()
+            # Already finished -- kill() (a no-op if it already exited on its
+            # own) then join with a bound, the same guaranteed-terminating
+            # sequence handle.close() uses for the PTY drivers' teardown. A
+            # bare handle.wait() here previously could hang forever: if the
+            # tracer's "everything this launch spawned has exited"
+            # bookkeeping ever misses an edge case (observed after a
+            # mid-turn backend crash killed the react loop), nothing bounds
+            # the wait, and the whole attempt is stuck with no recovery.
+            handle.kill()
+            stdout, stderr, rc = handle.wait(timeout=_REAP_TIMEOUT_S)
 
             if rc != 0:
                 return AttemptResult(

@@ -173,6 +173,41 @@ def test_native_reaps_process_before_removing_scratch_files(monkeypatch, outcome
             NativeAdapter(agconfig()).run_daemon_attempt(runtime, **kwargs)
 
 
+def test_native_kills_before_reaping_an_already_exited_process():
+    # handle.wait() alone can hang forever if the tracer's own "everything
+    # this launch spawned has exited" bookkeeping misses an edge case (see
+    # native.py's _REAP_TIMEOUT_S comment) -- kill() first, then a bounded
+    # wait(), mirrors agProxyPtraceHandle.close()'s own guaranteed-terminating
+    # sequence instead of the bare, unbounded wait() this used to call.
+    sandbox = _NativeSandbox()
+    handle = MagicMock(returncode=0)
+    handle.wait.return_value = ('{"result": "done"}', "", 0)
+    calls = []
+    handle.kill.side_effect = lambda: calls.append("kill")
+    handle.wait.side_effect = lambda *a, **k: calls.append("wait") or ("{}", "", 0)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(
+            "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
+            lambda *args, **kwargs: handle,
+        )
+        monkeypatch.setattr(
+            "agency.harness.agharness.cleanup_config_home_in_container", lambda *args: None
+        )
+        result = NativeAdapter(agconfig()).run_daemon_attempt(
+            _runtime(sandbox=sandbox),
+            prompt="work",
+            resume_session_id=None,
+            prior_session_blob=None,
+            max_steps=1,
+        )
+    assert calls == ["kill", "wait"]
+    assert handle.wait.call_args.kwargs.get("timeout") == native_module._REAP_TIMEOUT_S
+    assert result.ok
+
+
 def test_native_idle_deadline_returns_empty_success_with_no_progress_checkpoint(monkeypatch):
     """A process that never exits and never even reaches its first progress
     checkpoint still ends the attempt as a (empty) success once idle, never

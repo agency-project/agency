@@ -333,7 +333,11 @@ def _render_attempt_prompt(request: HarnessAttemptRequest) -> str:
     user_content = request.prompt.user_content
     if not isinstance(user_content, str):
         user_content = json.dumps(user_content)
-    parts = [request.prompt.system_instruction, user_content]
+    parts = (
+        [user_content]
+        if request.resume_session_id
+        else [request.prompt.system_instruction, user_content]
+    )
     if request.prompt.output_instruction:
         parts.append(request.prompt.output_instruction)
     return "\n\n".join(part for part in parts if part)

@@ -19,6 +19,36 @@ from agency.harness.daemon import HarnessManager
 from agency.harness.protocol import HarnessAttemptRequest, HarnessAttemptResult, PromptPayload
 
 
+def test_render_attempt_prompt_includes_system_instruction_for_a_fresh_session():
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn"),
+        harness="fake",
+    )
+    assert daemon._render_attempt_prompt(request) == "system prompt\n\nuser turn"
+
+
+def test_render_attempt_prompt_drops_system_instruction_when_resuming_a_session():
+    # A resumed harness session already has the system instruction from the
+    # attempt that established it -- retyping it here would duplicate it in
+    # the harness's own transcript. Covers both a schema retry (which resumes
+    # the attempt it's retrying) and any later turn on a persistent agent.
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn"),
+        harness="fake",
+        resume_session_id="session-1",
+    )
+    assert daemon._render_attempt_prompt(request) == "user turn"
+
+
+def test_render_attempt_prompt_keeps_output_instruction_when_resuming():
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn", "output instruction"),
+        harness="fake",
+        resume_session_id="session-1",
+    )
+    assert daemon._render_attempt_prompt(request) == "user turn\n\noutput instruction"
+
+
 @pytest.mark.parametrize("sandbox_payload", [None, "serialized-tools"])
 def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_payload):
     seen = {}
