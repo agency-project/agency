@@ -9,6 +9,7 @@ import pytest
 
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
+from agency.harness.adapters.codex import CodexDriver
 from agency.harness.adapters.opencode import OpencodeDriver
 from agency.harness.adapters.pty.driver import PtyDriver, driver_for
 from agency.harness.adapters.pty.execution import PtyExecution, restore_session, snapshot_session
@@ -753,6 +754,58 @@ def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
     )
 
     assert driver.ready(handle)
+
+
+def _codex_trust_dialog_screen(cwd_shown: str) -> "SimpleNamespace":
+    return SimpleNamespace(
+        terminal_screen=lambda: (
+            [
+                "  Welcome to Codex, OpenAI's command-line coding agent",
+                "",
+                f"> You are in {cwd_shown}",
+                "",
+                "  Do you trust the contents of this directory? Working with untrusted "
+                "contents comes with higher risk of prompt injection.",
+                "",
+                "› 1. Yes, continue",
+                "  2. No, quit",
+            ],
+            1,
+            6,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+
+
+def test_codex_ready_confirms_trust_dialog_when_banner_matches_cwd_exactly():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver.cwd = "/workspace"
+    handle = _codex_trust_dialog_screen("/workspace")
+
+    assert driver.ready(handle) is False  # confirming takes this poll; not the composer yet
+    handle.write_terminal.assert_called_once_with(b"\r")
+    assert driver._trusted_directory is True
+
+
+def test_codex_ready_confirms_trust_dialog_when_cwd_is_a_symlink(tmp_path):
+    """codex is launched at self.cwd, but a benchmark image can make that a symlink (e.g.
+    /workspace -> /testbed); codex's own banner then shows the resolved real path, not the
+    symlink name. Without checking both, the dialog is never confirmed and the run hangs."""
+    target = tmp_path / "testbed"
+    target.mkdir()
+    link = tmp_path / "workspace"
+    link.symlink_to(target)
+
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver.cwd = str(link)
+    handle = _codex_trust_dialog_screen(str(target))
+
+    assert driver.ready(handle) is False
+    handle.write_terminal.assert_called_once_with(b"\r")
+    assert driver._trusted_directory is True
 
 
 @pytest.mark.parametrize("suffix", ["\n", " \n"])
