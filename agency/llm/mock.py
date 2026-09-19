@@ -2,17 +2,27 @@
 calling a real model.
 
 Loads the `llm_block`-finalized exchanges from another agent's own
-agDataLogger sqlite db (`agdatalogger.py`'s `events` table) and replays them
-back, one exchange per `dispatch()`/`dispatch_stream()` call, in the order
-they were originally recorded. Matching is purely positional -- the Nth call
-this backend receives replays the Nth successful exchange in the source db
--- since `call_label` (a fresh uuid per HTTP attempt, see
+agDataLogger sqlite db (`agdatalogger.py`'s `exchanges`/`exchange_chain`/
+`blocks` tables) and replays them back, one exchange per
+`dispatch()`/`dispatch_stream()` call, in the order they were originally
+recorded. Matching is purely positional -- the Nth call this backend
+receives replays the Nth successful exchange in the source db -- since
+`call_label` (a fresh uuid per HTTP attempt, see
 `llm_handler_server.py`) has no stable meaning across two different runs and
 can't be used to correlate "the same logical call".
 
 Only `llm_block`-type exchanges (successful completions) are replayed;
 `llm_stream_error`/`llm_stream_cancelled` groups in the source db are
 skipped. Reproducing the original failure/retry sequence is out of scope.
+
+Each exchange's *prompt* chain (its recorded request -- messages, resent
+history, tool schemas, ...) is never read here at all: `_load_replay_exchanges`
+only pulls each exchange's *response* chain, since that's the only thing this
+backend needs to stand in for -- what the model actually said. There's no
+role-based filtering to separate "what the model said" from "what was sent
+to it" the way an earlier version of this file needed, because the data
+logger already keeps those as two independent chains per exchange (see
+`agdatalogger.reconstruct_llm_exchanges`).
 
 Does not subclass `agllm` -- `LlmHandlerServer` only ever calls `.model`,
 `.dispatch()`, `.dispatch_stream()`, and `.fetch_context_limit()` on a
@@ -24,12 +34,12 @@ backend (see the plain `_RecordingBackend` test double in
 from __future__ import annotations
 
 import copy
-import json
 import math
 import random
-import sqlite3
 import time
 from typing import TYPE_CHECKING, Callable, Iterator
+
+from ..observability.agdatalogger import read_llm_exchanges
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
@@ -39,23 +49,12 @@ _CHUNKS_PER_BLOCK = 4
 
 
 def _load_replay_exchanges(db_path: str) -> "list[list[dict]]":
-    """Read every finalized `llm_block` exchange from *db_path*, in the
-    order they were recorded, grouped by `call_label`."""
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        rows = connection.execute(
-            "SELECT call_label, payload FROM events WHERE type = 'llm_block' ORDER BY id"
-        ).fetchall()
-    finally:
-        connection.close()
-    exchanges: "list[list[dict]]" = []
-    current_label = object()
-    for call_label, payload_json in rows:
-        if call_label != current_label:
-            exchanges.append([])
-            current_label = call_label
-        exchanges[-1].append(json.loads(payload_json))
-    return exchanges
+    """Read every finalized `llm_block` exchange's *response* chain from
+    *db_path*, in the order they were recorded. The prompt chain each
+    exchange also carries in the source db is never read -- this backend
+    only ever needs to reproduce what the model said."""
+    exchanges = read_llm_exchanges(db_path, exchange_type="llm_block")
+    return [exchange["response"] for exchange in exchanges]
 
 
 def _split_text(text: str, chunk_count: int) -> "list[str]":

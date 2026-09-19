@@ -49,6 +49,9 @@ class agDataLogger:
         self._span_rows: list[tuple] = []
         self._latest_value_rows: list[tuple] = []
         self._stream_delta_rows: list[tuple] = []
+        self._block_rows: list[tuple] = []
+        self._exchange_rows: list[tuple] = []
+        self._exchange_chain_rows: list[tuple] = []
         self._pending_count = 0
         self._last_flush_ts = 0.0
 
@@ -244,20 +247,22 @@ class agDataLogger:
             else:
                 self._maybe_flush_locked()
 
-    def record_final_transcript(
+    def record_llm_exchange(
         self,
         call_label: str,
-        type: str,
-        payloads: "list[dict]",
         *,
+        exchange_type: str,
+        prompt_chain: "list[tuple[str, dict]]",
+        response_chain: "list[tuple[str, dict]]",
         name: "str | None" = None,
         object: "str | None" = None,
         term_message: "str | None" = None,
         print_to_terminal: bool = True,
     ) -> None:
         """Atomically clear every `stream_deltas` row for *call_label* (both
-        already-flushed and still-pending) and append each of *payloads* as
-        its own permanent row in `events`."""
+        already-flushed and still-pending), store each distinct block
+        exactly once in the agent-global `blocks` table (keyed by content
+        hash)."""
         timestamp = time.time()
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
@@ -267,20 +272,23 @@ class agDataLogger:
             self._stream_delta_rows = [
                 row for row in self._stream_delta_rows if row[5] != call_label
             ]
-            for i, payload in enumerate(payloads):
-                self._event_rows.append(
-                    (
-                        self._next_id_locked(),
-                        type,
-                        timestamp,
-                        name,
-                        object,
-                        call_label,
-                        json.dumps(payload),
-                        term_message if i == 0 else None,
-                    )
+            for digest, payload in (*prompt_chain, *response_chain):
+                self._block_rows.append((digest, json.dumps(payload), call_label, timestamp))
+            self._exchange_rows.append(
+                (
+                    call_label,
+                    self._next_id_locked(),
+                    exchange_type,
+                    timestamp,
+                    name,
+                    object,
+                    term_message,
                 )
-                self._pending_count += 1
+            )
+            for kind, chain in (("prompt", prompt_chain), ("response", response_chain)):
+                for seq, (digest, _payload) in enumerate(chain):
+                    self._exchange_chain_rows.append((call_label, kind, seq, digest))
+            self._pending_count += 1
             self._flush_locked()
             if self._conn is not None:
                 self._conn.execute("DELETE FROM stream_deltas WHERE call_label = ?", (call_label,))
@@ -442,6 +450,52 @@ class agDataLogger:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_stream_deltas_call_label ON stream_deltas(call_label)"
         )
+        # Content-addressable LLM transcript storage: each distinct block is
+        # stored once in `blocks`, keyed by its content hash (computed by
+        # the caller -- see `_payload_hash` in llm_handler_server.py); each
+        # exchange (one LLM dispatch/stream attempt, keyed by `call_label`)
+        # references its full prompt and response as two ordered chains of
+        # hashes into that shared store, rather than duplicating block
+        # content per exchange.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                call_label TEXT,
+                timestamp REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exchanges (
+                call_label TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                name TEXT,
+                object TEXT,
+                term_message TEXT
+            )
+            """
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_id ON exchanges(id)")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exchange_chain (
+                call_label TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                PRIMARY KEY (call_label, kind, seq)
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exchange_chain_label ON exchange_chain(call_label)"
+        )
         self._conn.commit()
 
     def _maybe_flush_locked(self) -> None:
@@ -460,6 +514,9 @@ class agDataLogger:
             and not self._span_rows
             and not self._latest_value_rows
             and not self._stream_delta_rows
+            and not self._block_rows
+            and not self._exchange_rows
+            and not self._exchange_chain_rows
         ):
             self._last_flush_ts = time.time()
             return
@@ -497,12 +554,101 @@ class agDataLogger:
                     "payload, term_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     self._stream_delta_rows,
                 )
+            if self._block_rows:
+                # OR IGNORE: the hash *is* the dedup key -- a block already
+                # stored by an earlier exchange (e.g. resent conversation
+                # history, or a tool schema unchanged since the last call)
+                # is a no-op here, not a duplicate row (and consumes no new
+                # `id`, so `call_label`/`timestamp` stay whichever exchange
+                # first produced this content, and `id` order is still
+                # exactly first-seen order).
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO blocks (hash, payload, call_label, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    self._block_rows,
+                )
+            if self._exchange_rows:
+                self._conn.executemany(
+                    "INSERT INTO exchanges (call_label, id, type, timestamp, name, object, "
+                    "term_message) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    self._exchange_rows,
+                )
+            if self._exchange_chain_rows:
+                self._conn.executemany(
+                    "INSERT INTO exchange_chain (call_label, kind, seq, hash) VALUES (?, ?, ?, ?)",
+                    self._exchange_chain_rows,
+                )
         self._event_rows.clear()
         self._span_rows.clear()
         self._latest_value_rows.clear()
         self._stream_delta_rows.clear()
+        self._block_rows.clear()
+        self._exchange_rows.clear()
+        self._exchange_chain_rows.clear()
         self._pending_count = 0
         self._last_flush_ts = time.time()
+
+
+def reconstruct_llm_exchanges(
+    connection: "sqlite3.Connection", exchange_type: "str | None" = None
+) -> "list[dict]":
+    """Read every recorded LLM exchange back out of *connection*'s
+    `exchanges`/`exchange_chain`/`blocks` tables, in the order they were
+    recorded, joining each exchange's hash chains back into ordered prompt
+    and response block lists. Pass *exchange_type* (e.g. ``"llm_block"``)
+    to filter to one exchange type; omitted, all types (including
+    ``"llm_stream_error"``/``"llm_stream_cancelled"``) are returned.
+
+    Shared by every reader of this schema (the mock replay backend,
+    agwebui) so the exchanges/exchange_chain/blocks join logic exists in
+    exactly one place."""
+    query = "SELECT call_label, id, type, timestamp, name, object, term_message FROM exchanges"
+    params: tuple = ()
+    if exchange_type is not None:
+        query += " WHERE type = ?"
+        params = (exchange_type,)
+    query += " ORDER BY id"
+    exchange_rows = connection.execute(query, params).fetchall()
+
+    chain_rows = connection.execute(
+        "SELECT exchange_chain.call_label, exchange_chain.kind, blocks.payload "
+        "FROM exchange_chain JOIN blocks ON blocks.hash = exchange_chain.hash "
+        "ORDER BY exchange_chain.call_label, exchange_chain.kind, exchange_chain.seq"
+    ).fetchall()
+    chains: "dict[str, dict[str, list[dict]]]" = {}
+    for call_label, kind, payload_json in chain_rows:
+        chains.setdefault(call_label, {"prompt": [], "response": []})[kind].append(
+            json.loads(payload_json)
+        )
+
+    exchanges = []
+    for call_label, _id, row_type, timestamp, name, object_, term_message in exchange_rows:
+        blocks_for = chains.get(call_label, {"prompt": [], "response": []})
+        exchanges.append(
+            {
+                "call_label": call_label,
+                "type": row_type,
+                "timestamp": timestamp,
+                "name": name,
+                "object": object_,
+                "term_message": term_message,
+                "prompt": blocks_for["prompt"],
+                "response": blocks_for["response"],
+            }
+        )
+    return exchanges
+
+
+def read_llm_exchanges(db_path: str, exchange_type: "str | None" = None) -> "list[dict]":
+    """Convenience wrapper for readers that don't already hold a live
+    connection (e.g. the mock replay backend, reading a completed run's own
+    db file): opens a short-lived read-only connection to *db_path* and
+    calls `reconstruct_llm_exchanges`."""
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return reconstruct_llm_exchanges(connection, exchange_type)
+    finally:
+        connection.close()
 
 
 def resolve_global_db_path(log_dir: "str | Path") -> Path:

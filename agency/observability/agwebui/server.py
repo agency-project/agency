@@ -364,6 +364,21 @@ def _known_agents(global_path: Path) -> "dict[str, str]":
     return agents
 
 
+# llm_stream_error/llm_stream_cancelled exchanges (the only LLM-exchange
+# types that ever carry a term_message -- see _finalize_terminal) now live
+# in `exchanges`, not `events` (see the content-addressable transcript
+# schema notes above _TOKEN_TOTALS_SQL). Both tables share one monotonic
+# `id` sequence per agDataLogger instance (one `_next_id_locked()` counter
+# backs every table it writes), so a plain UNION ALL merges back into the
+# same single chronological order the old all-in-`events` model gave for
+# free. `exchanges` has no `payload` column -- term_message is all either
+# consumer below ever needs from an exchange row, so `'{}'` stands in.
+_EXCHANGE_TERM_MESSAGES_SQL = (
+    "SELECT id, type, timestamp, name, '{}' AS payload, term_message FROM exchanges "
+    "WHERE term_message IS NOT NULL"
+)
+
+
 def _fetch_new_term_messages(path: Path, after_id: str) -> list[tuple[str, str]]:
     """Return (id, envelope_json) for rows with id > after_id that carry a
     term_message -- the compact human-readable status lines
@@ -389,8 +404,11 @@ def _fetch_new_term_messages(path: Path, after_id: str) -> list[tuple[str, str]]
         con = _open_db(path)
         rows = con.execute(
             "SELECT id, type, timestamp, name, payload, term_message FROM events "
-            "WHERE id > ? AND (term_message IS NOT NULL OR type = 'agent_state') ORDER BY id",
-            (after_id,),
+            "WHERE id > ? AND (term_message IS NOT NULL OR type = 'agent_state') "
+            "UNION ALL SELECT id, type, timestamp, name, '{}' AS payload, term_message "
+            "FROM exchanges WHERE id > ? AND term_message IS NOT NULL "
+            "ORDER BY id",
+            (after_id, after_id),
         ).fetchall()
         con.close()
         return [
@@ -419,8 +437,11 @@ def _fetch_agent_log_backlog(
         try:
             con = _open_db(path)
             rows = con.execute(
-                "SELECT type, timestamp, name, payload, term_message FROM events "
-                "WHERE term_message IS NOT NULL ORDER BY id DESC LIMIT ?",
+                "SELECT type, timestamp, name, payload, term_message FROM "
+                "(SELECT id, type, timestamp, name, payload, term_message FROM events "
+                "WHERE term_message IS NOT NULL "
+                f"UNION ALL {_EXCHANGE_TERM_MESSAGES_SQL}) "
+                "ORDER BY id DESC LIMIT ?",
                 (limit_per_agent,),
             ).fetchall()
             con.close()
@@ -537,34 +558,79 @@ def _json_object(value: str) -> dict:
         return {}
 
 
-# record_final_transcript() writes one `events` row per block (not one row per
-# exchange holding a blocks array) -- so the metadata block for an exchange
-# is its own row, type='llm_block', with its own $.type=='metadata' inside
-# payload; new_prompt_tokens is top-level (llm_handler_server._tag_metadata_
-# block) but completion_tokens stays nested under $.usage (anthropic.py/
-# openai.py's usage_dict). Only those two numbers are ever pulled out here;
-# the far more numerous text/tool_use/tool_result rows are filtered out by
-# SQLite itself and never reach Python, since nothing in the frontend
-# renders raw events anyway (only messages/state/config/tokens are).
+# record_llm_exchange() (agdatalogger.py) stores each distinct block once in
+# a content-addressable `blocks` table (keyed by content hash) and records
+# each exchange's full prompt and response as two ordered hash chains in
+# `exchange_chain`, rather than one `events` row per block the way the
+# older model did. The metadata block for an exchange is its own chain
+# entry, kind='response', with its own $.type=='metadata' inside the
+# joined blocks.payload; new_prompt_tokens is top-level (llm_handler_server.
+# _tag_metadata_block) but completion_tokens stays nested under $.usage
+# (anthropic.py/openai.py's usage_dict). Only those two numbers are ever
+# pulled out here.
+#
+# Deliberately NOT deduplicated by hash here (unlike _fetch_finalized_llm_
+# block_rows below): `exchange_chain` has exactly one response-chain row
+# per exchange regardless of whether its metadata block happens to be
+# byte-identical to another exchange's (rare, but possible for e.g. two
+# zero-token calls with the same stop_reason) -- summing over every
+# exchange_chain row, not every distinct block, is what makes each
+# exchange's own tokens count exactly once.
 _TOKEN_TOTALS_SQL = (
-    "SELECT SUM(json_extract(payload, '$.new_prompt_tokens')), "
-    "SUM(json_extract(payload, '$.usage.completion_tokens')), "
-    "SUM(json_extract(payload, '$.usage.cache_read_tokens')), "
-    "SUM(json_extract(payload, '$.usage.cache_write_tokens')) "
-    "FROM events WHERE type = 'llm_block' AND json_extract(payload, '$.type') = 'metadata'"
+    "SELECT SUM(json_extract(b.payload, '$.new_prompt_tokens')), "
+    "SUM(json_extract(b.payload, '$.usage.completion_tokens')), "
+    "SUM(json_extract(b.payload, '$.usage.cache_read_tokens')), "
+    "SUM(json_extract(b.payload, '$.usage.cache_write_tokens')) "
+    "FROM exchange_chain ec "
+    "JOIN exchanges e ON e.call_label = ec.call_label "
+    "JOIN blocks b ON b.hash = ec.hash "
+    "WHERE e.type = 'llm_block' AND ec.kind = 'response' "
+    "AND json_extract(b.payload, '$.type') = 'metadata'"
 )
 
 
-def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
-    """The full current transcript for one agent's db: llm_block events
-    plus whatever exchange is still streaming, shared by both HTTP pull
-    and push paths. Ignores orchestrator.py's live_messages snapshots (no
-    per-message clock) and host_interaction_server's tool_result events
-    (a duplicate record of what llm_block already covers)."""
-    finalized = con.execute(
-        "SELECT type, call_label, payload, timestamp FROM events "
-        "WHERE type = 'llm_block' ORDER BY id"
+def _fetch_finalized_llm_block_rows(
+    con: sqlite3.Connection,
+) -> "list[tuple[str, str, str, float]]":
+    """Reproduce the flat, deduplicated `(type, call_label, payload_json,
+    timestamp)` row sequence the older row-per-block `events` model used
+    to hand to `_reconstruct_in_progress_messages` directly -- from the
+    content-addressable `exchanges`/`exchange_chain`/`blocks` schema.
+
+    Each exchange's prompt chain (its full recorded request -- including
+    any resent history, since a request's prompt is stored in full every
+    time, not as a diff) is walked before its response chain, mirroring
+    the order blocks used to land in `events`. A block hash already seen
+    in an earlier exchange's chain (resent history, an unchanged tool
+    schema, a repeated tool result, ...) is skipped here -- the same
+    content, once -- exactly the way the write side used to drop it before
+    it ever reached the old `events` table."""
+    rows = con.execute(
+        "SELECT e.call_label, e.timestamp, ec.hash, b.payload "
+        "FROM exchanges e "
+        "JOIN exchange_chain ec ON ec.call_label = e.call_label "
+        "JOIN blocks b ON b.hash = ec.hash "
+        "WHERE e.type = 'llm_block' "
+        "ORDER BY e.id, ec.kind, ec.seq"
     ).fetchall()
+    seen: "set[str]" = set()
+    result: "list[tuple[str, str, str, float]]" = []
+    for call_label, timestamp, digest, payload_json in rows:
+        if digest in seen:
+            continue
+        seen.add(digest)
+        result.append(("llm_block", call_label, payload_json, timestamp))
+    return result
+
+
+def _compute_agent_messages(con: sqlite3.Connection) -> "list[dict]":
+    """The full current transcript for one agent's db: finalized llm_block
+    exchanges plus whatever exchange is still streaming, shared by both
+    HTTP pull and push paths. Ignores orchestrator.py's live_messages
+    snapshots (no per-message clock) and host_interaction_server's
+    tool_result events (a duplicate record of what llm_block already
+    covers)."""
+    finalized = _fetch_finalized_llm_block_rows(con)
     streaming_rows = con.execute(
         "SELECT call_label, payload, timestamp FROM stream_deltas "
         "WHERE type='llm_stream_delta' ORDER BY id"
@@ -681,10 +747,11 @@ def _merge_stream_item(block: dict, stream_item: dict) -> None:
 
 def _reconstruct_streaming_messages(rows: "list[tuple[str, str, float]]") -> "list[dict]":
     """The exchange (if any) that's still streaming right now -- not yet
-    finalized into a permanent events row (record_final_transcript() only runs once
-    the whole exchange completes), so without this the panel would freeze
-    for however long that one exchange takes (can be several real seconds)
-    even though the raw deltas are already landing on disk continuously.
+    finalized into permanent exchange/chain rows (record_llm_exchange() only
+    runs once the whole exchange completes), so without this the panel
+    would freeze for however long that one exchange takes (can be several
+    real seconds) even though the raw deltas are already landing on disk
+    continuously.
     Replicates llm_handler_server's own text/tool_use/thinking block merge
     (see _merge_stream_item) purely on read; metadata blocks and bare
     "usage" stream_items are dropped, same as the finalized-event path."""

@@ -5,6 +5,7 @@ latest_values), matching what the live execution process produces, rather
 than a hand-rolled schema of their own.
 """
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -18,6 +19,35 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _seed_llm_exchange(
+    logger,
+    call_label: str,
+    response_blocks: "list[dict]",
+    prompt_blocks: "list[dict] | None" = None,
+) -> None:
+    """Record one exchange the way a real LlmHandlerServer would, via
+    `agdatalogger.record_llm_exchange` -- content-addressable storage,
+    prompt and response as two independent chains (see
+    agdatalogger.py/llm_handler_server.py's `_prompt_chain`/
+    `_response_chain`). Blocks get a synthetic, unique hash for storage:
+    this module doesn't need `_payload_hash`'s identity-normalization
+    rules (tool_use/tool_result/text-by-content dedup), only a
+    deterministic key per distinct block."""
+
+    def _chain(blocks: "list[dict]") -> "list[tuple[str, dict]]":
+        return [
+            (hashlib.sha256(json.dumps(b, sort_keys=True, default=str).encode()).hexdigest(), b)
+            for b in blocks
+        ]
+
+    logger.record_llm_exchange(
+        call_label,
+        exchange_type="llm_block",
+        prompt_chain=_chain(prompt_blocks or []),
+        response_chain=_chain(response_blocks),
+    )
 
 
 def _write_events(db_path: Path, events: "list[dict]") -> None:
@@ -558,6 +588,46 @@ def test_shared_log_relays_agent_state_events_without_a_term_message(server):
     assert "term_message" not in relayed
 
 
+def test_shared_log_relays_llm_stream_error_term_message(server):
+    """llm_stream_error/llm_stream_cancelled exchanges (the only LLM-exchange
+    types that ever carry a term_message -- see llm_handler_server.
+    _finalize_terminal) now live in the `exchanges` table, not `events` --
+    the per-agent relay must merge both sources (see
+    _EXCHANGE_TERM_MESSAGES_SQL) or this term_message would silently stop
+    reaching the shared log after the content-addressable migration."""
+    client, run_dir, srv = server
+
+    agent_path = run_dir / "Failing_data.sqlite3"
+    agent_logger = _make_data_logger(agent_path)
+    global_logger = _make_data_logger(run_dir / "global_data.sqlite3")
+    global_logger.record_event(
+        "agent_registered",
+        {"db_path": str(agent_path), "team": None},
+        name="Failing",
+        object="agent",
+        update_latest_snapshot=True,
+    )
+    global_logger.stop()
+
+    with client.websocket_connect("/ws") as ws:
+        agent_logger.record_llm_exchange(
+            "call_1",
+            exchange_type="llm_stream_error",
+            prompt_chain=[],
+            response_chain=[("h1", {"error": "boom"})],
+            name="Failing",
+            term_message="[Failing] LLM    ✗  boom",
+        )
+        agent_logger.stop()
+
+        received = _recv_skipping_sync(ws, 3)
+
+    relayed = next((e for e in received if e.get("term_message")), None)
+    assert relayed is not None, f"no relayed llm_stream_error log line received; got {received}"
+    assert relayed["term_message"] == "[Failing] LLM    ✗  boom"
+    assert relayed["agname"] == "Failing"
+
+
 def test_websocket_connect_replays_per_agent_log_backlog(server):
     """A client connecting after per-agent activity already happened still
     sees it -- not just future updates."""
@@ -566,6 +636,14 @@ def test_websocket_connect_replays_per_agent_log_backlog(server):
     agent_path = run_dir / "Backfilled_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
     agent_logger.record_event("agent_created", {}, term_message="[Backfilled] CREATED model=m")
+    agent_logger.record_llm_exchange(
+        "call_1",
+        exchange_type="llm_stream_cancelled",
+        prompt_chain=[],
+        response_chain=[("h1", {"cancelled": True})],
+        name="Backfilled",
+        term_message="[Backfilled] LLM    ✗  cancelled",
+    )
     agent_logger.stop()
 
     global_logger = _make_data_logger(run_dir / "global_data.sqlite3")
@@ -580,11 +658,13 @@ def test_websocket_connect_replays_per_agent_log_backlog(server):
 
     with client.websocket_connect("/ws") as ws:
         # agent_registered replays twice on connect (raw event tail +
-        # latest_values state preamble), plus the per-agent log backlog.
-        received = _recv_skipping_sync(ws, 3)
+        # latest_values state preamble), plus the per-agent log backlog
+        # (one `events` row, one `exchanges` row).
+        received = _recv_skipping_sync(ws, 4)
 
     term_messages = [e.get("term_message") for e in received]
     assert "[Backfilled] CREATED model=m" in term_messages
+    assert "[Backfilled] LLM    ✗  cancelled" in term_messages
 
 
 # ---------------------------------------------------------------------------
@@ -798,14 +878,17 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
     agent_logger.record_event(
         "agent_config", {"agskill": {"react_max_steps": 7}}, update_latest_snapshot=True
     )
-    # One exchange's worth of llm_block rows -- one row per block, matching
-    # record_final_transcript()'s real behavior, with the metadata block carrying
-    # the token counts and a sibling text block that must be ignored.
-    agent_logger.record_event(
-        "llm_block",
-        {"type": "metadata", "new_prompt_tokens": 15, "usage": {"completion_tokens": 5}},
+    # One exchange's response chain, matching record_llm_exchange()'s real
+    # behavior, with the metadata block carrying the token counts and a
+    # sibling text block that must be ignored for token purposes.
+    _seed_llm_exchange(
+        agent_logger,
+        "call_1",
+        response_blocks=[
+            {"type": "metadata", "new_prompt_tokens": 15, "usage": {"completion_tokens": 5}},
+            {"type": "text", "index": 0, "text": "hi"},
+        ],
     )
-    agent_logger.record_event("llm_block", {"type": "text", "index": 0, "text": "hi"})
     agent_logger.stop()
 
     global_logger = _make_data_logger(run_dir / "global_data.sqlite3")
@@ -844,12 +927,19 @@ def test_agent_detail_endpoint_sums_tokens_across_multiple_exchanges(server):
 
     agent_path = run_dir / "Multi_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
-    agent_logger.record_event(
-        "llm_block",
-        {"type": "metadata", "new_prompt_tokens": 10, "usage": {"completion_tokens": 2}},
+    _seed_llm_exchange(
+        agent_logger,
+        "call_1",
+        response_blocks=[
+            {"type": "metadata", "new_prompt_tokens": 10, "usage": {"completion_tokens": 2}}
+        ],
     )
-    agent_logger.record_event(
-        "llm_block", {"type": "metadata", "new_prompt_tokens": 3, "usage": {"completion_tokens": 4}}
+    _seed_llm_exchange(
+        agent_logger,
+        "call_2",
+        response_blocks=[
+            {"type": "metadata", "new_prompt_tokens": 3, "usage": {"completion_tokens": 4}}
+        ],
     )
     agent_logger.stop()
 
@@ -872,7 +962,7 @@ def test_agent_detail_endpoint_ignores_orchestrator_skill_call_and_live_messages
     not the canonical transcript source -- agcontext's own transcript has no
     per-message clock, so every message in one of those snapshots would get
     stamped with a single blanket skill-finish timestamp. Only
-    llm_block/tool_result rows (record_final_transcript(), each with its own
+    llm_block/tool_result rows (record_llm_exchange(), each with its own
     real timestamp) should ever surface in messages."""
     client, run_dir, _srv = server
 
@@ -911,10 +1001,10 @@ def test_agent_detail_endpoint_ignores_orchestrator_skill_call_and_live_messages
 def test_reconstruct_in_progress_messages_leading_user_block_gets_its_own_message():
     """A harness-injected user message (e.g. the initial prompt, or a
     mid-run system/user edit) shares the exchange's call_label but carries
-    role="user" in its {role, **block} payload (see
-    _new_transcript_payloads) -- reconstruction keys on (call_label, role),
-    so it must split into its own leading message before the assistant's
-    own response blocks, even though both rows share call_label."""
+    role="user" in its {role, **block} payload (see llm_handler_server.
+    _prompt_chain) -- reconstruction keys on (call_label, role), so it
+    must split into its own leading message before the assistant's own
+    response blocks, even though both rows share call_label."""
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
 
     rows = [
@@ -973,7 +1063,7 @@ def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
 
 def test_reconstruct_in_progress_messages_llm_block_tool_result_starts_new_message():
     """A tool_result is logged as an llm_block row with role='tool' (see
-    llm_handler_server._new_transcript_payloads()) -- typically under the
+    llm_handler_server._prompt_chain()) -- typically under the
     *same* call_label as the next assistant turn it precedes (both get
     logged together once that next exchange finalizes), so it's the
     (call_label, role) key -- not call_label alone -- that must split them
@@ -1022,9 +1112,13 @@ def test_agent_detail_reconstructs_in_progress_content_from_llm_block_events(ser
 
     agent_path = run_dir / "InProgress_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
-    agent_logger.record_event("llm_block", {"type": "text", "index": 0, "text": "working on it"})
-    agent_logger.record_event(
-        "llm_block", {"type": "tool_use", "index": 1, "name": "write", "arguments": "{}"}
+    _seed_llm_exchange(
+        agent_logger,
+        "call_1",
+        response_blocks=[
+            {"type": "text", "index": 0, "text": "working on it"},
+            {"type": "tool_use", "index": 1, "name": "write", "arguments": "{}"},
+        ],
     )
     agent_logger.stop()
 
@@ -1051,7 +1145,7 @@ def test_agent_detail_reconstructs_in_progress_content_from_llm_block_events(ser
 
 
 # ---------------------------------------------------------------------------
-# Still-streaming exchange reconstruction (record_final_transcript() hasn't run yet
+# Still-streaming exchange reconstruction (record_llm_exchange() hasn't run yet
 # for this exchange -- read the raw deltas straight from stream_deltas)
 # ---------------------------------------------------------------------------
 
@@ -1161,7 +1255,7 @@ def test_reconstruct_streaming_messages_no_rows_returns_empty():
 
 
 def test_agent_detail_includes_currently_streaming_exchange(server):
-    """record_final_transcript() hasn't cleared stream_deltas for this exchange yet
+    """record_llm_exchange() hasn't cleared stream_deltas for this exchange yet
     (it's still in progress) -- the panel must show it anyway, not wait for
     completion."""
     client, run_dir, _srv = server

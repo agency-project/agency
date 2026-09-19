@@ -45,6 +45,19 @@ def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
 
 
+def _request_profile_metadata(request: dict) -> dict:
+    from ...observability.profiler import agprof
+
+    known = ("messages", "tools", "tool_choice")
+    return {
+        **agprof.detail_metadata("llm.tools", request.get("tools") or []),
+        **agprof.detail_metadata("llm.tool_choice", request.get("tool_choice")),
+        **agprof.detail_metadata(
+            "llm.request_extra", {k: v for k, v in request.items() if k not in known}
+        ),
+    }
+
+
 def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason) -> dict:
     from ...observability.profiler import agprof
 
@@ -68,17 +81,16 @@ def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason)
 
 
 def _payload_hash(payload: dict) -> str:
-    """Content identity for one {role, **block} transcript payload. Keys on
-    the block's own stable id/tool_call_id when present, since the same
-    call gets re-serialized in a reduced shape when replayed back through
-    a harness's wire protocol -- hashing the whole payload would treat
-    that reduced replay as new content and double-log it."""
+    """Content-addressable storage key for one {role, **block} transcript
+    payload."""
     role = payload.get("role")
     block_type = payload.get("type")
     if block_type == "tool_use" and payload.get("id"):
         identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
     elif block_type == "tool_result" and payload.get("tool_call_id"):
         identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
+    elif block_type in ("text", "thinking"):
+        identity = {"role": role, "type": block_type, "text": payload.get("text")}
     else:
         identity = payload
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
@@ -259,7 +271,6 @@ class LlmHandlerServer:
         parent_context=None,
         request_id: "str | None" = None,
         skill_name: "str | None" = None,
-        recent_transcript: "list[dict] | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -278,11 +289,6 @@ class LlmHandlerServer:
         self._request_id = request_id
         self._skill_name = skill_name
 
-        self._logged_block_hashes: "set[str]" = {
-            _payload_hash({"role": message.get("role"), **block})
-            for message in (recent_transcript or [])
-            for block in (message.get("blocks") or [])
-        }
         self.change_config(agconfig)
 
     def get_all_transcripts(self) -> "list[dict]":
@@ -422,6 +428,7 @@ class LlmHandlerServer:
                     provider=type(self._backend).__name__,
                     call_label=call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
+                    **_request_profile_metadata(request),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -756,53 +763,82 @@ class LlmHandlerServer:
         kind: str,
         error: "BaseException | None" = None,
     ) -> None:
-        """Record this exchange's non-success outcome."""
+        """Record this exchange's non-success outcome. No prompt is
+        captured here (matching prior behavior) -- only a single synthetic
+        marker block on the response chain."""
         agname = getattr(self._data_logger, "_default_name", None)
         if kind == "cancelled":
-            payloads = [{"cancelled": True}]
+            marker = {"cancelled": True}
             suffix = "cancelled"
         else:
             suffix = f"{type(error).__name__}: {error}"
-            payloads = [{"error": suffix}]
-        self._data_logger.record_final_transcript(
+            marker = {"error": suffix}
+        self._data_logger.record_llm_exchange(
             call_label,
-            type=f"llm_stream_{kind}",
-            payloads=payloads,
+            exchange_type=f"llm_stream_{kind}",
+            prompt_chain=[],
+            response_chain=[(_payload_hash(marker), marker)],
             term_message=f"[{agname}] LLM    ✗  {suffix}",
             print_to_terminal=False,
         )
 
-    def _new_transcript_payloads(
-        self, request: dict, response_message: "dict | None"
-    ) -> "list[dict]":
-        """Diff this exchange's full state (request + response) against
-        every payload already logged this attempt, returning only what's
-        new."""
+    def _prompt_chain(self, request: dict) -> "list[tuple[str, dict]]":
+        """This exchange's *complete* prompt, as an ordered list of
+        (content hash, payload) pairs -- covers every block the request
+        carries, not just `messages`."""
         candidates: "list[dict]" = []
         for message in request.get("messages") or []:
             role = message.get("role")
             for block in message.get("blocks") or []:
                 candidates.append({"role": role, **block})
-        if response_message is not None:
-            role = response_message.get("role", "assistant")
-            for block in response_message.get("blocks") or []:
-                candidates.append({"role": role, **block})
-        new_payloads = []
-        for payload in candidates:
-            digest = _payload_hash(payload)
-            if digest in self._logged_block_hashes:
-                continue
-            self._logged_block_hashes.add(digest)
-            new_payloads.append(payload)
-        return new_payloads
+        for tool in request.get("tools") or []:
+            function = tool.get("function") or {}
+            candidates.append(
+                {
+                    "role": "tool_schema",
+                    "type": "tool_definition",
+                    "name": function.get("name", ""),
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters"),
+                }
+            )
+        if request.get("tool_choice") is not None:
+            candidates.append(
+                {"role": "tool_schema", "type": "tool_choice", "value": request["tool_choice"]}
+            )
+        # Catch-all for any field this function doesn't know to name yet --
+        # same reasoning as llm.request_extra on the span side: an unnamed
+        # field caused exactly this kind of silent gap once already, so a
+        # *new* one must show up here too instead of requiring someone to
+        # notice and hand-add it to the list above first.
+        known_keys = {"messages", "tools", "tool_choice"}
+        request_extra = {k: v for k, v in request.items() if k not in known_keys}
+        if request_extra:
+            candidates.append(
+                {"role": "tool_schema", "type": "request_extra", "value": request_extra}
+            )
+        return [(_payload_hash(payload), payload) for payload in candidates]
+
+    def _response_chain(self, response_message: "dict | None") -> "list[tuple[str, dict]]":
+        """This exchange's *complete* response, as an ordered list of
+        (content hash, payload) pairs."""
+        if response_message is None:
+            return []
+        role = response_message.get("role", "assistant")
+        candidates = [{"role": role, **block} for block in response_message.get("blocks") or []]
+        return [(_payload_hash(payload), payload) for payload in candidates]
 
     def _finalize_success(
         self, call_label: "str | None", request: dict, response_message: "dict | None"
     ) -> None:
-        payloads = self._new_transcript_payloads(request, response_message)
-        if payloads:
-            self._data_logger.record_final_transcript(
-                call_label, type="llm_block", payloads=payloads
+        prompt_chain = self._prompt_chain(request)
+        response_chain = self._response_chain(response_message)
+        if prompt_chain or response_chain:
+            self._data_logger.record_llm_exchange(
+                call_label,
+                exchange_type="llm_block",
+                prompt_chain=prompt_chain,
+                response_chain=response_chain,
             )
 
     def _run_stream_producer(
@@ -878,6 +914,7 @@ class LlmHandlerServer:
                     provider=type(self._backend).__name__,
                     call_label=handle.call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
+                    **_request_profile_metadata(request),
                 )
                 t0 = time.perf_counter()
                 try:

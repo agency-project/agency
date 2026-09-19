@@ -31,10 +31,11 @@ def test_webui_reads_selected_agent_database_on_demand(tmp_path):
         "agent_state", {"state": "inactive", "skill": None}, update_latest_snapshot=True
     )
     agent_logger.record_event("agent_config", {"temperature": 0.2}, update_latest_snapshot=True)
-    agent_logger.record_event(
-        "llm_block",
-        {"role": "assistant", "content": "done"},
-        flush=True,
+    agent_logger.record_llm_exchange(
+        "call_1",
+        exchange_type="llm_block",
+        prompt_chain=[],
+        response_chain=[("h1", {"role": "assistant", "content": "done"})],
     )
     agent_logger.stop()
 

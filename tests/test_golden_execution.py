@@ -20,6 +20,7 @@ Pause/resume assertions cover requested state, not proof that every PID is stopp
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import subprocess
@@ -110,24 +111,41 @@ def _text(messages, role):
     return "\n".join(parts)
 
 
+def _response_chain(payloads: "list[dict]") -> "list[tuple[str, dict]]":
+    """Hash each block deterministically for storage -- the mock backend
+    (agency/llm/mock.py) only ever reads an exchange's response chain, so
+    this fixture never needs a prompt chain at all."""
+    return [
+        (hashlib.sha256(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest(), p)
+        for p in payloads
+    ]
+
+
 def _write_replay(path):
     logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(path))))
     logger.start()
     try:
         for index, answer in enumerate((ANSWER,) * 8):
-            logger.record_final_transcript(
+            logger.record_llm_exchange(
                 f"golden-{index}",
-                type="llm_block",
-                payloads=[
-                    {"type": "text", "index": 0, "text": answer},
-                    {
-                        "type": "metadata",
-                        "index": 2**31 - 1,
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-                        "stop_reason": "stop",
-                        "data": [],
-                    },
-                ],
+                exchange_type="llm_block",
+                prompt_chain=[],
+                response_chain=_response_chain(
+                    [
+                        {"type": "text", "index": 0, "text": answer},
+                        {
+                            "type": "metadata",
+                            "index": 2**31 - 1,
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 2,
+                                "total_tokens": 12,
+                            },
+                            "stop_reason": "stop",
+                            "data": [],
+                        },
+                    ]
+                ),
             )
     finally:
         logger.stop()

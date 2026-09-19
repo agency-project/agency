@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +25,32 @@ def _make_source_db(db_path: Path) -> agDataLogger:
     logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(db_path))))
     logger.start()
     return logger
+
+
+def _response_chain(payloads: "list[dict]") -> "list[tuple[str, dict]]":
+    """Build a response chain from a flat payload list, hashing each block
+    deterministically. This module doesn't need `_payload_hash`'s
+    identity-normalization rules (tool_use/tool_result/text-by-content
+    dedup) -- any unique, deterministic key works for seeding a source
+    db, since these fixtures never repeat a block across exchanges."""
+    return [
+        (hashlib.sha256(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest(), p)
+        for p in payloads
+    ]
+
+
+def _seed_exchange(
+    logger: agDataLogger, call_label: str, exchange_type: str, payloads: list
+) -> None:
+    """Record one exchange into a source db the way a real run's
+    `LlmHandlerServer` would -- as a response-only chain (these fixtures
+    represent recorded model output, never a captured prompt)."""
+    logger.record_llm_exchange(
+        call_label,
+        exchange_type=exchange_type,
+        prompt_chain=[],
+        response_chain=_response_chain(payloads),
+    )
 
 
 _TEXT_EXCHANGE = [
@@ -77,7 +105,7 @@ def test_replay_dispatch_hook_gates_response_after_config_clone(tmp_path, stream
 
     db_path = tmp_path / "source.sqlite3"
     logger = _make_source_db(db_path)
-    logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+    _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
     logger.stop()
     entered = threading.Event()
     release = threading.Event()
@@ -126,8 +154,8 @@ class TestReplayOrderingAndDispatch:
     def test_dispatch_reconstructs_exchanges_in_order(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
-        logger.record_final_transcript("call2", type="llm_block", payloads=_TOOL_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
+        _seed_exchange(logger, "call2", "llm_block", _TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -148,7 +176,7 @@ class TestReplayOrderingAndDispatch:
         recorded exchange."""
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -160,7 +188,7 @@ class TestReplayOrderingAndDispatch:
     def test_exhaustion_raises_clear_error(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -171,11 +199,9 @@ class TestReplayOrderingAndDispatch:
     def test_error_and_cancelled_exchanges_are_skipped(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
-        logger.record_final_transcript(
-            "call2", type="llm_stream_error", payloads=[{"error": "boom"}]
-        )
-        logger.record_final_transcript("call3", type="llm_block", payloads=_TOOL_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
+        _seed_exchange(logger, "call2", "llm_stream_error", [{"error": "boom"}])
+        _seed_exchange(logger, "call3", "llm_block", _TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path)
@@ -184,12 +210,41 @@ class TestReplayOrderingAndDispatch:
         second = backend.dispatch({"messages": []})
         assert second["stop_reason"] == "tool_use"
 
+    def test_replay_never_reads_the_prompt_chain(self, tmp_path):
+        """A source db's prompt chain (resent history, tool results, tool
+        schemas -- whatever was captured on the request side of the
+        original exchange) is invisible to this backend by construction:
+        `_load_replay_exchanges` only ever asks for each exchange's
+        response chain. Seed a prompt chain containing content that would
+        corrupt the replayed message if it leaked in (an assistant-role,
+        index-0 block colliding with the real tool_use also at index 0)
+        and confirm it never appears in the result."""
+        db_path = tmp_path / "agent_x_data.sqlite3"
+        logger = _make_source_db(db_path)
+        colliding_prompt_block = {
+            "role": "assistant",
+            "type": "text",
+            "index": 0,
+            "text": "resent history that must never leak into the replayed response",
+        }
+        logger.record_llm_exchange(
+            "call1",
+            exchange_type="llm_block",
+            prompt_chain=_response_chain([colliding_prompt_block]),
+            response_chain=_response_chain(_TOOL_EXCHANGE),
+        )
+        logger.stop()
+
+        backend = _mock_backend(db_path)
+        result = backend.dispatch({"messages": []})
+        assert result["message"]["blocks"] == _TOOL_EXCHANGE
+
 
 class TestDispatchStream:
     def test_streams_reconstructable_text_deltas(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path, timing_mode="instant")
@@ -206,7 +261,7 @@ class TestDispatchStream:
     def test_streams_reconstructable_tool_use_deltas(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TOOL_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TOOL_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(db_path, timing_mode="instant")
@@ -251,7 +306,7 @@ class TestTimingModes:
     def test_end_to_end_constant_timing_mode(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         backend = _mock_backend(
@@ -265,7 +320,7 @@ class TestTimingModes:
     def test_end_to_end_timing_modes_produce_measurable_delay_difference(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         instant_backend = _mock_backend(db_path, timing_mode="instant")
@@ -277,7 +332,7 @@ class TestTimingModes:
     def test_custom_timing_fn_overrides_timing_mode(self, tmp_path):
         db_path = tmp_path / "agent_x_data.sqlite3"
         logger = _make_source_db(db_path)
-        logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(logger, "call1", "llm_block", _TEXT_EXCHANGE)
         logger.stop()
 
         calls = []
@@ -317,7 +372,7 @@ class TestLlmHandlerServerIntegration:
 
         source_db = tmp_path / "source_agent_data.sqlite3"
         source_logger = _make_source_db(source_db)
-        source_logger.record_final_transcript("call1", type="llm_block", payloads=_TEXT_EXCHANGE)
+        _seed_exchange(source_logger, "call1", "llm_block", _TEXT_EXCHANGE)
         source_logger.stop()
 
         server_db = tmp_path / "server_data.sqlite3"
