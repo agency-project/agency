@@ -532,7 +532,7 @@ class AgentEngine:
             finally:
                 done.set()
 
-        threading.Thread(target=worker, name="harness-attempt-rpc", daemon=True).start()
+        agprof.spawn_traced(worker).start()
 
         consecutive_failures = 0
         while not done.wait(_HEALTH_CHECK_INTERVAL_S):
