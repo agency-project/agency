@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import uuid
 from functools import partial
@@ -227,7 +228,9 @@ class CodexDriver(_HookPtyDriver):
         if not self._trusted_directory and any(
             "Do you trust the contents of this directory?" in line for line in lines
         ):
-            if any(self.cwd in line for line in lines) and any(
+            # check both the real and symbolic path on where codex was launched
+            cwd_variants = {self.cwd, os.path.realpath(self.cwd)}
+            if any(any(variant in line for variant in cwd_variants) for line in lines) and any(
                 "1. Yes, continue" in line for line in lines
             ):
                 self._trusted_directory = True
