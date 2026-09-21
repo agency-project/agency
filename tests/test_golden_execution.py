@@ -23,7 +23,6 @@ import copy
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -45,6 +44,9 @@ from agency.engine.host_servers import llm_handler_server
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.llm.mock import _MockBackend
 
+# golden_image is a conftest.py fixture (shared with tests/integration/); CONTAINER_BACKEND
+# is a plain constant, so it still needs a normal import.
+from .conftest import CONTAINER_BACKEND
 
 # for_config() currently uses these strings; there is no harness enum/registry.
 HARNESSES = ("native", "claude_code", "codex", "opencode", "grok")
@@ -56,35 +58,6 @@ LATE = "golden completed-execution redirect"
 ANSWER = "GOLDEN_OK"
 WAIT_SECONDS = 90
 ARTIFACT_ROOT = Path(__file__).resolve().parents[1] / "artifacts" / "golden-execution"
-
-
-CONTAINER_BACKEND = os.environ.get("AGENCY_TEST_CONTAINER_BACKEND", "docker")
-
-
-@pytest.fixture(scope="module")
-def golden_image():
-    image = os.environ.get("AGENCY_TEST_HARNESS_IMAGE", "docker.io/library/python:3.12-slim")
-    problem = None
-    if not sys.platform.startswith("linux"):
-        problem = "golden profiling and real external harnesses require Linux"
-    else:
-        try:
-            subprocess.run([CONTAINER_BACKEND, "info"], capture_output=True, check=True, timeout=15)
-            subprocess.run(
-                [CONTAINER_BACKEND, "image", "inspect", image],
-                capture_output=True,
-                check=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            problem = (
-                f"golden execution requires {CONTAINER_BACKEND} and the local image {image}: {exc}"
-            )
-    if problem:
-        if os.environ.get("CI") or os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") == "1":
-            pytest.fail(problem)
-        pytest.skip(problem)
-    return image
 
 
 @pytest.fixture
