@@ -21,16 +21,26 @@ def golden_image():
     else:
         try:
             subprocess.run([CONTAINER_BACKEND, "info"], capture_output=True, check=True, timeout=15)
-            subprocess.run(
-                [CONTAINER_BACKEND, "image", "inspect", image],
-                capture_output=True,
-                check=True,
-                timeout=15,
-            )
         except (OSError, subprocess.SubprocessError) as exc:
-            problem = (
-                f"golden execution requires {CONTAINER_BACKEND} and the local image {image}: {exc}"
-            )
+            problem = f"golden execution requires {CONTAINER_BACKEND}: {exc}"
+        else:
+            try:
+                subprocess.run(
+                    [CONTAINER_BACKEND, "image", "inspect", image],
+                    capture_output=True,
+                    check=True,
+                    timeout=15,
+                )
+            except subprocess.SubprocessError:
+                try:
+                    subprocess.run(
+                        [CONTAINER_BACKEND, "pull", image],
+                        capture_output=True,
+                        check=True,
+                        timeout=120,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    problem = f"golden execution requires the local image {image}: {exc}"
     if problem:
         if os.environ.get("CI") or os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") == "1":
             pytest.fail(problem)
