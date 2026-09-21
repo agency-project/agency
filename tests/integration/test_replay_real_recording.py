@@ -23,7 +23,8 @@ import pytest
 from agency import Agent, agconfig, agdata, agskill
 from agency.configs.agconfig import agentconfig, llmconfig, sandboxconfig
 
-from ..test_golden_execution import CONTAINER_BACKEND  # noqa: F401 -- fixture
+# golden_image is a conftest.py fixture, picked up automatically by name -- no import needed.
+from ..conftest import CONTAINER_BACKEND
 
 HARNESSES = ("native", "claude_code", "codex")
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "bug_localization"
