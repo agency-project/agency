@@ -538,8 +538,11 @@ def _run_bash_tool(arguments_json: str) -> str:
 def _run_read_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     file_path = str(args.get("file_path", ""))
-    offset = int(args.get("offset") or 1)
-    limit = int(args.get("limit") or READ_DEFAULT_LIMIT)
+    try:
+        offset = int(args.get("offset") or 1)
+        limit = int(args.get("limit") or READ_DEFAULT_LIMIT)
+    except (TypeError, ValueError) as e:
+        return json.dumps({"error": f"invalid offset/limit: {e}"})
 
     if os.path.isdir(file_path):
         try:
@@ -650,7 +653,10 @@ def _run_webfetch_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     url = str(args.get("url", ""))
     fmt = str(args.get("format") or "markdown")
-    timeout = min(int(args.get("timeout") or _WEBFETCH_DEFAULT_TIMEOUT), _WEBFETCH_MAX_TIMEOUT)
+    try:
+        timeout = min(int(args.get("timeout") or _WEBFETCH_DEFAULT_TIMEOUT), _WEBFETCH_MAX_TIMEOUT)
+    except (TypeError, ValueError) as e:
+        return json.dumps({"error": f"invalid timeout: {e}"})
 
     if not url.startswith(("http://", "https://")):
         return json.dumps({"error": "URL must start with http:// or https://"})
@@ -703,7 +709,10 @@ def _run_todowrite_tool(arguments_json: str) -> str:
         return json.dumps({"error": "todos field is required"})
     if not isinstance(todos, list):
         return json.dumps({"error": "todos must be a list"})
-    _todo_store = [dict(t) for t in todos]
+    try:
+        _todo_store = [dict(t) for t in todos]
+    except (TypeError, ValueError) as e:
+        return json.dumps({"error": f"invalid todos entry: {e}"})
     pending = sum(1 for t in _todo_store if t.get("status") not in ("completed", "cancelled"))
     return json.dumps(
         {

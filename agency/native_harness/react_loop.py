@@ -162,18 +162,14 @@ def run_react_loop(
                         tool_started_wall_ns = time.time_ns()
                         try:
                             result_content = handler(fn_args)
-                        except BaseException as exc:
-                            bridge.complete_tool_policy(
-                                call_id,
-                                None,
-                                error=str(exc),
-                                duration_ns=time.perf_counter_ns() - tool_started_ns,
-                                started_wall_ns=tool_started_wall_ns,
-                            )
-                            raise
+                        except Exception as exc:
+                            result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
                 else:
-                    result_content = handler(fn_args)
+                    try:
+                        result_content = handler(fn_args)
+                    except Exception as exc:
+                        result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
                 result_error = _parse_tool_input(result_content).get("error")
                 result_content = tools.offload_if_oversized(
                     fn_name, tc["id"], result_content, offload_dir
