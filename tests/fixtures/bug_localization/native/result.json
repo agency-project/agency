@@ -1,0 +1,50 @@
+{
+  "instance_id": "django__django-11066",
+  "difficulty": "<15 min fix",
+  "repo": "django/django",
+  "harness": "native",
+  "backend": "openai",
+  "model": "claude-sonnet-5",
+  "max_steps": 60,
+  "agname": "agent_alex_0000",
+  "dropped_caches": true,
+  "status": "ok",
+  "reasoning": "The bug is in django/contrib/contenttypes/management/__init__.py, in the RenameContentType._rename() method. This method computes the database alias to use via `db = schema_editor.connection.alias` and correctly uses `db` for fetching the ContentType (`ContentType.objects.db_manager(db).get_by_natural_key(...)`) and for wrapping the save in `transaction.atomic(using=db)`. However, the actual save call:\n\n    content_type.save(update_fields={'model'})\n\ndoes not pass `using=db`, so Model.save() defaults to using the router (and ultimately the DEFAULT_DB_ALIAS/default database) to determine which database to write to, rather than the `db` alias determined from the schema_editor's connection. Even though the save happens inside `transaction.atomic(using=db)`, that only affects transaction management for that alias \u2014 it does not force the save's actual query to run against that database. As a result, when the migration is run against a non-default database (e.g., via a custom database router or an explicit `--database` argument), the ContentType save is attempted on the wrong (default) database, causing errors such as \"no such table: django_content_types\" when the default database doesn't have that table/isn't configured for use.\n\nThe fix is to explicitly pass `using=db` to the save call, i.e. change:\n\n    content_type.save(update_fields={'model'})\n\nto:\n\n    content_type.save(using=db, update_fields={'model'})\n\nThis ensures the save operation is performed on the same database connection/alias determined from the schema_editor, consistent with the rest of the method's logic (the get_by_natural_key call and the atomic transaction).",
+  "gold_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "reported_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "hit": true,
+  "scoring_error": null,
+  "wall_clock_s": 100.64,
+  "repo_dirty": false,
+  "tools_seen": {
+    "submit_output": 2,
+    "bash": 1
+  },
+  "io_read_mb": 53.023438,
+  "sandbox_cpu_seconds": 6.680357,
+  "tool_io_read_mb": 0.273919,
+  "setup_io_read_mb": 51.535927,
+  "harness_io_read_mb": 1.411006,
+  "io_read_mb_by_span": {
+    "run:bug_localizer": 53.023438,
+    "sync:result_wait": 53.023438,
+    "engine:execute": 53.023438,
+    "sandbox:ensure_daemon": 51.535927,
+    "runtime.harness_start": 51.534898,
+    "harness:attempt_rpc": 1.411006,
+    "run:container_call": 1.389327,
+    "turn": 0.546875,
+    "tool:bash": 0.273919,
+    "llm:attempt": 0.193631,
+    "syscall:execve": 0.092371,
+    "agency:services_close": 0.024445,
+    "agency:decode_harness_result": 8.8e-05
+  }
+}
