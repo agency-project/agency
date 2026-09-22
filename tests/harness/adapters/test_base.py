@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agency.configs.agconfig import agconfig, harnessadapterconfig
+from agency.configs.agconfig import agconfig, agentconfig, harnessadapterconfig
 from agency.harness.adapters.base import (
     AdapterRuntime,
     HarnessAdapter,
@@ -15,6 +15,7 @@ from agency.harness.adapters.codex import CodexAdapter
 from agency.harness.adapters.grok import GrokAdapter
 from agency.harness.adapters.kimi import KimiAdapter
 from agency.harness.adapters.native import NativeAdapter
+from agency.harness.adapters.tandem import TandemAdapter
 
 
 class TestForConfigDispatch:
@@ -45,6 +46,19 @@ class TestForConfigDispatch:
     def test_unknown_engine_raises_value_error(self):
         with pytest.raises(ValueError, match="Unknown harness"):
             HarnessAdapter.for_config("not-a-real-engine", agconfig())
+
+    def test_tandem_engine_returns_tandem_backend(self):
+        cfg = agconfig(
+            agentconfig(harness="tandem"),
+            harnessadapterconfig(supervisor_model="big-model"),
+        )
+        backend = HarnessAdapter.for_config("tandem", cfg)
+        assert isinstance(backend, TandemAdapter)
+
+    def test_tandem_without_supervisor_model_raises_value_error(self):
+        cfg = agconfig(agentconfig(harness="tandem"))
+        with pytest.raises(ValueError, match="supervisor_model"):
+            HarnessAdapter.for_config("tandem", cfg)
 
 
 class TestAgHarnessConfig:

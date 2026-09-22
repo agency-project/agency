@@ -320,12 +320,14 @@ def test_build_prompt_payload_uses_skill_methods():
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(
         _build_prompt=lambda: "the-system",
+        _build_output_instruction=lambda: "the-output-instruction",
         build_user_content=lambda skill_input: "the-prompt",
     )
     payload = engine._build_prompt_payload(skill, SimpleNamespace())
     assert payload == PromptPayload(
         system_instruction="the-system",
         user_content="the-prompt",
+        output_instruction="the-output-instruction",
     )
 
 
@@ -333,6 +335,7 @@ def test_build_prompt_payload_prefixes_typed_retained_context():
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(
         _build_prompt=lambda: "system",
+        _build_output_instruction=lambda: "",
         build_user_content=lambda skill_input: "current request",
     )
 
@@ -356,6 +359,7 @@ def test_build_prompt_payload_prefixes_retained_context_to_multimodal_content():
     engine = AgentEngine(_FakeAgent())
     skill = SimpleNamespace(
         _build_prompt=lambda: "system",
+        _build_output_instruction=lambda: "",
         build_user_content=lambda skill_input: current,
     )
 

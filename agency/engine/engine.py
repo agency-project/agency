@@ -408,6 +408,7 @@ class AgentEngine:
         return PromptPayload(
             system_instruction=skill._build_prompt(),
             user_content=user_content,
+            output_instruction=skill._build_output_instruction(),
         )
 
     @staticmethod

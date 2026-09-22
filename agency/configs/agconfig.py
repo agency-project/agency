@@ -284,6 +284,21 @@ class harnessadapterconfig(confignamespace):
     binary_path: "str | None" = None
     allow_subagents: bool = False
 
+    # harness == "tandem" only (agency/harness/adapters/tandem.py): the
+    # supervisor model keeps the full task history and never sees a tool
+    # schema; agent.model (the harness-wide model field every other harness
+    # already uses) is the worker model, the one that actually calls tools.
+    # supervisor_base_url/supervisor_api_key default to the same resolved
+    # endpoint as the worker (bridged or standalone) when unset -- set them
+    # only if the supervisor needs a genuinely different provider.
+    supervisor_model: "str | None" = None
+    supervisor_base_url: "str | None" = None
+    supervisor_api_key: "str | None" = None
+    # A soft ceiling, not a tight per-order budget: the worker may make
+    # several tool calls to satisfy one order before it must report back to
+    # the supervisor. See tandem_harness/tandem_loop.py's docstring.
+    segment_step_cap: int = 16
+
 
 @dataclass(slots=True)
 class ptraceconfig(confignamespace):

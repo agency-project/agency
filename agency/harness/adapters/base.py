@@ -121,7 +121,13 @@ class HarnessAdapter:
     # nothing about agconfig.harness_adapter is strictly required from
     # agconfig alone. Kept as a real, populated mechanism -- not a stub --
     # for the day a harness-specific field with no safe default is added.
-    _REQUIRED_FIELDS_BY_HARNESS: "ClassVar[dict[str, tuple[str, ...]]]" = {}
+    _REQUIRED_FIELDS_BY_HARNESS: "ClassVar[dict[str, tuple[str, ...]]]" = {
+        # tandem's worker model is agent.model (same field every other
+        # harness uses); the supervisor model has no safe default -- silently
+        # falling back to the worker model would produce a "tandem" run
+        # that's just native with extra overhead and no actual two-model split.
+        "tandem": ("supervisor_model",),
+    }
 
     def __init__(self, agconfig: "agconfig_cls") -> None:
         self.change_config(agconfig)
@@ -151,8 +157,14 @@ class HarnessAdapter:
         resume_session_id: "str | None",
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
+        output_instruction: "str | None" = None,
     ) -> AttemptResult:
-        """Run one CLI attempt through the narrow sandbox-daemon seam."""
+        """Run one CLI attempt through the narrow sandbox-daemon seam.
+
+        output_instruction is only ever passed for harness="tandem" (see
+        daemon.py's _run_adapter_attempt) -- every other adapter keeps
+        ignoring it via the default, since for them it's already folded
+        into `prompt` by _render_attempt_prompt."""
         raise NotImplementedError
 
     def register(self, app, router) -> None:
@@ -175,9 +187,12 @@ class HarnessAdapter:
         from .kimi import KimiAdapter
         from .native import NativeAdapter
         from .opencode import OpenCodeAdapter
+        from .tandem import TandemAdapter
 
         if harness == "native":
             return NativeAdapter(agconfig)
+        if harness == "tandem":
+            return TandemAdapter(agconfig)
         if harness == "opencode":
             return OpenCodeAdapter(agconfig)
         if harness == "claude_code":
@@ -190,5 +205,5 @@ class HarnessAdapter:
             return KimiAdapter(agconfig)
         raise ValueError(
             f"Unknown harness {harness!r} -- set agent(harness=...) to one of "
-            f"'native', 'opencode', 'claude_code', 'codex', 'grok', 'kimi'"
+            f"'native', 'tandem', 'opencode', 'claude_code', 'codex', 'grok', 'kimi'"
         )

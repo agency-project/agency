@@ -905,7 +905,7 @@ def test_start_stream_uses_spawn_traced(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][0] == server._run_stream_producer
-    assert calls[0][2] == {"daemon": True}
+    assert calls[0][2] == {"daemon": True, "internal_kind": None}
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -1191,6 +1191,95 @@ def test_controlled_paths_preserve_logger_call_labels_and_finalization():
     assert logger.events == [("agent_state", {"state": "waiting_llm"}, handle.call_label, True)]
     assert logger.finalized[-1][0] == handle.call_label
     assert logger.finalized[-1][1] == "llm_block"
+
+
+# ---------------------------------------------------------------------------
+# _display_tag / _tag_response_message_for_display / agency_internal_kind
+# threading -- the [Worker]/[Supervisor] webui tags (see tandem_harness).
+# ---------------------------------------------------------------------------
+
+
+def test_display_tag_strips_namespace_prefix_and_capitalizes():
+    assert mod._display_tag("tandem_worker") == "Worker"
+    assert mod._display_tag("tandem_supervisor") == "Supervisor"
+    assert mod._display_tag("compaction") == "Compaction"
+    assert mod._display_tag(None) is None
+    assert mod._display_tag("") is None
+
+
+def test_tag_response_message_for_display_tags_text_and_tool_use_only():
+    message = {
+        "role": "assistant",
+        "blocks": [
+            {"type": "text", "index": 0, "text": "done"},
+            {"type": "tool_use", "index": 1, "id": "c1", "name": "write", "arguments": "{}"},
+        ],
+    }
+    tagged = mod._tag_response_message_for_display(message, "Worker")
+
+    assert tagged["blocks"][0]["text"] == "[Worker] done"
+    assert tagged["blocks"][1]["name"] == "[Worker] write"
+    # The original, untagged message is never mutated -- callers keep using
+    # it for the real conversation/dispatch matching.
+    assert message["blocks"][0]["text"] == "done"
+    assert message["blocks"][1]["name"] == "write"
+
+
+def test_tag_response_message_for_display_handles_none():
+    assert mod._tag_response_message_for_display(None, "Worker") is None
+
+
+def test_dispatch_tags_recorded_text_response_from_internal_kind():
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend)
+
+    server.dispatch({"messages": [], "agency_internal_kind": "tandem_worker"})
+
+    # The tag never reaches the actual backend -- litellm rejects it as an
+    # unknown field (confirmed directly against a real provider).
+    assert "agency_internal_kind" not in backend.requests[-1][1]
+
+    response_chain = server._data_logger.finalized[-1][3]
+    payloads = _chain_payloads(response_chain)
+    assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "[Worker] done"}]
+
+
+def test_dispatch_tags_recorded_tool_use_name_from_internal_kind():
+    backend = _RecordingBackend(final=False)
+    server = _controlled_server(backend)
+
+    server.dispatch({"messages": [], "agency_internal_kind": "tandem_supervisor"})
+
+    response_chain = server._data_logger.finalized[-1][3]
+    payloads = _chain_payloads(response_chain)
+    assert payloads[0]["name"] == "[Supervisor] lookup"
+
+
+def test_dispatch_without_internal_kind_leaves_response_untagged():
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend)
+
+    server.dispatch({"messages": []})
+
+    response_chain = server._data_logger.finalized[-1][3]
+    payloads = _chain_payloads(response_chain)
+    assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "done"}]
+
+
+def test_start_stream_tags_recorded_response_from_internal_kind():
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend)
+
+    handle = server.start_stream({"messages": [], "agency_internal_kind": "tandem_worker"})
+    assert _drain(handle)[-1]["type"] == "done"
+    handle._thread.join(timeout=2.0)
+
+    assert "agency_internal_kind" not in backend.requests[-1][1]
+    response_chain = server._data_logger.finalized[-1][3]
+    payloads = _chain_payloads(response_chain)
+    assert len(payloads) == 1
+    assert payloads[0]["type"] == "text"
+    assert payloads[0]["text"] == "[Worker] done"
 
 
 def test_malformed_nonstream_result_finalizes_the_logger_call_label():

@@ -49,6 +49,27 @@ def test_render_attempt_prompt_keeps_output_instruction_when_resuming():
     assert daemon._render_attempt_prompt(request) == "user turn\n\noutput instruction"
 
 
+def test_render_attempt_prompt_includes_output_instruction_for_non_tandem_harness():
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn", "output instruction"),
+        harness="fake",
+    )
+    assert (
+        daemon._render_attempt_prompt(request) == "system prompt\n\nuser turn\n\noutput instruction"
+    )
+
+
+def test_render_attempt_prompt_excludes_output_instruction_for_tandem():
+    # tandem routes output_instruction to the worker directly (see
+    # _run_adapter_attempt) instead of folding it into the supervisor's
+    # own task prompt -- the supervisor never calls submit_output itself.
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn", "output instruction"),
+        harness="tandem",
+    )
+    assert daemon._render_attempt_prompt(request) == "system prompt\n\nuser turn"
+
+
 class _FakePingClient:
     """Records every POST made through it in the shared `posted` list --
     stands in for httpx.Client so _ping_daemon_lifecycle's tests don't need
@@ -202,6 +223,49 @@ def test_adapter_session_blob_crosses_daemon_protocol(monkeypatch, sandbox_paylo
     assert seen["runtime"].has_sandbox_mcp_tools is (sandbox_payload is not None)
     assert result.session_id == "session-2"
     assert base64.b64decode(result.session_blob_b64) == b"updated session state"
+
+
+@pytest.mark.parametrize(
+    ("harness", "expect_kwarg"),
+    [("tandem", True), ("fake", False)],
+)
+def test_run_adapter_attempt_passes_output_instruction_only_for_tandem(
+    monkeypatch, harness, expect_kwarg
+):
+    seen = {}
+
+    class FakeAdapter(HarnessAdapter):
+        engine_key = harness
+
+        def run_daemon_attempt(self, runtime, **kwargs):
+            seen.update(kwargs)
+            return AttemptResult(ok=True, final_text="done")
+
+    monkeypatch.setattr(
+        HarnessAdapter,
+        "for_config",
+        classmethod(lambda cls, name, config: FakeAdapter(config)),
+    )
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system", "user", "output instruction"),
+        harness=harness,
+        attempt_token="attempt-one",
+    )
+
+    daemon._run_adapter_attempt(
+        request,
+        agconfig(),
+        "http://127.0.0.1:8766",
+        "model",
+        "agent-1",
+        object(),
+        lambda handle: None,
+        lambda handler: None,
+    )
+
+    assert ("output_instruction" in seen) is expect_kwarg
+    if expect_kwarg:
+        assert seen["output_instruction"] == "output instruction"
 
 
 def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):

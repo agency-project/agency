@@ -313,25 +313,33 @@ class agskill:
                 parts.append(
                     "\nRespond with plain text only — no JSON wrapping, no markdown code fences."
                 )
-            else:
-                # Structured output is collected one field at a time through
-                # the host MCP server's submit_output tool.
-                field_lines = "\n".join(
-                    f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
-                )
-                parts.append(
-                    "\nTo return your results, you must call the Agency MCP server's "
-                    "submit_output tool once for each required output field. Pass the field "
-                    "name in `field` and its final value in `value`. Do not answer with the "
-                    "values in assistant text; text does not submit structured output. "
-                    "Required fields:\n"
-                    f"{field_lines}\n\n"
-                    "- Call submit_output separately for each field — one field per call.\n"
-                    "- Only call submit_output when you have the final value ready. "
-                    "Never call it with an empty or missing `field` or `value`.\n"
-                    "- You may continue using other tools after registering outputs if needed."
-                )
         return "\n".join(parts)
+
+    def _build_output_instruction(self) -> str:
+        """The submit_output tool-usage instructions, kept separate from
+        _build_prompt() so a harness that splits task context from tool
+        execution (e.g. tandem_harness's supervisor/worker split) can route
+        this to whichever side actually holds the submit_output tool,
+        instead of it always landing wherever the general task prompt goes."""
+        if self.output_schema is None or self.output_schema.raw_key() is not None:
+            return ""
+        # Structured output is collected one field at a time through
+        # the host MCP server's submit_output tool.
+        field_lines = "\n".join(
+            f"  - {f}: {self.output_schema.field_desc(f)}" for f in self.output_schema._data
+        )
+        return (
+            "To return your results, you must call the Agency MCP server's "
+            "submit_output tool once for each required output field. Pass the field "
+            "name in `field` and its final value in `value`. Do not answer with the "
+            "values in assistant text; text does not submit structured output. "
+            "Required fields:\n"
+            f"{field_lines}\n\n"
+            "- Call submit_output separately for each field — one field per call.\n"
+            "- Only call submit_output when you have the final value ready. "
+            "Never call it with an empty or missing `field` or `value`.\n"
+            "- You may continue using other tools after registering outputs if needed."
+        )
 
     def build_user_content(self, skill_input: agdata) -> "str | list":
         """Build the content value for the user message.

@@ -96,6 +96,38 @@ def _payload_hash(payload: dict) -> str:
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _display_tag(internal_kind: "str | None") -> "str | None":
+    """A short, human label for the optional `agency_internal_kind` a
+    caller's dispatch/check_tool_policy request carried (e.g.
+    "tandem_worker" -> "Worker") -- None when there's nothing to tag. Kept
+    generic (a prefix-strip + capitalize, not a hardcoded per-harness
+    mapping) so any future "<namespace>_<role>"-shaped internal_kind value
+    gets a reasonable label without this file needing to know about it."""
+    if not internal_kind:
+        return None
+    label = internal_kind.rsplit("_", 1)[-1]
+    return label.capitalize() if label else None
+
+
+def _tag_response_message_for_display(response_message: "dict | None", tag: str) -> "dict | None":
+    """A tagged DEEP COPY of `response_message`, for recording only -- the
+    caller must keep using the original, untagged dict for anything that
+    continues the actual conversation (the model's own context) or matches
+    a tool call by name for dispatch. Only text content and tool_use block
+    names get the tag; tool_result content is left alone since it's often
+    raw JSON a viewer may try to parse, and the adjacent (now-tagged)
+    tool_use block already carries the same attribution."""
+    if response_message is None:
+        return None
+    tagged = copy.deepcopy(response_message)
+    for block in tagged.get("blocks") or []:
+        if block.get("type") == "tool_use" and block.get("name"):
+            block["name"] = f"[{tag}] {block['name']}"
+        elif block.get("type") == "text" and block.get("text"):
+            block["text"] = f"[{tag}] {block['text']}"
+    return tagged
+
+
 def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
     """(status_code, transient) for a known LLM-backend failure category, or
     None if *error* isn't one of them (caller re-raises it unmodified)."""
@@ -386,6 +418,7 @@ class LlmHandlerServer:
     ) -> dict:
         from ...observability.profiler import agprof
 
+        internal_kind = request.get("agency_internal_kind")
         request = self._prepare_request(request, abort_event=abort_event)
         call_label = uuid.uuid4().hex[:12]
         self._data_logger.record_event(
@@ -470,7 +503,9 @@ class LlmHandlerServer:
                             "ts": time.time(),
                         }
                     )
-                self._finalize_success(call_label, request, result["message"])
+                self._finalize_success(
+                    call_label, request, result["message"], internal_kind=internal_kind
+                )
                 finalized = True
                 return result
         except BaseException as error:
@@ -500,6 +535,7 @@ class LlmHandlerServer:
         handle = _handle if _handle is not None else self._new_stream_handle(abort_event)
         if abort_event is not None and handle._cancel_event is not abort_event:
             raise ValueError("stream handle and abort event must use the same event")
+        internal_kind = request.get("agency_internal_kind")
         request = self._prepare_request(request, abort_event=handle._cancel_event)
         call_label = handle.call_label
         self._data_logger.record_event(
@@ -514,6 +550,7 @@ class LlmHandlerServer:
                 self._run_stream_producer,
                 request,
                 handle,
+                internal_kind=internal_kind,
                 daemon=True,
             )
             with self._handles_lock:
@@ -751,6 +788,13 @@ class LlmHandlerServer:
         abort_event: "threading.Event | None" = None,
     ) -> dict:
         prepared = copy.deepcopy(request)
+        # Callers wanting a display tag on the recorded exchange (see
+        # _display_tag()/_tag_response_message_for_display() below) must
+        # read this field BEFORE calling _prepare_request -- it's stripped
+        # here because it isn't a real request field any backend
+        # understands; passing it through to a real provider is a bad
+        # request (confirmed directly: litellm rejects it as an unknown
+        # field).
         prepared.pop("agency_internal_kind", None)
         if abort_event is not None and abort_event.is_set():
             raise _RequestAborted
@@ -829,8 +873,16 @@ class LlmHandlerServer:
         return [(_payload_hash(payload), payload) for payload in candidates]
 
     def _finalize_success(
-        self, call_label: "str | None", request: dict, response_message: "dict | None"
+        self,
+        call_label: "str | None",
+        request: dict,
+        response_message: "dict | None",
+        *,
+        internal_kind: "str | None" = None,
     ) -> None:
+        tag = _display_tag(internal_kind)
+        if tag is not None:
+            response_message = _tag_response_message_for_display(response_message, tag)
         prompt_chain = self._prompt_chain(request)
         response_chain = self._response_chain(response_message)
         if prompt_chain or response_chain:
@@ -845,6 +897,7 @@ class LlmHandlerServer:
         self,
         request: dict,
         handle: "_StreamHandle",
+        internal_kind: "str | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
@@ -868,7 +921,9 @@ class LlmHandlerServer:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_success(handle.call_label, request, response_message)
+            self._finalize_success(
+                handle.call_label, request, response_message, internal_kind=internal_kind
+            )
             finalized = True
 
         def publish_error(
