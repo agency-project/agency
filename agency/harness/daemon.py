@@ -340,10 +340,7 @@ def _render_attempt_prompt(request: HarnessAttemptRequest) -> str:
         if request.resume_session_id
         else [request.prompt.system_instruction, user_content]
     )
-    # tandem routes output_instruction (the submit_output tool-usage block)
-    # to the worker directly instead -- see _run_adapter_attempt -- since
-    # the worker, not the supervisor, is the one holding that tool.
-    if request.prompt.output_instruction and request.harness != "tandem":
+    if request.prompt.output_instruction:
         parts.append(request.prompt.output_instruction)
     return "\n\n".join(part for part in parts if part)
 
@@ -397,12 +394,6 @@ def _run_adapter_attempt(
             register_redirect=register_redirect,
             run_pty_execution=run_pty_execution,
         )
-        # Only tandem's adapter accepts output_instruction -- see its own
-        # run_daemon_attempt override -- so it's kept out of the shared kwargs
-        # every other adapter's fixed signature would reject.
-        extra_kwargs = {}
-        if request.harness == "tandem":
-            extra_kwargs["output_instruction"] = request.prompt.output_instruction
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
             prompt=_render_attempt_prompt(request),
@@ -413,7 +404,6 @@ def _run_adapter_attempt(
                 else None
             ),
             max_steps=request.max_steps,
-            **extra_kwargs,
         )
     except Exception as exc:
         return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")

@@ -16,8 +16,10 @@ external harness goes through. There is no separate "checkpoint" concept.
 **Reused for both levels of the tandem loop** (`tandem_loop.py`): the
 supervisor's own turn-taking IS a `run_react_loop` call, just with its
 built-in tools/MCP discovery swapped out for a caller-supplied
-`tool_schemas`/`dispatch_table` (its one synthetic action, `send_order`).
-Completion is the same implicit signal every ReAct loop here already uses
+`tool_schemas`/`dispatch_table` (its synthetic control-flow actions --
+`send_order`, `get_trace`, `get_tool_call_detail` -- plus the one real
+tool it keeps for itself, `submit_output`). Completion is the same
+implicit signal every ReAct loop here already uses
 -- a turn with no tool call -- so the supervisor needs no dedicated
 "finish" tool of its own. Each worker segment is a second, independent
 `run_react_loop` call (untouched built-ins) nested inside `send_order`'s

@@ -157,14 +157,8 @@ class HarnessAdapter:
         resume_session_id: "str | None",
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
-        output_instruction: "str | None" = None,
     ) -> AttemptResult:
-        """Run one CLI attempt through the narrow sandbox-daemon seam.
-
-        output_instruction is only ever passed for harness="tandem" (see
-        daemon.py's _run_adapter_attempt) -- every other adapter keeps
-        ignoring it via the default, since for them it's already folded
-        into `prompt` by _render_attempt_prompt."""
+        """Run one CLI attempt through the narrow sandbox-daemon seam."""
         raise NotImplementedError
 
     def register(self, app, router) -> None:

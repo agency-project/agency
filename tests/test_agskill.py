@@ -171,9 +171,8 @@ def test_prompt_type_names_shown_correctly():
     assert '"n": "int"' in prompt  # input schema still uses to_json()
     assert '"s": "str"' in prompt
     assert '"doc": "file"' in prompt
-    output_instruction = sk._build_output_instruction()
-    assert "result" in output_instruction  # output field listed by name
-    assert "float" in output_instruction  # output field type shown as "float"
+    assert "result" in prompt  # output field listed by name
+    assert "float" in prompt  # output field type shown as "float"
 
 
 # ---------------------------------------------------------------------------
@@ -271,15 +270,12 @@ def test_schemas_appended_to_prompt():
     assert "Be helpful." in prompt
     assert "Input JSON format" in prompt
     assert '"text"' in prompt
-    assert "submit_output" not in prompt  # moved to _build_output_instruction()
-
-    output_instruction = s._build_output_instruction()
-    assert "submit_output" in output_instruction
-    assert "return_summary" not in output_instruction
-    assert "`field`" in output_instruction and "`value`" in output_instruction
-    assert "Do not answer" in output_instruction
-    assert "summary" in output_instruction
-    assert "string" in output_instruction  # per-field description for str output
+    assert "submit_output" in prompt
+    assert "return_summary" not in prompt
+    assert "`field`" in prompt and "`value`" in prompt
+    assert "Do not answer" in prompt
+    assert "summary" in prompt
+    assert "string" in prompt  # per-field description for str output
 
 
 def test_no_schemas_prompt_unchanged():

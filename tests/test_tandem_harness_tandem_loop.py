@@ -93,6 +93,35 @@ def _worker_tool_call_response(command="echo hi"):
     }
 
 
+def _submit_output_response(field, value):
+    return {
+        "message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("submit_output", {"field": field, "value": value})],
+        },
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+
+
+class _FakeMcp:
+    """Stands in for McpToolset -- discover()/call() are the only two
+    methods run_tandem_loop's supervisor dispatch touches."""
+
+    def __init__(self, schemas=None):
+        self._schemas = list(schemas or [])
+        self.discover_calls = 0
+        self.calls = []
+
+    def discover(self):
+        self.discover_calls += 1
+        return self._schemas
+
+    def call(self, tool_name, arguments_json):
+        self.calls.append((tool_name, arguments_json))
+        return json.dumps({"result": f"field recorded via {tool_name}"})
+
+
 def test_run_tandem_loop_one_order_then_implicit_completion(monkeypatch, tmp_path):
     monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
     supervisor_llm = _Llm(
@@ -143,15 +172,14 @@ def test_worker_never_sees_supervisor_tool_schema_or_vice_versa(monkeypatch, tmp
     assert "bash" in worker_tool_names
 
 
-def test_worker_output_instruction_is_appended_to_worker_system_only(monkeypatch, tmp_path):
-    """The submit_output tool-usage instructions (exact required output
-    field names) belong to the worker, since it's the worker that holds the
-    submit_output tool -- see agskill.py's _build_output_instruction and
-    daemon.py's _render_attempt_prompt. They must never reach the
-    supervisor's own turns."""
-    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
-    supervisor_llm = _Llm([_send_order_response("do it"), _supervisor_final_response("done")])
-    worker_llm = _Llm([_worker_tool_call_response()])
+def test_supervisor_gets_submit_output_tool_when_mcp_is_configured(tmp_path):
+    """submit_output is a host-side bookkeeping call (record one output
+    field's value), not sandbox execution, so the supervisor -- the one
+    with full task context -- calls it directly instead of routing a
+    completion message through send_order to the worker."""
+    mcp = _FakeMcp()
+    supervisor_llm = _Llm([_supervisor_final_response("done")])
+    worker_llm = _Llm([])
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -159,17 +187,56 @@ def test_worker_output_instruction_is_appended_to_worker_system_only(monkeypatch
         "worker-model",
         supervisor_llm,
         worker_llm,
-        segment_step_cap=1,
+        mcp=mcp,
         offload_dir=str(tmp_path),
-        worker_output_instruction="Required fields:\n  - path: the file path",
     )
 
-    worker_system_message = worker_llm.requests[0][1][0]
-    assert worker_system_message["role"] == "system"
-    assert "Required fields:\n  - path: the file path" in worker_system_message["content"]
+    supervisor_tool_names = {s["function"]["name"] for s in supervisor_llm.requests[0][2]}
+    assert "submit_output" in supervisor_tool_names
+    # Discovered up front, not lazily on first use -- see run_tandem_loop.
+    assert mcp.discover_calls >= 1
 
-    supervisor_messages_seen = json.dumps([r[1] for r in supervisor_llm.requests])
-    assert "Required fields:\n  - path: the file path" not in supervisor_messages_seen
+
+def test_supervisor_has_no_submit_output_tool_without_mcp(tmp_path):
+    supervisor_llm = _Llm([_supervisor_final_response("done")])
+    worker_llm = _Llm([])
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        offload_dir=str(tmp_path),
+    )
+
+    supervisor_tool_names = {s["function"]["name"] for s in supervisor_llm.requests[0][2]}
+    assert "submit_output" not in supervisor_tool_names
+
+
+def test_supervisor_submit_output_call_dispatches_through_mcp(tmp_path):
+    mcp = _FakeMcp()
+    supervisor_llm = _Llm(
+        [
+            _submit_output_response("path", "/workspace/note.txt"),
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm([])
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        mcp=mcp,
+        offload_dir=str(tmp_path),
+    )
+
+    assert mcp.calls == [
+        ("submit_output", json.dumps({"field": "path", "value": "/workspace/note.txt"}))
+    ]
 
 
 def test_each_order_gets_a_fresh_worker_session_with_no_carryover(monkeypatch, tmp_path):

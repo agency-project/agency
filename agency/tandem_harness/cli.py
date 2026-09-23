@@ -99,18 +99,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--supervisor-llm-api-key", default=None)
 
     p.add_argument(
-        "--worker-output-instruction",
-        default=None,
-        help="submit_output tool-usage instructions (exact required output field names/"
-        "descriptions) appended to the worker's own system prompt -- the worker holds the "
-        "submit_output tool, not the supervisor, so this is kept out of the supervisor's task "
-        "prompt entirely (see agskill.py's _build_output_instruction).",
-    )
-    p.add_argument(
         "--mcp-config",
         default=None,
         help='JSON, same shape as Claude Code\'s own flag: {"mcpServers": {"name": '
-        '{"type": "http", "url": "...", "headers": {...}}}} -- available to the worker only.',
+        '{"type": "http", "url": "...", "headers": {...}}}} -- the worker gets every '
+        "configured tool; the supervisor additionally gets submit_output directly (see "
+        "tandem_loop.py).",
     )
     p.add_argument("--offload-dir", default=_DEFAULT_OFFLOAD_DIR)
     p.add_argument(
@@ -189,7 +183,6 @@ def main(argv: "list[str] | None" = None) -> int:
         max_segments=args.max_steps,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
-        worker_output_instruction=args.worker_output_instruction,
     )
 
     if result.status != "done":

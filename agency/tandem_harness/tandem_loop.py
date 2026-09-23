@@ -9,13 +9,21 @@ own natural-language summary of what it did.
 Both levels are just `run_react_loop` (see that module's docstring): the
 supervisor's turn-taking IS a `run_react_loop` call with its built-in tools
 swapped out for three synthetic actions (`send_order`, `get_trace`,
-`get_tool_call_detail`); each worker segment is a second, independent
-`run_react_loop` call (untouched
+`get_tool_call_detail`) plus one real one, `submit_output`, dispatched
+straight through the shared `McpToolset` (the same connection the worker's
+own MCP tools use) rather than through a synthetic handler; each worker
+segment is a second, independent `run_react_loop` call (untouched
 built-ins: Bash/Read/Write/Edit/Glob/Grep/WebFetch/TodoWrite/MCP) nested
-inside `send_order`'s own handler. No dedicated "finish" tool: the
-supervisor completes the same way every ReAct loop in this package already
-does -- a turn with no tool call -- so a stray toolless turn and a
-deliberate finish aren't different code paths, just like they aren't for
+inside `send_order`'s own handler. `submit_output` is a host-side
+bookkeeping call (record one output field's value), not sandbox execution,
+so it belongs to the supervisor -- the one with full task context -- not
+the worker: routing task completion through send_order gave the supervisor
+no clean way to recognize "done" and stop, so it would keep re-sending
+"the task is complete" as if it were still an order for the worker to
+carry out. No dedicated "finish" tool beyond that: the supervisor
+completes the same way every ReAct loop in this package already does --
+a turn with no tool call -- so a stray toolless turn and a deliberate
+finish aren't different code paths, just like they aren't for
 native/codex/claude_code today.
 
 `segment_step_cap` (default 16) is a soft ceiling, not a tight per-order
@@ -72,13 +80,15 @@ _SUPERVISOR_TOOL_NAMES = {"send_order", "get_trace", "get_tool_call_detail"}
 SUPERVISOR_SYSTEM = """\
 You are a helpful assistant that carries out a task given to you by a user.
 You have access to a harness and execution environment to carry out the task through a natural language-based interface, accesible via the send_order tool.
-You are ONLY given the following three tools:
+You are ONLY given the following four tools:
 
 - send_order(order): Give the harness an instruction to carry out. The instruction should be conscise and explicit and in natural language. You should provide specific instructions of the order. Returns a truncated tool_calls list, a summary_text, and a finish_reason.
 
 - get_trace(): Get the full, untruncated trace of the most recent send_order execution, including the input and output of every tool call it made. Use this when send_order's own truncated tool_calls preview or summary_text doesn't have enough detail for your decision-making.
 
 - get_tool_call_detail(call_id): Get the full, untruncated arguments and result of just ONE tool call from the most recent send_order execution, identified by the call_id in that send_order result's tool_calls entries. Prefer this over get_trace() when you only need one call's detail, not the whole trace.
+
+- submit_output(field, value): Submit one required output field's value to the user. Use the exact field name and description given to you in this task's own instructions. Call it once per required field.
 
 Example:
 ```
@@ -90,14 +100,15 @@ send_order("Run JSONFieldTests.test_has_key_number via runtests.py")
 get_tool_call_detail("call_1") -> returns the full, untruncated arguments/result of that one tool call.
 get_trace() -> returns the full trace of the runtests.py execution, including the input and output of the tools.
 ... more orders ...
+submit_output("field_name", "final value") -> once per required output field, when you have the confirmed final value to be reported to the user.
 ```
-ALL other tools, such as "bash", "read", or "submit_output", are not available to you. You will have to use "send_order" to carry out the task. You may need to give explicit bash commands or code snippets to the worker to carry out the task.
+ALL other tools, such as "bash" or "read", are not available to you. You will have to use "send_order" to carry out the task. You may need to give explicit bash commands or code snippets to the worker to carry out the task.
 
 For task execution, please keep going until the query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved.
 
-If the codebase has tests or the ability to build or run, consider using them to verify that your work is complete. Your philosophy should be to start as specific as possible to the code you changed so that you can catch issues efficiently, then make your way to broader tests as you build confidence. Fix the problem at the root cause rather than applying surface-level patches, when possible.
+If you are working on a codebase that has tests or the ability to build or run, consider using them to verify that your work is complete. Your philosophy should be to start as specific as possible to the code you changed so that you can catch issues efficiently, then make your way to broader tests as you build confidence. Fix the problem at the root cause rather than applying surface-level patches, when possible.
 
-If the task is complete, use the send_order tool to evoke the harness to use the "submit_output" to submit the result to the user.
+Once you have confirmed the final output values for every required output field, call submit_output for each field and provided a summary of the work you did (no further tool call) -- that ends the task.
 """
 
 WORKER_SYSTEM = """
@@ -158,6 +169,27 @@ _GET_TOOL_CALL_DETAIL_SCHEMA = {
                 },
             },
             "required": ["call_id"],
+        },
+    },
+}
+
+# Mirrors the Agency MCP server's own submit_output tool schema
+# (agskill.py's _DEFAULT_HOST_MCP_TOOLS) verbatim -- the supervisor is the
+# one that calls this directly (see run_tandem_loop's docstring), never the
+# worker, since it's a host-side bookkeeping call (record one output
+# field's value), not sandbox execution.
+_SUBMIT_OUTPUT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_output",
+        "description": "Submit one required output field's value.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "description": "output field name"},
+                "value": {"description": "the field's value"},
+            },
+            "required": ["field", "value"],
         },
     },
 }
@@ -267,15 +299,7 @@ def run_tandem_loop(
     max_segments: int = _DEFAULT_MAX_SEGMENTS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
-    worker_output_instruction: "str | None" = None,
 ) -> TandemLoopResult:
-    # The skill's submit_output tool-usage instructions (exact required
-    # output field names/descriptions) -- the worker holds the tool, so
-    # this is appended to its own system prompt rather than left for the
-    # supervisor to (unreliably) paraphrase into each order's text.
-    worker_system = WORKER_SYSTEM
-    if worker_output_instruction:
-        worker_system = f"{WORKER_SYSTEM}\n\n{worker_output_instruction}"
     worker_totals = {"input": 0, "output": 0}
     segment_counter = {"n": 0}
     # The full, untruncated trace of the most recent send_order execution --
@@ -306,7 +330,7 @@ def run_tandem_loop(
             # invisible -- confirmed by inspecting an actual run's log.
             # Each segment gets its own fresh dispatch, so this reappears
             # once per segment.
-            {"role": "system", "content": worker_system},
+            {"role": "system", "content": WORKER_SYSTEM},
             {"role": "user", "content": f"[TANDEM WORKER segment {segment_index}] {order}"},
         ]
         result = run_react_loop(
@@ -352,6 +376,24 @@ def run_tandem_loop(
             {"error": f"no tool call with call_id={call_id!r} in the most recent trace"}
         )
 
+    supervisor_tool_schemas = [_SEND_ORDER_SCHEMA, _GET_TRACE_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
+    supervisor_dispatch_table = {
+        "send_order": send_order_handler,
+        "get_trace": get_trace_handler,
+        "get_tool_call_detail": get_tool_call_detail_handler,
+    }
+    if mcp is not None:
+        # Discover once up front, not lazily inside the lambda below: the
+        # supervisor may call submit_output as its very first action (there's
+        # nothing stopping it from doing so before any send_order), so
+        # McpToolset's tool_name -> server routing must already be populated
+        # by the time that first call happens.
+        mcp.discover()
+        supervisor_tool_schemas.append(_SUBMIT_OUTPUT_SCHEMA)
+        supervisor_dispatch_table["submit_output"] = lambda args_json: mcp.call(
+            "submit_output", args_json
+        )
+
     result = run_react_loop(
         messages,
         supervisor_model,
@@ -360,12 +402,12 @@ def run_tandem_loop(
         max_steps=max_segments,
         offload_dir=offload_dir,
         progress_path=progress_path,
-        tool_schemas=[_SEND_ORDER_SCHEMA, _GET_TRACE_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA],
-        dispatch_table={
-            "send_order": send_order_handler,
-            "get_trace": get_trace_handler,
-            "get_tool_call_detail": get_tool_call_detail_handler,
-        },
+        tool_schemas=supervisor_tool_schemas,
+        dispatch_table=supervisor_dispatch_table,
+        # submit_output is a real host tool call, not a synthetic
+        # control-flow action -- it goes through the same bridge policy
+        # check any other real tool call does, so it's deliberately left
+        # out of policy_exempt_tools.
         policy_exempt_tools=_SUPERVISOR_TOOL_NAMES,
         span_prefix="supervisor_turn",
         internal_kind=("tandem_supervisor" if bridge is not None else None),

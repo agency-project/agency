@@ -52,7 +52,6 @@ class TandemAdapter(NativeAdapter):
         resume_session_id: "str | None",
         prior_session_blob: "bytes | None",
         max_steps: "int | None",
-        output_instruction: "str | None" = None,
     ) -> AttemptResult:
         from .. import agharness
         from ..ptrace.supervisor import agProxyPtrace
@@ -119,12 +118,6 @@ class TandemAdapter(NativeAdapter):
                 argv += ["--supervisor-llm-base-url", ha.supervisor_base_url]
             if ha.supervisor_api_key:
                 argv += ["--supervisor-llm-api-key", ha.supervisor_api_key]
-            if output_instruction:
-                # The submit_output tool-usage block -- goes to the worker's
-                # own system prompt, since it's the worker that holds the
-                # tool, not the supervisor (see daemon.py's
-                # _render_attempt_prompt/_run_adapter_attempt).
-                argv += ["--worker-output-instruction", output_instruction]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
 
