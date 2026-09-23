@@ -32,6 +32,7 @@ class NativeProfiler:
         self.failed = False
         self.stack: "list[str]" = []
         self.process_identity: dict = {}
+        self._previous_profiler = None
 
     def _report_span(self, payload: dict) -> None:
         if self.failed:
@@ -59,6 +60,14 @@ class NativeProfiler:
             print(f"[agprof] native sample report failed: {exc}", file=sys.stderr)
 
     def __enter__(self):
+        # A nested run_react_loop call (a worker segment launched from within
+        # the supervisor's own turn) enters/exits its own NativeProfiler on
+        # this same bridge, so this must nest like a stack, not a flat
+        # assignment -- otherwise the worker's __exit__ would clobber the
+        # supervisor's still-in-flight self.bridge._profiler back to None,
+        # silently turning every later profile_span() in the outer loop into
+        # a no-op nullcontext() for the rest of the run.
+        self._previous_profiler = getattr(self.bridge, "_profiler", None)
         try:
             settings = self.bridge.profiler_settings()
             self.enabled = bool(settings.get("enabled"))
@@ -124,7 +133,7 @@ class NativeProfiler:
                     ]
                 )
         finally:
-            self.bridge._profiler = None
+            self.bridge._profiler = self._previous_profiler
 
     @contextmanager
     def span(self, name):
