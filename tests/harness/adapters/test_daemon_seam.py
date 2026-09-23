@@ -275,6 +275,75 @@ def test_native_idle_deadline_recovers_partial_output_from_progress_checkpoint(m
     assert result.output_tokens == 40
 
 
+def test_native_always_passes_a_session_id_even_when_not_resuming(monkeypatch):
+    """The adapter must know the session_id up front, not just learn it
+    from the subprocess's own stdout on a clean exit -- otherwise an
+    attempt that never gets that far (an idle timeout) leaves the adapter
+    with no id to recover a session under at all."""
+    sandbox = _NativeSandbox()
+    captured: dict = {}
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
+        _native_launch(captured, json.dumps({"result": "ok", "usage": {}})),
+    )
+
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
+        _runtime(sandbox=sandbox),
+        prompt="work",
+        resume_session_id=None,
+        prior_session_blob=None,
+        max_steps=1,
+    )
+
+    assert result.ok
+    argv = captured["argv"]
+    assert "--session-id" in argv
+    session_id = argv[argv.index("--session-id") + 1]
+    assert session_id  # a real, non-empty id, decided before launch
+
+
+def test_native_idle_deadline_also_recovers_the_session_for_resume(monkeypatch):
+    """Companion to the progress-checkpoint recovery test above: a session
+    file checkpointed under the pre-decided session_id must also come back
+    in the timed-out AttemptResult, since that's what engine.py's retry
+    loop needs to actually resume from instead of starting over blank."""
+    monkeypatch.setattr(native_module, "_DEFAULT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_module, "_PROGRESS_POLL_INTERVAL_S", 0.01)
+    sandbox = _NativeSandbox()
+
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+        scratch_dir = argv[argv.index("--session-dir") + 1]
+        session_id = argv[argv.index("--session-id") + 1]
+        sandbox.files[argv[argv.index("--progress-file") + 1]] = json.dumps({})
+        sandbox.files[native_module._session_file_path(scratch_dir, session_id)] = (
+            '{"messages": [{"role": "user", "content": "checkpointed mid-run"}]}'
+        )
+        return MagicMock(returncode=None)  # never exits within the test
+
+    monkeypatch.setattr(
+        "agency.utils.agutil.ensure_python_packages_locally", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("agency.harness.ptrace.supervisor.agProxyPtrace.launch", launch)
+    monkeypatch.setattr(
+        "agency.harness.agharness.cleanup_config_home_in_container", lambda *args: None
+    )
+
+    result = NativeAdapter(agconfig()).run_daemon_attempt(
+        _runtime(sandbox=sandbox),
+        prompt="work",
+        resume_session_id=None,
+        prior_session_blob=None,
+        max_steps=1,
+    )
+
+    assert result.ok
+    assert result.session_id
+    assert b"checkpointed mid-run" in result.session_blob
+
+
 def test_native_idle_deadline_resets_on_progress_and_still_reaches_real_completion(
     monkeypatch, tmp_path
 ):

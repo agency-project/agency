@@ -130,6 +130,13 @@ def main(argv: "list[str] | None" = None) -> int:
         max_steps=args.max_steps,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
+        # Checkpoints the session after every turn, not just on a clean
+        # finish -- so a host that kills this process mid-run (an idle
+        # timeout, say) still has a resumable session on disk, not just
+        # whatever `--resume`/`--session-id` it started with.
+        on_checkpoint=lambda msgs: session_store.save_session(
+            args.session_dir, session_id, args.model, msgs
+        ),
     )
 
     if result.status != "done":

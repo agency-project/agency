@@ -1,9 +1,12 @@
 """Tests for the pure replace/paginate algorithms in
 native_harness/tools.py, shared by that harness's edit/read tool
-dispatch."""
+dispatch; also the bash built-in's workdir/timeout handling (see
+TestBash -- both were silently ignored before)."""
 
 from __future__ import annotations
 
+import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,35 @@ from mcp.types import ImageContent, TextContent
 
 from agency.native_harness import tools
 from agency.native_harness.mcp_client import _decode_tool_result
+
+
+def _run_bash(**kwargs):
+    return json.loads(tools.TOOL_DISPATCH["bash"](json.dumps(kwargs)))
+
+
+class TestBash:
+    def test_honors_workdir(self, tmp_path):
+        result = _run_bash(command="pwd", workdir=str(tmp_path))
+        assert result["output"].strip() == str(tmp_path)
+        assert result["returncode"] == 0
+
+    def test_defaults_workdir_to_process_cwd_when_omitted(self):
+        result = _run_bash(command="pwd")
+        assert result["output"].strip() == os.getcwd()
+
+    def test_reports_a_clear_error_for_a_missing_workdir(self, tmp_path):
+        missing = str(tmp_path / "does-not-exist")
+        result = _run_bash(command="pwd", workdir=missing)
+        assert "error" in result
+        assert missing in result["error"]
+
+    def test_honors_a_custom_timeout(self):
+        result = _run_bash(command="sleep 5", timeout=1)
+        assert result == {"error": "command timed out after 1s"}
+
+    def test_without_a_timeout_uses_the_120s_default(self):
+        result = _run_bash(command="true")
+        assert result["returncode"] == 0
 
 
 class TestMcpToolResults:

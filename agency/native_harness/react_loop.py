@@ -19,7 +19,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from . import tools
 from .profiling import profile_run, span as profile_span
@@ -89,6 +89,7 @@ def run_react_loop(
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
+    on_checkpoint: "Callable[[list], None] | None" = None,
 ) -> ReactLoopResult:
     messages = list(messages)
     total_input_tokens = 0
@@ -139,6 +140,11 @@ def run_react_loop(
             _write_progress(
                 progress_path, messages, total_input_tokens, total_output_tokens, step + 1
             )
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint(messages)
+                except Exception:  # noqa: S110 - best-effort, same as _write_progress
+                    pass
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]

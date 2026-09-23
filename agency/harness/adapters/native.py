@@ -105,11 +105,18 @@ class NativeAdapter(HarnessAdapter):
         )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
         progress_path = f"{scratch_dir}/progress.json"
+        # Decided here, not left for the subprocess to invent internally --
+        # this way we always know which file to read a session out of,
+        # even from an attempt that never reaches its own clean exit (an
+        # idle timeout, say). Continuing a prior session keeps that same
+        # id; a fresh attempt still gets one up front rather than only
+        # learning it after the fact from the subprocess's own stdout.
+        session_id = resume_session_id or uuid.uuid4().hex
         handle = None
         try:
             if resume_session_id and prior_session_blob is not None:
                 sandbox.write_file_bytes(
-                    _session_file_path(scratch_dir, resume_session_id), prior_session_blob
+                    _session_file_path(scratch_dir, session_id), prior_session_blob
                 )
 
             mcp_config = agharness.mcp_config_for(
@@ -143,9 +150,14 @@ class NativeAdapter(HarnessAdapter):
                 offload_dir,
                 "--progress-file",
                 progress_path,
+                # Always passed now, resuming or not -- see session_id's
+                # own comment above. cli.py's _resolve_session() already
+                # treats --session-id and --resume identically (both just
+                # seed which id to look up), so this alone covers both
+                # cases; --resume is no longer needed.
+                "--session-id",
+                session_id,
             ]
-            if resume_session_id:
-                argv += ["--resume", resume_session_id]
 
             envp = {
                 "PATH": HARNESS_PATH,
@@ -172,7 +184,9 @@ class NativeAdapter(HarnessAdapter):
             while handle.returncode is None:
                 now = time.monotonic()
                 if now > deadline:
-                    return self._partial_result_from_progress(sandbox, progress_path)
+                    return self._partial_result_from_progress(
+                        sandbox, progress_path, scratch_dir=scratch_dir, session_id=session_id
+                    )
                 try:
                     mtime = os.stat(progress_path).st_mtime
                 except OSError:
@@ -199,15 +213,12 @@ class NativeAdapter(HarnessAdapter):
                 )
 
             payload = json.loads(stdout)
-            session_id = payload.get("session_id")
-            session_blob = None
-            if session_id:
-                try:
-                    session_blob = sandbox.read_file_bytes(
-                        _session_file_path(scratch_dir, session_id)
-                    )
-                except Exception:  # noqa: S110 - session persistence is best-effort
-                    session_blob = None
+            # session_id is ours from the start now (see above) -- no need
+            # to trust payload's own echo of it back.
+            try:
+                session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
+            except Exception:  # noqa: S110 - session persistence is best-effort
+                session_blob = None
 
             usage = payload.get("usage") or {}
             return AttemptResult(
@@ -229,7 +240,13 @@ class NativeAdapter(HarnessAdapter):
                 agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
 
     @staticmethod
-    def _partial_result_from_progress(sandbox, progress_path: str) -> AttemptResult:
+    def _partial_result_from_progress(
+        sandbox,
+        progress_path: str,
+        *,
+        scratch_dir: "str | None" = None,
+        session_id: "str | None" = None,
+    ) -> AttemptResult:
         """The react loop idled past its deadline with no completion signal.
         Recover whatever it last checkpointed instead of failing an attempt
         that may still be genuinely working -- mirrors the PTY-based
@@ -237,16 +254,32 @@ class NativeAdapter(HarnessAdapter):
         `harness/adapters/pty/execution.py`), since the underlying reason is
         the same: a step-driven completion signal that can arrive late (or
         not at all) is not evidence the run itself failed.
+
+        `scratch_dir`/`session_id` are the caller's own pre-decided id (see
+        run_daemon_attempt) and its on-disk session path -- known upfront
+        now, not just learned from the subprocess's own stdout on a clean
+        exit, so a session_id/session_blob is recoverable here too. Without
+        it, engine.py's output-schema retry loop has nothing to resume
+        from and starts the next attempt from scratch, silently dropping
+        everything the run had done so far.
         """
         try:
             progress = json.loads(sandbox.read_file_bytes(progress_path))
         except Exception:  # noqa: S110 - no checkpoint yet is not an error
             progress = {}
+        session_blob = None
+        if scratch_dir is not None and session_id is not None:
+            try:
+                session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
+            except Exception:  # noqa: S110 - no checkpoint yet is not an error
+                session_blob = None
         return AttemptResult(
             ok=True,
             final_text=progress.get("final_text", ""),
             input_tokens=progress.get("total_input_tokens", 0),
             output_tokens=progress.get("total_output_tokens", 0),
+            session_id=session_id if session_blob is not None else None,
+            session_blob=session_blob,
         )
 
     def register(self, app, router) -> None:
