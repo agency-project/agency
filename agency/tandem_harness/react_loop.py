@@ -17,21 +17,26 @@ external harness goes through. There is no separate "checkpoint" concept.
 supervisor's own turn-taking IS a `run_react_loop` call, just with its
 built-in tools/MCP discovery swapped out for a caller-supplied
 `tool_schemas`/`dispatch_table` (its synthetic control-flow actions --
-`send_order`, `get_trace`, `get_tool_call_detail` -- plus the one real
+`smart_tool`, `get_trace`, `get_tool_call_detail` -- plus the one real
 tool it keeps for itself, `submit_output`). Completion is the same
 implicit signal every ReAct loop here already uses
 -- a turn with no tool call -- so the supervisor needs no dedicated
 "finish" tool of its own. Each worker segment is a second, independent
-`run_react_loop` call (untouched built-ins) nested inside `send_order`'s
-own handler. `policy_exempt_tools` lets a synthetic control-flow action
-like `send_order` skip `bridge.check_tool_policy` entirely -- it never
-touches the sandbox, so there's nothing for that policy to admit or deny,
-and policy's fail-closed-on-unknown-tool default would otherwise block it
-for no reason. `span_prefix` keeps the two levels' per-turn spans
-distinguishable in one trace (`supervisor_turn{i}` vs.
-`worker_seg{i}_turn{j}`), and `internal_kind` is passed straight through to
-`llm.dispatch()` the same way `compaction.py`'s summarization call already
-tags itself, so the two models' spans can also be told apart by role."""
+`run_react_loop` call (built-ins plus `forward_tool_output`, layered on
+via `extra_tool_schemas`/`extra_dispatch_table` so it doesn't disturb MCP
+discovery) nested inside `smart_tool`'s own handler. `policy_exempt_tools`
+lets a synthetic control-flow action like `smart_tool` skip
+`bridge.check_tool_policy` entirely -- it never touches the sandbox, so
+there's nothing for that policy to admit or deny, and policy's
+fail-closed-on-unknown-tool default would otherwise block it for no
+reason. `span_prefix` keeps the two levels' per-turn spans distinguishable
+in one trace (`supervisor_turn{i}` vs. `worker_seg{i}_turn{j}`), and
+`internal_kind` is passed straight through to `llm.dispatch()` the same
+way `compaction.py`'s summarization call already tags itself, so the two
+models' spans can also be told apart by role. `call_id_results`, if given,
+is filled in with `{tool_call_id: result_content}` for every tool call
+this loop dispatches -- the worker's `forward_tool_output` handler reads
+straight from it rather than re-deriving anything from `messages`."""
 
 from __future__ import annotations
 
@@ -39,7 +44,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from . import tools
 from .profiling import profile_run, span as profile_span
@@ -111,9 +116,14 @@ def run_react_loop(
     progress_path: "str | None" = None,
     tool_schemas: "list[dict] | None" = None,
     dispatch_table: "dict | None" = None,
+    extra_tool_schemas: "list[dict] | None" = None,
+    extra_dispatch_table: "dict | None" = None,
     policy_exempt_tools: "set[str] | None" = None,
     span_prefix: str = "turn",
     internal_kind: "str | None" = None,
+    unknown_tool_hint: "str | None" = None,
+    call_id_results: "dict[str, str] | None" = None,
+    on_checkpoint: "Callable[[list], None] | None" = None,
 ) -> ReactLoopResult:
     messages = list(messages)
     total_input_tokens = 0
@@ -122,7 +132,7 @@ def run_react_loop(
     policy_exempt_tools = policy_exempt_tools or set()
 
     if tool_schemas is not None or dispatch_table is not None:
-        # Caller-supplied tool surface (the tandem supervisor's send_order)
+        # Caller-supplied tool surface (the tandem supervisor's smart_tool)
         # replaces the built-ins + MCP discovery entirely.
         dispatch_table = dict(dispatch_table or {})
         tool_schemas = list(tool_schemas or [])
@@ -139,6 +149,14 @@ def run_react_loop(
             tool_schemas.append(schema)
             have_tool.add(name)
             dispatch_table[name] = lambda args_json, _name=name: mcp.call(_name, args_json)
+
+    # Layered on top of either branch above (built-in+MCP or fully custom) --
+    # e.g. the worker's own forward_tool_output, added to its otherwise
+    # untouched built-in toolset without disturbing MCP discovery.
+    if extra_tool_schemas:
+        tool_schemas.extend(extra_tool_schemas)
+    if extra_dispatch_table:
+        dispatch_table.update(extra_dispatch_table)
 
     for step in range(max_steps):
         with profile_span(bridge, f"{span_prefix}{step}"):
@@ -171,6 +189,11 @@ def run_react_loop(
             _write_progress(
                 progress_path, messages, total_input_tokens, total_output_tokens, step + 1
             )
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint(messages)
+                except Exception:  # noqa: S110 - best-effort, same as _write_progress
+                    pass
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -179,7 +202,10 @@ def run_react_loop(
                 call_id = None
                 tool_duration_ns = None
                 if handler is None:
-                    result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
+                    error_message = f"You do not have access to the {fn_name} tool."
+                    if unknown_tool_hint:
+                        error_message += f" -- {unknown_tool_hint}"
+                    result_content = json.dumps({"error": error_message})
                 elif bridge is not None and fn_name not in policy_exempt_tools:
                     decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
                     call_id = decision.get("call_id")
@@ -220,6 +246,8 @@ def run_react_loop(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )
+                if call_id_results is not None:
+                    call_id_results[tc["id"]] = result_content
     return ReactLoopResult(
         status="error",
         messages=messages,

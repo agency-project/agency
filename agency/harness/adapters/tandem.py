@@ -67,11 +67,18 @@ class TandemAdapter(NativeAdapter):
         )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
         progress_path = f"{scratch_dir}/progress.json"
+        # Decided here, not left for the subprocess to invent internally --
+        # this way we always know which file to read a session out of,
+        # even from an attempt that never reaches its own clean exit (an
+        # idle timeout, say). Continuing a prior session keeps that same
+        # id; a fresh attempt still gets one up front rather than only
+        # learning it after the fact from the subprocess's own stdout.
+        session_id = resume_session_id or uuid.uuid4().hex
         handle = None
         try:
             if resume_session_id and prior_session_blob is not None:
                 sandbox.write_file_bytes(
-                    _session_file_path(scratch_dir, resume_session_id), prior_session_blob
+                    _session_file_path(scratch_dir, session_id), prior_session_blob
                 )
 
             mcp_config = agharness.mcp_config_for(
@@ -113,13 +120,18 @@ class TandemAdapter(NativeAdapter):
                 offload_dir,
                 "--progress-file",
                 progress_path,
+                # Always passed now, resuming or not -- see session_id's
+                # own comment above. cli.py's _resolve_session() already
+                # treats --session-id and --resume identically (both just
+                # seed which id to look up), so this alone covers both
+                # cases; --resume is no longer needed.
+                "--session-id",
+                session_id,
             ]
             if ha.supervisor_base_url:
                 argv += ["--supervisor-llm-base-url", ha.supervisor_base_url]
             if ha.supervisor_api_key:
                 argv += ["--supervisor-llm-api-key", ha.supervisor_api_key]
-            if resume_session_id:
-                argv += ["--resume", resume_session_id]
 
             envp = {
                 "PATH": HARNESS_PATH,
@@ -144,7 +156,9 @@ class TandemAdapter(NativeAdapter):
             while handle.returncode is None:
                 now = time.monotonic()
                 if now > deadline:
-                    return self._partial_result_from_progress(sandbox, progress_path)
+                    return self._partial_result_from_progress(
+                        sandbox, progress_path, scratch_dir=scratch_dir, session_id=session_id
+                    )
                 try:
                     mtime = os.stat(progress_path).st_mtime
                 except OSError:
@@ -163,15 +177,12 @@ class TandemAdapter(NativeAdapter):
                 )
 
             payload = json.loads(stdout)
-            session_id = payload.get("session_id")
-            session_blob = None
-            if session_id:
-                try:
-                    session_blob = sandbox.read_file_bytes(
-                        _session_file_path(scratch_dir, session_id)
-                    )
-                except Exception:  # noqa: S110 - session persistence is best-effort
-                    session_blob = None
+            # session_id is ours from the start now (see above) -- no need
+            # to trust payload's own echo of it back.
+            try:
+                session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
+            except Exception:  # noqa: S110 - session persistence is best-effort
+                session_blob = None
 
             usage = payload.get("usage") or {}
             return AttemptResult(

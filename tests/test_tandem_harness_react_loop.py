@@ -94,14 +94,14 @@ def test_max_steps_exhausted_preserves_transcript_of_the_executed_tool_call(tmp_
 
 def test_custom_tool_schemas_bypass_builtins_and_mcp(tmp_path):
     llm = _Llm([_final_response()])
-    custom_schema = [{"type": "function", "function": {"name": "send_order", "parameters": {}}}]
+    custom_schema = [{"type": "function", "function": {"name": "smart_tool", "parameters": {}}}]
 
     result = run_react_loop(
         [{"role": "user", "content": "start"}],
         "model",
         llm,
         tool_schemas=custom_schema,
-        dispatch_table={"send_order": lambda args: "{}"},
+        dispatch_table={"smart_tool": lambda args: "{}"},
         offload_dir=str(tmp_path),
     )
 
@@ -112,9 +112,43 @@ def test_custom_tool_schemas_bypass_builtins_and_mcp(tmp_path):
     assert "bash" not in names and "Bash" not in names
 
 
+def test_unknown_tool_error_carries_the_given_hint(tmp_path):
+    llm = _Llm([_tool_call_response(name="bash", arguments={"command": "ls"}), _final_response()])
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        tool_schemas=[{"type": "function", "function": {"name": "smart_tool", "parameters": {}}}],
+        dispatch_table={"smart_tool": lambda args: "{}"},
+        unknown_tool_hint="use smart_tool to run this instead",
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "done"
+    tool_result = json.loads(result.messages[2]["content"])
+    assert tool_result == {"error": "unknown tool: bash -- use smart_tool to run this instead"}
+
+
+def test_unknown_tool_error_has_no_hint_by_default(tmp_path):
+    llm = _Llm([_tool_call_response(name="bash", arguments={"command": "ls"}), _final_response()])
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        tool_schemas=[{"type": "function", "function": {"name": "smart_tool", "parameters": {}}}],
+        dispatch_table={"smart_tool": lambda args: "{}"},
+        offload_dir=str(tmp_path),
+    )
+
+    tool_result = json.loads(result.messages[2]["content"])
+    assert tool_result == {"error": "unknown tool: bash"}
+
+
 def test_policy_exempt_tools_skip_bridge_check(tmp_path):
     llm = _Llm(
-        [_tool_call_response(name="send_order", arguments={"order": "do it"}), _final_response()]
+        [_tool_call_response(name="smart_tool", arguments={"task": "do it"}), _final_response()]
     )
     handler_calls = []
 
@@ -123,14 +157,14 @@ def test_policy_exempt_tools_skip_bridge_check(tmp_path):
         "model",
         llm,
         bridge=_DenyingBridge(),
-        tool_schemas=[{"type": "function", "function": {"name": "send_order", "parameters": {}}}],
-        dispatch_table={"send_order": lambda args: handler_calls.append(args) or "{}"},
-        policy_exempt_tools={"send_order"},
+        tool_schemas=[{"type": "function", "function": {"name": "smart_tool", "parameters": {}}}],
+        dispatch_table={"smart_tool": lambda args: handler_calls.append(args) or "{}"},
+        policy_exempt_tools={"smart_tool"},
         offload_dir=str(tmp_path),
     )
 
     assert result.status == "done"
-    assert handler_calls == [json.dumps({"order": "do it"})]
+    assert handler_calls == [json.dumps({"task": "do it"})]
 
 
 def test_non_exempt_tool_still_goes_through_bridge_policy_check(tmp_path):
@@ -215,3 +249,104 @@ def test_builtin_path_is_unchanged_when_no_overrides_given(monkeypatch, tmp_path
     assert result.status == "done"
     assert result.final_text == "done"
     assert tool_events == [json.dumps({"command": "echo hi"})]
+
+
+def test_extra_tool_schemas_are_layered_onto_the_builtin_path(monkeypatch, tmp_path):
+    """extra_tool_schemas/extra_dispatch_table (the worker's own
+    forward_tool_output) must not disturb the built-in tools/MCP path --
+    both are available side by side."""
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    llm = _Llm(
+        [_tool_call_response(name="extra_tool", arguments={"x": 1}), _final_response("done")]
+    )
+    handler_calls = []
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        extra_tool_schemas=[
+            {"type": "function", "function": {"name": "extra_tool", "parameters": {}}}
+        ],
+        extra_dispatch_table={"extra_tool": lambda args: handler_calls.append(args) or "{}"},
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "done"
+    assert handler_calls == [json.dumps({"x": 1})]
+    sent_names = {schema["function"]["name"] for schema in llm.requests[0][2]}
+    assert {"bash", "extra_tool"} <= sent_names
+
+
+def test_call_id_results_is_populated_for_every_dispatched_tool_call(tmp_path):
+    llm = _Llm([_tool_call_response(name="bash", arguments={"command": "ls"}), _final_response()])
+    call_id_results: dict = {}
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        tool_schemas=[{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+        dispatch_table={"bash": lambda args: json.dumps({"files": ["a.py"]})},
+        call_id_results=call_id_results,
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "done"
+    assert call_id_results == {"call-0": json.dumps({"files": ["a.py"]})}
+
+
+def test_on_checkpoint_fires_after_every_step_with_the_running_transcript(tmp_path):
+    """A host that kills this process mid-run (an idle timeout, say) needs
+    a way to persist the session as it goes, not just once at a clean
+    finish -- on_checkpoint is that hook. Must fire on every non-final step
+    (mirrors _write_progress, called from the same spot), and each call
+    must see that step's own tool call already appended."""
+    llm = _Llm(
+        [
+            _tool_call_response(name="bash", arguments={"command": "one"}),
+            _tool_call_response(name="bash", arguments={"command": "two"}),
+            _final_response(),
+        ]
+    )
+    checkpoints: "list[list]" = []
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        tool_schemas=[{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+        dispatch_table={"bash": lambda args: "{}"},
+        on_checkpoint=lambda messages: checkpoints.append(copy.deepcopy(messages)),
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "done"
+    # Once per tool-calling step -- not on the final, toolless step, whose
+    # completion is handled by the caller's own explicit save instead.
+    assert len(checkpoints) == 2
+    assert checkpoints[0][-1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
+        {"command": "one"}
+    )
+    assert checkpoints[1][-1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
+        {"command": "two"}
+    )
+
+
+def test_on_checkpoint_failure_does_not_interrupt_the_loop(tmp_path):
+    """Best-effort, same as _write_progress -- a broken session save must
+    never itself break the actual task."""
+    llm = _Llm([_tool_call_response(arguments={"command": "one"}), _final_response()])
+
+    def blows_up(_messages):
+        raise RuntimeError("disk full")
+
+    result = run_react_loop(
+        [{"role": "user", "content": "start"}],
+        "model",
+        llm,
+        on_checkpoint=blows_up,
+        offload_dir=str(tmp_path),
+    )
+
+    assert result.status == "done"
