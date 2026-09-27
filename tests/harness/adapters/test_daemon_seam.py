@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agency.configs.agconfig import agconfig
+from agency.configs.agconfig import agconfig, agentconfig, harnessadapterconfig
 from agency.harness.adapters.base import AdapterRuntime, HarnessAdapter
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 from agency.harness.adapters.codex import CodexAdapter
@@ -17,6 +17,7 @@ from agency.harness.adapters.grok import GrokAdapter
 from agency.harness.adapters import native as native_module
 from agency.harness.adapters.native import NativeAdapter
 from agency.harness.adapters.opencode import OpenCodeAdapter
+from agency.harness.adapters.tandem import TandemAdapter
 
 
 def _runtime(*, sandbox=None) -> AdapterRuntime:
@@ -392,6 +393,61 @@ def test_native_idle_deadline_resets_on_progress_and_still_reaches_real_completi
         thread.join(timeout=2)
     assert result.ok
     assert result.final_text == "finished for real"
+
+
+def test_tandem_adapter_raises_if_the_runtime_agconfig_lost_the_supervisor_model(monkeypatch):
+    monkeypatch.setattr("agency.utils.agutil.ensure_python_packages_locally", lambda *a, **k: None)
+    cfg = agconfig(
+        harnessadapterconfig(supervisor_model="sonnet-5"),
+        agentconfig(harness="tandem"),
+    )
+    adapter = TandemAdapter(cfg)
+    runtime = _runtime(sandbox=_NativeSandbox())
+    with pytest.raises(ValueError, match="supervisor_model"):
+        adapter.run_daemon_attempt(
+            runtime, prompt="x", resume_session_id=None, prior_session_blob=None, max_steps=4
+        )
+
+
+def test_tandem_adapter_points_the_supervisor_at_the_in_container_loopback_route(monkeypatch):
+    monkeypatch.setattr("agency.utils.agutil.ensure_python_packages_locally", lambda *a, **k: None)
+    captured: dict = {}
+    monkeypatch.setattr(
+        "agency.harness.ptrace.supervisor.agProxyPtrace.launch",
+        _native_launch(captured, json.dumps({"result": "tandem-ok", "usage": {}})),
+    )
+    cfg = agconfig(
+        harnessadapterconfig(
+            supervisor_model="sonnet-5",
+            supervisor_base_url="https://real-provider.example/v1",
+            supervisor_api_key="real-secret",
+        ),
+        agentconfig(harness="tandem"),
+    )
+    adapter = TandemAdapter(cfg)
+    runtime = AdapterRuntime(
+        agconfig=cfg,
+        model="worker-model",
+        engine_name="test-agent",
+        harness_base_url="http://127.0.0.1:8766",
+        token="test-token",
+        syscall_policy=object(),
+        sandbox=_NativeSandbox(),
+    )
+
+    result = adapter.run_daemon_attempt(
+        runtime, prompt="x", resume_session_id=None, prior_session_blob=None, max_steps=4
+    )
+
+    assert result.ok
+    argv = captured["argv"]
+    assert (
+        argv[argv.index("--supervisor-llm-base-url") + 1]
+        == f"{runtime.harness_base_url}/supervisor"
+    )
+    assert argv[argv.index("--supervisor-llm-api-key") + 1] == runtime.token
+    assert "real-secret" not in argv
+    assert "https://real-provider.example/v1" not in argv
 
 
 def test_native_adapter_launches_through_typed_runtime(monkeypatch):

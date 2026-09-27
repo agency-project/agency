@@ -79,6 +79,8 @@ class HostServerManager:
     ) -> None:
         from ...observability.profiler import agprof
 
+        from ...llm.usage_tracker import LlmUsageTracker
+
         agprof.register_engine(getattr(agent, "harness", "unknown"))
         self._ensure_runtime_configs(agent.agconfig)
         self._data_logger = agent.data_logger
@@ -90,6 +92,19 @@ class HostServerManager:
             request_id=request_id,
             skill_name=skill.name,
         )
+        self._llm_handler_server_supervisor: "LlmHandlerServer | None" = None
+        if (
+            getattr(agent, "harness", None) == "tandem"
+            and agent.agconfig.harness_adapter.supervisor_model
+        ):
+            self._llm_handler_server_supervisor = LlmHandlerServer(
+                type(self)._supervisor_agconfig(agent.agconfig),
+                self._data_logger,
+                LlmUsageTracker(),
+                parent_context=agprof.current_span_context(),
+                request_id=request_id,
+                skill_name=skill.name,
+            )
         self._interaction_server = HostInteractionServer(
             skill,
             self._data_logger,
@@ -142,10 +157,27 @@ class HostServerManager:
     def llm_handler_server(self) -> "LlmHandlerServer":
         return self._llm_handler_server
 
+    @property
+    def llm_handler_server_supervisor(self) -> "LlmHandlerServer | None":
+        return self._llm_handler_server_supervisor
+
+    @staticmethod
+    def _supervisor_agconfig(agconfig: "agconfig_cls") -> "agconfig_cls":
+        supervisor_agconfig = agconfig.clone()
+        ha = agconfig.harness_adapter
+        supervisor_agconfig.llm.model = ha.supervisor_model
+        if ha.supervisor_base_url:
+            supervisor_agconfig.llm.base_url = ha.supervisor_base_url
+        if ha.supervisor_api_key:
+            supervisor_agconfig.llm.api_key = ha.supervisor_api_key
+        return supervisor_agconfig
+
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._ensure_runtime_configs(agconfig)
         self._configs = agconfig
         self._llm_handler_server.change_config(agconfig)
+        if self._llm_handler_server_supervisor is not None:
+            self._llm_handler_server_supervisor.change_config(self._supervisor_agconfig(agconfig))
 
     def bind_attempt_token(self, token: str) -> None:
         """Authorize exactly one in-flight harness attempt."""
@@ -255,6 +287,11 @@ class HostServerManager:
                     "/interaction",
                     self._interaction_server.build_app(),
                 ),
+                *(
+                    [("/llm_supervisor", self._llm_handler_server_supervisor.build_app())]
+                    if self._llm_handler_server_supervisor is not None
+                    else []
+                ),
                 # MCP's Streamable HTTP app defines the exact route /mcp.
                 # Mount it last at the root so that route remains /mcp rather
                 # than becoming /mcp/mcp or redirecting to /mcp/.
@@ -334,6 +371,8 @@ class HostServerManager:
             # allowing Uvicorn's graceful shutdown to drain their ASGI leases.
             try:
                 self._llm_handler_server.stop()
+                if self._llm_handler_server_supervisor is not None:
+                    self._llm_handler_server_supervisor.stop()
             except BaseException as exc:
                 llm_error = exc
                 from ...utils.agutil import format_exception

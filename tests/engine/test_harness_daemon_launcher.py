@@ -300,7 +300,10 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
     )
 
     assert launcher._daemon_config(config) == {
-        "harness_adapter": {"binary_path": "/bin/claude"},
+        "harness_adapter": {
+            "binary_path": "/bin/claude",
+            "supervisor_model": None,
+        },
         "sandbox": {"checkpoint_fast_resume": False, "harness_python_path": None},
         "ptrace": {
             "syscalls": list(agconfig().ptrace.syscalls),
@@ -309,6 +312,22 @@ def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
             "disable_harness_native_sandbox": True,
         },
     }
+
+
+def test_daemon_config_forwards_tandem_supervisor_model_but_not_its_secrets():
+    config = agconfig(
+        harnessadapterconfig(
+            supervisor_model="claude-sonnet-5",
+            supervisor_base_url="https://router.example.com/v1",
+            supervisor_api_key="supervisor-secret",
+        ),
+        agentconfig(harness="tandem"),
+    )
+
+    result = launcher._daemon_config(config)["harness_adapter"]
+    assert result["supervisor_model"] == "claude-sonnet-5"
+    assert "supervisor_base_url" not in result
+    assert "supervisor_api_key" not in result
 
 
 @pytest.mark.parametrize("harness", ["claude_code", "codex", "grok", "opencode"])

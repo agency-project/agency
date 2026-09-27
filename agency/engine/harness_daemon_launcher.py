@@ -90,11 +90,11 @@ def _container_socket_path(host_path: Path) -> str:
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
     if agconfig is None:
         return {}
-    # The daemon needs harness/ptrace knobs, not host credentials or live
-    # Python objects. Keeping this allow-list narrow also keeps secrets out
-    # of the detached process command line.
     return {
-        "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
+        "harness_adapter": {
+            "binary_path": agconfig.harness_adapter.binary_path,
+            "supervisor_model": agconfig.harness_adapter.supervisor_model,
+        },
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),
             "file_access": agconfig.ptrace.file_access,

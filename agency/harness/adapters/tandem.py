@@ -10,11 +10,12 @@ Subclasses `NativeAdapter` rather than duplicating it wholesale: the wire
 format between this adapter and its own subprocess
 (`/v1/chat/completions`, OpenAI-compatible chat-completions) is identical
 to native's, since `tandem_harness/llm_client.py` is byte-for-byte the same
-dispatch client -- so `register()`/`_format_context_harness_to_agency()`/
+dispatch client -- so `_format_context_harness_to_agency()`/
 `_format_context_agency_to_harness()`/`_format_agency_stream_to_harness()`
-are inherited unchanged. Only `run_daemon_attempt()` differs, since it
-launches `tandem_harness.cli` with two models (`--worker-model`/
-`--supervisor-model`) instead of `native_harness.cli`'s single `--model`.
+are inherited unchanged. `run_daemon_attempt()` differs since it launches
+`tandem_harness.cli` with two models (`--worker-model`/`--supervisor-model`)
+instead of `native_harness.cli`'s single `--model`, and `register()` adds
+a second route forwarding to the host's `/llm_supervisor` handler.
 """
 
 from __future__ import annotations
@@ -25,8 +26,12 @@ import sys
 import time
 import uuid
 
+from fastapi import Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
 from .base import AdapterRuntime, AttemptResult
 from .native import NativeAdapter
+from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
 # Same activity-driven idle deadline as native.py -- see that module's own
@@ -89,6 +94,13 @@ class TandemAdapter(NativeAdapter):
             pkg_pythonpath = f"{AGENCY_PACKAGE_CONTAINER_MOUNT}/agency"
 
             ha = runtime.agconfig.harness_adapter
+            if not ha.supervisor_model:
+                raise ValueError(
+                    "tandem harness_adapter.supervisor_model is unset -- refusing to launch a "
+                    "'tandem' attempt that would silently run the worker model for both roles"
+                )
+            if not runtime.model:
+                raise ValueError("tandem runtime.model (worker model) is unset")
             argv = [
                 sys.executable,
                 "-m",
@@ -99,9 +111,9 @@ class TandemAdapter(NativeAdapter):
                 # already gets (agconfig.agent.model) -- tandem treats it as
                 # the worker model, the one that actually calls tools.
                 "--worker-model",
-                runtime.model or "",
+                runtime.model,
                 "--supervisor-model",
-                ha.supervisor_model or "",
+                ha.supervisor_model,
                 "--segment-step-cap",
                 str(ha.segment_step_cap),
                 "--max-steps",
@@ -127,11 +139,11 @@ class TandemAdapter(NativeAdapter):
                 # cases; --resume is no longer needed.
                 "--session-id",
                 session_id,
+                "--supervisor-llm-base-url",
+                f"{runtime.harness_base_url}/supervisor",
+                "--supervisor-llm-api-key",
+                runtime.token,
             ]
-            if ha.supervisor_base_url:
-                argv += ["--supervisor-llm-base-url", ha.supervisor_base_url]
-            if ha.supervisor_api_key:
-                argv += ["--supervisor-llm-api-key", ha.supervisor_api_key]
 
             envp = {
                 "PATH": HARNESS_PATH,
@@ -199,6 +211,31 @@ class TandemAdapter(NativeAdapter):
                     handle.close()
             finally:
                 agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
+
+    def register(self, app, router) -> None:
+        super().register(app, router)
+
+        @app.post("/supervisor/v1/chat/completions")
+        async def supervisor_chat_completions(request: Request):
+            token = extract_bearer_token(request)
+            if not token or not router.validate_token(token):
+                return JSONResponse(
+                    {"error": {"message": "unknown or missing bearer token"}}, status_code=401
+                )
+            body = await request.json()
+            model = router.resolve_model(token, mount="llm_supervisor")
+            agency_context = self._format_context_harness_to_agency(body)
+            if body.get("stream"):
+
+                def gen():
+                    yield from self._format_agency_stream_to_harness(
+                        router.dispatch_stream(token, agency_context, mount="llm_supervisor"),
+                        model,
+                    )
+
+                return StreamingResponse(gen(), media_type="text/event-stream")
+            agency_response = router.dispatch(token, agency_context, mount="llm_supervisor")
+            return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
 
 __all__ = ["TandemAdapter"]

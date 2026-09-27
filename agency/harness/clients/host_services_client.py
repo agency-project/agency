@@ -109,17 +109,17 @@ class HostServicesClient:
             timeout=self._timeout_s,
         )
 
-    def resolve_model(self, token: str) -> str:
-        resp = self.client.get("/llm/resolve_model", headers=self._attempt_headers(token))
+    def resolve_model(self, token: str, *, mount: str = "llm") -> str:
+        resp = self.client.get(f"/{mount}/resolve_model", headers=self._attempt_headers(token))
         resp.raise_for_status()
         return resp.json()["model"]
 
-    def context_limit(self, token: str) -> "int | None":
+    def context_limit(self, token: str, *, mount: str = "llm") -> "int | None":
         """This agent's model's context window, for a caller that runs its
         own ReAct loop and needs to know when to compact (native_harness's
         `compaction.py`)."""
         try:
-            resp = self.client.get("/llm/context_limit", headers=self._attempt_headers(token))
+            resp = self.client.get(f"/{mount}/context_limit", headers=self._attempt_headers(token))
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
@@ -222,9 +222,9 @@ class HostServicesClient:
         )
         response.raise_for_status()
 
-    def dispatch(self, token: str, agency_context: dict) -> dict:
+    def dispatch(self, token: str, agency_context: dict, *, mount: str = "llm") -> dict:
         resp = self.client.post(
-            "/llm/dispatch",
+            f"/{mount}/dispatch",
             json=agency_context,
             headers=self._attempt_headers(token),
         )
@@ -232,10 +232,10 @@ class HostServicesClient:
             raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
         return resp.json()
 
-    def dispatch_stream(self, token: str, agency_context: dict):
+    def dispatch_stream(self, token: str, agency_context: dict, *, mount: str = "llm"):
         with self.client.stream(
             "POST",
-            "/llm/dispatch",
+            f"/{mount}/dispatch",
             json={**agency_context, "stream": True},
             headers=self._attempt_headers(token),
         ) as resp:

@@ -10,12 +10,9 @@ the identical command from their own bash prompt with no agency involved
 at all.
 
 **Two models, one endpoint by default**: `--supervisor-model`/
-`--worker-model` are both dispatched through the SAME resolved LLM
-endpoint (bridged or standalone -- see below) unless
-`--supervisor-llm-base-url`/`--supervisor-llm-api-key` are given to point
-the supervisor at a genuinely different provider. This is what lets one
-litellm-routed bridge serve both a large supervisor model and a small
-worker model with no extra plumbing in the common case.
+`--worker-model` share one connection unless `--supervisor-llm-base-url`/
+`--supervisor-llm-api-key` point the supervisor elsewhere.
+`harness/adapters/tandem.py` always supplies a distinct one.
 
 **Two configurations, same code path** (see `llm_client.py`'s docstring):
 - Bridged (launched by agency): `--bridge-base-url`/`--bridge-token` point
@@ -133,7 +130,15 @@ def _resolve_supervisor_llm(
     base_url = args.supervisor_llm_base_url or worker_base_url
     api_key = args.supervisor_llm_api_key or worker_api_key
     if base_url == worker_base_url and api_key == worker_api_key:
-        return worker_llm  # same endpoint -- share the connection, just dispatch a different model
+        if args.supervisor_model != args.worker_model:
+            raise SystemExit(
+                f"supervisor model {args.supervisor_model!r} differs from worker model "
+                f"{args.worker_model!r} but no distinct --supervisor-llm-base-url/"
+                "--supervisor-llm-api-key was given: a shared bridged connection always "
+                "dispatches under the agent's single configured model, so this would silently "
+                "run the worker model under the supervisor's name"
+            )
+        return worker_llm
     return LLMClient(base_url, api_key)
 
 
@@ -151,7 +156,12 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 
 
 def main(argv: "list[str] | None" = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if not args.supervisor_model:
+        parser.error("--supervisor-model must not be empty")
+    if not args.worker_model:
+        parser.error("--worker-model must not be empty")
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     worker_llm = LLMClient(llm_base_url, llm_api_key)

@@ -479,3 +479,55 @@ def test_start_serves_the_mounted_mcp_server_without_a_lifespan_error():
         manager.stop()
         Path(uds_path).unlink(missing_ok=True)
         Path(db_path).unlink(missing_ok=True)
+
+
+def test_tandem_agent_gets_a_second_llm_handler_for_the_supervisor(tmp_path):
+    from agency.configs.agconfig import harnessadapterconfig, agentconfig
+
+    cfg = agconfig(
+        llmconfig(model="worker-model", base_url="http://x/v1"),
+        harnessadapterconfig(supervisor_model="supervisor-model"),
+        agentconfig(harness="tandem"),
+        hostserverconfig(uds_path=str(tmp_path / "host.sock")),
+        dataloggerconfig(db_path=str(tmp_path / "agent.db")),
+    )
+    agent = SimpleNamespace(
+        agname="agent-1",
+        agconfig=cfg,
+        harness="tandem",
+        data_logger=agDataLogger(cfg),
+        llm_usage_tracker=LlmUsageTracker(),
+    )
+    sandbox = SimpleNamespace(
+        ensure_gpu_acquired=lambda _agname, *, is_cancelled: None,
+        current_gpu_ids=lambda: None,
+    )
+    skill = agskill(name="s", prompt="p", policy=agpolicy())
+    manager = HostServerManager(agent, sandbox, skill, SimpleNamespace())
+    assert manager.llm_handler_server_supervisor is not None
+    assert manager.llm_handler_server_supervisor._backend.model == "supervisor-model"
+    assert manager.llm_handler_server._backend.model == "worker-model"
+    try:
+        manager.start()
+        attempt_token = "current-attempt"
+        manager.bind_attempt_token(attempt_token)
+        with httpx2.Client(
+            transport=httpx2.HTTPTransport(uds=cfg.host_server.uds_path),
+            base_url="http://localhost",
+        ) as client:
+            resp = client.get(
+                "/llm_supervisor/resolve_model",
+                headers={ATTEMPT_TOKEN_HEADER: attempt_token},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["model"] == "supervisor-model"
+
+            resp = client.get("/llm/resolve_model", headers={ATTEMPT_TOKEN_HEADER: attempt_token})
+            assert resp.json()["model"] == "worker-model"
+    finally:
+        manager.stop()
+
+
+def test_non_tandem_agent_gets_no_second_llm_handler(tmp_path):
+    manager, _, _ = _make_manager(tmp_path, harness="claude_code")
+    assert manager.llm_handler_server_supervisor is None

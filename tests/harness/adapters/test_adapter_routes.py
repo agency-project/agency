@@ -13,6 +13,7 @@ from agency.harness.adapters.codex import CodexAdapter
 from agency.harness.adapters.grok import GrokAdapter
 from agency.harness.adapters.native import NativeAdapter
 from agency.harness.adapters.opencode import OpenCodeAdapter
+from agency.harness.adapters.tandem import TandemAdapter
 
 
 @pytest.mark.parametrize(
@@ -44,6 +45,8 @@ def test_external_stream_only_emits_authoritative_text_after_redirect(backend_cl
         (GrokAdapter, "/v1/chat/completions"),
         (NativeAdapter, "/v1/chat/completions"),
         (OpenCodeAdapter, "/v1/chat/completions"),
+        (TandemAdapter, "/v1/chat/completions"),
+        (TandemAdapter, "/supervisor/v1/chat/completions"),
     ],
 )
 def test_registered_adapter_routes_inject_fastapi_request(backend_cls, path):
@@ -56,6 +59,41 @@ def test_registered_adapter_routes_inject_fastapi_request(backend_cls, path):
 
     assert response.status_code == 401
     assert "unknown or missing bearer token" in response.text
+
+
+def test_tandem_supervisor_route_dispatches_through_the_llm_supervisor_mount():
+    app = FastAPI()
+    calls: list = []
+    bridge = SimpleNamespace(
+        validate_token=lambda _token: True,
+        resolve_model=lambda _token, mount="llm": (
+            calls.append(("resolve_model", mount)) or "supervisor-model"
+        ),
+        dispatch=lambda _token, _ctx, mount="llm": (
+            calls.append(("dispatch", mount))
+            or {"message": {"role": "assistant", "blocks": []}, "usage": {}}
+        ),
+    )
+    TandemAdapter(agconfig()).register(app, bridge)
+
+    with TestClient(app) as client:
+        worker_resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": []},
+            headers={"Authorization": "Bearer t"},
+        )
+        supervisor_resp = client.post(
+            "/supervisor/v1/chat/completions",
+            json={"messages": []},
+            headers={"Authorization": "Bearer t"},
+        )
+
+    assert worker_resp.status_code == 200
+    assert supervisor_resp.status_code == 200
+    assert ("resolve_model", "llm") in calls
+    assert ("dispatch", "llm") in calls
+    assert ("resolve_model", "llm_supervisor") in calls
+    assert ("dispatch", "llm_supervisor") in calls
 
 
 @pytest.mark.parametrize("stream", [False, True])
