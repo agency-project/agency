@@ -113,13 +113,16 @@ class HostMcpServer:
                     if var_name not in self._persistent_vars:
                         self._persistent_vars[var_name] = factory()
                     persistent[var_name] = self._persistent_vars[var_name]
-            return tool(
-                agdata(**kwargs),
-                sandbox=self._sandbox,
-                resource_pool=self._resource_pool,
-                output_schema=self._skill.output_schema,
-                **persistent,
-            ).to_dict()
+            # This runs on an MCP worker thread while the engine's thread holds
+            # the sandbox for the whole run; joining lets the tool use it.
+            with self._sandbox.join_transaction():
+                return tool(
+                    agdata(**kwargs),
+                    sandbox=self._sandbox,
+                    resource_pool=self._resource_pool,
+                    output_schema=self._skill.output_schema,
+                    **persistent,
+                ).to_dict()
 
         call_tool.__name__ = tool.name
         call_tool.__signature__ = inspect.Signature(

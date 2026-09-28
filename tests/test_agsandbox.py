@@ -174,6 +174,7 @@ def test_public_facade_operation_uses_shared_lock(operation, args):
     sandbox._agname = "lock-test"
     sandbox._destroyed = operation != "destroy"
     sandbox._lock = threading.RLock()
+    sandbox._reset_transaction_state()
     sandbox._backend = MagicMock()
 
     attempted = threading.Event()

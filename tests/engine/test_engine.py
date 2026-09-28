@@ -105,6 +105,12 @@ class _FakeSandbox:
         self.discard_error = None
         self.commit_callback = None
 
+    def begin_transaction(self):
+        self._lock.acquire()
+
+    def end_transaction(self):
+        self._lock.release()
+
     def commit(self):
         assert self._lock.held
         self.events.append("commit")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,9 @@ class _FakeSandbox:
         self._gpu_count_requested = 0
         self._gpu_acquire_fn = None
         self._gpu_release_fn = None
+
+    def join_transaction(self):
+        return nullcontext()
 
     def update_limits(self, cpus=None, memory=None):
         self.last_update = (cpus, memory)
@@ -78,7 +82,7 @@ class _FakeDataLogger:
 
 
 def _make_server(add_host_mcp_tools=None, sandbox=None, resource_pool=None, output_schema=None):
-    sandbox = sandbox if sandbox is not None else SimpleNamespace()
+    sandbox = sandbox if sandbox is not None else SimpleNamespace(join_transaction=nullcontext)
     resource_pool = resource_pool if resource_pool is not None else SimpleNamespace()
     skill = agskill(
         name="s",
@@ -241,7 +245,7 @@ def test_call_tool_does_not_check_policy_itself():
         params={"type": "object", "properties": {}},
         fn=lambda d: calls.append("ran") or agdata(ok=True),
     )
-    sandbox = SimpleNamespace()
+    sandbox = SimpleNamespace(join_transaction=nullcontext)
     resource_pool = SimpleNamespace()
     from agency.agpolicy import agpolicy
 
@@ -520,7 +524,7 @@ def test_host_tool_receives_the_servers_sandbox_and_resource_pool_as_context():
         return agdata(ok=True)
 
     probe_tool = agtool(name="probe", description="d", fn=_probe)
-    sandbox = SimpleNamespace(marker="sandbox")
+    sandbox = SimpleNamespace(marker="sandbox", join_transaction=nullcontext)
     resource_pool = SimpleNamespace(marker="resource_pool")
     server, sandbox, resource_pool = _make_server(
         add_host_mcp_tools=[probe_tool], sandbox=sandbox, resource_pool=resource_pool

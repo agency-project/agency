@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -92,7 +92,9 @@ def sandbox_manager(request):
             llm_usage_tracker=LlmUsageTracker(),
         )
         skill = agskill("host", "test", add_host_mcp_tools=[agtool("host_probe", "", host_tool)])
-        host = HostServerManager(agent, SimpleNamespace(), skill, SimpleNamespace())
+        host = HostServerManager(
+            agent, SimpleNamespace(join_transaction=nullcontext), skill, SimpleNamespace()
+        )
         process = ctx.Process(
             target=_serve_manager, args=(directory, ready, release, stop, request.param)
         )

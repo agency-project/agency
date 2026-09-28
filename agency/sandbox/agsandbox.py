@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import threading
 import weakref
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -76,6 +77,7 @@ class agSandbox:
         # AgentEngine holds this for a complete execution so two agents sharing
         # this facade cannot interleave harness or teardown operations.
         self._lock = threading.RLock()
+        self._reset_transaction_state()
         self._destroyed = False
         # Cloned so this sandbox's own agconfig is independent of the
         # caller's -- mutating the caller's original agconfig afterward does
@@ -307,81 +309,144 @@ class agSandbox:
         # threading.RLock is not picklable. A lock is process-local, so there is
         # nothing meaningful to carry if a caller explicitly serializes a sandbox.
         state = self.__dict__.copy()
-        del state["_lock"]
+        for key in ("_lock", "_guest_lock", "_guest_threads", "_transaction_owner"):
+            del state[key]
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self._lock = threading.RLock()
+        self._reset_transaction_state()
+
+    # ------------------------------------------------------------------
+    # Transactions. AgentEngine.execute() holds the sandbox for a whole run,
+    # but a host tool invoked during that run executes on an MCP server worker
+    # thread, not the owner's -- and an RLock only re-enters for the thread
+    # that holds it, so without an explicit hand-off that tool's first
+    # sandbox.exec() waits forever on a lock its own caller holds.
+    # ------------------------------------------------------------------
+
+    def _reset_transaction_state(self) -> None:
+        self._transaction_owner: "threading.Thread | None" = None
+        self._transaction_depth = 0
+        self._guest_lock = threading.Lock()
+        self._guest_threads: "set[threading.Thread]" = set()
+
+    def begin_transaction(self) -> None:
+        """Hold this sandbox for the calling thread until end_transaction()."""
+        self._lock.acquire()
+        with self._guest_lock:
+            self._transaction_owner = threading.current_thread()
+            self._transaction_depth += 1
+
+    def end_transaction(self) -> None:
+        with self._guest_lock:
+            self._transaction_depth -= 1
+            if self._transaction_depth == 0:
+                self._transaction_owner = None
+                # Not waited out: a guest can block indefinitely (ask_human, a
+                # hung tool), and teardown must not. Any guest still running
+                # takes the lock like everyone else from its next operation on.
+                self._guest_threads.clear()
+        self._lock.release()
+
+    @contextmanager
+    def join_transaction(self):
+        """Run the body as a guest of the transaction open on this sandbox, if any.
+
+        Guests are not serialized with each other: they belong to the same run,
+        and host tools are expected to run concurrently. With no open
+        transaction, or on the owner's own thread, this is a no-op.
+        """
+        me = threading.current_thread()
+        with self._guest_lock:
+            admitted = (
+                self._transaction_owner is not None
+                and self._transaction_owner is not me
+                and me not in self._guest_threads
+            )
+            if admitted:
+                self._guest_threads.add(me)
+        try:
+            yield
+        finally:
+            if admitted:
+                with self._guest_lock:
+                    self._guest_threads.discard(me)
+
+    def _guard(self):
+        if threading.current_thread() in self._guest_threads:
+            return nullcontext()
+        return self._lock
 
     # ------------------------------------------------------------------
     # Sandboxing operations -- all forwarded straight to the backend.
     # ------------------------------------------------------------------
 
     def _container_exec(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             return self._backend._container_exec(*args, **kwargs)
 
     def exec(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:exec"):
                 return self._backend.exec(*args, **kwargs)
 
     def exec_detached(self, *args, **kwargs) -> None:
-        with self._lock:
+        with self._guard():
             return self._backend.exec_detached(*args, **kwargs)
 
     def read_file(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:read_file"):
                 return self._backend.read_file(*args, **kwargs)
 
     def read_file_bytes(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:read_file_bytes"):
                 return self._backend.read_file_bytes(*args, **kwargs)
 
     def write_file(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:write_file"):
                 return self._backend.write_file(*args, **kwargs)
 
     def write_file_bytes(self, *args, **kwargs):
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:write_file_bytes"):
                 return self._backend.write_file_bytes(*args, **kwargs)
 
     def update_limits(self, *args, **kwargs) -> None:
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:update_limits"):
                 self._backend.update_limits(*args, **kwargs)
 
     def commit(self, *args, **kwargs) -> bool:
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:commit"):
                 return self._backend.commit(*args, **kwargs)
 
     def checkpoint(self):
         """Capture a container checkpoint at an idle boundary and return its handle."""
-        with self._lock:
+        with self._guard():
             return self._backend.checkpoint()
 
     def delete_checkpoint(self, checkpoint) -> None:
-        with self._lock:
+        with self._guard():
             self._backend.delete_checkpoint(checkpoint)
 
     def stop(self, *args, **kwargs) -> None:
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:stop"):
                 self._backend.stop(*args, **kwargs)
 
     def rm_container(self, *args, **kwargs) -> None:
-        with self._lock:
+        with self._guard():
             with agprof.span("sandbox:rm"):
                 self._backend.rm_container(*args, **kwargs)
 
     def restore(self, *args, **kwargs) -> None:
-        with self._lock:
+        with self._guard():
             self._backend.restore(*args, **kwargs)
 
     def release_daemon(self, pid: int) -> None:
@@ -412,7 +477,7 @@ class agSandbox:
             print(f"[agsandbox] WARNING: destroy() failed during __del__ for {self._agname}: {_e}")
 
     def destroy(self) -> None:
-        with self._lock:
+        with self._guard():
             if self._destroyed:
                 return
             with agprof.span("sandbox:destroy"):
@@ -425,7 +490,7 @@ class agSandbox:
         sandbox's checkpoint image (fresh if none exists; *new_name*
         auto-deduplicated). Without *agconfig*, inherits this sandbox's
         own config unchanged. Caller must destroy() the result."""
-        with self._lock, agprof.span("sandbox:fork"):
+        with self._guard(), agprof.span("sandbox:fork"):
             if self.agconfig.sandbox.checkpoint_backend == "cow_zfs":
                 raise ValueError(
                     "Private ZFS checkpoints currently support same-sandbox restore only"

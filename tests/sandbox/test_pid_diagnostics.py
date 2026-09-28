@@ -100,8 +100,10 @@ def test_engine_preserves_skip_even_when_probe_finds_stale_pid(monkeypatch):
     engine = AgentEngine(agent)
     engine._execute_harness = Mock(return_value=agdata())
     engine._commit_pending_session_update = Mock()
+    lock = threading.RLock()
     sandbox = SimpleNamespace(
-        _lock=threading.RLock(),
+        begin_transaction=lock.acquire,
+        end_transaction=lock.release,
         _backend=object(),
         commit=Mock(),
         _has_pending_background_work=Mock(return_value=True),

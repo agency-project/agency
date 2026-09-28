@@ -122,8 +122,7 @@ class AgentEngine:
 
         from ..agdata import agerror
 
-        sandbox_lock = sandbox._lock
-        sandbox_lock.acquire()
+        sandbox.begin_transaction()
         try:
             failed = True
             self._pending_session_update = None
@@ -198,7 +197,7 @@ class AgentEngine:
                         sandbox.rm_container()
         finally:
             try:
-                sandbox_lock.release()
+                sandbox.end_transaction()
             finally:
                 # _execute_harness() closes services before commit.  This
                 # outer idempotent pass retries only a component whose first
