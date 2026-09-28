@@ -98,16 +98,32 @@ async def _list_tools_async(url: str, headers: dict) -> list:
             ]
 
 
-async def _call_tool_async(url: str, headers: dict, tool_name: str, arguments: dict) -> dict:
+def _describe_exception(e: BaseException) -> str:
+    """asyncio.TaskGroup wraps a single failing task's exception and says nothing about
+    what actually happened, unwrap it so the agent sees the real cause"""
+    if isinstance(e, BaseExceptionGroup) and len(e.exceptions) == 1:
+        return _describe_exception(e.exceptions[0])
+    return f"{type(e).__name__}: {e}"
+
+
+async def _call_tool_async(
+    url: str, headers: dict, tool_name: str, arguments: dict, timeout_s: float
+) -> dict:
     import httpx2
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
 
-    http_client = httpx2.AsyncClient(headers=headers)
+    # connect fails fast. read has
+    # to outlive the protocol-level deadline passed to call_tool() below, so that deadline (a
+    # clean MCP cancellation) fires first.
+    http_client = httpx2.AsyncClient(
+        headers=headers,
+        timeout=httpx2.Timeout(connect=10.0, read=timeout_s + 30.0, write=10.0, pool=10.0),
+    )
     async with streamable_http_client(url, http_client=http_client) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
+            result = await session.call_tool(tool_name, arguments, read_timeout_seconds=timeout_s)
             return _decode_tool_result(result)
 
 
@@ -115,8 +131,9 @@ class McpToolset:
     """Discovers every configured MCP server's tools once, and dispatches
     a tool call by name back to whichever server owns it."""
 
-    def __init__(self, mcp_config: "dict | None") -> None:
+    def __init__(self, mcp_config: "dict | None", timeout_s: float = 1800.0) -> None:
         self._servers = _mcp_server_configs(mcp_config)
+        self._timeout_s = timeout_s
         # tool_name -> (url, headers), last server registered for a given
         # name wins on collision.
         self._tool_owner: "dict[str, tuple[str, dict]]" = {}
@@ -142,9 +159,11 @@ class McpToolset:
             arguments = {}
         url, headers = self._tool_owner[tool_name]
         try:
-            result = asyncio.run(_call_tool_async(url, headers, tool_name, arguments))
+            result = asyncio.run(
+                _call_tool_async(url, headers, tool_name, arguments, self._timeout_s)
+            )
         except Exception as e:
-            result = {"error": f"{type(e).__name__}: {e}"}
+            result = {"error": _describe_exception(e)}
         return json.dumps(result)
 
 

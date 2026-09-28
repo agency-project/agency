@@ -78,6 +78,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
         "liveness and recover a partial answer from if it gives up waiting.",
     )
+    p.add_argument(
+        "--tool-timeout",
+        type=float,
+        default=1800.0,
+        help="Seconds an MCP tool call may run before the host connection gives up.",
+    )
     return p
 
 
@@ -115,7 +121,7 @@ def main(argv: "list[str] | None" = None) -> int:
     context_limit = bridge.context_limit() if bridge is not None else None
 
     mcp_config = json.loads(args.mcp_config) if args.mcp_config else None
-    mcp = McpToolset(mcp_config) if mcp_config else None
+    mcp = McpToolset(mcp_config, timeout_s=args.tool_timeout) if mcp_config else None
 
     session_id, messages = _resolve_session(args)
     messages = messages + [{"role": "user", "content": args.prompt}]
