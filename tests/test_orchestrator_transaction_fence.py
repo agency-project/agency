@@ -31,6 +31,12 @@ class _TransactionSandbox:
     def change_config(self, _agconfig) -> None:
         pass
 
+    def begin_transaction(self) -> None:
+        self._lock.acquire()
+
+    def end_transaction(self) -> None:
+        self._lock.release()
+
     def commit(self) -> None:
         self.events.append("commit")
 
