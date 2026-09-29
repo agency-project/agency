@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
+
 import httpx
 
 from .agllm import agllm
@@ -40,31 +42,58 @@ def _anthropic_sdk_timeout(timeout: httpx.Timeout):
 # this module's _AnthropicBackend and .bedrock's Anthropic-family backends.
 _ANTHROPIC_BEDROCK_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?anthropic\.")
 
-# Bedrock's native invoke_model API has no /v1/models-style endpoint to query
-# context windows from, so known Anthropic model context windows are hardcoded
-# here instead. Keyed by the bare model name, after stripping the region and
-# "anthropic." prefix Bedrock IDs carry — see _known_anthropic_context_window
-# below. Where the first-party Models API still lists a model, its value here
-# is that listing's max_input_tokens. Update when new models ship.
-_ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-fable-5-1": 1_000_000,
-    "claude-fable-5": 1_000_000,
-    "claude-mythos-5": 1_000_000,
-    "claude-mythos-preview": 1_000_000,
-    "claude-opus-5-5": 1_000_000,
-    "claude-opus-5": 1_000_000,
-    "claude-opus-4-8": 1_000_000,
-    "claude-opus-4-7": 1_000_000,
-    "claude-opus-4-6": 1_000_000,
-    "claude-opus-4-5": 200_000,
-    "claude-opus-4-1": 1_000_000,
-    "claude-opus-4-0": 1_000_000,
-    "claude-sonnet-5-5": 1_000_000,
-    "claude-sonnet-5": 1_000_000,
-    "claude-sonnet-4-6": 1_000_000,
-    "claude-sonnet-4-5": 1_000_000,
-    "claude-sonnet-4-0": 1_000_000,
-    "claude-haiku-4-5": 200_000,
+_EFFORT_ALL = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_NO_XHIGH = frozenset({"low", "medium", "high", "max"})
+_EFFORT_BASIC = frozenset({"low", "medium", "high"})
+
+
+@dataclass(frozen=True)
+class _AnthropicModelInfo:
+    """What Agency knows about one Claude model's request surface. `None`
+    means unverified: the request field passes through untouched and the
+    API decides, exactly as for a model missing from the table."""
+
+    context_window: int
+    # False: tool_choice {"type": "any"} / {"type": "tool"} is a 400.
+    forced_tool_choice: "bool | None" = None
+    # "none": temperature other than 1.0, and any top_p/top_k, are a 400.
+    # "exclusive": each is accepted alone, but temperature + top_p is a 400.
+    sampling: "str | None" = None
+    # Accepted output_config.effort levels; empty = effort is a 400.
+    effort: "frozenset[str] | None" = None
+    # Whether role:"system" is accepted inside `messages`. Informational for
+    # now: mid-conversation system-class messages are still sent as `user`
+    # on every model (the native form has placement rules of its own).
+    mid_conversation_system: "bool | None" = None
+
+
+# Keyed by the bare model name, after stripping the region and "anthropic."
+# prefix Bedrock IDs carry — see _anthropic_model_info below. Context windows
+# are also the static fallback for Bedrock, whose invoke_model API has no
+# /v1/models endpoint; where the first-party Models API lists a model, the
+# value here is its max_input_tokens. The restriction fields were verified
+# against the live API on 2026-09-29 (Mythos entries: Anthropic's docs, same
+# surface as their Fable counterparts). Update when new models ship.
+_ANTHROPIC_MODELS: "dict[str, _AnthropicModelInfo]" = {
+    "claude-fable-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-mythos-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-fable-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-mythos-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-mythos-preview": _AnthropicModelInfo(1_000_000),
+    "claude-opus-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-opus-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-opus-4-8": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-opus-4-7": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, False),
+    "claude-opus-4-6": _AnthropicModelInfo(1_000_000, True, "exclusive", _EFFORT_NO_XHIGH, False),
+    "claude-opus-4-5": _AnthropicModelInfo(200_000, True, "exclusive", _EFFORT_BASIC, False),
+    "claude-opus-4-1": _AnthropicModelInfo(1_000_000),
+    "claude-opus-4-0": _AnthropicModelInfo(1_000_000),
+    "claude-sonnet-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-sonnet-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-sonnet-4-6": _AnthropicModelInfo(1_000_000, True, "exclusive", _EFFORT_NO_XHIGH, False),
+    "claude-sonnet-4-5": _AnthropicModelInfo(1_000_000, True, "exclusive", frozenset(), False),
+    "claude-sonnet-4-0": _AnthropicModelInfo(1_000_000),
+    "claude-haiku-4-5": _AnthropicModelInfo(200_000, True, "exclusive", frozenset(), False),
 }
 
 # What may follow a known bare model name and still be that same model: a
@@ -74,17 +103,23 @@ _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
 _ANTHROPIC_SNAPSHOT_SUFFIX_RE = re.compile(r"(?:-\d{8})?(?:-v\d+(?::\d+)?)?")
 
 
-def _known_anthropic_context_window(model: str) -> "int | None":
-    """Look up a known context window for an Anthropic model ID (plain or
-    Bedrock). Strips region/"anthropic." prefixes, then matches the bare name
-    exactly or followed only by a snapshot/version suffix."""
+def _anthropic_model_info(model: str) -> "_AnthropicModelInfo | None":
+    """Look up what's known about an Anthropic model ID (plain or Bedrock).
+    Strips region/"anthropic." prefixes, then matches the bare name exactly
+    or followed only by a snapshot/version suffix -- never a family prefix,
+    so an unlisted model inherits no restrictions."""
     bare = _ANTHROPIC_BEDROCK_MODEL_RE.sub("", model or "")
-    for known_id, window in _ANTHROPIC_CONTEXT_WINDOWS.items():
+    for known_id, info in _ANTHROPIC_MODELS.items():
         if bare.startswith(known_id) and _ANTHROPIC_SNAPSHOT_SUFFIX_RE.fullmatch(
             bare[len(known_id) :]
         ):
-            return window
+            return info
     return None
+
+
+def _known_anthropic_context_window(model: str) -> "int | None":
+    info = _anthropic_model_info(model)
+    return info.context_window if info is not None else None
 
 
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
@@ -260,6 +295,75 @@ def _agency_tool_choice_to_anthropic(tool_choice):
     return None
 
 
+_WARNED_ONCE: "set[tuple]" = set()
+
+
+def _warn_once(key: tuple, message: str) -> None:
+    """Config-driven warnings would otherwise repeat on every call of an
+    agent loop; one per process per distinct (model, cause) is enough."""
+    if key not in _WARNED_ONCE:
+        _WARNED_ONCE.add(key)
+        print(f"[anthropic] WARNING: {message}")
+
+
+def _tool_choice_for_model(tool_choice, model: str, info: "_AnthropicModelInfo | None"):
+    """Degrade forced tool choice to `auto` on models that reject it.
+
+    Semantic tradeoff: `required` ("at least one tool call") and a named tool
+    ("call exactly this one") cannot be enforced by the provider on these
+    models -- the API 400s on {"type": "any"} / {"type": "tool"} regardless
+    of thinking settings. Agency itself never requests forced choice (its
+    own must-call contract, structured output via submit_output, is enforced
+    by prompt + engine retry); only a harness does, and a harness validates
+    its own tool loop. Degrading keeps the attempt alive where a hard error
+    would end it. No steering text is injected: a per-request message that
+    the harness doesn't keep in its history would edit the transcript and
+    invalidate later thinking blocks. Models not verified to reject forced
+    choice (older Claude, unknown IDs) keep it unchanged."""
+    if not isinstance(tool_choice, dict) or tool_choice.get("type") not in ("any", "tool"):
+        return tool_choice
+    if info is None or info.forced_tool_choice is not False:
+        return tool_choice
+    requested = (
+        "required" if tool_choice["type"] == "any" else f"named tool {tool_choice.get('name')!r}"
+    )
+    # Every occurrence, not once: each one is a request whose tool call the
+    # provider no longer guarantees.
+    print(
+        f"[anthropic] WARNING: {model} does not support provider-level tool "
+        f"enforcement; the requested tool_choice ({requested}) was converted to "
+        f"`auto`, so tool use is no longer guaranteed by the provider for this request"
+    )
+    return {"type": "auto"}
+
+
+def _sampling_for_model(sampling: dict, model: str, info: "_AnthropicModelInfo | None") -> dict:
+    """Drop the sampling fields a known model would 400 on. Unknown models,
+    and models whose sampling rules are unverified, get everything as set."""
+    policy = info.sampling if info is not None else None
+    kept = dict(sampling)
+    if policy == "none":
+        dropped = [k for k in ("top_p", "top_k") if k in kept]
+        if "temperature" in kept and kept["temperature"] != 1:
+            dropped.insert(0, "temperature")
+        for key in dropped:
+            del kept[key]
+        if dropped:
+            _warn_once(
+                (model, "sampling", tuple(dropped)),
+                f"{model} rejects sampling parameters (only temperature=1.0 is "
+                f"accepted); not sending {', '.join(dropped)}",
+            )
+    elif policy == "exclusive" and "temperature" in kept and "top_p" in kept:
+        # Deterministic: temperature is the more commonly set knob.
+        del kept["top_p"]
+        _warn_once(
+            (model, "sampling", "top_p"),
+            f"{model} accepts temperature or top_p but not both; sending temperature and not top_p",
+        )
+    return kept
+
+
 def _with_cache_control(content):
     """Return `content` with cache_control on its last block, normalizing a
     bare string into a single text block first (cache_control attaches to a
@@ -337,9 +441,11 @@ class _AnthropicBackend(agllm):
             close()
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
+        model = self.agconfig.llm.model or ""
+        info = _anthropic_model_info(model)
         system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
         kwargs: dict = dict(
-            model=self.agconfig.llm.model or "",
+            model=model,
             messages=anthropic_messages,
             max_tokens=self.agconfig.llm.max_completion_tokens
             or self.agconfig.llm.max_tokens
@@ -351,17 +457,21 @@ class _AnthropicBackend(agllm):
             # before system in Anthropic's prefix order, so this one
             # breakpoint caches tools + system together.
             kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
+        sampling: dict = {}
         if self.agconfig.llm.temperature is not None:
-            kwargs["temperature"] = self.agconfig.llm.temperature
+            sampling["temperature"] = self.agconfig.llm.temperature
         if self.agconfig.llm.top_p is not None:
-            kwargs["top_p"] = self.agconfig.llm.top_p
+            sampling["top_p"] = self.agconfig.llm.top_p
         extra_body = self.agconfig.llm.extra_body or {}
         if "top_k" in extra_body:
-            kwargs["top_k"] = extra_body["top_k"]
+            sampling["top_k"] = extra_body["top_k"]
+        kwargs.update(_sampling_for_model(sampling, model, info))
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
-        anthropic_tool_choice = _agency_tool_choice_to_anthropic(request.get("tool_choice"))
+        anthropic_tool_choice = _tool_choice_for_model(
+            _agency_tool_choice_to_anthropic(request.get("tool_choice")), model, info
+        )
         if anthropic_tool_choice is not None:
             kwargs["tool_choice"] = anthropic_tool_choice
         if anthropic_messages:

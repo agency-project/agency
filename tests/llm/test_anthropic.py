@@ -13,6 +13,7 @@ import httpx
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.anthropic import (
     _AnthropicBackend,
+    _AnthropicModelInfo,
     _agency_messages_to_anthropic,
     _agency_tool_choice_to_anthropic,
     _agency_tools_to_anthropic,
@@ -305,8 +306,8 @@ class TestKnownAnthropicContextWindow:
         """'claude-fable-5-1' is its own model, not a dated snapshot of
         'claude-fable-5' -- it must resolve through its own entry even when
         the older model's entry is listed (or iterated) first."""
-        windows = {older_model: 123, new_model: 456}
-        monkeypatch.setattr("agency.llm.anthropic._ANTHROPIC_CONTEXT_WINDOWS", windows)
+        windows = {older_model: _AnthropicModelInfo(123), new_model: _AnthropicModelInfo(456)}
+        monkeypatch.setattr("agency.llm.anthropic._ANTHROPIC_MODELS", windows)
         assert _known_anthropic_context_window(new_model) == 456
         assert _known_anthropic_context_window(f"us.anthropic.{new_model}-v1:0") == 456
         assert _known_anthropic_context_window(older_model) == 123
@@ -317,7 +318,7 @@ class TestKnownAnthropicContextWindow:
         caller uses the live listing or default_context_limit) instead of
         silently inheriting an older model's window via prefix matching."""
         monkeypatch.setattr(
-            "agency.llm.anthropic._ANTHROPIC_CONTEXT_WINDOWS", {"claude-fable-5": 123}
+            "agency.llm.anthropic._ANTHROPIC_MODELS", {"claude-fable-5": _AnthropicModelInfo(123)}
         )
         assert _known_anthropic_context_window("claude-fable-5-1") is None
         assert _known_anthropic_context_window("anthropic.claude-fable-5-2-v1:0") is None
@@ -1408,3 +1409,180 @@ class TestFormatStreamToAgency:
         stream = [_ev(type="message_start", message=_ev(usage=None))]
         items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
         assert items[-1]["usage"]["prompt_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Model-scoped request policy: forced tool_choice and sampling parameters.
+# Model sets mirror the live 2026-09-29 compatibility matrix.
+# ---------------------------------------------------------------------------
+
+# Reject tool_choice {"type": "any"} / {"type": "tool"} with a 400.
+_NO_FORCED_CHOICE = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-mythos-5-1",
+    "us.anthropic.claude-opus-5-5",  # Bedrock inference-profile ID
+    "global.anthropic.claude-sonnet-5-5-v1:0",
+]
+# Accept forced tool_choice, including with adaptive thinking on.
+_FORCED_CHOICE_OK = [
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-5-20251101",
+    "claude-haiku-4-5",
+]
+# Not in the table, or in it with unverified restrictions: pass through.
+_UNVERIFIED = ["m", "claude-future-9", "claude-opus-4-1", "claude-sonnet-4-0"]
+# 400 on temperature != 1.0 and on any top_p / top_k.
+_NO_SAMPLING = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+]
+# Each sampling field accepted alone; temperature + top_p together is a 400.
+_EXCLUSIVE_SAMPLING = [
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5-20251001",
+]
+
+_TOOLS = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+_NAMED = {"type": "function", "function": {"name": "f"}}
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+
+@pytest.fixture
+def fresh_warnings(monkeypatch):
+    monkeypatch.setattr("agency.llm.anthropic._WARNED_ONCE", set())
+
+
+def _kwargs(model, tool_choice=None, **llm_fields):
+    backend = _AnthropicBackend(_cfg(model=model, **llm_fields))
+    request = {"messages": [_text_msg("user", "call f")], "tools": _TOOLS}
+    if tool_choice is not None:
+        request["tool_choice"] = tool_choice
+    return backend._format_context_agency_to_backend(request)
+
+
+class TestForcedToolChoicePolicy:
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE)
+    @pytest.mark.parametrize(
+        "tool_choice,requested", [("required", "required"), (_NAMED, "named tool 'f'")]
+    )
+    def test_restricted_models_degrade_to_auto_with_warning(
+        self, model, tool_choice, requested, capsys
+    ):
+        kwargs = _kwargs(model, tool_choice)
+        assert kwargs["tool_choice"] == {"type": "auto"}
+        warning = capsys.readouterr().out
+        assert f"{model} does not support provider-level tool enforcement" in warning
+        assert f"({requested}) was converted to `auto`" in warning
+        assert "no longer guaranteed by the provider" in warning
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    def test_degradation_warns_on_every_request(self, model, capsys):
+        _kwargs(model, "required")
+        _kwargs(model, "required")
+        assert capsys.readouterr().out.count("provider-level tool enforcement") == 2
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    def test_degradation_injects_no_messages(self, model):
+        assert (
+            _kwargs(model, "required")["messages"]
+            == _kwargs(model, "auto")["messages"]
+            == _kwargs(model)["messages"]
+        )
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    @pytest.mark.parametrize("tool_choice,expected", [("auto", "auto"), ("none", "none")])
+    def test_restricted_models_keep_auto_and_none(self, model, tool_choice, expected, capsys):
+        assert _kwargs(model, tool_choice)["tool_choice"] == {"type": expected}
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize("model", _FORCED_CHOICE_OK + _UNVERIFIED)
+    def test_other_models_keep_forced_choice(self, model, capsys):
+        assert _kwargs(model, "required")["tool_choice"] == {"type": "any"}
+        assert _kwargs(model, _NAMED)["tool_choice"] == {"type": "tool", "name": "f"}
+        assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestSamplingPolicy:
+    @pytest.mark.parametrize("model", _NO_SAMPLING)
+    @pytest.mark.parametrize(
+        "fields,expected",
+        [
+            ({"temperature": 0.2}, {}),
+            ({"temperature": 0.0}, {}),
+            ({"temperature": 1.0}, {"temperature": 1.0}),
+            ({"temperature": 1}, {"temperature": 1}),
+            ({"top_p": 0.9}, {}),
+            ({"top_p": 1.0}, {}),  # rejected even at its default
+            ({"extra_body": {"top_k": 40}}, {}),
+            ({"temperature": 0.2, "top_p": 0.9}, {}),
+            ({"temperature": 1.0, "top_p": 0.9}, {"temperature": 1.0}),
+        ],
+    )
+    def test_no_sampling_models(self, model, fields, expected):
+        kwargs = _kwargs(model, **fields)
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS if k in kwargs} == expected
+
+    @pytest.mark.parametrize("model", _EXCLUSIVE_SAMPLING)
+    @pytest.mark.parametrize(
+        "fields,expected",
+        [
+            ({"temperature": 0.2}, {"temperature": 0.2}),
+            ({"temperature": 1.0}, {"temperature": 1.0}),
+            ({"top_p": 0.9}, {"top_p": 0.9}),
+            ({"extra_body": {"top_k": 40}}, {"top_k": 40}),
+            ({"temperature": 0.2, "top_p": 0.9}, {"temperature": 0.2}),
+            (
+                {"temperature": 0.2, "top_p": 0.9, "extra_body": {"top_k": 40}},
+                {"temperature": 0.2, "top_k": 40},
+            ),
+        ],
+    )
+    def test_exclusive_sampling_models(self, model, fields, expected):
+        kwargs = _kwargs(model, **fields)
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS if k in kwargs} == expected
+
+    @pytest.mark.parametrize("model", _UNVERIFIED)
+    def test_unverified_models_pass_everything_through(self, model, capsys):
+        kwargs = _kwargs(model, temperature=0.2, top_p=0.9, extra_body={"top_k": 40})
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS} == {
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+        }
+        assert capsys.readouterr().out == ""
+
+    def test_dropped_sampling_warns_once_per_model_and_cause(self, capsys):
+        for _ in range(3):
+            _kwargs("claude-opus-5-5", temperature=0.2, top_p=0.9)
+        out = capsys.readouterr().out
+        assert out.count("WARNING") == 1
+        assert "claude-opus-5-5 rejects sampling parameters" in out
+        assert "not sending temperature, top_p" in out
+
+    def test_exclusive_conflict_warns(self, capsys):
+        _kwargs("claude-haiku-4-5", temperature=0.2, top_p=0.9)
+        assert "sending temperature and not top_p" in capsys.readouterr().out
+
+    def test_no_warning_when_nothing_dropped(self, capsys):
+        _kwargs("claude-opus-5-5", temperature=1.0)
+        _kwargs("claude-haiku-4-5", top_p=0.9)
+        assert capsys.readouterr().out == ""
