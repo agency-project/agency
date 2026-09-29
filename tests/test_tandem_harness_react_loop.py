@@ -127,7 +127,9 @@ def test_unknown_tool_error_carries_the_given_hint(tmp_path):
 
     assert result.status == "done"
     tool_result = json.loads(result.messages[2]["content"])
-    assert tool_result == {"error": "unknown tool: bash -- use smart_tool to run this instead"}
+    assert tool_result == {
+        "error": "You do not have access to the bash tool. -- use smart_tool to run this instead"
+    }
 
 
 def test_unknown_tool_error_has_no_hint_by_default(tmp_path):
@@ -143,7 +145,7 @@ def test_unknown_tool_error_has_no_hint_by_default(tmp_path):
     )
 
     tool_result = json.loads(result.messages[2]["content"])
-    assert tool_result == {"error": "unknown tool: bash"}
+    assert tool_result == {"error": "You do not have access to the bash tool."}
 
 
 def test_policy_exempt_tools_skip_bridge_check(tmp_path):

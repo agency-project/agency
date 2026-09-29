@@ -249,12 +249,25 @@ class _OpenAICompatibleBackend(agllm):
 
 
 def _serialize_openai_usage(usage) -> "dict | None":
+    """Full copy of the SDK's usage object, not a hand-picked subset."""
     if usage is None:
         return None
-    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
-    }
+    dumped = _serialize_sdk_object(usage)
+    if not isinstance(dumped, dict):
+        return dumped
+    prompt_tokens = dumped.get("prompt_tokens") or 0
+    completion_tokens = dumped.get("completion_tokens") or 0
+    dumped["prompt_tokens"] = prompt_tokens
+    dumped["completion_tokens"] = completion_tokens
+    dumped["total_tokens"] = dumped.get("total_tokens") or (prompt_tokens + completion_tokens)
+    # Same aliases anthropic.py/bedrock.py add -- one consistent pair of names.
+    details = dumped.get("prompt_tokens_details")
+    cached_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
+    created_cache_tokens = (
+        details.get("created_cache_tokens") if isinstance(details, dict) else None
+    )
+    dumped["cache_read_tokens"] = dumped.get("cache_read_input_tokens") or cached_tokens or 0
+    dumped["cache_write_tokens"] = (
+        dumped.get("cache_creation_input_tokens") or created_cache_tokens or 0
+    )
+    return dumped

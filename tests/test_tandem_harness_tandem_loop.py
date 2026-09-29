@@ -1,11 +1,12 @@
 """Tests for tandem_harness/tandem_loop.py -- the two-model orchestration:
-a supervisor drives smart_tool/get_trace, completing the same way every
-ReAct loop in this package does -- a turn with no tool call -- each
-smart_tool call spins up a fresh, independent worker react-loop segment,
-and the segment's own transcript is turned directly into a structured,
-truncated report (mechanical, never model-authored), with get_trace()
-serving the full untruncated version of the most recent one back on
-demand."""
+a supervisor drives smart_tool/get_tool_call_detail, completing the same
+way every ReAct loop in this package does -- a turn with no tool call --
+each smart_tool call spins up a worker react-loop segment (its own
+conversation carried forward across segments), and the segment's own
+transcript is turned directly into a structured, truncated report
+(mechanical, never model-authored), with get_tool_call_detail(call_id)
+serving the full untruncated version of any one call back on demand, from
+any past segment, not just the most recent one."""
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from agency.tandem_harness import tools
 from agency.tandem_harness.tandem_loop import (
     ARGUMENTS_TRUNCATE_CHARS,
     RESULT_TRUNCATE_CHARS,
+    _SUBMIT_OUTPUT_SCHEMA,
     _build_report,
     _short_call_id,
     _trim_worker_history,
@@ -51,17 +53,6 @@ def _smart_tool_response(task):
             "tool_calls": [_tool_call("smart_tool", {"task": task})],
         },
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-    }
-
-
-def _get_trace_response():
-    return {
-        "message": {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [_tool_call("get_trace", {})],
-        },
-        "usage": {"prompt_tokens": 6, "completion_tokens": 2},
     }
 
 
@@ -242,11 +233,36 @@ def test_worker_never_sees_supervisor_tool_schema_or_vice_versa(monkeypatch, tmp
     )
 
     supervisor_tool_names = {s["function"]["name"] for s in supervisor_llm.requests[0][2]}
-    assert supervisor_tool_names == {"smart_tool", "get_trace", "get_tool_call_detail"}
+    assert supervisor_tool_names == {"smart_tool", "get_tool_call_detail"}
 
     worker_tool_names = {s["function"]["name"] for s in worker_llm.requests[0][2]}
     assert not worker_tool_names & supervisor_tool_names
     assert "bash" in worker_tool_names
+
+
+def test_worker_does_not_get_submit_output_via_mcp_discovery(monkeypatch, tmp_path):
+    """The worker's MCP discovery must not hand it submit_output."""
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    mcp = _FakeMcp([_SUBMIT_OUTPUT_SCHEMA])
+    supervisor_llm = _Llm([_smart_tool_response("do it"), _supervisor_final_response("done")])
+    worker_llm = _Llm([_worker_tool_call_response()])
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        mcp=mcp,
+        segment_step_cap=1,
+        offload_dir=str(tmp_path),
+    )
+
+    supervisor_tool_names = {s["function"]["name"] for s in supervisor_llm.requests[0][2]}
+    assert "submit_output" in supervisor_tool_names
+
+    worker_tool_names = {s["function"]["name"] for s in worker_llm.requests[0][2]}
+    assert "submit_output" not in worker_tool_names
 
 
 def _supervisor_bash_call_response():
@@ -277,7 +293,9 @@ def test_supervisor_calling_a_real_tool_directly_is_pointed_back_at_smart_tool(t
     )
 
     tool_result = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert tool_result == {"error": "unknown tool: bash -- use smart_tool to run this instead"}
+    assert tool_result == {
+        "error": "You do not have access to the bash tool. -- Use the smart_tool instead."
+    }
 
 
 def test_supervisor_gets_submit_output_tool_when_mcp_is_configured(tmp_path):
@@ -459,18 +477,38 @@ def test_smart_tool_with_empty_task_short_circuits_without_invoking_worker(tmp_p
     assert result.segment_count == 0
 
 
-def test_get_trace_returns_the_full_untruncated_trace_of_the_previous_task(monkeypatch, tmp_path):
-    long_command = "echo " + "x" * 100
-    long_output = "y" * 500
-    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: long_output)
+def test_get_tool_call_detail_reaches_a_call_from_an_earlier_segment(monkeypatch, tmp_path):
+    """get_tool_call_detail must reach a call from an earlier segment too."""
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    seg0_call_id = _short_call_id("seg0-call", set())
     supervisor_llm = _Llm(
         [
-            _smart_tool_response("do a big thing"),
-            _get_trace_response(),
+            _smart_tool_response("first"),
+            _smart_tool_response("second"),
+            _get_tool_call_detail_response(seg0_call_id),
             _supervisor_final_response("done"),
         ]
     )
-    worker_llm = _Llm([_worker_tool_call_response(long_command)])
+    worker_llm = _Llm(
+        [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call("bash", {"command": "one"}, call_id="seg0-call")],
+                },
+                "usage": {"prompt_tokens": 20, "completion_tokens": 7},
+            },
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call("bash", {"command": "two"}, call_id="seg1-call")],
+                },
+                "usage": {"prompt_tokens": 20, "completion_tokens": 7},
+            },
+        ]
+    )
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -482,34 +520,9 @@ def test_get_trace_returns_the_full_untruncated_trace_of_the_previous_task(monke
         offload_dir=str(tmp_path),
     )
 
-    # smart_tool's own tool result (fed back to the supervisor) is truncated.
-    smart_tool_result = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert len(smart_tool_result["tool_calls"][0]["arguments"]) == ARGUMENTS_TRUNCATE_CHARS + len(
-        "[TRUNCATED]"
-    )
-    assert "[TRUNCATED]" in smart_tool_result["tool_calls"][0]["result"]
-
-    # get_trace's result carries the same call, untruncated.
-    trace_result = json.loads(supervisor_llm.requests[2][1][-1]["content"])
-    assert trace_result["tool_calls"][0]["result"] == long_output
-    assert long_command in trace_result["tool_calls"][0]["arguments"]
-
-
-def test_get_trace_before_any_smart_tool_call_returns_an_error(tmp_path):
-    supervisor_llm = _Llm([_get_trace_response(), _supervisor_final_response("done")])
-    worker_llm = _Llm([])
-
-    run_tandem_loop(
-        [{"role": "user", "content": "task"}],
-        "supervisor-model",
-        "worker-model",
-        supervisor_llm,
-        worker_llm,
-        offload_dir=str(tmp_path),
-    )
-
-    trace_result = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert "error" in trace_result
+    detail = json.loads(supervisor_llm.requests[3][1][-1]["content"])
+    assert detail["call_id"] == seg0_call_id
+    assert "one" in detail["arguments"]
 
 
 def test_get_tool_call_detail_returns_the_full_untruncated_entry(monkeypatch, tmp_path):
@@ -630,10 +643,11 @@ def test_truncate_keeps_head_and_tail_with_marker_in_the_middle():
     # Digits so head/tail slices are unambiguous -- not just a length check.
     long_text = "".join(str(i % 10) for i in range(100))
     truncated = _truncate(long_text, 50)
-    assert truncated == long_text[:25] + "[TRUNCATED]" + long_text[-25:]
+    marker = " ...[TRUNCATED]... "
+    assert truncated == long_text[:25] + marker + long_text[-25:]
     assert truncated.startswith(long_text[:25])
     assert truncated.endswith(long_text[-25:])
-    assert len(truncated) == 50 + len("[TRUNCATED]")
+    assert len(truncated) == 50 + len(marker)
 
 
 def test_build_report_step_cap_reached_carries_the_executed_tool_call(monkeypatch, tmp_path):
@@ -700,7 +714,8 @@ def test_build_report_truncates_long_arguments_and_results():
     truncated = report["tool_calls"][0]
     full_arguments = json.dumps({"command": "x" * 100})
     full_result = "y" * 500
-    assert len(truncated["arguments"]) == ARGUMENTS_TRUNCATE_CHARS + len("[TRUNCATED]")
+    marker = " ...[TRUNCATED]... "
+    assert len(truncated["arguments"]) == ARGUMENTS_TRUNCATE_CHARS + len(marker)
     assert "[TRUNCATED]" in truncated["arguments"]
     # The result's tail (e.g. a traceback's actual exception line, a
     # command's final status) is at least as informative as its head, so
@@ -709,7 +724,7 @@ def test_build_report_truncates_long_arguments_and_results():
     assert truncated["arguments"].endswith(
         full_arguments[-(ARGUMENTS_TRUNCATE_CHARS - ARGUMENTS_TRUNCATE_CHARS // 2) :]
     )
-    assert len(truncated["result"]) == RESULT_TRUNCATE_CHARS + len("[TRUNCATED]")
+    assert len(truncated["result"]) == RESULT_TRUNCATE_CHARS + len(marker)
     assert "[TRUNCATED]" in truncated["result"]
     assert truncated["result"].startswith(full_result[: RESULT_TRUNCATE_CHARS // 2])
     assert truncated["result"].endswith(

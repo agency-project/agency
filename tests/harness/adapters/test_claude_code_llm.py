@@ -409,7 +409,13 @@ def test_agency_to_harness_text_only():
     assert out["role"] == "assistant"
     assert out["content"] == [{"type": "text", "text": "hi there"}]
     assert out["stop_reason"] == "end_turn"
-    assert out["usage"] == {"input_tokens": 5, "output_tokens": 3}
+    assert out["usage"]["input_tokens"] == 5
+    assert out["usage"]["output_tokens"] == 3
+    # The source dict's own fields survive alongside the Anthropic-native
+    # aliases -- not narrowed away, see _forward_usage_to_anthropic.
+    assert out["usage"]["prompt_tokens"] == 5
+    assert out["usage"]["completion_tokens"] == 3
+    assert out["usage"]["total_tokens"] == 8
 
 
 def test_agency_to_harness_tool_use():

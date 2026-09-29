@@ -60,6 +60,15 @@ def _flatten_unknown_data(data):
     return merged
 
 
+def _forward_usage(usage: "dict | None") -> dict:
+    """Full copy of the usage dict, not a hand-picked subset."""
+    usage = dict(usage or {})
+    usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
+    usage["completion_tokens"] = usage.get("completion_tokens", 0)
+    usage["total_tokens"] = usage.get("total_tokens", 0)
+    return usage
+
+
 class ChatCompletionsProtocol:
     """Mixin supplying the Chat Completions route and its block mapping."""
 
@@ -196,7 +205,6 @@ class ChatCompletionsProtocol:
                 field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
                 response_message[field] = _flatten_unknown_data(b.get("data"))
 
-        usage = agency_response.get("usage") or {}
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -209,11 +217,7 @@ class ChatCompletionsProtocol:
                     "finish_reason": _stop_reason_to_openai(agency_response.get("stop_reason")),
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": _forward_usage(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -265,18 +269,13 @@ class ChatCompletionsProtocol:
 
             yield _chunk({}, finish_reason=_stop_reason_to_openai(item.get("stop_reason")))
 
-            usage = item.get("usage") or {}
             usage_payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                },
+                "usage": _forward_usage(item.get("usage")),
             }
             yield f"data: {json.dumps(usage_payload)}\n\n"
             yield "data: [DONE]\n\n"

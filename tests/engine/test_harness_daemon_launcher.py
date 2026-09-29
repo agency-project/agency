@@ -292,29 +292,26 @@ def test_daemon_log_is_preclaimed_host_side_before_container_can_write_it(monkey
     assert oct(log_path.stat().st_mode)[-3:] == "666"
 
 
-def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
+def test_daemon_config_forwards_every_harness_adapter_ptrace_sandbox_field():
+    """Every field reaches the daemon -- no hand-picked subset."""
     config = agconfig(
-        harnessadapterconfig(binary_path="/bin/claude"),
+        harnessadapterconfig(binary_path="/bin/claude", segment_step_cap=64),
         llmconfig(api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
-    assert launcher._daemon_config(config) == {
-        "harness_adapter": {
-            "binary_path": "/bin/claude",
-            "supervisor_model": None,
-        },
-        "sandbox": {"checkpoint_fast_resume": False, "harness_python_path": None},
-        "ptrace": {
-            "syscalls": list(agconfig().ptrace.syscalls),
-            "file_access": False,
-            "profiler": None,
-            "disable_harness_native_sandbox": True,
-        },
-    }
+    result = launcher._daemon_config(config)
+    assert result["harness_adapter"]["binary_path"] == "/bin/claude"
+    assert result["harness_adapter"]["segment_step_cap"] == 64
+    assert result["sandbox"]["harness_python_path"] is None
+    assert result["ptrace"]["syscalls"] == agconfig().ptrace.syscalls
+    # llmconfig isn't one of the three namespaces this function forwards at
+    # all -- its secret never has a chance to leak through here.
+    assert "llm" not in result
+    assert not any("secret" in json.dumps(section) for section in result.values())
 
 
-def test_daemon_config_forwards_tandem_supervisor_model_but_not_its_secrets():
+def test_daemon_config_forwards_tandem_supervisor_settings_but_not_its_api_key():
     config = agconfig(
         harnessadapterconfig(
             supervisor_model="claude-sonnet-5",
@@ -326,7 +323,7 @@ def test_daemon_config_forwards_tandem_supervisor_model_but_not_its_secrets():
 
     result = launcher._daemon_config(config)["harness_adapter"]
     assert result["supervisor_model"] == "claude-sonnet-5"
-    assert "supervisor_base_url" not in result
+    assert result["supervisor_base_url"] == "https://router.example.com/v1"
     assert "supervisor_api_key" not in result
 
 

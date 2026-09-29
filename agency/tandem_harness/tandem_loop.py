@@ -16,10 +16,11 @@ survives however many segments of replayed history.
 
 Both levels are just `run_react_loop` (see that module's docstring): the
 supervisor's turn-taking IS a `run_react_loop` call with its built-in tools
-swapped out for three synthetic actions (`smart_tool`, `get_trace`,
-`get_tool_call_detail`) plus one real one, `submit_output`, dispatched
-straight through the shared `McpToolset` (the same connection the worker's
-own MCP tools use) rather than through a synthetic handler; each worker
+swapped out for two synthetic actions (`smart_tool`, `get_tool_call_detail`)
+plus one real one, `submit_output`, dispatched straight through the shared
+`McpToolset` (the same connection the worker's own MCP tools use, minus
+`submit_output` itself -- see `exclude_mcp_tool_names` on the worker's own
+call below) rather than through a synthetic handler; each worker
 segment is a second, independent `run_react_loop` call (untouched
 built-ins: Bash/Read/Write/Edit/Glob/Grep/WebFetch/TodoWrite/MCP) nested
 inside `smart_tool`'s own handler. `smart_tool` is deliberately framed to
@@ -39,7 +40,7 @@ a turn with no tool call -- so a stray toolless turn and a deliberate
 finish aren't different code paths, just like they aren't for
 native/codex/claude_code today.
 
-`segment_step_cap` (default 16) is a soft ceiling, not a tight per-task
+`segment_step_cap` (default 64) is a soft ceiling, not a tight per-task
 budget: the worker may make several tool calls to satisfy one task if it
 needs to, and `WORKER_SYSTEM` instructs it to finish with a concise
 natural-language summary once it's done rather than trailing off. Each
@@ -49,13 +50,9 @@ harness-extracted, never model-authored: each entry has a `call_id` plus
 cross-reference), `tool_output` (the worker's own factual account of what
 it ran and what happened -- `WORKER_SYSTEM` tells it to report like a tool
 returning output, not offer its own diagnosis/beliefs), and `finish_reason`
-(`worker_finished` /
-`step_cap_reached` / `worker_error` / `invalid_task`). `get_trace()` (no
-arguments) returns the full, untruncated tool-call trace of the
-immediately preceding `smart_tool` call; `get_tool_call_detail(call_id)`
-returns just the one entry matching that `call_id`. Both are served from an
-in-process cache of that same execution, so neither costs an extra worker
-LLM call or re-execution.
+(`worker_finished` / `step_cap_reached` / `worker_error` / `invalid_task`).
+`call_id`s are unique execution-wide (see `_short_call_id`) and kept in one
+hash table (`all_calls`), so `get_tool_call_detail(call_id)` can look up any past call, not just the most recent segment's.
 
 The worker also gets one extra tool of its own, `forward_tool_output`: for
 a task a single tool call already answers in full (a file listing, a
@@ -100,7 +97,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAX_SEGMENTS = 4096
 # A soft ceiling, not a tight per-order budget -- see this module's docstring.
-DEFAULT_SEGMENT_STEP_CAP = 16
+DEFAULT_SEGMENT_STEP_CAP = 64
 
 # How many previous smart_tool segments' own messages (task line through
 # that segment's concluding turn) get replayed into a fresh segment's
@@ -112,21 +109,20 @@ DEFAULT_WORKER_HISTORY_TURNS = 4096
 
 # Preview lengths for the mechanical tool_calls cross-reference in a
 # smart_tool report. Always applied (there is no "give me the full thing in
-# this same call" flag) -- get_trace() is the escape hatch for full detail.
+# this same call" flag) -- get_tool_call_detail(call_id) is the escape hatch
+# for full detail on any one of them.
 ARGUMENTS_TRUNCATE_CHARS = 80
 RESULT_TRUNCATE_CHARS = 160
 
-_SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_trace", "get_tool_call_detail"}
+_SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_tool_call_detail"}
 
 SUPERVISOR_SYSTEM = """\
 You are a helpful assistant that carries out a task given to you by a user.
-You are only given the following four tools:
+You are only given the following three tools:
 
 - smart_tool(task): Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason.
 
-- get_trace(): Get the full, untruncated trace of the decomposed base tool calls from the most recent smart_tool call, including the input and output of every tool call. Use this when smart_tool's basic tool call list doesn't have enough detail for your decision-making.
-
-- get_tool_call_detail(call_id): Get the full, untruncated arguments and result of just ONE tool call from the most recent smart_tool call, identified by the call_id in that smart_tool result's tool_calls entries. Prefer this over get_trace() when you only need one call's detail, not the whole trace.
+- get_tool_call_detail(call_id): Get the full, untruncated arguments and result of ONE tool call, identified by the call_id in any smart_tool result's tool_calls entries. Works for a call from any past smart_tool call this task has made, not just the most recent one.
 
 - submit_output(field, value): Submit one required output field's value to the user. Use the exact field name and description given to you in this task's own instructions. Call it once per required field.
 
@@ -137,13 +133,12 @@ smart_tool("Read file ./file.json and return the keys using grep.")
 smart_tool("Show me the function parse_json in the file ./file.json.")
 smart_tool("Replace the function parse_json in the file ./file.json with ...")
 smart_tool("Run JSONFieldTests.test_has_key_number via runtests.py")
-get_tool_call_detail("call_1") -> returns the full, untruncated input and output  of that one tool call from the previous smart_tool call.
-get_trace() -> returns the full tool call trace of the previous smart_tool call, including the input and output of the tools.
+get_tool_call_detail("call_1") -> returns the full, untruncated input and output of that one tool call, wherever it happened.
 ... more smart_tool calls ...
 submit_output("field_name", "final value") -> once per required output field, when you have the confirmed final value to be reported to the user.
 ```
 
-ALL basic tools, such as "bash", "grep", "read", etc., are NOT AVAILABLE TO YOU DIRECTLY. Use the smart_tool to run them. When given a high-level task, the smart tool may have trouble decomposing the task accurately. In this case, you may need to give explicit bash commands or code snippets in your task description. You should be able to learn what the smart tool is capable of as you go along. When needed, inspect what the smart tool has executed by calling get_trace() or get_tool_call_detail(call_id), to have a better understanding of the smart tool's capabilities.
+ALL basic tools, such as "bash", "grep", "read", etc., are NOT AVAILABLE TO YOU DIRECTLY. Use the smart_tool to run them. When given a high-level task, the smart tool may have trouble decomposing the task accurately. In this case, you may need to give explicit bash commands or code snippets in your task description. You should be able to learn what the smart tool is capable of as you go along. When needed, inspect what the smart tool has executed by calling get_tool_call_detail(call_id), to have a better understanding of the smart tool's capabilities.
 
 If the smart tool is not returning the expected result, or only a summary of the desired result, inspect the basic tool call that contains the result yourself by calling get_tool_call_detail(call_id) to get the full, untruncated input and output of the basic tool call. Do not run the basic tool yourself, you do not have direct access to the basic tools.
 
@@ -180,23 +175,12 @@ _SMART_TOOL_SCHEMA = {
     },
 }
 
-_GET_TRACE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "get_trace",
-        "description": (
-            "Get the full, untruncated trace of the decomposed base tool calls from the most recent smart_tool call, including the input and output of every tool call."
-        ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-}
-
 _GET_TOOL_CALL_DETAIL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "get_tool_call_detail",
         "description": (
-            "Get the full, untruncated arguments and result of just ONE tool call from the most recent smart_tool call, identified by the call_id in that smart_tool result's tool_calls entries."
+            "Get the full, untruncated arguments and result of ONE tool call, identified by the call_id in any smart_tool result's tool_calls entries. Works for a call from any past smart_tool call this task has made, not just the most recent one."
         ),
         "parameters": {
             "type": "object",
@@ -277,13 +261,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _short_call_id(real_id: str, used_ids: "set[str]") -> str:
-    """4-hex-char id derived from the API's own (long) tool-call id -- unique
-    only within one segment's trace, which is all get_trace()/
-    get_tool_call_detail() ever look it up against; the real id is single-use
-    and discarded once the segment ends, so there's nothing for a short id to
-    stay stable across. Falls back to a longer hex prefix on the rare
-    within-segment collision so two different calls never end up sharing one
-    id."""
+    """4-hex-char id from the real one; `used_ids` must persist across the
+    whole execution (not per segment) for ids to stay unique."""
     digest = hashlib.sha1(real_id.encode()).hexdigest()
     length = 4
     short = digest[:length]
@@ -294,20 +273,23 @@ def _short_call_id(real_id: str, used_ids: "set[str]") -> str:
     return short
 
 
-def _extract_full_trace(result) -> "list[dict]":
-    """The worker segment's raw tool-call trace, untruncated -- what
-    get_trace() serves back verbatim, and what _build_report() truncates for
-    smart_tool's own return value. `result` is the worker's own
-    ReactLoopResult; `arguments`/`result` here are the raw strings the API
-    actually carried, never re-parsed into a dict -- this is a mechanical
-    transcript read, not model-authored content. `call_id` on each entry is
-    a short hash (see `_short_call_id`), not the API's own long id -- results
-    are still matched back to their call via that real id, just not exposed
-    as such."""
+def _extract_full_trace(
+    result, segment_marker: "str | None" = None, used_short_ids: "set[str] | None" = None
+) -> "list[dict]":
+    """This segment's tool-call trace, untruncated; `segment_marker` scopes
+    it, `used_short_ids` must be the caller's persistent set."""
     trace: "list[dict]" = []
     by_call_id: "dict[str, dict]" = {}
-    used_short_ids: "set[str]" = set()
-    for m in result.messages or []:
+    used_short_ids = used_short_ids if used_short_ids is not None else set()
+    messages = result.messages or []
+    start = 0
+    if segment_marker is not None:
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if m.get("role") == "user" and m.get("content") == segment_marker:
+                start = i + 1
+                break
+    for m in messages[start:]:
         if m.get("role") == "assistant":
             for tc in m.get("tool_calls") or []:
                 entry = {
@@ -325,18 +307,16 @@ def _extract_full_trace(result) -> "list[dict]":
     return trace
 
 
-def _build_report(result, forwarded_tool_output: "str | None" = None) -> "tuple[dict, list[dict]]":
-    """Returns (report, full_trace). `report` is exactly what smart_tool
-    hands back to the supervisor -- tool_calls truncated to
-    ARGUMENTS_TRUNCATE_CHARS/RESULT_TRUNCATE_CHARS as a cheap mechanical
-    cross-reference, alongside the worker's own tool_output. `full_trace`
-    is the untruncated version, cached by the caller for get_trace().
-    `result` is the worker's own ReactLoopResult. `forwarded_tool_output`,
-    if the worker called forward_tool_output, is that tool call's own raw
-    result -- appended to tool_output verbatim (mechanical, never
-    regenerated by the worker's own model) rather than replacing whatever
-    closing text the worker did write."""
-    full_trace = _extract_full_trace(result)
+def _build_report(
+    result,
+    forwarded_tool_output: "str | None" = None,
+    segment_marker: "str | None" = None,
+    used_short_ids: "set[str] | None" = None,
+) -> "tuple[dict, list[dict]]":
+    """Returns (report, full_trace): report is smart_tool's truncated reply
+    to the supervisor, full_trace the untruncated version fed into all_calls.
+    `segment_marker`/`used_short_ids` pass straight through to _extract_full_trace."""
+    full_trace = _extract_full_trace(result, segment_marker, used_short_ids)
     truncated_calls = [
         {
             "call_id": entry["call_id"],
@@ -415,9 +395,10 @@ def run_tandem_loop(
 ) -> TandemLoopResult:
     worker_totals = {"input": 0, "output": 0}
     segment_counter = {"n": 0}
-    # The full, untruncated trace of the most recent smart_tool call --
-    # get_trace() serves this back verbatim, no re-execution needed.
-    last_trace: "dict[str, list[dict] | None]" = {"tool_calls": None}
+    # Every tool-call entry from every segment so far, keyed by call_id.
+    all_calls: "dict[str, dict]" = {}
+    # Persistent execution-wide set -- see _short_call_id.
+    used_short_ids: "set[str]" = set()
     # The worker's own running conversation, carried across segments so it
     # isn't rediscovering things (like where the repo actually lives) a
     # prior segment already found -- system prompt at index 0, then each
@@ -459,9 +440,8 @@ def run_tandem_loop(
         worker_conversation["messages"] = _trim_worker_history(
             worker_conversation["messages"], worker_history_turns
         )
-        worker_conversation["messages"].append(
-            {"role": "user", "content": f"[TANDEM WORKER segment {segment_index}] {task}"}
-        )
+        segment_marker = f"[TANDEM WORKER segment {segment_index}] {task}"
+        worker_conversation["messages"].append({"role": "user", "content": segment_marker})
         worker_messages = worker_conversation["messages"]
         # Populated by react_loop.py with every tool call this segment makes,
         # in call order ({tool_call_id: result_content}) -- so
@@ -507,6 +487,8 @@ def run_tandem_loop(
             extra_tool_schemas=[_FORWARD_TOOL_OUTPUT_SCHEMA],
             extra_dispatch_table={"forward_tool_output": forward_tool_output_handler},
             call_id_results=call_id_results,
+            # Keep submit_output supervisor-only, not MCP-discoverable by the worker.
+            exclude_mcp_tool_names=frozenset({"submit_output"}),
         )
         worker_totals["input"] += result.total_input_tokens
         worker_totals["output"] += result.total_output_tokens
@@ -517,35 +499,32 @@ def run_tandem_loop(
             # maybe_compact() folded in along the way, not just our own
             # worker_messages input plus the new turns.
             worker_conversation["messages"] = result.messages
-        report, full_trace = _build_report(result, forwarded_tool_output=forwarded["content"])
-        last_trace["tool_calls"] = full_trace
+        report, full_trace = _build_report(
+            result,
+            forwarded_tool_output=forwarded["content"],
+            segment_marker=segment_marker,
+            used_short_ids=used_short_ids,
+        )
+        for entry in full_trace:
+            all_calls[entry["call_id"]] = entry
         _debug(f"report[{segment_index}]: {json.dumps(report)[:500]}")
         return json.dumps(report)
-
-    def get_trace_handler(_args_json: str) -> str:
-        if last_trace["tool_calls"] is None:
-            return json.dumps({"error": "no previous smart_tool call to trace"})
-        return json.dumps({"tool_calls": last_trace["tool_calls"]})
 
     def get_tool_call_detail_handler(args_json: str) -> str:
         args = _parse_args(args_json)
         call_id = (args.get("call_id") or "").strip()
         if not call_id:
             return json.dumps({"error": "get_tool_call_detail called with an empty call_id"})
-        trace = last_trace["tool_calls"]
-        if trace is None:
-            return json.dumps({"error": "no previous smart_tool call to look up"})
-        for entry in trace:
-            if entry["call_id"] == call_id:
-                return json.dumps(entry)
-        return json.dumps(
-            {"error": f"no tool call with call_id={call_id!r} in the most recent trace"}
-        )
+        entry = all_calls.get(call_id)
+        if entry is None:
+            return json.dumps(
+                {"error": f"no tool call with call_id={call_id!r} in this task's history"}
+            )
+        return json.dumps(entry)
 
-    supervisor_tool_schemas = [_SMART_TOOL_SCHEMA, _GET_TRACE_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
+    supervisor_tool_schemas = [_SMART_TOOL_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
     supervisor_dispatch_table = {
         "smart_tool": smart_tool_handler,
-        "get_trace": get_trace_handler,
         "get_tool_call_detail": get_tool_call_detail_handler,
     }
     if mcp is not None:

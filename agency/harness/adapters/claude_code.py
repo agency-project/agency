@@ -257,6 +257,26 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _forward_usage_to_anthropic(
+    usage: "dict | None", *, output_tokens: "int | None" = None
+) -> dict:
+    """Full copy, plus Anthropic's own field names layered on top."""
+    usage = dict(usage or {})
+    usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    usage["output_tokens"] = (
+        output_tokens
+        if output_tokens is not None
+        else usage.get("completion_tokens", usage.get("output_tokens", 0))
+    )
+    usage["cache_read_input_tokens"] = usage.get(
+        "cache_read_tokens", usage.get("cache_read_input_tokens", 0)
+    )
+    usage["cache_creation_input_tokens"] = usage.get(
+        "cache_write_tokens", usage.get("cache_creation_input_tokens", 0)
+    )
+    return usage
+
+
 class ClaudeDriver(PtyDriver):
     """Claude Code: Agency-assigned turn identity, hook-driven completion.
 
@@ -417,11 +437,15 @@ class ClaudeDriver(PtyDriver):
         return True
 
     def _record_usage(self, blob, event):
+        """Sums every numeric usage field the CLI's rows carry, not just
+        input_tokens/output_tokens."""
         self._snapshot = blob
-        usage = {"input_tokens": 0, "output_tokens": 0}
+        usage: "dict[str, int]" = {"input_tokens": 0, "output_tokens": 0}
         for row in self._rows(blob[self._attempt_offset :]):
-            for key in usage:
-                usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
+            row_usage = row.get("message", {}).get("usage") or {}
+            for key, value in row_usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
         event.update(usage)
 
     def snapshot(self):
@@ -769,7 +793,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 )
             elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
                 content_blocks.append(_unknown_block_to_anthropic(b))
-        usage = agency_response.get("usage") or {}
         return {
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
@@ -778,10 +801,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "model": model,
             "stop_reason": _stop_reason_to_anthropic(agency_response.get("stop_reason")),
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-            },
+            "usage": _forward_usage_to_anthropic(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -813,10 +833,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                     "model": model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": final_usage.get("prompt_tokens", 0),
-                        "output_tokens": 0,
-                    },
+                    "usage": _forward_usage_to_anthropic(final_usage, output_tokens=0),
                 },
             },
         )
@@ -918,7 +935,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
                         },
                     )
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-            usage = item.get("usage") or {}
             yield _sse(
                 "message_delta",
                 {
@@ -927,7 +943,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                         "stop_reason": _stop_reason_to_anthropic(item.get("stop_reason")),
                         "stop_sequence": None,
                     },
-                    "usage": {"output_tokens": usage.get("completion_tokens", 0)},
+                    "usage": _forward_usage_to_anthropic(item.get("usage")),
                 },
             )
             yield _sse("message_stop", {"type": "message_stop"})

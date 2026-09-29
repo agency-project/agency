@@ -297,7 +297,9 @@ class harnessadapterconfig(confignamespace):
     # A soft ceiling, not a tight per-order budget: the worker may make
     # several tool calls to satisfy one order before it must report back to
     # the supervisor. See tandem_harness/tandem_loop.py's docstring.
-    segment_step_cap: int = 16
+    segment_step_cap: int = 64
+
+    _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 
 
 @dataclass(slots=True)

@@ -88,27 +88,13 @@ def _container_socket_path(host_path: Path) -> str:
 
 
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
+    """Every field, via safe_snapshot() -- not a hand-picked subset."""
     if agconfig is None:
         return {}
     return {
-        "harness_adapter": {
-            "binary_path": agconfig.harness_adapter.binary_path,
-            "supervisor_model": agconfig.harness_adapter.supervisor_model,
-        },
-        "ptrace": {
-            "syscalls": list(agconfig.ptrace.syscalls),
-            "file_access": agconfig.ptrace.file_access,
-            "profiler": agconfig.ptrace.profiler,
-            "disable_harness_native_sandbox": agconfig.ptrace.disable_harness_native_sandbox,
-        },
-        "sandbox": {
-            "checkpoint_fast_resume": agconfig.sandbox.checkpoint_fast_resume,
-            # Whether the daemon may pip-install a missing required package
-            # into itself: only the unpinned default ("python3") interpreter
-            # is allowed to self-heal that way -- see HarnessManager's own
-            # bootstrap step in harness/daemon.py.
-            "harness_python_path": agconfig.sandbox.harness_python_path,
-        },
+        "harness_adapter": agconfig.harness_adapter.safe_snapshot(),
+        "ptrace": agconfig.ptrace.safe_snapshot(),
+        "sandbox": agconfig.sandbox.safe_snapshot(),
     }
 
 

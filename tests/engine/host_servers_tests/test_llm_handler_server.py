@@ -684,7 +684,10 @@ def test_dispatch_returns_message_usage_stop_reason():
     content_blocks = [b for b in result["message"]["blocks"] if b["type"] != "metadata"]
     assert result["message"]["role"] == "assistant"
     assert content_blocks == [{"type": "text", "index": 0, "text": "hi there"}]
-    assert result["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+    usage = result["usage"]
+    assert usage["prompt_tokens"] == 5
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 8
     assert result["stop_reason"] == "stop"
     assert client.closed is True
 
@@ -874,13 +877,15 @@ def test_start_stream_accumulates_deltas_and_delivers_one_done_item():
     block = content_blocks[0]
     assert block["type"] == "text" and block["text"] == "Hello"
     assert "ts_start" in block and "ts_end" in block
-    assert items[0]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    usage = items[0]["usage"]
+    assert usage["prompt_tokens"] == 1
+    assert usage["completion_tokens"] == 2
+    assert usage["total_tokens"] == 3
     metadata_block = next(b for b in message["blocks"] if b["type"] == "metadata")
-    assert metadata_block["data"][-1]["usage"] == {
-        "prompt_tokens": 1,
-        "completion_tokens": 2,
-        "total_tokens": 3,
-    }
+    last_usage = metadata_block["data"][-1]["usage"]
+    assert last_usage["prompt_tokens"] == 1
+    assert last_usage["completion_tokens"] == 2
+    assert last_usage["total_tokens"] == 3
     # Streaming calls persist TTFT into the durable record, not just an
     # agprof span annotation -- a replay backend needs it without depending
     # on profiling having been active during the original run.

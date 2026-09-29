@@ -17,8 +17,10 @@ external harness goes through. There is no separate "checkpoint" concept.
 supervisor's own turn-taking IS a `run_react_loop` call, just with its
 built-in tools/MCP discovery swapped out for a caller-supplied
 `tool_schemas`/`dispatch_table` (its synthetic control-flow actions --
-`smart_tool`, `get_trace`, `get_tool_call_detail` -- plus the one real
-tool it keeps for itself, `submit_output`). Completion is the same
+`smart_tool`, `get_tool_call_detail` -- plus the one real
+tool it keeps for itself, `submit_output`, which the worker's own call
+below excludes via `exclude_mcp_tool_names` since it shares the same
+McpToolset). Completion is the same
 implicit signal every ReAct loop here already uses
 -- a turn with no tool call -- so the supervisor needs no dedicated
 "finish" tool of its own. Each worker segment is a second, independent
@@ -119,6 +121,7 @@ def run_react_loop(
     extra_tool_schemas: "list[dict] | None" = None,
     extra_dispatch_table: "dict | None" = None,
     policy_exempt_tools: "set[str] | None" = None,
+    exclude_mcp_tool_names: "frozenset[str] | None" = None,
     span_prefix: str = "turn",
     internal_kind: "str | None" = None,
     unknown_tool_hint: "str | None" = None,
@@ -144,7 +147,9 @@ def run_react_loop(
         mcp_schemas = mcp.discover() if mcp is not None else []
         for schema in mcp_schemas:
             name = schema["function"]["name"]
-            if name in have_tool:
+            # MCP discovery is caller-agnostic; exclude_mcp_tool_names is how
+            # a caller (e.g. tandem_loop.py) keeps a tool role-restricted.
+            if name in have_tool or name in (exclude_mcp_tool_names or ()):
                 continue  # built-ins take precedence, same as tool-set-collision rules elsewhere
             tool_schemas.append(schema)
             have_tool.add(name)

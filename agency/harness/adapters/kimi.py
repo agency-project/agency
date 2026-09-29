@@ -278,13 +278,23 @@ class KimiDriver(PtyDriver):
                     if part.get("type") == "text":
                         text.append(part.get("text", ""))
                 elif loop.get("type") == "step.end":
-                    counts = loop.get("usage", {})
+                    counts = loop.get("usage", {}) or {}
+                    # Sum every field under its own name too, not just the blend below.
+                    for key, value in counts.items():
+                        if isinstance(value, (int, float)):
+                            usage[key] = usage.get(key, 0) + value
                     usage["input_tokens"] += (
                         counts.get("inputOther", 0)
                         + counts.get("inputCacheRead", 0)
                         + counts.get("inputCacheCreation", 0)
                     )
                     usage["output_tokens"] += counts.get("output", 0)
+                    usage["cache_read_tokens"] = usage.get("cache_read_tokens", 0) + counts.get(
+                        "inputCacheRead", 0
+                    )
+                    usage["cache_write_tokens"] = usage.get("cache_write_tokens", 0) + counts.get(
+                        "inputCacheCreation", 0
+                    )
             elif kind == "turn.ended" and self._turn(row.get("turnId")) == turn:
                 if row.get("reason") != "completed":
                     raise RuntimeError(f"Kimi turn ended: {row.get('reason')}")

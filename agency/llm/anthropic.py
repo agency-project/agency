@@ -89,6 +89,39 @@ def _anthropic_native_block_type(native_type: str) -> str:
     return f"{_ANTHROPIC_TYPE_PREFIX}{native_type}"
 
 
+def _usage_to_dict(usage) -> dict:
+    """Coerces to a real dict even when _serialize_sdk_object can't."""
+    if usage is None:
+        return {}
+    dumped = _serialize_sdk_object(usage)
+    if isinstance(dumped, dict):
+        return dumped
+    try:
+        return dict(vars(dumped))
+    except TypeError:
+        return {}
+
+
+def _merge_usage(acc: dict, dump: dict) -> None:
+    """Merges without letting a later falsy field clobber an earlier real one."""
+    for k, v in dump.items():
+        if v or k not in acc:
+            acc[k] = v
+
+
+def _serialize_anthropic_usage(usage) -> dict:
+    """Full copy of the SDK's usage object, not a hand-picked subset."""
+    dumped = _usage_to_dict(usage)
+    input_tokens = dumped.get("input_tokens") or 0
+    output_tokens = dumped.get("output_tokens") or 0
+    dumped["prompt_tokens"] = input_tokens
+    dumped["completion_tokens"] = output_tokens
+    dumped["total_tokens"] = input_tokens + output_tokens
+    dumped["cache_read_tokens"] = dumped.get("cache_read_input_tokens") or 0
+    dumped["cache_write_tokens"] = dumped.get("cache_creation_input_tokens") or 0
+    return dumped
+
+
 def _flatten_unknown_fragment(fragment) -> dict:
     if not isinstance(fragment, dict):
         return {}
@@ -387,18 +420,7 @@ class _AnthropicBackend(agllm):
                         "data": _serialize_sdk_object(b),
                     }
                 )
-        usage = getattr(raw_result, "usage", None)
-        input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
-        output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
-        cache_read_tokens = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
-        cache_write_tokens = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-        }
+        usage_dict = _serialize_anthropic_usage(getattr(raw_result, "usage", None))
         stop_reason = getattr(raw_result, "stop_reason", None)
         blocks.append(
             {
@@ -429,10 +451,7 @@ class _AnthropicBackend(agllm):
         viewer anyway, so nothing is lost — and emitting one complete item
         instead of many small ones avoids relying on every fragment
         individually surviving whatever consumes this generator."""
-        input_tokens = 0
-        output_tokens = 0
-        cache_read_tokens = 0
-        cache_write_tokens = 0
+        usage_acc: "dict" = {}
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
@@ -443,12 +462,9 @@ class _AnthropicBackend(agllm):
             if etype == "message_start":
                 usage = getattr(event.message, "usage", None)
                 if usage is not None:
-                    input_tokens = getattr(usage, "input_tokens", 0) or 0
-                    cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-                    cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                    metadata_events.append(
-                        {"event": "message_start", "usage": _serialize_sdk_object(usage)}
-                    )
+                    usage_dump = _usage_to_dict(usage)
+                    _merge_usage(usage_acc, usage_dump)
+                    metadata_events.append({"event": "message_start", "usage": usage_dump})
             elif etype == "content_block_start":
                 block = event.content_block
                 if block.type == "tool_use":
@@ -522,7 +538,8 @@ class _AnthropicBackend(agllm):
             elif etype == "message_delta":
                 usage = getattr(event, "usage", None)
                 if usage is not None:
-                    output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
+                    usage_dump = _usage_to_dict(usage)
+                    _merge_usage(usage_acc, usage_dump)
                 delta_stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
                 if delta_stop_reason is not None:
                     stop_reason = delta_stop_reason
@@ -561,13 +578,14 @@ class _AnthropicBackend(agllm):
                 "data": {"start": unknown["start"], "deltas": unknown["deltas"]},
             }
 
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-        }
+        input_tokens = usage_acc.get("input_tokens") or 0
+        output_tokens = usage_acc.get("output_tokens") or 0
+        usage_dict = dict(usage_acc)
+        usage_dict["prompt_tokens"] = input_tokens
+        usage_dict["completion_tokens"] = output_tokens
+        usage_dict["total_tokens"] = input_tokens + output_tokens
+        usage_dict["cache_read_tokens"] = usage_acc.get("cache_read_input_tokens") or 0
+        usage_dict["cache_write_tokens"] = usage_acc.get("cache_creation_input_tokens") or 0
         # The metadata block is a plain block_delta -- like any other unknown
         # native block, it flows through the host server's generic block
         # accumulator with no dedicated handling required there. All

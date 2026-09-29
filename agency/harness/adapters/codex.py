@@ -79,6 +79,17 @@ def _unknown_block_to_responses(b: dict) -> dict:
     return merged
 
 
+def _forward_usage_to_responses(usage: "dict | None") -> dict:
+    """Full copy, plus the Responses API's own field names layered on top."""
+    usage = dict(usage or {})
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    usage["input_tokens"] = input_tokens
+    usage["output_tokens"] = output_tokens
+    usage["total_tokens"] = usage.get("total_tokens") or (input_tokens + output_tokens)
+    return usage
+
+
 def _responses_content_to_text(content) -> str:
     return "".join(b["text"] for b in _responses_content_to_blocks(content))
 
@@ -580,20 +591,13 @@ class CodexAdapter(HarnessAdapter):
             elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
                 output.append(_unknown_block_to_responses(b))
 
-        usage = agency_response.get("usage") or {}
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
         return {
             "id": f"resp_{uuid.uuid4().hex}",
             "object": "response",
             "status": "completed",
             "model": model,
             "output": output,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
+            "usage": _forward_usage_to_responses(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
@@ -738,9 +742,6 @@ class CodexAdapter(HarnessAdapter):
                         },
                     )
 
-            usage = item.get("usage") or {}
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
             yield _sse(
                 "response.completed",
                 {
@@ -750,11 +751,7 @@ class CodexAdapter(HarnessAdapter):
                         "object": "response",
                         "status": "completed",
                         "model": model,
-                        "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens,
-                        },
+                        "usage": _forward_usage_to_responses(item.get("usage")),
                     },
                 },
             )
