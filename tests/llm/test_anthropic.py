@@ -1871,3 +1871,41 @@ class TestFirstClassTopK:
     @pytest.mark.parametrize("model", _NO_SAMPLING)
     def test_llmconfig_top_k_dropped_where_sampling_is_rejected(self, model):
         assert "top_k" not in _kwargs(model, top_k=40)
+
+
+class TestToolStrict:
+    _SCHEMA = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    }
+
+    def test_chat_completions_strict_is_preserved(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "w",
+                    "description": "d",
+                    "parameters": self._SCHEMA,
+                    "strict": True,
+                },
+            }
+        ]
+        assert _agency_tools_to_anthropic(tools) == [
+            {"name": "w", "description": "d", "input_schema": self._SCHEMA, "strict": True}
+        ]
+
+    def test_flat_tool_strict_is_preserved(self):
+        converted = _agency_tools_to_anthropic(
+            [{"name": "w", "parameters": self._SCHEMA, "strict": True}]
+        )
+        assert converted[0]["strict"] is True
+
+    @pytest.mark.parametrize("strict", [False, None, "true"])
+    def test_non_true_strict_is_omitted(self, strict):
+        fn = {"name": "w", "parameters": self._SCHEMA}
+        if strict is not None:
+            fn["strict"] = strict
+        assert "strict" not in _agency_tools_to_anthropic([{"type": "function", "function": fn}])[0]

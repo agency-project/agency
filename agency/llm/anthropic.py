@@ -322,13 +322,18 @@ def _agency_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None
     converted = []
     for t in tools:
         fn = t.get("function", t)
-        converted.append(
-            {
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
-            }
-        )
+        tool = {
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        # Anthropic strict tool use has the same schema precondition as
+        # OpenAI's (additionalProperties: false on every object), so a schema
+        # a harness marked strict for OpenAI is valid here too. Only an
+        # explicit True is forwarded.
+        if fn.get("strict") is True:
+            tool["strict"] = True
+        converted.append(tool)
     return converted
 
 
