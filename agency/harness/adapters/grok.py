@@ -10,7 +10,7 @@ from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_l
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
 from .openai_chat_completions import ChatCompletionsProtocol
-from .streaming import stream_response
+from .streaming import start_streaming_response, stream_response
 
 
 def grok_available() -> bool:
@@ -249,12 +249,10 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
                 return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router, token, agency_context, model, self._format_agency_stream_to_harness
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router, token, agency_context, model, self._format_agency_stream_to_harness
                 )
+                return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

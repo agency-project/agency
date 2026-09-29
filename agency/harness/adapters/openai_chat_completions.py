@@ -14,7 +14,7 @@ import uuid
 from fastapi import Request
 
 from ..common import extract_bearer_token
-from .streaming import stream_response
+from .streaming import start_streaming_response, stream_response
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -64,7 +64,7 @@ class ChatCompletionsProtocol:
     """Mixin supplying the Chat Completions route and its block mapping."""
 
     def register(self, app, router) -> None:
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
@@ -77,12 +77,10 @@ class ChatCompletionsProtocol:
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router, token, agency_context, model, self._format_agency_stream_to_harness
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router, token, agency_context, model, self._format_agency_stream_to_harness
                 )
+                return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
