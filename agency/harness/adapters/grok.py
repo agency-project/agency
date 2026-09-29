@@ -10,7 +10,7 @@ from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_l
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
 from .openai_chat_completions import ChatCompletionsProtocol
-from .pty.execution import stream_response
+from .streaming import stream_response
 
 
 def grok_available() -> bool:

@@ -111,21 +111,6 @@ def snapshot_session(root, harness, session_id):
     return blob
 
 
-async def stream_response(router, token, context, model, formatter):
-    """A TUI interrupt must close the upstream request, not just its HTTP socket."""
-    import anyio
-
-    stream = router.dispatch_stream_async(token, context)
-    try:
-        async for item in stream:
-            if item.get("type") == "done":
-                for frame in formatter([item], model):
-                    yield frame
-    finally:
-        with anyio.CancelScope(shield=True):
-            await stream.aclose()
-
-
 class PtyExecution:
     INPUT_TIMEOUT = 60.0
     START_TIMEOUT = 45.0

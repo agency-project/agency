@@ -17,6 +17,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
+from .streaming import start_streaming_response, stream_response
 
 # An idle deadline, not a flat one: reset whenever the react loop's progress
 # checkpoint advances (see react_loop.py's _write_progress), the same
@@ -250,7 +251,7 @@ class NativeAdapter(HarnessAdapter):
         )
 
     def register(self, app, router) -> None:
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
@@ -263,13 +264,10 @@ class NativeAdapter(HarnessAdapter):
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context), model
-                    )
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
+                frames = stream_response(
+                    router, token, agency_context, model, self._format_agency_stream_to_harness
+                )
+                return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

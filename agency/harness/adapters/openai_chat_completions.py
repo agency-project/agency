@@ -14,7 +14,7 @@ import uuid
 from fastapi import Request
 
 from ..common import extract_bearer_token
-from .pty.execution import stream_response
+from .streaming import stream_response
 
 
 _STOP_REASON_TO_OPENAI = {

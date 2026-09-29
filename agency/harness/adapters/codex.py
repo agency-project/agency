@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -14,7 +13,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .pty.execution import stream_response
+from .streaming import start_streaming_response, stream_response
 
 
 def codex_available() -> bool:
@@ -348,7 +347,7 @@ class CodexAdapter(HarnessAdapter):
         (config_home / "config.toml").write_text(toml_text)
 
     def register(self, app, router) -> None:
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse
 
         def _auth_error():
             return JSONResponse(
@@ -366,8 +365,6 @@ class CodexAdapter(HarnessAdapter):
             # Keep routing request-local: one adapter serves multiple tokens.
             tool_routes = _responses_tool_routes(body)
             if body.get("stream"):
-                from ..clients.host_services_client import HostDispatchError
-
                 frames = stream_response(
                     router,
                     token,
@@ -375,60 +372,9 @@ class CodexAdapter(HarnessAdapter):
                     model,
                     partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
                 )
-
-                # This adapter already buffers through `done`. Fetch the first
-                # frame before committing HTTP 200 so a permanent upstream 400
-                # is not turned into a retryable truncated SSE connection.
-                async def wait_for_disconnect():
-                    while (await request.receive())["type"] != "http.disconnect":
-                        pass
-
-                first_task = asyncio.create_task(anext(frames))
-                disconnect_task = asyncio.create_task(wait_for_disconnect())
-                first_received = False
-                try:
-                    done, _ = await asyncio.wait(
-                        {first_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    if disconnect_task in done:
-                        return JSONResponse({"error": "client disconnected"}, status_code=499)
-                    first = first_task.result()
-                    first_received = True
-                except HostDispatchError as exc:
-                    return JSONResponse(
-                        {
-                            "error": {
-                                "message": str(exc),
-                                "type": "upstream_error",
-                                "transient": exc.transient,
-                            }
-                        },
-                        status_code=exc.status_code,
-                    )
-                finally:
-                    import anyio
-
-                    # A disconnect before HTTP headers must cancel the blocked
-                    # model read just as a later StreamingResponse disconnect does.
-                    with anyio.CancelScope(shield=True):
-                        first_task.cancel()
-                        disconnect_task.cancel()
-                        await asyncio.gather(first_task, disconnect_task, return_exceptions=True)
-                        if not first_received:
-                            await frames.aclose()
-
-                async def response_frames():
-                    try:
-                        yield first
-                        async for frame in frames:
-                            yield frame
-                    finally:
-                        await frames.aclose()
-
-                return StreamingResponse(
-                    response_frames(),
-                    media_type="text/event-stream",
-                )
+                # This adapter already buffers through `done`; see
+                # start_streaming_response for why the first frame comes first.
+                return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(
                 self._format_context_agency_to_harness(

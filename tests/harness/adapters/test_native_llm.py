@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.native import NativeAdapter
 
@@ -365,3 +367,136 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
         if isinstance(e, dict) and e["choices"] and e["choices"][0]["delta"].get("refusal")
     )
     assert unknown_chunk["choices"][0]["delta"]["refusal"] == "no"
+
+
+def _stream_client(router):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    _backend().register(app, router)
+    return TestClient(app)
+
+
+class _StreamRouter:
+    def __init__(self, items, exc=None):
+        self.items, self.exc = items, exc
+
+    def validate_token(self, token):
+        return True
+
+    def resolve_model(self, token):
+        return "m"
+
+    async def dispatch_stream_async(self, token, request):
+        for item in self.items:
+            yield item
+        if self.exc:
+            raise self.exc
+
+
+def _post_stream(client):
+    return client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer fake"},
+        json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+
+def _done(text="hello"):
+    return {
+        "type": "done",
+        "message": {"blocks": [{"type": "text", "index": 0, "text": text}]},
+        "stop_reason": "end_turn",
+        "usage": {},
+    }
+
+
+@pytest.mark.parametrize("status,transient", [(400, False), (503, True)])
+def test_stream_upstream_error_before_first_event_preserves_status_and_transient(status, transient):
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    exc = HostDispatchError(
+        {"message": "invalid_request: bad param", "status_code": status, "transient": transient}
+    )
+    with _stream_client(_StreamRouter([], exc)) as client:
+        response = _post_stream(client)
+    assert response.status_code == status
+    error = response.json()["error"]
+    assert error["message"] == "invalid_request: bad param"
+    assert error["type"] == "upstream_error"
+    assert error["transient"] is transient
+
+
+def test_stream_ending_without_events_is_502():
+    with _stream_client(_StreamRouter([])) as client:
+        response = _post_stream(client)
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_error"
+
+
+def test_stream_tool_use_and_usage_pass_through_route():
+    done = {
+        "type": "done",
+        "message": {
+            "blocks": [{"type": "tool_use", "index": 0, "id": "c1", "name": "f", "arguments": "{}"}]
+        },
+        "stop_reason": "tool_use",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+    }
+    with _stream_client(_StreamRouter([{"type": "delta"}, done])) as client:
+        response = _post_stream(client)
+    payloads = [
+        json.loads(f[len("data: ") :])
+        for f in response.text.split("\n\n")
+        if f.startswith("data: {")
+    ]
+    assert payloads[0]["choices"][0]["delta"]["tool_calls"][0]["id"] == "c1"
+    assert payloads[1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert payloads[-1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+
+
+def test_stream_exception_before_first_event_is_structured_error():
+    with _stream_client(_StreamRouter([], RuntimeError("upstream exploded"))) as client:
+        response = _post_stream(client)
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "upstream exploded"
+
+
+def test_stream_exception_after_delta_before_done_still_surfaces_error():
+    # Native only publishes the finalized message, so deltas commit nothing.
+    items = [{"type": "delta", "delta": {"text": "par"}}]
+    with _stream_client(_StreamRouter(items, RuntimeError("mid-stream"))) as client:
+        response = _post_stream(client)
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "mid-stream"
+
+
+def test_stream_success_is_incremental_sse():
+    with _stream_client(_StreamRouter([_done()])) as client:
+        response = _post_stream(client)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    frames = [f for f in response.text.split("\n\n") if f]
+    assert len(frames) > 2 and frames[-1] == "data: [DONE]"
+    assert json.loads(frames[0][len("data: ") :])["choices"][0]["delta"] == {"content": "hello"}
+
+
+def test_stream_error_after_first_frame_keeps_earlier_frames_intact():
+    import asyncio
+
+    from agency.harness.adapters.streaming import stream_response
+
+    router = _StreamRouter([_done()], RuntimeError("late"))
+    frames = []
+
+    async def collect():
+        with pytest.raises(RuntimeError, match="late"):
+            async for frame in stream_response(
+                router, "t", {}, "m", _backend()._format_agency_stream_to_harness
+            ):
+                frames.append(frame)
+
+    asyncio.run(collect())
+    assert json.loads(frames[0][len("data: ") :])["choices"][0]["delta"] == {"content": "hello"}
+    assert frames[-1] == "data: [DONE]\n\n"

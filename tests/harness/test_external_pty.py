@@ -670,7 +670,7 @@ def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(r
 
 def test_stream_cancellation_closes_upstream_generator():
     import asyncio
-    from agency.harness.adapters.pty.execution import stream_response
+    from agency.harness.adapters.streaming import stream_response
 
     closed = []
 
