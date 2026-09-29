@@ -519,6 +519,9 @@ class _AnthropicBackend(agllm):
         if "top_k" in extra_body:
             sampling["top_k"] = extra_body["top_k"]
         kwargs.update(_sampling_for_model(sampling, model, info))
+        stop = self.agconfig.llm.stop
+        if stop:
+            kwargs["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools

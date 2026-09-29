@@ -1799,3 +1799,15 @@ class TestThinkingReplay:
             {"data": "opaque", "type": "redacted_thinking"},
             {"type": "text", "text": "ok"},
         ]
+
+
+class TestStopSequences:
+    @pytest.mark.parametrize(
+        "stop,expected", [("END", ["END"]), (["a", "b"], ["a", "b"]), (("x",), ["x"])]
+    )
+    def test_stop_becomes_stop_sequences(self, stop, expected):
+        assert _kwargs("claude-opus-5-5", stop=stop)["stop_sequences"] == expected
+
+    @pytest.mark.parametrize("stop", [None, [], ""])
+    def test_no_stop_omits_stop_sequences(self, stop):
+        assert "stop_sequences" not in _kwargs("claude-opus-5-5", stop=stop)
