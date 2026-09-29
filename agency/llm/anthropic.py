@@ -249,15 +249,21 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 out.append({"role": "user", "content": content_blocks})
         elif role == "assistant":
             anthropic_blocks: list[dict] = []
+            dropped_thinking = 0
             for b in blocks:
                 if b["type"] == "text":
                     anthropic_blocks.append(_text_block_to_anthropic(b))
                 elif b["type"] == "thinking":
-                    if (b.get("signature") or "").startswith(ENCRYPTED_REASONING_TAG):
-                        # OpenAI encrypted reasoning from an earlier turn on
-                        # provider="openai_responses": Anthropic can't verify
-                        # it as a thinking signature (a 400), so only the
-                        # rest of the turn is replayed.
+                    signature = b.get("signature") or ""
+                    if not signature or signature.startswith(ENCRYPTED_REASONING_TAG):
+                        # Only Claude-signed blocks can be replayed: an
+                        # unsigned one (vLLM/Chat Completions reasoning_content,
+                        # Converse reasoningText without a signature) or
+                        # OpenAI encrypted reasoning from provider=
+                        # "openai_responses" is a 400 ("Invalid `signature`"),
+                        # on every Claude model. Only the rest of the turn is
+                        # replayed; nothing is ever re-signed.
+                        dropped_thinking += 1
                         continue
                     anthropic_blocks.append(
                         {
@@ -276,6 +282,16 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                     )
                 elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
                     anthropic_blocks.append(_unknown_block_to_anthropic(b))
+            if dropped_thinking:
+                _warn_once(
+                    ("thinking", "unsigned"),
+                    "history carries thinking blocks without a Claude signature "
+                    "(another provider's reasoning); they are not sent to Anthropic",
+                )
+                if not anthropic_blocks:
+                    # Nothing but foreign reasoning -- an empty assistant turn
+                    # would itself be rejected.
+                    continue
             text_only = "".join(b["text"] for b in blocks if b["type"] == "text")
             out.append({"role": "assistant", "content": anthropic_blocks or text_only})
             pending_tool_ids = {b["id"] for b in anthropic_blocks if b["type"] == "tool_use"}

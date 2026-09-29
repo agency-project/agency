@@ -1697,3 +1697,105 @@ class TestDeveloperRole:
         )
         assert kwargs["system"][0]["text"] == "BASE\n\nDEVELOPER RULES"
         assert [m["role"] for m in kwargs["messages"]] == ["user"]
+
+
+# ---------------------------------------------------------------------------
+# Thinking replay: only Claude-signed blocks are sent back
+# ---------------------------------------------------------------------------
+
+
+def _thinking(text, index, **fields):
+    return {"type": "thinking", "index": index, "text": text, **fields}
+
+
+def _replayed_assistant(blocks):
+    _, msgs = _agency_messages_to_anthropic(
+        [_text_msg("user", "go"), {"role": "assistant", "blocks": blocks}]
+    )
+    return msgs[1:]
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestThinkingReplay:
+    def test_signed_blocks_replay_byte_identical_in_order_around_tool_calls(self):
+        blocks = [
+            _thinking("", 0, signature="sig-1"),
+            {"type": "text", "index": 1, "text": "Checking."},
+            _thinking("progress", 2, signature="sig-2"),
+            {"type": "tool_use", "index": 3, "id": "t1", "name": "f", "arguments": '{"a": 1}'},
+        ]
+        assert _replayed_assistant(blocks) == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig-1"},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "thinking", "thinking": "progress", "signature": "sig-2"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"a": 1}},
+                ],
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            _thinking("reasoned", 0, signature=""),  # empty signature
+            _thinking("reasoned", 0),  # missing signature
+            _thinking("", 0, signature="openai_responses:gAAAAB"),  # OpenAI Responses
+        ],
+        ids=["empty_signature", "missing_signature", "openai_responses"],
+    )
+    def test_unsigned_and_foreign_blocks_are_not_sent(self, block, capsys):
+        tool_use = {"type": "tool_use", "index": 1, "id": "t1", "name": "f", "arguments": "{}"}
+        assert _replayed_assistant([block, {**tool_use}]) == [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+            }
+        ]
+        assert "without a Claude signature" in capsys.readouterr().out
+
+    def test_foreign_provider_reasoning_content_is_never_replayed_as_thinking(self):
+        """vLLM / Chat Completions `reasoning_content` becomes an unsigned
+        agency thinking block; after a provider switch it must not reach
+        Anthropic as a thinking block."""
+        from agency.llm.openai import _OpenAICompatibleBackend
+
+        raw = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="answer",
+                        reasoning_content="private chain of thought",
+                        tool_calls=None,
+                        function_call=None,
+                        model_extra={},
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        agency = _OpenAICompatibleBackend(
+            _cfg(provider="vllm", base_url="http://x/v1", model="m")
+        )._format_context_backend_to_agency(raw)
+        thinking = [b for b in agency["message"]["blocks"] if b["type"] == "thinking"]
+        assert thinking and not thinking[0].get("signature")
+        replayed = _replayed_assistant(
+            [b for b in agency["message"]["blocks"] if b["type"] != "metadata"]
+        )
+        assert replayed == [{"role": "assistant", "content": [{"type": "text", "text": "answer"}]}]
+
+    def test_turn_of_only_foreign_reasoning_is_omitted_not_sent_empty(self):
+        assert _replayed_assistant([_thinking("reasoned", 0, signature="")]) == []
+
+    def test_redacted_thinking_still_round_trips(self):
+        blocks = [
+            {"type": "anthropic_redacted_thinking", "index": 0, "data": {"data": "opaque"}},
+            {"type": "text", "index": 1, "text": "ok"},
+        ]
+        assert _replayed_assistant(blocks)[0]["content"] == [
+            {"data": "opaque", "type": "redacted_thinking"},
+            {"type": "text", "text": "ok"},
+        ]
