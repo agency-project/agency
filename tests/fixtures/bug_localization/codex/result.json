@@ -1,0 +1,52 @@
+{
+  "instance_id": "django__django-11066",
+  "difficulty": "<15 min fix",
+  "repo": "django/django",
+  "harness": "codex",
+  "backend": "openai",
+  "model": "claude-sonnet-5",
+  "max_steps": 60,
+  "agname": "agent_alex_0000",
+  "dropped_caches": true,
+  "status": "ok",
+  "reasoning": "The bug is in django/contrib/contenttypes/management/__init__.py, in RenameContentType._rename(). This method determines the correct database alias via `db = schema_editor.connection.alias` and even wraps the save in `with transaction.atomic(using=db):`, but the actual save call `content_type.save(update_fields={'model'})` omits the `using=db` argument. Since Model.save() defaults to using `router.db_for_write()` (which typically resolves to the default database alias) when `using` is not explicitly passed, the ContentType instance ends up being saved against the default database connection rather than the one specified by the migration's schema_editor/db alias. This causes failures (e.g. OperationalError: no such table) in setups where the default database is not a real/usable database and the actual migration target database is passed explicitly (e.g., via a custom --database dict or dynamic database router), because the transaction.atomic(using=db) only affects transaction management, not which connection save() uses. The fix is to explicitly pass `using=db` to the save call: `content_type.save(using=db, update_fields={'model'})`, ensuring the write happens on the same database connection identified by schema_editor and used for the router.allow_migrate_model check and the initial get_by_natural_key lookup (which already correctly used db via `ContentType.objects.db_manager(db)`).",
+  "gold_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "reported_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "hit": true,
+  "scoring_error": null,
+  "wall_clock_s": 93.71,
+  "repo_dirty": false,
+  "tools_seen": {
+    "mcp__agency__submit_output": 2,
+    "Bash": 1
+  },
+  "io_read_mb": 260.464844,
+  "sandbox_cpu_seconds": 10.3884,
+  "tool_io_read_mb": 3.346829,
+  "setup_io_read_mb": 51.498053,
+  "harness_io_read_mb": 208.925419,
+  "io_read_mb_by_span": {
+    "run:bug_localizer": 260.464844,
+    "sync:result_wait": 260.464844,
+    "engine:execute": 260.464844,
+    "harness:attempt_rpc": 208.925419,
+    "harness:startup_ready": 83.319834,
+    "harness:await_cli": 58.741324,
+    "sandbox:ensure_daemon": 51.498053,
+    "runtime.harness_start": 51.497117,
+    "llm:attempt": 50.016043,
+    "harness:submit": 41.420347,
+    "syscall:execve": 19.256712,
+    "tool:Bash": 3.028751,
+    "run:container_call": 0.648421,
+    "tool:mcp__agency__submit_output": 0.318078,
+    "harness:launch": 0.105454
+  }
+}

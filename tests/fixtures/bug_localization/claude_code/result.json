@@ -1,0 +1,54 @@
+{
+  "instance_id": "django__django-11066",
+  "difficulty": "<15 min fix",
+  "repo": "django/django",
+  "harness": "claude_code",
+  "backend": "openai",
+  "model": "claude-sonnet-5",
+  "max_steps": 60,
+  "agname": "agent_alex_0000",
+  "dropped_caches": true,
+  "status": "ok",
+  "reasoning": "The bug is in django/contrib/contenttypes/management/__init__.py, in the RenameContentType._rename() method. This method computes the correct database alias via `db = schema_editor.connection.alias` and uses `db` for the initial lookup (`ContentType.objects.db_manager(db).get_by_natural_key(...)`) and wraps the save call in `transaction.atomic(using=db)`. However, wrapping a call in `transaction.atomic(using=db)` only ensures the *transaction* is opened on that database connection \u2014 it does not route the actual save() call to that database. The line:\n\n    content_type.save(update_fields={'model'})\n\ndoes not pass `using=db`, so Model.save() falls back to its default database resolution (via the router / instance's default state), which is not necessarily the same as the `db` alias computed from `schema_editor.connection.alias`. In setups with dynamic database routers where the default database isn't a real/usable database, this causes the save to be attempted against the wrong (default) database connection, leading to errors like \"no such table: django_content_types\" even though the surrounding code went to the trouble of determining the correct `db` alias for schema_editor's connection.\n\nThe fix is to explicitly pass `using=db` to the save call:\n\n    content_type.save(using=db, update_fields={'model'})\n\nThis is the only source file involved \u2014 it's a small, self-contained bug in a single method's single line, with no other files needing changes to fix the described issue.",
+  "gold_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "reported_files": [
+    "django/contrib/contenttypes/management/__init__.py"
+  ],
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "hit": true,
+  "scoring_error": null,
+  "wall_clock_s": 112.87,
+  "repo_dirty": false,
+  "tools_seen": {
+    "mcp__agency__submit_output": 2,
+    "Bash": 1
+  },
+  "io_read_mb": 122.054688,
+  "sandbox_cpu_seconds": 10.786539,
+  "tool_io_read_mb": 13.935349,
+  "setup_io_read_mb": 53.190721,
+  "harness_io_read_mb": 66.950276,
+  "io_read_mb_by_span": {
+    "run:bug_localizer": 122.054688,
+    "sync:result_wait": 122.054688,
+    "engine:execute": 122.054688,
+    "harness:attempt_rpc": 66.950276,
+    "sandbox:ensure_daemon": 53.190721,
+    "runtime.harness_start": 53.142635,
+    "harness:startup_ready": 35.312105,
+    "harness:await_cli": 15.222656,
+    "tool:Bash": 13.925621,
+    "harness:submit": 5.75458,
+    "syscall:execve": 4.456072,
+    "run:container_call": 0.905905,
+    "llm:attempt": 0.857183,
+    "harness:launch": 0.510029,
+    "tool:mcp__agency__submit_output": 0.009728,
+    "agency:services_close": 0.002225,
+    "agency:decode_harness_result": 7.1e-05
+  }
+}
