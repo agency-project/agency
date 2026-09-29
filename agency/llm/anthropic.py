@@ -310,6 +310,19 @@ class _AnthropicBackend(agllm):
             ).models.list()
         )
 
+    def retrieve_model(self, model: str):
+        # GET /v1/models/{id} resolves aliases ("claude-haiku-4-5") that the
+        # listing only carries under their dated ID.
+        if _anthropic_sdk is None or not model:
+            return None
+        client = self.make_client(httpx.Timeout(self.agconfig.llm.model_listing_timeout_seconds))
+        try:
+            return client.models.retrieve(model)
+        except _anthropic_sdk.NotFoundError:
+            return None
+        finally:
+            self._close(client)
+
     def tokenize_url(self) -> "str | None":
         return None
 

@@ -179,6 +179,87 @@ class TestAnthropicBackend:
 
 
 # ---------------------------------------------------------------------------
+# fetch_context_limit -- aliases resolve through GET /v1/models/{id}
+# ---------------------------------------------------------------------------
+
+
+def _model_info(model_id, max_input_tokens):
+    return SimpleNamespace(id=model_id, max_input_tokens=max_input_tokens, model_extra={})
+
+
+_LIVE_LISTING = [
+    _model_info("claude-sonnet-5-5", 1_000_000),
+    _model_info("claude-opus-5-5", 1_000_000),
+    _model_info("claude-opus-4-5-20251101", 200_000),
+    _model_info("claude-haiku-4-5-20251001", 200_000),
+]
+_ALIASES = {
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+    "claude-opus-4-5": "claude-opus-4-5-20251101",
+}
+
+
+def _fake_anthropic_client():
+    import anthropic
+
+    def retrieve(model_id):
+        target = _ALIASES.get(model_id, model_id)
+        for info in _LIVE_LISTING:
+            if info.id == target:
+                return info
+        raise anthropic.NotFoundError(
+            "not found",
+            response=httpx.Response(404, request=httpx.Request("GET", "http://x")),
+            body=None,
+        )
+
+    client = MagicMock()
+    client.models.list.return_value = list(_LIVE_LISTING)
+    client.models.retrieve.side_effect = retrieve
+    return client
+
+
+class TestAnthropicFetchContextLimit:
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("claude-opus-5-5", 1_000_000),  # exact listing match
+            ("claude-haiku-4-5-20251001", 200_000),  # exact listing match
+            ("claude-haiku-4-5", 200_000),  # alias: was 1M (first listed model)
+            ("claude-opus-4-5", 200_000),  # alias: was 1M
+        ],
+    )
+    def test_listing_and_alias_resolution(self, model, expected):
+        backend = _AnthropicBackend(_cfg(model=model, api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == expected
+
+    def test_exact_match_does_not_call_retrieve(self):
+        backend = _AnthropicBackend(_cfg(model="claude-opus-5-5", api_key="k"))
+        client = _fake_anthropic_client()
+        with patch.object(backend, "make_client", return_value=client):
+            backend.fetch_context_limit()
+        client.models.retrieve.assert_not_called()
+
+    def test_typo_model_gets_default_not_first_listed_window(self):
+        backend = _AnthropicBackend(_cfg(model="claude-typo-model", api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == 200_000  # default_context_limit
+
+    def test_unlisted_model_with_static_entry_uses_table(self):
+        backend = _AnthropicBackend(_cfg(model="claude-mythos-5", api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == 1_000_000
+
+    def test_bedrock_has_no_retrieve_and_uses_table(self):
+        from agency.llm.bedrock import _AnthropicBedrockBackend
+
+        backend = _AnthropicBedrockBackend(_cfg(model="us.anthropic.claude-haiku-4-5", api_key="k"))
+        assert backend.retrieve_model("us.anthropic.claude-haiku-4-5") is None
+        assert backend.fetch_context_limit() == 200_000
+
+
+# ---------------------------------------------------------------------------
 # _known_anthropic_context_window
 # ---------------------------------------------------------------------------
 

@@ -207,3 +207,48 @@ class TestExceptionTuples:
     @pytest.mark.skipif(_anthropic_sdk is None, reason="anthropic package not installed")
     def test_api_conn_excs_includes_anthropic_when_installed(self):
         assert _anthropic_sdk.APIConnectionError in API_CONN_EXCS
+
+
+# ---------------------------------------------------------------------------
+# fetch_context_limit -- listing resolution (vLLM / OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+
+def _listed(model_id, *, max_model_len=None, max_input_tokens=None):
+    info = MagicMock(spec=["id", "model_extra", "max_input_tokens"])
+    info.id = model_id
+    info.model_extra = {"max_model_len": max_model_len} if max_model_len is not None else {}
+    info.max_input_tokens = max_input_tokens
+    return info
+
+
+class TestFetchContextLimitListing:
+    def _backend(self, model, listing):
+        backend = _OpenAICompatibleBackend(_cfg(model=model))
+        return backend, patch.object(backend, "list_models", return_value=listing)
+
+    def test_exact_match_wins_over_other_listed_models(self):
+        backend, listing = self._backend(
+            "b", [_listed("a", max_model_len=1_000), _listed("b", max_model_len=2_000)]
+        )
+        with listing:
+            assert backend.fetch_context_limit() == 2_000
+
+    def test_multi_model_listing_never_lends_another_models_window(self):
+        backend, listing = self._backend(
+            "typo-model", [_listed("a", max_model_len=1_000), _listed("b", max_model_len=2_000)]
+        )
+        with listing:
+            assert backend.fetch_context_limit() == 200_000  # default_context_limit
+
+    def test_single_model_vllm_listing_is_used_even_under_another_name(self):
+        """vLLM serves one model, possibly under a --served-model-name that
+        differs from the configured model string."""
+        backend, listing = self._backend("my-alias", [_listed("served-name", max_model_len=131072)])
+        with listing:
+            assert backend.fetch_context_limit() == 131072
+
+    def test_multi_model_listing_falls_back_to_static_table(self):
+        backend = _OpenAICompatibleBackend(_cfg(model="gpt-6-luna"))
+        with patch.object(backend, "list_models", return_value=[_listed("a"), _listed("b")]):
+            assert backend.fetch_context_limit() == backend.known_context_limit("gpt-6-luna")

@@ -113,6 +113,9 @@ class _AnthropicBedrockBackend(_AnthropicBackend):
     def list_models(self) -> list:
         return []  # Bedrock's native invoke_model API has no OpenAI-style /v1/models
 
+    def retrieve_model(self, model: str):
+        return None  # ...nor a /v1/models/{id}
+
     def tokenize_url(self) -> "str | None":
         return None
 
