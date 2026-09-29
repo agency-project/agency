@@ -76,9 +76,9 @@ class ModelSpec:
     model: str
     provider: str
     # None leaves the provider default in place. GPT-6 Sol/Luna accept
-    # function tools on Chat Completions only with "none"; Astra rejects
-    # "none" outright, so it keeps its default -- and can only run tools
-    # through provider="openai_responses".
+    # function tools on Chat Completions only with "none"; Astra and GPT-6.1
+    # Sol reject "none" outright, so they keep their default -- and can only
+    # run tools through provider="openai_responses".
     reasoning_effort: "str | None" = None
     # The harness whose wire protocol matches the provider, exercised in
     # addition to the native harness.
@@ -90,8 +90,9 @@ class ModelSpec:
 
 
 MODELS: "tuple[ModelSpec, ...]" = (
-    # Chat Completions rejects function tools for Astra at every effort it
-    # accepts; it runs agents only through provider="openai_responses".
+    # Chat Completions rejects function tools for Astra and GPT-6.1 Sol at
+    # every effort they accept (neither accepts "none"); they run agents only
+    # through provider="openai_responses".
     ModelSpec(
         "gpt-6-astra",
         "openai",
@@ -102,9 +103,18 @@ MODELS: "tuple[ModelSpec, ...]" = (
         ),
     ),
     ModelSpec("gpt-6-sol", "openai", reasoning_effort="none", home_harness="codex"),
-    ModelSpec("gpt-6.1-sol", "openai", reasoning_effort="none", home_harness="codex"),
+    ModelSpec(
+        "gpt-6.1-sol",
+        "openai",
+        home_harness="codex",
+        expected_e2e_error=(
+            "Function tools with reasoning_effort are not supported for "
+            "gpt-6.1-sol in /v1/chat/completions"
+        ),
+    ),
     ModelSpec("gpt-6-luna", "openai", reasoning_effort="none", home_harness="codex"),
     ModelSpec("gpt-6-astra", "openai_responses", home_harness="codex"),
+    ModelSpec("gpt-6.1-sol", "openai_responses", home_harness="codex"),
     ModelSpec("claude-fable-5-1", "anthropic", home_harness="claude_code"),
     ModelSpec("claude-opus-5-5", "anthropic", home_harness="claude_code"),
     ModelSpec("claude-sonnet-5-5", "anthropic", home_harness="claude_code"),

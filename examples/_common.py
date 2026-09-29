@@ -66,10 +66,10 @@ def tutorial_config(
         # Agency calls OpenAI through Chat Completions, where GPT-6 Sol and
         # Luna accept function tools only with reasoning_effort "none" (any
         # other value, or leaving it unset, is a 400 once tools are present).
-        # GPT-6 Astra rejects "none" and so cannot use tools on that
-        # endpoint at all -- use AGENCY_LLM_PROVIDER=openai_responses for it,
-        # where tools work with reasoning on; Astra still rejects "none", so
-        # set AGENCY_REASONING_EFFORT to low/medium/high/xhigh/max.
+        # GPT-6 Astra and GPT-6.1 Sol reject "none" and so cannot use tools
+        # on that endpoint at all -- use AGENCY_LLM_PROVIDER=openai_responses
+        # for them, where tools work with reasoning on; they still reject
+        # "none", so set AGENCY_REASONING_EFFORT to low/medium/high/xhigh/max.
         "reasoning_effort": os.environ.get("AGENCY_REASONING_EFFORT", "none"),
         "max_completion_tokens": int(os.environ.get("AGENCY_MAX_COMPLETION_TOKENS", "4096")),
     }

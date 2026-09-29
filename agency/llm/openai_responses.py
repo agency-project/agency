@@ -3,8 +3,9 @@
 An opt-in alternative to `.openai`'s Chat Completions backend. It exists for
 models whose tool calling only works on /v1/responses: on Chat Completions,
 GPT-6 models accept function tools only with reasoning_effort="none", and
-GPT-6 Astra rejects "none" outright -- so Astra cannot run an agent there at
-all. On /v1/responses every GPT-6 model (Astra, Sol, GPT-6.1 Sol, Luna) can reason and call tools together.
+GPT-6 Astra and GPT-6.1 Sol reject "none" outright -- so they cannot run an
+agent there at all. On /v1/responses every GPT-6 model (Astra, Sol, GPT-6.1
+Sol, Luna) can reason and call tools together.
 
 The request stays stateless, exactly like the Chat Completions path: every
 call carries the whole conversation, and store=False tells OpenAI to keep

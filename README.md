@@ -143,7 +143,7 @@ ag = agent(agconfig=cfg)
 
 This is the same underlying backend used for vLLM/local endpoints above — omit `base_url` and it talks to `https://api.openai.com/v1`. Unlike the other providers, the API key isn't picked up from an environment variable automatically; pass it explicitly.
 
-`provider="openai"` uses Chat Completions. There, GPT-6 Sol, GPT-6.1 Sol and Luna accept function tools (which every agent sends) only with `reasoning_effort="none"`, and GPT-6 Astra rejects `"none"`, so it cannot call tools at all. For those cases use `provider="openai_responses"` (same fields, same `base_url`), which talks to the Responses API. There every GPT-6 model can reason and call tools together, e.g. Astra with `reasoning_effort="medium"`; Astra still rejects `"none"`. Requests stay stateless (`store=False`). Encrypted reasoning is carried in the transcript and sent back each turn. Chat-only fields (`seed`, `stop`, `n`, penalties, vLLM sampling extras) are rejected rather than ignored.
+`provider="openai"` uses Chat Completions. There, GPT-6 Sol and Luna accept function tools (which every agent sends) only with `reasoning_effort="none"`, and GPT-6 Astra and GPT-6.1 Sol reject `"none"`, so they cannot call tools at all. For those cases use `provider="openai_responses"` (same fields, same `base_url`), which talks to the Responses API. There every GPT-6 model can reason and call tools together, e.g. Astra with `reasoning_effort="medium"`; Astra and GPT-6.1 Sol still reject `"none"`. Requests stay stateless (`store=False`). Encrypted reasoning is carried in the transcript and sent back each turn. Chat-only fields (`seed`, `stop`, `n`, penalties, vLLM sampling extras) are rejected rather than ignored.
 
 **Anthropic**
 
