@@ -417,6 +417,30 @@ def _sampling_for_model(sampling: dict, model: str, info: "_AnthropicModelInfo |
     return kept
 
 
+def _effort_for_model(effort: "str | None", model: str, info: "_AnthropicModelInfo | None"):
+    """Agency's reasoning_effort as output_config.effort, only where this
+    model is verified to accept that exact level. Everything else -- OpenAI-
+    only values ("none", "minimal"), levels a model lacks, models that reject
+    effort, and models with unverified effort support -- is omitted (the
+    model's own default applies) rather than mapped or guessed."""
+    if effort is None:
+        return None
+    if info is not None and info.effort is not None and effort in info.effort:
+        return effort
+    if info is None or info.effort is None:
+        reason = "its effort support is unverified"
+    elif not info.effort:
+        reason = "it does not support the effort parameter"
+    else:
+        reason = f"it accepts only {', '.join(sorted(info.effort))}"
+    _warn_once(
+        (model, "effort", effort),
+        f"not sending reasoning_effort={effort!r} to {model}: {reason}; "
+        f"the model's default effort applies",
+    )
+    return None
+
+
 def _with_cache_control(content):
     """Return `content` with cache_control on its last block, normalizing a
     bare string into a single text block first (cache_control attaches to a
@@ -522,6 +546,9 @@ class _AnthropicBackend(agllm):
         stop = self.agconfig.llm.stop
         if stop:
             kwargs["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+        effort = _effort_for_model(self.agconfig.llm.reasoning_effort, model, info)
+        if effort is not None:
+            kwargs["output_config"] = {"effort": effort}
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools

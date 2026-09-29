@@ -1811,3 +1811,49 @@ class TestStopSequences:
     @pytest.mark.parametrize("stop", [None, [], ""])
     def test_no_stop_omits_stop_sequences(self, stop):
         assert "stop_sequences" not in _kwargs("claude-opus-5-5", stop=stop)
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestReasoningEffort:
+    @pytest.mark.parametrize(
+        "model,effort",
+        [
+            ("claude-opus-5-5", "low"),
+            ("claude-opus-5-5", "xhigh"),
+            ("claude-fable-5-1", "max"),
+            ("claude-sonnet-5-5", "medium"),
+            ("claude-opus-4-8", "xhigh"),
+            ("claude-opus-4-6", "max"),
+            ("claude-opus-4-5", "high"),
+            ("us.anthropic.claude-opus-5-5", "high"),
+        ],
+    )
+    def test_supported_level_maps_to_output_config(self, model, effort, capsys):
+        assert _kwargs(model, reasoning_effort=effort)["output_config"] == {"effort": effort}
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        "model,effort,reason",
+        [
+            ("claude-haiku-4-5", "low", "does not support the effort parameter"),
+            ("claude-sonnet-4-5", "high", "does not support the effort parameter"),
+            ("claude-opus-4-6", "xhigh", "accepts only"),
+            ("claude-opus-4-5", "max", "accepts only"),
+            ("claude-opus-5-5", "none", "accepts only"),  # OpenAI-only value
+            ("claude-opus-5-5", "minimal", "accepts only"),
+            ("claude-opus-4-1", "high", "unverified"),
+            ("claude-future-9", "high", "unverified"),
+        ],
+    )
+    def test_unsupported_or_unverified_effort_is_omitted_with_warning(
+        self, model, effort, reason, capsys
+    ):
+        assert "output_config" not in _kwargs(model, reasoning_effort=effort)
+        out = capsys.readouterr().out
+        assert f"not sending reasoning_effort={effort!r} to {model}" in out
+        assert reason in out
+
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-4-5", "m"])
+    def test_unset_effort_keeps_model_default(self, model, capsys):
+        assert "output_config" not in _kwargs(model)
+        assert capsys.readouterr().out == ""
