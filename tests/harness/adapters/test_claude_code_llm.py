@@ -726,3 +726,102 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
     events = _parse_sse(frames)
     start_event = next(d for t, d in events if t == "content_block_start")
     assert start_event["content_block"] == {"type": "redacted_thinking", "data": "encrypted-blob"}
+
+
+# ---------------------------------------------------------------------------
+# /v1/messages streaming route: upstream errors must reach Claude Code as a
+# real HTTP error, not a truncated SSE body ("incomplete chunked read").
+# ---------------------------------------------------------------------------
+
+
+class _StreamRouter:
+    def __init__(self, items, exc=None):
+        self.items, self.exc = items, exc
+        self.closed = False
+
+    def validate_token(self, token):
+        return True
+
+    def resolve_model(self, token):
+        return "claude-opus-5-5"
+
+    async def dispatch_stream_async(self, token, request):
+        try:
+            for item in self.items:
+                yield item
+            if self.exc:
+                raise self.exc
+        finally:
+            self.closed = True
+
+
+def _post_messages_stream(router):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    _backend().register(app, router)
+    with TestClient(app) as client:
+        return client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer fake"},
+            json={
+                "model": "claude-opus-5-5",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+
+def test_messages_stream_upstream_400_keeps_provider_status_and_message():
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    provider_message = (
+        "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+        "'message': 'tool_choice: type \"tool\" and \"any\" are not supported for this model.'}}"
+    )
+    router = _StreamRouter(
+        [], HostDispatchError({"message": provider_message, "status_code": 400, "transient": False})
+    )
+    response = _post_messages_stream(router)
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["message"] == provider_message
+    assert error["transient"] is False
+    assert router.closed
+
+
+def test_messages_stream_transient_upstream_error_keeps_503():
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    router = _StreamRouter(
+        [], HostDispatchError({"message": "overloaded", "status_code": 503, "transient": True})
+    )
+    response = _post_messages_stream(router)
+    assert response.status_code == 503
+    assert response.json()["error"]["transient"] is True
+
+
+def test_messages_stream_success_is_unchanged_sse():
+    done = {
+        "type": "done",
+        "message": {"role": "assistant", "blocks": [_text_block("hello")]},
+        "stop_reason": "end_turn",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+    }
+    router = _StreamRouter([{"type": "delta", "content": "draft"}, done])
+    response = _post_messages_stream(router)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse(response.text)
+    assert [t for t, _ in events][0] == "message_start"
+    assert [t for t, _ in events][-1] == "message_stop"
+    assert "draft" not in response.text
+    text = "".join(
+        d["delta"]["text"]
+        for t, d in events
+        if t == "content_block_delta" and d["delta"]["type"] == "text_delta"
+    )
+    assert text == "hello"
+    assert router.closed
