@@ -1857,3 +1857,17 @@ class TestReasoningEffort:
     def test_unset_effort_keeps_model_default(self, model, capsys):
         assert "output_config" not in _kwargs(model)
         assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestFirstClassTopK:
+    @pytest.mark.parametrize("model", _EXCLUSIVE_SAMPLING + _UNVERIFIED)
+    def test_llmconfig_top_k_is_sent(self, model):
+        assert _kwargs(model, top_k=40)["top_k"] == 40
+
+    def test_llmconfig_top_k_wins_over_extra_body(self):
+        assert _kwargs("claude-haiku-4-5", top_k=40, extra_body={"top_k": 5})["top_k"] == 40
+
+    @pytest.mark.parametrize("model", _NO_SAMPLING)
+    def test_llmconfig_top_k_dropped_where_sampling_is_rejected(self, model):
+        assert "top_k" not in _kwargs(model, top_k=40)

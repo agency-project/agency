@@ -539,8 +539,11 @@ class _AnthropicBackend(agllm):
             sampling["temperature"] = self.agconfig.llm.temperature
         if self.agconfig.llm.top_p is not None:
             sampling["top_p"] = self.agconfig.llm.top_p
+        # The first-class field wins; extra_body.top_k is the older spelling.
         extra_body = self.agconfig.llm.extra_body or {}
-        if "top_k" in extra_body:
+        if self.agconfig.llm.top_k is not None:
+            sampling["top_k"] = self.agconfig.llm.top_k
+        elif "top_k" in extra_body:
             sampling["top_k"] = extra_body["top_k"]
         kwargs.update(_sampling_for_model(sampling, model, info))
         stop = self.agconfig.llm.stop
