@@ -177,17 +177,46 @@ def _text_block_to_anthropic(b: dict) -> dict:
     return block
 
 
+# OpenAI's Responses API added "developer" as a companion/successor to
+# "system" (Codex emits it); both are operator instructions. Same set as
+# agllm.build_kwargs's _SYSTEM_CLASS_ROLES.
+_SYSTEM_CLASS_ROLES = ("system", "developer")
+
+
+def _flush_deferred_text(out: list[dict], deferred: "list[str]") -> None:
+    """Emit system-class text held back while tool results were pending:
+    after the tool_result blocks of the same user message when there is one
+    (text may follow tool results there, never precede them), else as its
+    own user message."""
+    if not deferred:
+        return
+    prev_content = out[-1]["content"] if out and out[-1]["role"] == "user" else None
+    if isinstance(prev_content, list):
+        prev_content.extend({"type": "text", "text": text} for text in deferred)
+    else:
+        out.extend({"role": "user", "content": text} for text in deferred)
+    deferred.clear()
+
+
 def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, list[dict]]":
     system_parts: list[str] = []
     out: list[dict] = []
     conversation_started = False
+    # tool_use ids of the latest assistant turn still waiting for a result,
+    # and system-class text that arrived meanwhile: nothing may sit between
+    # a tool_use and its tool_result message (a 400).
+    pending_tool_ids: "set[str]" = set()
+    deferred_text: "list[str]" = []
 
     for m in messages:
         role = m.get("role")
         blocks = m.get("blocks") or []
-        if role != "system":
+        if role not in _SYSTEM_CLASS_ROLES:
             conversation_started = True
-        if role == "system":
+            if role != "tool":
+                pending_tool_ids.clear()
+                _flush_deferred_text(out, deferred_text)
+        if role in _SYSTEM_CLASS_ROLES:
             text = "".join(b["text"] for b in blocks if b["type"] == "text")
             if not text:
                 continue
@@ -195,13 +224,16 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 system_parts.append(text)
             else:
                 print(
-                    "[anthropic] WARNING: harness emitted a mid-conversation "
-                    "system-role message -- not valid per the Anthropic Messages "
+                    f"[anthropic] WARNING: harness emitted a mid-conversation "
+                    f"{role}-role message -- not valid per the Anthropic Messages "
                     "API (system must be the top-level `system` field, never a "
-                    "`messages` entry); sending it as a `user` message at its "
-                    "original position instead"
+                    "`messages` entry); sending it as `user` content at its "
+                    "original position instead (after any pending tool results)"
                 )
-                out.append({"role": "user", "content": text})
+                if pending_tool_ids:
+                    deferred_text.append(text)
+                else:
+                    out.append({"role": "user", "content": text})
         elif role == "user":
             has_non_text = any(b["type"] != "text" for b in blocks)
             if not has_non_text:
@@ -246,6 +278,7 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                     anthropic_blocks.append(_unknown_block_to_anthropic(b))
             text_only = "".join(b["text"] for b in blocks if b["type"] == "text")
             out.append({"role": "assistant", "content": anthropic_blocks or text_only})
+            pending_tool_ids = {b["id"] for b in anthropic_blocks if b["type"] == "tool_use"}
         elif role == "tool":
             result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
             content = result_block.get("text", "") if result_block else ""
@@ -260,6 +293,10 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 prev_content.append(result)
             else:
                 out.append({"role": "user", "content": [result]})
+            pending_tool_ids.discard(result["tool_use_id"])
+            if not pending_tool_ids:
+                _flush_deferred_text(out, deferred_text)
+    _flush_deferred_text(out, deferred_text)
     return ("\n\n".join(system_parts) or None), out
 
 

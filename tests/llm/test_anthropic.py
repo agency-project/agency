@@ -1586,3 +1586,114 @@ class TestSamplingPolicy:
         _kwargs("claude-opus-5-5", temperature=1.0)
         _kwargs("claude-haiku-4-5", top_p=0.9)
         assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# developer role (Codex / Responses-style operator instructions)
+# ---------------------------------------------------------------------------
+
+
+def _assistant_tool_calls(*ids):
+    return {
+        "role": "assistant",
+        "blocks": [
+            {"type": "tool_use", "index": i, "id": tid, "name": "f", "arguments": "{}"}
+            for i, tid in enumerate(ids)
+        ],
+    }
+
+
+def _tool_result(tid, text="ok"):
+    return {
+        "role": "tool",
+        "blocks": [{"type": "tool_result", "index": 0, "tool_call_id": tid, "text": text}],
+    }
+
+
+class TestDeveloperRole:
+    def test_initial_developer_message_joins_top_level_system(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [_text_msg("developer", "Sandbox is read-only."), _text_msg("user", "hi")]
+        )
+        assert system == "Sandbox is read-only."
+        assert msgs == [{"role": "user", "content": "hi"}]
+
+    def test_system_then_developer_both_kept_in_order(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [_text_msg("system", "Base."), _text_msg("developer", "Dev."), _text_msg("user", "hi")]
+        )
+        assert system == "Base.\n\nDev."
+        assert msgs == [{"role": "user", "content": "hi"}]
+
+    def test_mid_conversation_developer_becomes_user_message_in_place(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "hi"),
+                _text_msg("assistant", "hello"),
+                _text_msg("developer", "Now answer in French."),
+                _text_msg("user", "again"),
+            ]
+        )
+        assert system is None
+        assert msgs[2] == {"role": "user", "content": "Now answer in French."}
+        assert msgs[3] == {"role": "user", "content": "again"}
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_system_class_text_never_splits_tool_use_from_its_result(self, role):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "go"),
+                _assistant_tool_calls("t1"),
+                _text_msg(role, "Reminder."),
+                _tool_result("t1"),
+                _text_msg("assistant", "done"),
+            ]
+        )
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant"]
+        assert msgs[2]["content"] == [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text", "text": "Reminder."},
+        ]
+
+    def test_parallel_results_stay_together_around_system_class_text(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "go"),
+                _assistant_tool_calls("t1", "t2"),
+                _tool_result("t1", "a"),
+                _text_msg("developer", "Reminder."),
+                _tool_result("t2", "b"),
+            ]
+        )
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+        assert [b.get("tool_use_id") or b["text"] for b in msgs[2]["content"]] == [
+            "t1",
+            "t2",
+            "Reminder.",
+        ]
+
+    def test_codex_developer_instructions_reach_anthropic(self):
+        from agency.harness.adapters.codex import CodexAdapter
+
+        context = CodexAdapter(agconfig())._format_context_harness_to_agency(
+            {
+                "instructions": "BASE",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "DEVELOPER RULES"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                ],
+            }
+        )
+        kwargs = _AnthropicBackend(_cfg(model="claude-opus-5-5"))._format_context_agency_to_backend(
+            context
+        )
+        assert kwargs["system"][0]["text"] == "BASE\n\nDEVELOPER RULES"
+        assert [m["role"] for m in kwargs["messages"]] == ["user"]
