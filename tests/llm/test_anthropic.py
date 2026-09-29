@@ -193,13 +193,53 @@ class TestKnownAnthropicContextWindow:
             ("global.anthropic.claude-fable-5", 1_000_000),
             ("apac.anthropic.claude-haiku-4-5", 200_000),
             ("anthropic.claude-haiku-4-5-20251001-v1:0", 200_000),
-            ("anthropic.claude-opus-4-5-20251101-v1:0", 1_000_000),
+            # First-party Models API reports max_input_tokens=200000 for Opus 4.5.
+            ("anthropic.claude-opus-4-5-20251101-v1:0", 200_000),
+            ("claude-opus-4-5-20251101", 200_000),
             ("claude-sonnet-5", 1_000_000),  # bare first-party ID, no Bedrock prefix
             ("claude-haiku-4-5", 200_000),
+            ("claude-fable-5-1", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
+            ("claude-opus-5", 1_000_000),
+            ("us.anthropic.claude-opus-5-5", 1_000_000),
+            ("global.anthropic.claude-fable-5-1-v1:0", 1_000_000),
+            ("anthropic.claude-sonnet-5-5-v1", 1_000_000),
         ],
     )
     def test_known_models_resolve(self, model, expected):
         assert _known_anthropic_context_window(model) == expected
+
+    @pytest.mark.parametrize(
+        "new_model,older_model",
+        [
+            ("claude-fable-5-1", "claude-fable-5"),
+            ("claude-opus-5-5", "claude-opus-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+        ],
+    )
+    def test_new_point_release_uses_its_own_entry_not_older_model(
+        self, monkeypatch, new_model, older_model
+    ):
+        """'claude-fable-5-1' is its own model, not a dated snapshot of
+        'claude-fable-5' -- it must resolve through its own entry even when
+        the older model's entry is listed (or iterated) first."""
+        windows = {older_model: 123, new_model: 456}
+        monkeypatch.setattr("agency.llm.anthropic._ANTHROPIC_CONTEXT_WINDOWS", windows)
+        assert _known_anthropic_context_window(new_model) == 456
+        assert _known_anthropic_context_window(f"us.anthropic.{new_model}-v1:0") == 456
+        assert _known_anthropic_context_window(older_model) == 123
+        assert _known_anthropic_context_window(f"{older_model}-20260101") == 123
+
+    def test_unlisted_point_release_does_not_inherit_older_model_window(self, monkeypatch):
+        """A model newer than the table must fall through to None (so the
+        caller uses the live listing or default_context_limit) instead of
+        silently inheriting an older model's window via prefix matching."""
+        monkeypatch.setattr(
+            "agency.llm.anthropic._ANTHROPIC_CONTEXT_WINDOWS", {"claude-fable-5": 123}
+        )
+        assert _known_anthropic_context_window("claude-fable-5-1") is None
+        assert _known_anthropic_context_window("anthropic.claude-fable-5-2-v1:0") is None
 
     @pytest.mark.parametrize(
         "model",
@@ -722,6 +762,62 @@ class TestFormatContextAgencyToBackend:
                     "input_schema": {"type": "object", "properties": {}},
                 }
             ],
+        }
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
+    def test_default_config_request_is_valid_for_current_claude_models(self, model):
+        """These models 400 on explicit `thinking` configs other than
+        adaptive, on non-default temperature/top_p/top_k, and on forced
+        tool_choice. Omitting all of them (thinking then runs adaptive, effort
+        at the model's default) is the valid default request -- the model ID
+        itself must pass through untouched."""
+        backend = _AnthropicBackend(_cfg(model=model))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_choice": "auto",
+            }
+        )
+        assert kwargs["model"] == model
+        assert kwargs["tool_choice"] == {"type": "auto"}
+        for rejected in ("thinking", "temperature", "top_p", "top_k", "output_config"):
+            assert rejected not in kwargs
+
+    def test_thinking_block_replayed_with_signature_for_tool_loop(self):
+        """Current Claude models return (possibly empty-text) thinking blocks
+        whose signature must be echoed back unchanged on the next turn."""
+        backend = _AnthropicBackend(_cfg(model="claude-opus-5-5"))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [
+                    _text_msg("user", "call f"),
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "thinking", "index": 0, "text": "", "signature": "sig"},
+                            {
+                                "type": "tool_use",
+                                "index": 1,
+                                "id": "t1",
+                                "name": "f",
+                                "arguments": "{}",
+                            },
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "blocks": [
+                            {"type": "tool_result", "index": 0, "tool_call_id": "t1", "text": "ok"}
+                        ],
+                    },
+                ]
+            }
+        )
+        assert kwargs["messages"][1]["content"][0] == {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "sig",
         }
 
     def test_no_messages_omits_last_message_cache_control(self):

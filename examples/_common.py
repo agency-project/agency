@@ -5,7 +5,7 @@ model backend remain independent. Change either with environment variables:
 
     AGENCY_HARNESS=codex
     AGENCY_LLM_PROVIDER=openai
-    AGENCY_LLM_MODEL=gpt-5.6-luna
+    AGENCY_LLM_MODEL=gpt-6-luna
     OPENAI_API_KEY=...
 
 The API key is read only when a tutorial starts. Importing tutorial modules is
@@ -32,7 +32,7 @@ from agency.configs.agconfig import (
 
 
 DEFAULT_HARNESS = "codex"
-DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
 
 # Profiling gets its own explicit lesson. Keeping process-lifetime profiling
@@ -63,16 +63,20 @@ def tutorial_config(
     llm_kwargs: dict[str, object] = {
         "provider": provider,
         "model": model,
-        # Luna's Chat Completions endpoint requires "none" when function
-        # tools are present. Responses-based harnesses can still opt into a
-        # higher value through the environment.
+        # Agency calls OpenAI through Chat Completions, where GPT-6 Sol and
+        # Luna accept function tools only with reasoning_effort "none" (any
+        # other value, or leaving it unset, is a 400 once tools are present).
+        # GPT-6 Astra rejects "none" and so cannot use tools on that
+        # endpoint at all -- use AGENCY_LLM_PROVIDER=openai_responses for it,
+        # where tools work with reasoning on; Astra still rejects "none", so
+        # set AGENCY_REASONING_EFFORT to low/medium/high/xhigh/max.
         "reasoning_effort": os.environ.get("AGENCY_REASONING_EFFORT", "none"),
         "max_completion_tokens": int(os.environ.get("AGENCY_MAX_COMPLETION_TOKENS", "4096")),
     }
-    if provider == "openai":
+    if provider in ("openai", "openai_responses"):
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key and require_llm:
-            raise SystemExit("OPENAI_API_KEY is required for AGENCY_LLM_PROVIDER=openai")
+            raise SystemExit(f"OPENAI_API_KEY is required for AGENCY_LLM_PROVIDER={provider}")
         if api_key:
             llm_kwargs["api_key"] = api_key
         llm_kwargs["base_url"] = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")

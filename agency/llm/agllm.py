@@ -120,6 +120,10 @@ class agllm:
             return _AnthropicAWSBackend(agconfig)
         if provider == "anthropic":
             return _AnthropicBackend(agconfig)
+        if provider == "openai_responses":
+            from .openai_responses import _OpenAIResponsesBackend
+
+            return _OpenAIResponsesBackend(agconfig)
         # _OpenAICompatibleBackend.__init__ -> change_config() validates the
         # required base_url -- no need to duplicate that check here just to
         # fail one call frame earlier.

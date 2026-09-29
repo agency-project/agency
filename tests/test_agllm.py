@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agency.llm.agllm import agllm
 from agency.configs.agconfig import agconfig, llmconfig
 
@@ -31,6 +33,47 @@ def test_build_llm_kwargs_includes_reasoning_effort():
     )
 
     assert kwargs["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+def test_build_llm_kwargs_gpt6_tool_request_shape(model):
+    """GPT-6 Sol/Luna accept function tools on Chat Completions only with
+    reasoning_effort="none", reject the legacy max_tokens parameter, and
+    reject any non-default temperature -- so a default config must send
+    max_completion_tokens, no max_tokens, and no temperature."""
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+    cfg = agconfig(
+        llmconfig(
+            provider="openai",
+            model=model,
+            reasoning_effort="none",
+            max_completion_tokens=4096,
+            base_url="https://api.openai.com/v1",
+        )
+    )
+    msgs = [
+        {"role": "system", "blocks": [{"type": "text", "index": 0, "text": "be terse"}]},
+        {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]},
+    ]
+    kw = build_llm_kwargs(cfg, msgs, tools)
+    assert kw["model"] == model
+    assert kw["reasoning_effort"] == "none"
+    assert kw["max_completion_tokens"] == 4096
+    assert kw["tools"] == tools
+    assert kw["messages"][0] == {"role": "system", "content": "be terse"}
+    for rejected in ("max_tokens", "temperature", "top_p"):
+        assert rejected not in kw
+
+
+def test_build_llm_kwargs_gpt6_astra_omits_reasoning_effort_when_unset():
+    """Astra rejects reasoning_effort="none"; leaving it unset must not
+    inject any value."""
+    cfg = agconfig(llmconfig(model="gpt-6-astra", base_url="https://api.openai.com/v1"))
+    kw = build_llm_kwargs(
+        cfg, [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hi"}]}]
+    )
+    assert kw["model"] == "gpt-6-astra"
+    assert "reasoning_effort" not in kw
 
 
 # ---------------------------------------------------------------------------

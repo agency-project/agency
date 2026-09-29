@@ -7,6 +7,7 @@ import re
 import httpx
 
 from .agllm import agllm
+from .openai_responses import ENCRYPTED_REASONING_TAG
 
 try:
     import anthropic as _anthropic_sdk
@@ -43,17 +44,22 @@ _ANTHROPIC_BEDROCK_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?anthropi
 # context windows from, so known Anthropic model context windows are hardcoded
 # here instead. Keyed by the bare model name, after stripping the region and
 # "anthropic." prefix Bedrock IDs carry — see _known_anthropic_context_window
-# below. Update when new models ship.
+# below. Where the first-party Models API still lists a model, its value here
+# is that listing's max_input_tokens. Update when new models ship.
 _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-fable-5-1": 1_000_000,
     "claude-fable-5": 1_000_000,
     "claude-mythos-5": 1_000_000,
     "claude-mythos-preview": 1_000_000,
+    "claude-opus-5-5": 1_000_000,
+    "claude-opus-5": 1_000_000,
     "claude-opus-4-8": 1_000_000,
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-6": 1_000_000,
-    "claude-opus-4-5": 1_000_000,
+    "claude-opus-4-5": 200_000,
     "claude-opus-4-1": 1_000_000,
     "claude-opus-4-0": 1_000_000,
+    "claude-sonnet-5-5": 1_000_000,
     "claude-sonnet-5": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-sonnet-4-5": 1_000_000,
@@ -61,14 +67,22 @@ _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
 }
 
+# What may follow a known bare model name and still be that same model: a
+# dated snapshot ("-20251001") and/or a Bedrock version tag ("-v1:0"). Anything
+# else is a different model -- "claude-fable-5-1" is a new model, not a
+# snapshot of "claude-fable-5", and must never inherit its metadata.
+_ANTHROPIC_SNAPSHOT_SUFFIX_RE = re.compile(r"(?:-\d{8})?(?:-v\d+(?::\d+)?)?")
+
 
 def _known_anthropic_context_window(model: str) -> "int | None":
     """Look up a known context window for an Anthropic model ID (plain or
-    Bedrock). Strips region/"anthropic." prefixes, then matches by exact
-    or prefix (to tolerate dated snapshot suffixes)."""
+    Bedrock). Strips region/"anthropic." prefixes, then matches the bare name
+    exactly or followed only by a snapshot/version suffix."""
     bare = _ANTHROPIC_BEDROCK_MODEL_RE.sub("", model or "")
     for known_id, window in _ANTHROPIC_CONTEXT_WINDOWS.items():
-        if bare == known_id or bare.startswith(known_id + "-"):
+        if bare.startswith(known_id) and _ANTHROPIC_SNAPSHOT_SUFFIX_RE.fullmatch(
+            bare[len(known_id) :]
+        ):
             return window
     return None
 
@@ -172,6 +186,12 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 if b["type"] == "text":
                     anthropic_blocks.append(_text_block_to_anthropic(b))
                 elif b["type"] == "thinking":
+                    if (b.get("signature") or "").startswith(ENCRYPTED_REASONING_TAG):
+                        # OpenAI encrypted reasoning from an earlier turn on
+                        # provider="openai_responses": Anthropic can't verify
+                        # it as a thinking signature (a 400), so only the
+                        # rest of the turn is replayed.
+                        continue
                     anthropic_blocks.append(
                         {
                             "type": "thinking",

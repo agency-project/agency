@@ -87,6 +87,28 @@ class TestForConfig:
         # specific subclass, not the plain first-party one.
         assert type(backend) is not _AnthropicBackend
 
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
+    def test_current_claude_models_select_anthropic_backend_and_keep_model_id(self, model):
+        backend = agllm.for_config(_cfg(provider="anthropic", model=model))
+        assert type(backend) is _AnthropicBackend
+        assert backend.model == model
+
+    @pytest.mark.parametrize(
+        "model", ["us.anthropic.claude-opus-5-5", "anthropic.claude-sonnet-5-5-v1:0"]
+    )
+    def test_current_claude_models_on_bedrock_select_anthropic_bedrock_backend(self, model):
+        backend = agllm.for_config(_cfg(provider="bedrock", region="us-east-2", model=model))
+        assert isinstance(backend, _AnthropicBedrockBackend)
+        assert backend.known_context_limit(model) == 1_000_000
+
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"])
+    def test_gpt6_models_select_openai_compatible_backend_and_keep_model_id(self, model):
+        backend = agllm.for_config(
+            _cfg(provider="openai", base_url="https://api.openai.com/v1", model=model)
+        )
+        assert type(backend) is _OpenAICompatibleBackend
+        assert backend.model == model
+
     def test_anthropic_aws_snake_case_alias(self):
         backend = agllm.for_config(_cfg(provider="anthropic_aws", model="claude-sonnet-5"))
         assert isinstance(backend, _AnthropicAWSBackend)
