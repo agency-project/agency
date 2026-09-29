@@ -102,6 +102,7 @@ MODELS: "tuple[ModelSpec, ...]" = (
         ),
     ),
     ModelSpec("gpt-6-sol", "openai", reasoning_effort="none", home_harness="codex"),
+    ModelSpec("gpt-6.1-sol", "openai", reasoning_effort="none", home_harness="codex"),
     ModelSpec("gpt-6-luna", "openai", reasoning_effort="none", home_harness="codex"),
     ModelSpec("gpt-6-astra", "openai_responses", home_harness="codex"),
     ModelSpec("claude-fable-5-1", "anthropic", home_harness="claude_code"),

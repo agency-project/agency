@@ -1,6 +1,7 @@
 """OpenAI (and, via `.vllm`, any other OpenAI-compatible endpoint) backend."""
 
 from __future__ import annotations
+import re
 import httpx
 import openai
 
@@ -12,6 +13,35 @@ _CHATCOMPLETIONS_TYPE_PREFIX = "openai_chatcompletions_"
 _METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
 
 _CHATCOMPLETIONS_TOOL_CHOICE_VALUES = {"auto", "required", "none"}
+
+# OpenAI's /v1/models exposes no context metadata, so known limits are
+# hardcoded. These are MAX INPUT TOKENS -- what Agency's `context_limit`
+# means -- NOT the advertised 1,050,000-token total context window (which
+# also has to fit the 128,000-token max output). Storing 1,050,000 here would
+# push native's 90% compaction threshold (945,000) past the real 922,000
+# input cap. Update when new models ship.
+_OPENAI_MAX_INPUT_TOKENS: dict[str, int] = {
+    "gpt-6-astra": 922_000,
+    "gpt-6-sol": 922_000,
+    "gpt-6.1-sol": 922_000,
+    "gpt-6-luna": 922_000,
+}
+
+# What may follow a known model name and still be that same model: a dated
+# snapshot ("-2026-05-18"). Anything else is a different model.
+_OPENAI_SNAPSHOT_SUFFIX_RE = re.compile(r"(?:-\d{4}-\d{2}-\d{2})?")
+
+
+def _known_openai_max_input_tokens(model: "str | None") -> "int | None":
+    """Look up the known max input tokens for an OpenAI model ID, matching
+    the name exactly or followed only by a dated snapshot suffix."""
+    model = model or ""
+    for known_id, limit in _OPENAI_MAX_INPUT_TOKENS.items():
+        if model.startswith(known_id) and _OPENAI_SNAPSHOT_SUFFIX_RE.fullmatch(
+            model[len(known_id) :]
+        ):
+            return limit
+    return None
 
 
 def _serialize_sdk_object(obj):
@@ -54,6 +84,9 @@ class _OpenAICompatibleBackend(agllm):
             base_url=self.agconfig.llm.base_url,
             timeout=timeout,
         )
+
+    def known_context_limit(self, model: str) -> "int | None":
+        return _known_openai_max_input_tokens(model)
 
     def tokenize_url(self) -> "str | None":
         base_url: str = self.agconfig.llm.base_url or ""
