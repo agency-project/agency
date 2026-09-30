@@ -24,12 +24,14 @@ sys.modules[_spec.name] = smt
 _spec.loader.exec_module(smt)
 
 
-def test_targets_the_six_current_models_plus_astra_on_responses():
+def test_targets_current_models_plus_astra_and_6_1_sol_on_responses():
     assert [(s.model, s.provider) for s in smt.MODELS] == [
         ("gpt-6-astra", "openai"),
         ("gpt-6-sol", "openai"),
+        ("gpt-6.1-sol", "openai"),
         ("gpt-6-luna", "openai"),
         ("gpt-6-astra", "openai_responses"),
+        ("gpt-6.1-sol", "openai_responses"),
         ("claude-fable-5-1", "anthropic"),
         ("claude-opus-5-5", "anthropic"),
         ("claude-sonnet-5-5", "anthropic"),
@@ -67,8 +69,10 @@ def test_gpt6_tool_capable_models_default_to_reasoning_effort_none():
     }
     assert efforts["gpt-6-sol"] == "none"
     assert efforts["gpt-6-luna"] == "none"
-    # Astra rejects "none"; its provider default must be left alone.
+    # Astra and GPT-6.1 Sol reject "none"; their provider default must be
+    # left alone.
     assert efforts["gpt-6-astra"] is None
+    assert efforts["gpt-6.1-sol"] is None
 
 
 def test_reasoning_effort_override_applies_to_openai_only():
@@ -85,7 +89,10 @@ def test_reasoning_effort_override_applies_to_openai_only():
 
 def test_select_by_provider_and_model():
     assert {s.provider for s in smt.select_models("anthropic", None)} == {"anthropic"}
-    assert [s.model for s in smt.select_models("openai_responses", None)] == ["gpt-6-astra"]
+    assert [s.model for s in smt.select_models("openai_responses", None)] == [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+    ]
     # One model name can run on both OpenAI backends.
     assert {s.provider for s in smt.select_models(None, ["gpt-6-astra"])} == {
         "openai",
@@ -149,9 +156,12 @@ ASTRA_CHAT_ERROR = (
 )
 
 
-def test_only_astra_on_chat_completions_is_an_expected_failure():
+def test_only_astra_and_6_1_sol_on_chat_completions_are_expected_failures():
     expected = {(s.model, s.provider): s.expected_e2e_error for s in smt.MODELS}
     assert expected.pop(("gpt-6-astra", "openai")) == ASTRA_CHAT_ERROR
+    assert expected.pop(("gpt-6.1-sol", "openai")) == ASTRA_CHAT_ERROR.replace(
+        "gpt-6-astra", "gpt-6.1-sol"
+    )
     assert set(expected.values()) == {None}
 
 
