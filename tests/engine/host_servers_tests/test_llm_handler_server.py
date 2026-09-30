@@ -458,6 +458,45 @@ def test_payload_hash_distinguishes_different_tool_results():
     assert mod._payload_hash(a) != mod._payload_hash(b)
 
 
+def test_payload_hash_keeps_empty_text_thinking_blocks_with_different_signatures_distinct():
+    """Claude's default thinking display returns empty text; distinct blocks
+    differ only by signature and must not collapse into one stored payload."""
+    a = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-a"}
+    b = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-b"}
+    assert mod._payload_hash(a) != mod._payload_hash(b)
+
+
+def test_payload_hash_treats_native_and_replayed_thinking_as_the_same_block():
+    rich = {
+        "role": "assistant",
+        "type": "thinking",
+        "index": 2,
+        "text": "",
+        "signature": "sig-a",
+        "id": "",
+        "name": "",
+        "arguments": "",
+        "data": None,
+        "citations": None,
+        "ts_start": 1.0,
+        "ts_end": 2.0,
+    }
+    replayed = {
+        "role": "assistant",
+        "type": "thinking",
+        "index": 0,
+        "text": "",
+        "signature": "sig-a",
+    }
+    assert mod._payload_hash(rich) == mod._payload_hash(replayed)
+
+
+def test_payload_hash_unsigned_thinking_missing_and_empty_signature_match():
+    a = {"role": "assistant", "type": "thinking", "text": "t"}
+    b = {"role": "assistant", "type": "thinking", "text": "t", "signature": ""}
+    assert mod._payload_hash(a) == mod._payload_hash(b)
+
+
 def test_payload_hash_treats_native_and_resent_text_as_the_same_message():
     """A text block gets logged once in its rich response shape (ts_start/
     ts_end/index/etc.) and again in the reduced shape it takes when the

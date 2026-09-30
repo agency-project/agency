@@ -295,3 +295,45 @@ class TestAnthropicAWSBackend:
     def test_known_context_limit_delegates_to_lookup(self):
         backend = _AnthropicAWSBackend(_cfg())
         assert backend.known_context_limit("claude-sonnet-5") == 1_000_000
+
+
+class TestConverseSystemClassRoles:
+    @staticmethod
+    def _msg(role, text):
+        return {"role": role, "blocks": [{"type": "text", "index": 0, "text": text}]}
+
+    def test_initial_developer_joins_system(self):
+        from agency.llm.bedrock import _agency_messages_to_converse
+
+        system, msgs = _agency_messages_to_converse(
+            [self._msg("developer", "Dev."), self._msg("user", "hi")]
+        )
+        assert system == "Dev."
+        assert msgs == [{"role": "user", "content": [{"text": "hi"}]}]
+
+    def test_mid_conversation_developer_waits_for_pending_tool_result(self):
+        from agency.llm.bedrock import _agency_messages_to_converse
+
+        _, msgs = _agency_messages_to_converse(
+            [
+                self._msg("user", "go"),
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {"type": "tool_use", "index": 0, "id": "t1", "name": "f", "arguments": "{}"}
+                    ],
+                },
+                self._msg("developer", "Reminder."),
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {"type": "tool_result", "index": 0, "tool_call_id": "t1", "text": "ok"}
+                    ],
+                },
+            ]
+        )
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+        assert msgs[2]["content"] == [
+            {"toolResult": {"toolUseId": "t1", "content": [{"text": "ok"}], "status": "success"}},
+            {"text": "Reminder."},
+        ]

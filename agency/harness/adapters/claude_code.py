@@ -17,6 +17,7 @@ from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
+from .streaming import start_streaming_response, stream_response
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -604,27 +605,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                async def gen():
-                    # Closing Claude's request closes the upstream UDS stream,
-                    # including while the host is still generating its batch.
-                    from contextlib import aclosing
-                    import anyio
-
-                    stream = router.dispatch_stream_async(token, agency_context)
-                    try:
-                        async with aclosing(stream):
-                            async for item in stream:
-                                if item["type"] == "done":
-                                    for event in self._format_agency_stream_to_harness(
-                                        [item], model
-                                    ):
-                                        yield event
-                    finally:
-                        with anyio.CancelScope(shield=True):
-                            await stream.aclose()
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
+                frames = stream_response(
+                    router, token, agency_context, model, self._format_agency_stream_to_harness
+                )
+                # Only the finalized message is published; see
+                # start_streaming_response for why the first frame comes first.
+                return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

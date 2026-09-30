@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
+
 import httpx
 
 from .agllm import agllm
@@ -40,31 +42,58 @@ def _anthropic_sdk_timeout(timeout: httpx.Timeout):
 # this module's _AnthropicBackend and .bedrock's Anthropic-family backends.
 _ANTHROPIC_BEDROCK_MODEL_RE = re.compile(r"^(?:(?:us|eu|apac|global)\.)?anthropic\.")
 
-# Bedrock's native invoke_model API has no /v1/models-style endpoint to query
-# context windows from, so known Anthropic model context windows are hardcoded
-# here instead. Keyed by the bare model name, after stripping the region and
-# "anthropic." prefix Bedrock IDs carry — see _known_anthropic_context_window
-# below. Where the first-party Models API still lists a model, its value here
-# is that listing's max_input_tokens. Update when new models ship.
-_ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-fable-5-1": 1_000_000,
-    "claude-fable-5": 1_000_000,
-    "claude-mythos-5": 1_000_000,
-    "claude-mythos-preview": 1_000_000,
-    "claude-opus-5-5": 1_000_000,
-    "claude-opus-5": 1_000_000,
-    "claude-opus-4-8": 1_000_000,
-    "claude-opus-4-7": 1_000_000,
-    "claude-opus-4-6": 1_000_000,
-    "claude-opus-4-5": 200_000,
-    "claude-opus-4-1": 1_000_000,
-    "claude-opus-4-0": 1_000_000,
-    "claude-sonnet-5-5": 1_000_000,
-    "claude-sonnet-5": 1_000_000,
-    "claude-sonnet-4-6": 1_000_000,
-    "claude-sonnet-4-5": 1_000_000,
-    "claude-sonnet-4-0": 1_000_000,
-    "claude-haiku-4-5": 200_000,
+_EFFORT_ALL = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_NO_XHIGH = frozenset({"low", "medium", "high", "max"})
+_EFFORT_BASIC = frozenset({"low", "medium", "high"})
+
+
+@dataclass(frozen=True)
+class _AnthropicModelInfo:
+    """What Agency knows about one Claude model's request surface. `None`
+    means unverified: the request field passes through untouched and the
+    API decides, exactly as for a model missing from the table."""
+
+    context_window: int
+    # False: tool_choice {"type": "any"} / {"type": "tool"} is a 400.
+    forced_tool_choice: "bool | None" = None
+    # "none": temperature other than 1.0, and any top_p/top_k, are a 400.
+    # "exclusive": each is accepted alone, but temperature + top_p is a 400.
+    sampling: "str | None" = None
+    # Accepted output_config.effort levels; empty = effort is a 400.
+    effort: "frozenset[str] | None" = None
+    # Whether role:"system" is accepted inside `messages`. Informational for
+    # now: mid-conversation system-class messages are still sent as `user`
+    # on every model (the native form has placement rules of its own).
+    mid_conversation_system: "bool | None" = None
+
+
+# Keyed by the bare model name, after stripping the region and "anthropic."
+# prefix Bedrock IDs carry — see _anthropic_model_info below. Context windows
+# are also the static fallback for Bedrock, whose invoke_model API has no
+# /v1/models endpoint; where the first-party Models API lists a model, the
+# value here is its max_input_tokens. The restriction fields were verified
+# against the live API on 2026-09-29 (Mythos entries: Anthropic's docs, same
+# surface as their Fable counterparts). Update when new models ship.
+_ANTHROPIC_MODELS: "dict[str, _AnthropicModelInfo]" = {
+    "claude-fable-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-mythos-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-fable-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-mythos-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-mythos-preview": _AnthropicModelInfo(1_000_000),
+    "claude-opus-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-opus-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-opus-4-8": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-opus-4-7": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, False),
+    "claude-opus-4-6": _AnthropicModelInfo(1_000_000, True, "exclusive", _EFFORT_NO_XHIGH, False),
+    "claude-opus-4-5": _AnthropicModelInfo(200_000, True, "exclusive", _EFFORT_BASIC, False),
+    "claude-opus-4-1": _AnthropicModelInfo(1_000_000),
+    "claude-opus-4-0": _AnthropicModelInfo(1_000_000),
+    "claude-sonnet-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-sonnet-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
+    "claude-sonnet-4-6": _AnthropicModelInfo(1_000_000, True, "exclusive", _EFFORT_NO_XHIGH, False),
+    "claude-sonnet-4-5": _AnthropicModelInfo(1_000_000, True, "exclusive", frozenset(), False),
+    "claude-sonnet-4-0": _AnthropicModelInfo(1_000_000),
+    "claude-haiku-4-5": _AnthropicModelInfo(200_000, True, "exclusive", frozenset(), False),
 }
 
 # What may follow a known bare model name and still be that same model: a
@@ -74,17 +103,23 @@ _ANTHROPIC_CONTEXT_WINDOWS: dict[str, int] = {
 _ANTHROPIC_SNAPSHOT_SUFFIX_RE = re.compile(r"(?:-\d{8})?(?:-v\d+(?::\d+)?)?")
 
 
-def _known_anthropic_context_window(model: str) -> "int | None":
-    """Look up a known context window for an Anthropic model ID (plain or
-    Bedrock). Strips region/"anthropic." prefixes, then matches the bare name
-    exactly or followed only by a snapshot/version suffix."""
+def _anthropic_model_info(model: str) -> "_AnthropicModelInfo | None":
+    """Look up what's known about an Anthropic model ID (plain or Bedrock).
+    Strips region/"anthropic." prefixes, then matches the bare name exactly
+    or followed only by a snapshot/version suffix -- never a family prefix,
+    so an unlisted model inherits no restrictions."""
     bare = _ANTHROPIC_BEDROCK_MODEL_RE.sub("", model or "")
-    for known_id, window in _ANTHROPIC_CONTEXT_WINDOWS.items():
+    for known_id, info in _ANTHROPIC_MODELS.items():
         if bare.startswith(known_id) and _ANTHROPIC_SNAPSHOT_SUFFIX_RE.fullmatch(
             bare[len(known_id) :]
         ):
-            return window
+            return info
     return None
+
+
+def _known_anthropic_context_window(model: str) -> "int | None":
+    info = _anthropic_model_info(model)
+    return info.context_window if info is not None else None
 
 
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
@@ -142,17 +177,46 @@ def _text_block_to_anthropic(b: dict) -> dict:
     return block
 
 
+# OpenAI's Responses API added "developer" as a companion/successor to
+# "system" (Codex emits it); both are operator instructions. Same set as
+# agllm.build_kwargs's _SYSTEM_CLASS_ROLES.
+_SYSTEM_CLASS_ROLES = ("system", "developer")
+
+
+def _flush_deferred_text(out: list[dict], deferred: "list[str]") -> None:
+    """Emit system-class text held back while tool results were pending:
+    after the tool_result blocks of the same user message when there is one
+    (text may follow tool results there, never precede them), else as its
+    own user message."""
+    if not deferred:
+        return
+    prev_content = out[-1]["content"] if out and out[-1]["role"] == "user" else None
+    if isinstance(prev_content, list):
+        prev_content.extend({"type": "text", "text": text} for text in deferred)
+    else:
+        out.extend({"role": "user", "content": text} for text in deferred)
+    deferred.clear()
+
+
 def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, list[dict]]":
     system_parts: list[str] = []
     out: list[dict] = []
     conversation_started = False
+    # tool_use ids of the latest assistant turn still waiting for a result,
+    # and system-class text that arrived meanwhile: nothing may sit between
+    # a tool_use and its tool_result message (a 400).
+    pending_tool_ids: "set[str]" = set()
+    deferred_text: "list[str]" = []
 
     for m in messages:
         role = m.get("role")
         blocks = m.get("blocks") or []
-        if role != "system":
+        if role not in _SYSTEM_CLASS_ROLES:
             conversation_started = True
-        if role == "system":
+            if role != "tool":
+                pending_tool_ids.clear()
+                _flush_deferred_text(out, deferred_text)
+        if role in _SYSTEM_CLASS_ROLES:
             text = "".join(b["text"] for b in blocks if b["type"] == "text")
             if not text:
                 continue
@@ -160,13 +224,16 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 system_parts.append(text)
             else:
                 print(
-                    "[anthropic] WARNING: harness emitted a mid-conversation "
-                    "system-role message -- not valid per the Anthropic Messages "
+                    f"[anthropic] WARNING: harness emitted a mid-conversation "
+                    f"{role}-role message -- not valid per the Anthropic Messages "
                     "API (system must be the top-level `system` field, never a "
-                    "`messages` entry); sending it as a `user` message at its "
-                    "original position instead"
+                    "`messages` entry); sending it as `user` content at its "
+                    "original position instead (after any pending tool results)"
                 )
-                out.append({"role": "user", "content": text})
+                if pending_tool_ids:
+                    deferred_text.append(text)
+                else:
+                    out.append({"role": "user", "content": text})
         elif role == "user":
             has_non_text = any(b["type"] != "text" for b in blocks)
             if not has_non_text:
@@ -182,15 +249,21 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 out.append({"role": "user", "content": content_blocks})
         elif role == "assistant":
             anthropic_blocks: list[dict] = []
+            dropped_thinking = 0
             for b in blocks:
                 if b["type"] == "text":
                     anthropic_blocks.append(_text_block_to_anthropic(b))
                 elif b["type"] == "thinking":
-                    if (b.get("signature") or "").startswith(ENCRYPTED_REASONING_TAG):
-                        # OpenAI encrypted reasoning from an earlier turn on
-                        # provider="openai_responses": Anthropic can't verify
-                        # it as a thinking signature (a 400), so only the
-                        # rest of the turn is replayed.
+                    signature = b.get("signature") or ""
+                    if not signature or signature.startswith(ENCRYPTED_REASONING_TAG):
+                        # Only Claude-signed blocks can be replayed: an
+                        # unsigned one (vLLM/Chat Completions reasoning_content,
+                        # Converse reasoningText without a signature) or
+                        # OpenAI encrypted reasoning from provider=
+                        # "openai_responses" is a 400 ("Invalid `signature`"),
+                        # on every Claude model. Only the rest of the turn is
+                        # replayed; nothing is ever re-signed.
+                        dropped_thinking += 1
                         continue
                     anthropic_blocks.append(
                         {
@@ -209,8 +282,19 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                     )
                 elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
                     anthropic_blocks.append(_unknown_block_to_anthropic(b))
+            if dropped_thinking:
+                _warn_once(
+                    ("thinking", "unsigned"),
+                    "history carries thinking blocks without a Claude signature "
+                    "(another provider's reasoning); they are not sent to Anthropic",
+                )
+                if not anthropic_blocks:
+                    # Nothing but foreign reasoning -- an empty assistant turn
+                    # would itself be rejected.
+                    continue
             text_only = "".join(b["text"] for b in blocks if b["type"] == "text")
             out.append({"role": "assistant", "content": anthropic_blocks or text_only})
+            pending_tool_ids = {b["id"] for b in anthropic_blocks if b["type"] == "tool_use"}
         elif role == "tool":
             result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
             content = result_block.get("text", "") if result_block else ""
@@ -225,6 +309,10 @@ def _agency_messages_to_anthropic(messages: list[dict]) -> "tuple[str | None, li
                 prev_content.append(result)
             else:
                 out.append({"role": "user", "content": [result]})
+            pending_tool_ids.discard(result["tool_use_id"])
+            if not pending_tool_ids:
+                _flush_deferred_text(out, deferred_text)
+    _flush_deferred_text(out, deferred_text)
     return ("\n\n".join(system_parts) or None), out
 
 
@@ -234,13 +322,18 @@ def _agency_tools_to_anthropic(tools: "list[dict] | None") -> "list[dict] | None
     converted = []
     for t in tools:
         fn = t.get("function", t)
-        converted.append(
-            {
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
-            }
-        )
+        tool = {
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        # Anthropic strict tool use has the same schema precondition as
+        # OpenAI's (additionalProperties: false on every object), so a schema
+        # a harness marked strict for OpenAI is valid here too. Only an
+        # explicit True is forwarded.
+        if fn.get("strict") is True:
+            tool["strict"] = True
+        converted.append(tool)
     return converted
 
 
@@ -257,6 +350,99 @@ def _agency_tool_choice_to_anthropic(tool_choice):
         name = tool_choice.get("function", {}).get("name") or tool_choice.get("name")
         if name:
             return {"type": "tool", "name": name}
+    return None
+
+
+_WARNED_ONCE: "set[tuple]" = set()
+
+
+def _warn_once(key: tuple, message: str) -> None:
+    """Config-driven warnings would otherwise repeat on every call of an
+    agent loop; one per process per distinct (model, cause) is enough."""
+    if key not in _WARNED_ONCE:
+        _WARNED_ONCE.add(key)
+        print(f"[anthropic] WARNING: {message}")
+
+
+def _tool_choice_for_model(tool_choice, model: str, info: "_AnthropicModelInfo | None"):
+    """Degrade forced tool choice to `auto` on models that reject it.
+
+    Semantic tradeoff: `required` ("at least one tool call") and a named tool
+    ("call exactly this one") cannot be enforced by the provider on these
+    models -- the API 400s on {"type": "any"} / {"type": "tool"} regardless
+    of thinking settings. Agency itself never requests forced choice (its
+    own must-call contract, structured output via submit_output, is enforced
+    by prompt + engine retry); only a harness does, and a harness validates
+    its own tool loop. Degrading keeps the attempt alive where a hard error
+    would end it. No steering text is injected: a per-request message that
+    the harness doesn't keep in its history would edit the transcript and
+    invalidate later thinking blocks. Models not verified to reject forced
+    choice (older Claude, unknown IDs) keep it unchanged."""
+    if not isinstance(tool_choice, dict) or tool_choice.get("type") not in ("any", "tool"):
+        return tool_choice
+    if info is None or info.forced_tool_choice is not False:
+        return tool_choice
+    requested = (
+        "required" if tool_choice["type"] == "any" else f"named tool {tool_choice.get('name')!r}"
+    )
+    # Every occurrence, not once: each one is a request whose tool call the
+    # provider no longer guarantees.
+    print(
+        f"[anthropic] WARNING: {model} does not support provider-level tool "
+        f"enforcement; the requested tool_choice ({requested}) was converted to "
+        f"`auto`, so tool use is no longer guaranteed by the provider for this request"
+    )
+    return {"type": "auto"}
+
+
+def _sampling_for_model(sampling: dict, model: str, info: "_AnthropicModelInfo | None") -> dict:
+    """Drop the sampling fields a known model would 400 on. Unknown models,
+    and models whose sampling rules are unverified, get everything as set."""
+    policy = info.sampling if info is not None else None
+    kept = dict(sampling)
+    if policy == "none":
+        dropped = [k for k in ("top_p", "top_k") if k in kept]
+        if "temperature" in kept and kept["temperature"] != 1:
+            dropped.insert(0, "temperature")
+        for key in dropped:
+            del kept[key]
+        if dropped:
+            _warn_once(
+                (model, "sampling", tuple(dropped)),
+                f"{model} rejects sampling parameters (only temperature=1.0 is "
+                f"accepted); not sending {', '.join(dropped)}",
+            )
+    elif policy == "exclusive" and "temperature" in kept and "top_p" in kept:
+        # Deterministic: temperature is the more commonly set knob.
+        del kept["top_p"]
+        _warn_once(
+            (model, "sampling", "top_p"),
+            f"{model} accepts temperature or top_p but not both; sending temperature and not top_p",
+        )
+    return kept
+
+
+def _effort_for_model(effort: "str | None", model: str, info: "_AnthropicModelInfo | None"):
+    """Agency's reasoning_effort as output_config.effort, only where this
+    model is verified to accept that exact level. Everything else -- OpenAI-
+    only values ("none", "minimal"), levels a model lacks, models that reject
+    effort, and models with unverified effort support -- is omitted (the
+    model's own default applies) rather than mapped or guessed."""
+    if effort is None:
+        return None
+    if info is not None and info.effort is not None and effort in info.effort:
+        return effort
+    if info is None or info.effort is None:
+        reason = "its effort support is unverified"
+    elif not info.effort:
+        reason = "it does not support the effort parameter"
+    else:
+        reason = f"it accepts only {', '.join(sorted(info.effort))}"
+    _warn_once(
+        (model, "effort", effort),
+        f"not sending reasoning_effort={effort!r} to {model}: {reason}; "
+        f"the model's default effort applies",
+    )
     return None
 
 
@@ -310,6 +496,19 @@ class _AnthropicBackend(agllm):
             ).models.list()
         )
 
+    def retrieve_model(self, model: str):
+        # GET /v1/models/{id} resolves aliases ("claude-haiku-4-5") that the
+        # listing only carries under their dated ID.
+        if _anthropic_sdk is None or not model:
+            return None
+        client = self.make_client(httpx.Timeout(self.agconfig.llm.model_listing_timeout_seconds))
+        try:
+            return client.models.retrieve(model)
+        except _anthropic_sdk.NotFoundError:
+            return None
+        finally:
+            self._close(client)
+
     def tokenize_url(self) -> "str | None":
         return None
 
@@ -324,9 +523,11 @@ class _AnthropicBackend(agllm):
             close()
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
+        model = self.agconfig.llm.model or ""
+        info = _anthropic_model_info(model)
         system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
         kwargs: dict = dict(
-            model=self.agconfig.llm.model or "",
+            model=model,
             messages=anthropic_messages,
             max_tokens=self.agconfig.llm.max_completion_tokens
             or self.agconfig.llm.max_tokens
@@ -338,17 +539,30 @@ class _AnthropicBackend(agllm):
             # before system in Anthropic's prefix order, so this one
             # breakpoint caches tools + system together.
             kwargs["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
+        sampling: dict = {}
         if self.agconfig.llm.temperature is not None:
-            kwargs["temperature"] = self.agconfig.llm.temperature
+            sampling["temperature"] = self.agconfig.llm.temperature
         if self.agconfig.llm.top_p is not None:
-            kwargs["top_p"] = self.agconfig.llm.top_p
+            sampling["top_p"] = self.agconfig.llm.top_p
+        # The first-class field wins; extra_body.top_k is the older spelling.
         extra_body = self.agconfig.llm.extra_body or {}
-        if "top_k" in extra_body:
-            kwargs["top_k"] = extra_body["top_k"]
+        if self.agconfig.llm.top_k is not None:
+            sampling["top_k"] = self.agconfig.llm.top_k
+        elif "top_k" in extra_body:
+            sampling["top_k"] = extra_body["top_k"]
+        kwargs.update(_sampling_for_model(sampling, model, info))
+        stop = self.agconfig.llm.stop
+        if stop:
+            kwargs["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+        effort = _effort_for_model(self.agconfig.llm.reasoning_effort, model, info)
+        if effort is not None:
+            kwargs["output_config"] = {"effort": effort}
         anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
-        anthropic_tool_choice = _agency_tool_choice_to_anthropic(request.get("tool_choice"))
+        anthropic_tool_choice = _tool_choice_for_model(
+            _agency_tool_choice_to_anthropic(request.get("tool_choice")), model, info
+        )
         if anthropic_tool_choice is not None:
             kwargs["tool_choice"] = anthropic_tool_choice
         if anthropic_messages:

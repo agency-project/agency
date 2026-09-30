@@ -500,3 +500,17 @@ def test_stream_error_after_first_frame_keeps_earlier_frames_intact():
     asyncio.run(collect())
     assert json.loads(frames[0][len("data: ") :])["choices"][0]["delta"] == {"content": "hello"}
     assert frames[-1] == "data: [DONE]\n\n"
+
+
+def test_harness_to_agency_never_turns_reasoning_content_into_thinking():
+    """reasoning_content carries no signature; an Anthropic thinking block
+    rebuilt from it would be a 400, so it is not read back at all."""
+    context = _backend()._format_context_harness_to_agency(
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello", "reasoning_content": "thoughts"},
+            ]
+        }
+    )
+    assert [b["type"] for b in context["messages"][1]["blocks"]] == ["text"]
