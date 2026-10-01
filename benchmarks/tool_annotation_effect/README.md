@@ -48,6 +48,8 @@ python -m benchmarks.tool_annotation_effect power --margin .05 \
   --suite rag --model-id gpt-6-luna-openai --active purpose --control schema_only
 ```
 
+`configs/rag-repeat-10.json` reproduces the single-task RAG setup with ten repetitions per arm (40 fresh trials). It uses the EC2 cached Podman image ID from live validation. Set both `OPENAI_API_KEY` and `OPENAI_BASE_URL=https://api.openai.com/v1` before execution. This repeated-run design still has only one task cluster; see [VALIDATION.md](VALIDATION.md) for the saved outcomes and limits.
+
 `run --limit N` stops after N new assignments; unexecuted assignments remain missing in analysis. Completed failures are never retried by resume. After a crash, `--resume-partial` explicitly preserves the interrupted attempt and starts a fresh environment in the next attempt directory. The original attempt defines assigned-trial accounting; recovery attempts are exported and counted separately. A file lock prevents concurrent mutation. Status files use atomic replacement; immutable JSON artifacts use atomic hard-link publication. Modified manifests or implementation sources fail validation before execution.
 
 `analyze --pricing PATH` accepts only an explicit versioned USD pricing file. The example contains placeholder rates that must be replaced; it is not a price estimate. Usage with unknown input/output/cache counts produces unknown cost where appropriate. Annotation token estimates never stand in for billed tokens. `analyze --tokenizer-file PATH` optionally uses the `tokenizers` library with a supplied local tokenizer JSON. No tokenizer is downloaded. The tokenizer hash and pricing version are recorded.

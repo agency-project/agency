@@ -34,3 +34,22 @@ These are versioned software validation attempts, not a selectively rerun pilot.
 ## Unverified integration boundaries
 
 SWE-bench official evaluation, Harbor 0.23.0 execution on published Terminal-Bench 2.0 tasks, live C→Rust compilation/differential behavior, and live tandem worker workflows were **not** executed. Harbor/SWE-bench are optional dependencies and absent from the EC2 test environment; `rustc` was also absent. Their fake contract tests establish export/import, dispatch, and failure-accounting behavior, not live compatibility or benchmark results. Task images and repository dependency setup must be prepared explicitly before a published-suite run.
+
+## Ten repetitions per arm — October 1, 2026
+
+The user requested n = 10 with the same setup. `configs/rag-repeat-10.json` changes only `repetitions` from 1 to 10: one frozen `atlas-escalation` task, all four arms, GPT-6 Luna, reasoning effort none, provider seed 42, identical budgets, Podman image, schemas, prompts, resource limits, and randomized block order. Source was synced before execution and its hash verified. The source differs from validation-v4 only by the previously documented formatting change in commit `daa9a88`; the frozen task is identical. Forty fresh model-backed assignments executed sequentially, with no recovery attempts or retries of completed trials.
+
+| Arm | Success | Mean tool calls (range) | Mean input tokens | Mean output tokens | Mean total tokens | Mean agent seconds |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 10/10 | 8.9 (8–9) | 10,196.1 | 216.9 | 10,413.0 | 8.11 |
+| schema_only | 10/10 | 8.4 (6–10) | 10,170.0 | 207.0 | 10,377.0 | 8.84 |
+| purpose | 10/10 | 6.8 (5–9) | 10,034.1 | 281.1 | 10,315.2 | 7.10 |
+| purpose_workstreams | 10/10 | 5.6 (5–6) | 9,572.4 | 274.9 | 9,847.3 | 6.62 |
+
+All 40 final answer/evidence outputs had the same hash. All 297 tool actions had actual Agency call IDs. Purpose annotations were valid on 68/68 calls; purpose/workstream annotations were valid on 56/56 calls. Schema-only supplied no annotations on its 84 calls. One schema-only run requested nonexistent document ID `regions`, then recovered and passed. No input/output usage was missing, and no malformed annotation, compaction, or truncation was recorded. Agent timing excludes environment setup; mean setup times were 9.31–9.66 seconds across arms. No pricing file was supplied, so no billed dollar cost is estimated.
+
+Purpose used 23.6% fewer tool calls and 0.9% fewer total tokens than baseline; purpose + workstreams used 37.1% fewer calls and 5.4% fewer tokens. These are observed mean differences on this task, not general performance claims. Mean normalized operation-edit distance was 0.180 across the 45 baseline-baseline pairs, 0.394 for baseline-purpose, and 0.470 for baseline-workstreams. Cross-arm distances thus exceeded observed baseline variability, while correctness was identical. Pairwise comparisons share runs and are not independent samples.
+
+**Sample size:** 10 runs per arm, 40 runs total, one independent task cluster. Repetition estimates within-task variability but does not establish effects across tasks or providers. The task-clustered report correctly leaves confidence intervals unavailable with one cluster; no significance or equivalence claim is made. Passing 10/10 on this task does not establish a perfect underlying success rate.
+
+Full artifacts, raw traces, CSV/JSON exports, descriptive means/sample SDs/ranges, provenance, and blinded review packets are in `artifacts/tool-annotation-ec2/rag-repeat-10-v2/` and `/home/eric/episode-traces-results/rag-repeat-10-v2/`. A failed initial launch is preserved separately in `rag-repeat-10/`: all 40 assignments failed before model calls because the remote environment lacked `OPENAI_BASE_URL`. The corrected launch explicitly set the same `https://api.openai.com/v1` endpoint used for validation-v4. The temporary remote credential file was removed after execution.
