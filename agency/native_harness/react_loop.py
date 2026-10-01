@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from . import tools
 from .profiling import profile_run, span as profile_span
 from .compaction import maybe_compact
+from .annotations import augment_schemas, extract, instruction, event_id
 
 if TYPE_CHECKING:
     from .bridge_client import BridgeClient
@@ -89,15 +90,20 @@ def run_react_loop(
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
+    annotation_arm: str = "baseline",
+    observer=None,
+    toolset: "tuple[list[dict], dict] | None" = None,
 ) -> ReactLoopResult:
     messages = list(messages)
     total_input_tokens = 0
     total_output_tokens = 0
     previous_summary: "str | None" = None
 
-    dispatch_table = dict(tools.TOOL_DISPATCH)
-    tool_schemas = list(tools.BUILTIN_TOOL_SCHEMAS.values())
-    have_tool = set(tools.BUILTIN_TOOL_SCHEMAS.keys())
+    dispatch_table = dict(tools.TOOL_DISPATCH) if toolset is None else dict(toolset[1])
+    tool_schemas = (
+        list(tools.BUILTIN_TOOL_SCHEMAS.values()) if toolset is None else list(toolset[0])
+    )
+    have_tool = {schema["function"]["name"] for schema in tool_schemas}
 
     mcp_schemas = mcp.discover() if mcp is not None else []
     for schema in mcp_schemas:
@@ -108,13 +114,41 @@ def run_react_loop(
         have_tool.add(name)
         dispatch_table[name] = lambda args_json, _name=name: mcp.call(_name, args_json)
 
+    tool_schemas = augment_schemas(tool_schemas, annotation_arm)
+    treatment_instruction = instruction(annotation_arm)
+    if treatment_instruction:
+        messages.insert(0, {"role": "system", "content": treatment_instruction})
+    if observer is not None:
+        observer(
+            "treatment",
+            {
+                "arm": annotation_arm,
+                "schemas": tool_schemas,
+                "instruction": treatment_instruction,
+                "initial_messages": messages,
+            },
+        )
+
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
+            before_compaction = messages
             messages, previous_summary = maybe_compact(
                 messages, context_limit, llm, model, previous_summary
             )
+            if observer is not None and messages != before_compaction:
+                observer("compaction", {"exchange": step, "messages": messages})
 
+            dispatch_started = time.perf_counter_ns()
             resp = llm.dispatch(model, messages, tool_schemas or None)
+            if observer is not None:
+                observer(
+                    "model_exchange",
+                    {
+                        "exchange": step,
+                        "response": resp,
+                        "duration_ns": time.perf_counter_ns() - dispatch_started,
+                    },
+                )
             if "error" in resp:
                 return ReactLoopResult(
                     status="error", message=str(resp["error"]), turn_count=step + 1
@@ -140,9 +174,34 @@ def run_react_loop(
                 progress_path, messages, total_input_tokens, total_output_tokens, step + 1
             )
 
+            prepared_calls = []
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 fn_args = tc["function"]["arguments"]
+                fn_args, annotation = extract(fn_args, annotation_arm)
+                trace_id = event_id() if observer is not None else None
+                correlation = {
+                    "event_id": trace_id,
+                    "model_tool_call_id": tc["id"],
+                    "exchange": step,
+                    "batch_size": len(tool_calls),
+                    "execution": "serial",
+                    "tool_name": fn_name,
+                }
+                if observer is not None:
+                    observer(
+                        "tool_annotation",
+                        {
+                            **correlation,
+                            "annotation": annotation,
+                            "arguments": _parse_tool_input(fn_args),
+                            "arguments_json": fn_args,
+                            "call_id": None,
+                        },
+                    )
+                prepared_calls.append((tc, fn_name, fn_args, correlation))
+
+            for tc, fn_name, fn_args, correlation in prepared_calls:
                 handler = dispatch_table.get(fn_name)
                 call_id = None
                 tool_duration_ns = None
@@ -151,6 +210,11 @@ def run_react_loop(
                 elif bridge is not None:
                     decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
                     call_id = decision.get("call_id")
+                    if observer is not None:
+                        observer(
+                            "tool_admission",
+                            {**correlation, "call_id": call_id, "decision": decision},
+                        )
                     if decision.get("decision") == "deny":
                         result_content = json.dumps(
                             {
@@ -166,11 +230,30 @@ def run_react_loop(
                             result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
                 else:
+                    observer_started_ns = time.perf_counter_ns() if observer is not None else None
                     try:
                         result_content = handler(fn_args)
                     except Exception as exc:
                         result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+                    if observer_started_ns is not None:
+                        tool_duration_ns = time.perf_counter_ns() - observer_started_ns
                 result_error = _parse_tool_input(result_content).get("error")
+                if observer is not None:
+                    result_data = _parse_tool_input(result_content)
+                    failed = bool(result_error) or result_data.get("isError") is True
+                    failed = failed or any(
+                        result_data.get(key) not in (None, 0) for key in ("returncode", "exit_code")
+                    )
+                    observer(
+                        "tool_result",
+                        {
+                            **correlation,
+                            "call_id": call_id,
+                            "result": result_content,
+                            "duration_ns": tool_duration_ns,
+                            "category": "error" if failed else "ok",
+                        },
+                    )
                 result_content = tools.offload_if_oversized(
                     fn_name, tc["id"], result_content, offload_dir
                 )

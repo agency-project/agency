@@ -93,7 +93,7 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
     # The daemon needs harness/ptrace knobs, not host credentials or live
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
-    return {
+    config = {
         "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),
@@ -110,6 +110,14 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
             "harness_python_path": agconfig.sandbox.harness_python_path,
         },
     }
+    if agconfig.agent.annotation_arm != "baseline" or agconfig.agent.native_trace_file:
+        config["agent"] = {
+            "annotation_arm": agconfig.agent.annotation_arm,
+            "native_trace_file": agconfig.agent.native_trace_file,
+            "experiment_run_id": agconfig.agent.experiment_run_id,
+            "experiment_agent_id": agconfig.agent.experiment_agent_id,
+        }
+    return config
 
 
 def _package_bootstrap_command(

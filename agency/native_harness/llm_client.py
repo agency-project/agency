@@ -46,7 +46,17 @@ def _retry_backoff_s(attempt: int) -> float:
 
 
 class LLMClient:
-    def __init__(self, base_url: str, api_key: str, timeout_s: float = 300) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout_s: float = 300,
+        *,
+        model_settings: dict | None = None,
+        observer=None,
+    ) -> None:
+        self.model_settings = dict(model_settings or {})
+        self.observer = observer
         self._client = httpx.Client(
             base_url=base_url,
             timeout=timeout_s,
@@ -64,7 +74,7 @@ class LLMClient:
         """Returns `{"message": {...}, "usage": {...} | None}` on success,
         `{"error": "..."}` on failure (exhausted retries or a non-retryable
         status)."""
-        kwargs = {"model": model, "messages": messages, "stream": True}
+        kwargs = {**self.model_settings, "model": model, "messages": messages, "stream": True}
         if tools:
             kwargs["tools"] = tools
         if internal_kind is not None:
@@ -72,9 +82,12 @@ class LLMClient:
 
         last_error = "dispatch failed with no attempts made"
         for attempt in range(_DISPATCH_MAX_RETRIES):
+            if self.observer is not None:
+                self.observer("model_attempt", {"attempt": attempt, "internal_kind": internal_kind})
             content_parts: "list[str]" = []
             tool_calls_raw: "dict[int, dict]" = {}
             usage: "dict | None" = None
+            finish_reason = None
             try:
                 with self._client.stream("POST", "/v1/chat/completions", json=kwargs) as resp:
                     if resp.status_code == 503:
@@ -84,10 +97,14 @@ class LLMClient:
                             with profile_span(self, f"llm:retry_backoff[{attempt}]"):
                                 time.sleep(_retry_backoff_s(attempt))
                             continue
-                        return {"error": last_error}
+                        return self._dispatch_error(last_error, attempt + 1, internal_kind)
                     if resp.status_code != 200:
                         resp.read()
-                        return {"error": f"dispatch failed: {resp.status_code} {resp.text}"}
+                        return self._dispatch_error(
+                            f"dispatch failed: {resp.status_code} {resp.text}",
+                            attempt + 1,
+                            internal_kind,
+                        )
 
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data: "):
@@ -102,6 +119,7 @@ class LLMClient:
                         if not choices:
                             continue
                         delta = choices[0].get("delta") or {}
+                        finish_reason = choices[0].get("finish_reason") or finish_reason
                         if delta.get("content"):
                             content_parts.append(delta["content"])
                         for tc_delta in delta.get("tool_calls") or []:
@@ -125,7 +143,18 @@ class LLMClient:
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
                 if tool_calls_raw:
                     message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
-                return {"message": message, "usage": usage}
+                result = {"message": message, "usage": usage}
+                if self.observer is not None:
+                    self.observer(
+                        "model_dispatch_complete",
+                        {
+                            "usage": usage,
+                            "finish_reason": finish_reason,
+                            "attempts": attempt + 1,
+                            "internal_kind": internal_kind,
+                        },
+                    )
+                return result
 
             except (httpx.ConnectError, httpx.TimeoutException) as e:
                 last_error = f"llm endpoint unreachable: {e}"
@@ -133,9 +162,25 @@ class LLMClient:
                     with profile_span(self, f"llm:retry_backoff[{attempt}]"):
                         time.sleep(_retry_backoff_s(attempt))
                     continue
-                return {"error": last_error}
+                return self._dispatch_error(last_error, attempt + 1, internal_kind)
 
-        return {"error": last_error}
+        return self._dispatch_error(last_error, _DISPATCH_MAX_RETRIES, internal_kind)
+
+    def _dispatch_error(self, error, attempts, internal_kind):
+        if self.observer is not None:
+            self.observer(
+                "model_dispatch_complete",
+                {
+                    "usage": None,
+                    "finish_reason": "error",
+                    "attempts": attempts,
+                    "internal_kind": internal_kind,
+                },
+            )
+        return {"error": error}
+
+    def close(self) -> None:
+        self._client.close()
 
 
 __all__ = ["LLMClient"]

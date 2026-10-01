@@ -246,6 +246,10 @@ class agentconfig(confignamespace):
     checkpoint_save_timeout_s: int = 600
     checkpoint_load_timeout_s: int = 600
     harness: str = "native"
+    annotation_arm: str = "baseline"
+    native_trace_file: "str | None" = None
+    experiment_run_id: "str | None" = None
+    experiment_agent_id: "str | None" = None
 
 
 @dataclass(slots=True)

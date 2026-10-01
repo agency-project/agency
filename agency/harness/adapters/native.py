@@ -147,6 +147,17 @@ class NativeAdapter(HarnessAdapter):
             ]
             if resume_session_id:
                 argv += ["--resume", resume_session_id]
+            if runtime.agconfig.agent.annotation_arm != "baseline":
+                argv += ["--annotation-arm", runtime.agconfig.agent.annotation_arm]
+            if runtime.agconfig.agent.native_trace_file:
+                argv += [
+                    "--trace-file",
+                    runtime.agconfig.agent.native_trace_file,
+                    "--agent-id",
+                    runtime.agconfig.agent.experiment_agent_id or runtime.engine_name,
+                    "--run-id",
+                    runtime.agconfig.agent.experiment_run_id or scratch_dir,
+                ]
 
             envp = {
                 "PATH": HARNESS_PATH,

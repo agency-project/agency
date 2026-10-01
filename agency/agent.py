@@ -148,6 +148,8 @@ class agent:
 
             self.harness: str = harness if harness is not None else self.agconfig.agent.harness
             self.agconfig.agent.harness = self.harness  # keep config snapshot consistent
+            if self.agconfig.agent.annotation_arm != "baseline" and self.harness != "native":
+                raise ValueError("Tool annotation treatments support only the native harness")
             self.context: agcontext = agcontext()
             # Sandbox is created lazily on first skill run; container provisioning
             # is expensive and agents may be constructed without ever running a skill.

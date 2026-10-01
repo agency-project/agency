@@ -40,6 +40,7 @@ from .llm_client import LLMClient
 from .mcp_client import McpToolset
 from .react_loop import run_react_loop
 from . import session as session_store
+from .annotations import ARMS, TraceWriter
 
 _DEFAULT_SESSION_DIR = os.path.join(os.path.expanduser("~"), ".native_harness", "sessions")
 _DEFAULT_OFFLOAD_DIR = "./long_tool_call_outputs"
@@ -51,6 +52,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True)
     p.add_argument("--system", default=None, help="System prompt (only used for a fresh session).")
     p.add_argument("--max-steps", type=int, default=4096)
+    p.add_argument("--annotation-arm", choices=ARMS, default="baseline")
+    p.add_argument("--trace-file", default=None)
+    p.add_argument("--agent-id", default="standalone")
+    p.add_argument("--run-id", default=None)
     p.add_argument(
         "--output-format", choices=["json"], default="json", help="Only 'json' is supported today."
     )
@@ -119,6 +124,17 @@ def main(argv: "list[str] | None" = None) -> int:
 
     session_id, messages = _resolve_session(args)
     messages = messages + [{"role": "user", "content": args.prompt}]
+    observer = (
+        TraceWriter(
+            args.trace_file,
+            agent_id=args.agent_id,
+            run_id=args.run_id or session_id,
+            secrets=(args.bridge_token, llm_api_key),
+        )
+        if args.trace_file
+        else None
+    )
+    llm.observer = observer
 
     result = run_react_loop(
         messages,
@@ -130,6 +146,8 @@ def main(argv: "list[str] | None" = None) -> int:
         max_steps=args.max_steps,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
+        annotation_arm=args.annotation_arm,
+        observer=observer,
     )
 
     if result.status != "done":

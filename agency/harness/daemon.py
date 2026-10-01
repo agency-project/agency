@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 
 from ..configs.agconfig import (
     agconfig as agconfig_cls,
+    agentconfig,
     harnessadapterconfig,
     ptraceconfig,
     sandboxconfig,
@@ -803,6 +804,7 @@ def main(argv: "list[str] | None" = None) -> None:
         args.engine_name,
         args.harness,
         agconfig=agconfig_cls(
+            agentconfig(**payload.get("agent", {})),
             harnessadapterconfig(**payload.get("harness_adapter", {})),
             ptraceconfig(**payload.get("ptrace", {})),
             sandboxconfig(**payload.get("sandbox", {})),
