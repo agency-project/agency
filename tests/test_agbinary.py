@@ -241,14 +241,28 @@ class TestAgSandboxBinaryIO:
         # Must NOT raise UnicodeDecodeError — binary is expected
         assert isinstance(result, bytes)
 
-    def test_write_file_bytes_encodes_via_base64(self):
+    def test_write_file_bytes_preserves_non_utf8_input(self):
         sb = self._make_sb()
         with patch.object(sb, "_container_exec", return_value=("", 0)) as mock_exec:
             sb.write_file_bytes("/workspace/out.bin", PNG_MAGIC)
-        cmd = mock_exec.call_args[0][0]
-        # The base64-encoded payload must appear in the shell command
-        expected_b64 = base64.b64encode(PNG_MAGIC).decode("ascii")
-        assert expected_b64 in cmd
+        assert mock_exec.call_args.kwargs["stdin"] == PNG_MAGIC
+
+    def test_write_file_bytes_round_trips_payload_larger_than_argument_limit(self, tmp_path):
+        import subprocess
+
+        sb = self._make_sb()
+        payload = bytes(range(256)) * 8192
+        target = tmp_path / "directory with spaces" / "binary 'data'.bin"
+
+        def execute(command, *, stdin=None, timeout=None, shell="sh"):
+            result = subprocess.run(
+                [shell, "-c", command], input=stdin, capture_output=True, timeout=timeout
+            )
+            return result.stderr.decode(), result.returncode
+
+        with patch.object(sb, "_container_exec", side_effect=execute):
+            sb.write_file_bytes(str(target), payload)
+        assert target.read_bytes() == payload
 
     def test_write_file_bytes_failure_raises_os_error(self):
         sb = self._make_sb()

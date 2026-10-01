@@ -490,22 +490,16 @@ class agsandbox_backend(AgSandboxBackendFields):
     def write_file_bytes(self, path: str, data: bytes) -> None:
         """Write raw bytes to a file in the container.
 
-        Use for binary files. The data is base64-encoded on the host and
-        decoded inside the container, avoiding any shell-quoting issues with
-        arbitrary byte sequences.
+        Stream through stdin so repository archives and other large payloads
+        never hit the operating system's command-line argument limit.
         """
-        import base64
-
-        b64 = base64.b64encode(data).decode("ascii")
         quoted = shlex.quote(path)
-        sh_cmd = (
-            f"mkdir -p $(dirname {quoted}) && printf '%s' {shlex.quote(b64)} | base64 -d > {quoted}"
-        )
-        _, rc = self._container_exec(
-            sh_cmd, timeout=self._agconfig.sandbox.file_io_timeout_s, shell="sh"
+        sh_cmd = f'mkdir -p -- "$(dirname -- {quoted})" && cat > {quoted}'
+        output, rc = self._container_exec(
+            sh_cmd, stdin=data, timeout=self._agconfig.sandbox.file_io_timeout_s, shell="sh"
         )
         if rc != 0:
-            raise OSError(f"Failed to write binary file {path} in container")
+            raise OSError(f"Failed to write binary file {path} in container: {output}")
 
     def write_file(self, path: str, content: str) -> None:
         quoted = shlex.quote(path)
