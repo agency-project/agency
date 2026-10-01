@@ -1,0 +1,51 @@
+{
+  "profile": "custom",
+  "harness": "native",
+  "seed": 20261001,
+  "task_sampling_seed": 1729,
+  "repetitions": 1,
+  "models": [
+    {
+      "id": "gpt-6-luna-openai",
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "reasoning_effort": "none",
+        "max_completion_tokens": 4096,
+        "seed": 42
+      }
+    }
+  ],
+  "budgets": {
+    "max_steps": 50,
+    "timeout_s": 600
+  },
+  "context_limit": 196000,
+  "compaction_policy": "native-v1",
+  "cache_policy": "provider-managed; record cache usage when reported",
+  "profiling": {
+    "enabled": false
+  },
+  "roles": "both",
+  "contention": false,
+  "system_prompt": "Complete the task using the available tools.",
+  "base_image": "docker.io/library/python:3.12-slim",
+  "practical_margins": {
+    "success_rate": 0.05,
+    "operation_edit_distance": 0.1
+  },
+  "suites": {
+    "terminalbench": {
+      "sample_size": 10,
+      "tasks_file": "/home/eric/episode-traces-prepared/terminalbench-2/tasks-ready.json"
+    }
+  },
+  "resource_limits": {
+    "cpus": 2,
+    "memory": "4g"
+  },
+  "tool_python_path": "/opt/agency-python/bin/python3",
+  "terminal_memory_mb": 4096
+}

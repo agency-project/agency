@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .common import ROOT, read_events
@@ -160,6 +161,7 @@ def agent_config(config, model, trial, directory, role):
         ),
         skillconfig(react_max_steps=config["budgets"]["max_steps"]),
         sandboxconfig(
+            backend=config.get("sandbox_backend", "auto"),
             base_image=config.get("base_image", "docker.io/library/python:3.12-slim"),
             gpu_passthrough=False,
             mounts={"_agency_package": (config["runtime_source"], "/opt/agency_pkg", "ro")}
@@ -311,14 +313,30 @@ def _execute(task, trial, model, config, directory):
         report = TerminalBenchAdapter().launch(task, trial, model, config, directory)
         event_files = sorted((directory / "harbor").rglob("events.jsonl"))
         events = [event for path in event_files for event in read_events(path)]
+        native_files = sorted((directory / "harbor").rglob("native-result.json"))
+        native_result = json.loads(native_files[0].read_text()) if len(native_files) == 1 else {}
+        treatment = [event for event in events if event["kind"] == "treatment"]
+        verified = bool(treatment) and all(event["arm"] == trial["arm"] for event in treatment)
+        timings = {}
+        for phase in ("environment_setup", "agent_setup", "agent_execution"):
+            timing = report.get(phase) or {}
+            if timing.get("started_at") and timing.get("finished_at"):
+                timings[phase] = (
+                    datetime.fromisoformat(timing["finished_at"])
+                    - datetime.fromisoformat(timing["started_at"])
+                ).total_seconds()
         return {
             "events": events,
             "metrics": trace_metrics(events),
             "agent_executions": 1,
             "harbor_report": report,
             "end_to_end_seconds": time.monotonic() - started,
-            "final_text": "",
-            "failure": None,
+            "agent_seconds": native_result.get("agent_seconds", timings.get("agent_execution")),
+            "setup_seconds": sum(timings[phase] for phase in ("environment_setup", "agent_setup"))
+            if all(phase in timings for phase in ("environment_setup", "agent_setup"))
+            else None,
+            "final_text": native_result.get("final_text", ""),
+            "failure": None if verified else "infrastructure",
         }
     agents = {}
     handles = {}

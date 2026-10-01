@@ -75,6 +75,13 @@ def test_official_saved_verifier_formats_are_imported():
         harbor.import_report({"exception_info": {"exception_type": "Timeout"}})["failure"]
         == "infrastructure"
     )
+    for exception in (
+        {"exception_type": "AgentTimeoutError"},
+        {"exception_type": "RuntimeError", "exception_message": "exceeded max_steps=50"},
+    ):
+        verdict = harbor.import_report({"exception_info": exception})
+        assert verdict["failure"] == "budget"
+        assert verdict["success"] is False
 
 
 def test_harbor_job_uses_agency_native_agent_and_one_owned_environment(tmp_path):
@@ -92,6 +99,8 @@ def test_harbor_job_uses_agency_native_agent_and_one_owned_environment(tmp_path)
     assert job["n_attempts"] == 1
     assert job["retry"]["max_retries"] == 0
     assert job["tasks"] == [{"path": str(tmp_path)}]
+    assert job["environment"]["override_cpus"] == 2
+    assert job["environment"]["override_memory_mb"] == 4096
 
 
 def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
@@ -160,7 +169,11 @@ def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
         model_name="fake",
         arm="purpose",
         model_config={"base_url_env": "TEST_URL", "api_key_env": "TEST_KEY"},
-        experiment_config={"budgets": {"max_steps": 2, "timeout_s": 5}, "context_limit": None},
+        experiment_config={
+            "budgets": {"max_steps": 2, "timeout_s": 5},
+            "context_limit": None,
+            "tool_python_path": "/opt/agency-python/bin/python3",
+        },
     )
     context = SimpleNamespace()
 
@@ -171,6 +184,8 @@ def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
     asyncio.run(execute())
     assert uploads == ["/tmp/agency_native_tools.py"]
     assert "agency_native_tools" in executions[-1]
+    assert executions[0].startswith("command -v /opt/agency-python/bin/python3")
+    assert executions[-1].startswith("/opt/agency-python/bin/python3 -c ")
     assert len(requests) == 2
     assistant = next(message for message in requests[1][0] if message.get("tool_calls"))
     assert "_agency" in assistant["tool_calls"][0]["function"]["arguments"]
@@ -238,3 +253,40 @@ def test_benchmark_runtime_mount_excludes_gold_manifests_and_credentials(tmp_pat
     monkeypatch.setattr(execution, "_execute", fake_execution)
     assert execution.execute({}, {"suite": "rag"}, {}, {}, tmp_path) == {"success": True}
     assert not observed["path"].exists()
+
+
+def test_terminal_execution_retains_native_duration_and_final_answer(tmp_path, monkeypatch):
+    from benchmarks.tool_annotation_effect.execution import execute
+
+    def launch(*args):
+        logs = tmp_path / "harbor" / "trial" / "agent"
+        logs.mkdir(parents=True)
+        (logs / "native-result.json").write_text(
+            json.dumps({"final_text": "Finished artifact", "agent_seconds": 3.25})
+        )
+        return {"verifier_result": {"rewards": {"reward": 1}}}
+
+    monkeypatch.setattr(TerminalBenchAdapter, "launch", launch)
+    result = execute({}, {"suite": "terminalbench"}, {}, {}, tmp_path)
+    assert result["final_text"] == "Finished artifact"
+    assert result["agent_seconds"] == 3.25
+
+
+def test_agent_config_uses_explicit_container_backend(tmp_path, monkeypatch):
+    from benchmarks.tool_annotation_effect.execution import agent_config
+
+    monkeypatch.setenv("TEST_URL", "http://fake")
+    monkeypatch.setenv("TEST_KEY", "not-a-real-key")
+    config = agent_config(
+        {"sandbox_backend": "docker", "context_limit": 196000, "budgets": {"max_steps": 50}},
+        {
+            "provider": "openai",
+            "model": "fake",
+            "base_url_env": "TEST_URL",
+            "api_key_env": "TEST_KEY",
+        },
+        {"suite": "swebench", "arm": "baseline", "trial_id": "trial"},
+        tmp_path,
+        "agent",
+    )
+    assert config.sandbox.backend == "docker"

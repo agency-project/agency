@@ -158,11 +158,19 @@ class TerminalBenchAdapter:
             "n_attempts": 1,
             "n_concurrent_trials": 1,
             "retry": {"max_retries": 0},
+            "environment": {
+                "type": "docker",
+                "override_cpus": config.get("resource_limits", {}).get("cpus", 2),
+                "override_memory_mb": config.get("terminal_memory_mb", 4096),
+            },
             "tasks": [{"path": str(task_path)}],
             "agents": [
                 {
                     "import_path": "benchmarks.tool_annotation_effect.harbor_agent:AgencyNativeAgent",
                     "model_name": model["model"],
+                    "override_timeout_sec": config["budgets"]["timeout_s"]
+                    if config.get("budgets")
+                    else None,
                     "kwargs": {
                         "arm": trial["arm"],
                         "model_config": model,
@@ -204,6 +212,12 @@ class TerminalBenchAdapter:
 
     def import_report(self, report):
         if report.get("exception_info"):
+            exception = report["exception_info"]
+            if exception.get("exception_type") == "AgentTimeoutError" or (
+                exception.get("exception_type") == "RuntimeError"
+                and "exceeded max_steps=" in exception.get("exception_message", "")
+            ):
+                return {"success": False, "failure": "budget", "official": report}
             return {"success": None, "failure": "infrastructure", "official": report}
         rewards = (report.get("verifier_result") or {}).get("rewards")
         if not isinstance(rewards, dict) or "reward" not in rewards:

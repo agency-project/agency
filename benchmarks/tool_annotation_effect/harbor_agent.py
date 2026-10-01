@@ -47,7 +47,8 @@ class AgencyNativeAgent(BaseAgent):
             raise RuntimeError(
                 "Task-provided Harbor MCP servers are not supported by this adapter; native Agency MCP discovery is supported"
             )
-        result = await environment.exec("command -v python3 && command -v bash")
+        python = self.experiment_config.get("tool_python_path", "python3")
+        result = await environment.exec("command -v " + shlex.quote(python) + " && command -v bash")
         if result.return_code != 0:
             raise RuntimeError(
                 "Agency native tools need python3 and bash in the Harbor task image; prepare the image explicitly"
@@ -78,7 +79,8 @@ class AgencyNativeAgent(BaseAgent):
 
         def remote_call(name, arguments):
             encoded = base64.b64encode(arguments.encode()).decode()
-            command = "python3 -c " + shlex.quote(remote_script)
+            python = config.get("tool_python_path", "python3")
+            command = shlex.quote(python) + " -c " + shlex.quote(remote_script)
             command += " " + shlex.quote(name) + " " + shlex.quote(encoded)
             future = asyncio.run_coroutine_threadsafe(
                 environment.exec(command, timeout_sec=config["budgets"]["timeout_s"]), event_loop
