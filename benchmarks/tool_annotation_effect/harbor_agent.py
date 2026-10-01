@@ -1,0 +1,143 @@
+"""Harbor 0.23.0 external agent running Agency's real native ReAct loop.
+
+Harbor owns the environment and verifier. Built-ins execute there, never in a
+second Agency sandbox. Import this module only from a Harbor process.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import shlex
+import time
+
+from harbor.agents.base import BaseAgent
+
+from .common import ROOT, atomic_json, native, read_events
+from .execution import trace_metrics
+
+
+class AgencyNativeAgent(BaseAgent):
+    def __init__(
+        self,
+        *args,
+        arm="baseline",
+        model_config=None,
+        experiment_config=None,
+        run_id=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.arm = arm
+        self.model_config = model_config or {}
+        self.experiment_config = experiment_config or {}
+        self.run_id = run_id or "harbor"
+
+    @staticmethod
+    def name():
+        return "agency-native-annotations"
+
+    def version(self):
+        return "1"
+
+    async def setup(self, environment):
+        if getattr(self, "mcp_servers", []):
+            raise RuntimeError(
+                "Task-provided Harbor MCP servers are not supported by this adapter; native Agency MCP discovery is supported"
+            )
+        result = await environment.exec("command -v python3 && command -v bash")
+        if result.return_code != 0:
+            raise RuntimeError(
+                "Agency native tools need python3 and bash in the Harbor task image; prepare the image explicitly"
+            )
+        await environment.upload_file(
+            ROOT / "agency/native_harness/tools.py", "/tmp/agency_native_tools.py"
+        )
+        await environment.exec("mkdir -p /tmp/agency-tool-output")
+
+    async def run(self, instruction, environment, context):
+        event_loop = asyncio.get_running_loop()
+        config = self.experiment_config
+        model = self.model_config
+        base_url = os.environ[model["base_url_env"]].rstrip("/").removesuffix("/v1")
+        api_key = os.environ[model["api_key_env"]]
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        trace = native("annotations").TraceWriter(
+            str(self.logs_dir / "events.jsonl"), agent_id="terminal-agent", run_id=self.run_id
+        )
+        tools = native("tools")
+        remote_script = (
+            "import importlib.util,base64,sys; "
+            "s=importlib.util.spec_from_file_location('agency_tools','/tmp/agency_native_tools.py'); "
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m); "
+            "r=m.TOOL_DISPATCH[sys.argv[1]](base64.b64decode(sys.argv[2]).decode()); "
+            "print(m.offload_if_oversized(sys.argv[1],m.uuid.uuid4().hex,r,'/tmp/agency-tool-output'))"
+        )
+
+        def remote_call(name, arguments):
+            encoded = base64.b64encode(arguments.encode()).decode()
+            command = "python3 -c " + shlex.quote(remote_script)
+            command += " " + shlex.quote(name) + " " + shlex.quote(encoded)
+            future = asyncio.run_coroutine_threadsafe(
+                environment.exec(command, timeout_sec=config["budgets"]["timeout_s"]), event_loop
+            )
+            response = future.result(timeout=config["budgets"]["timeout_s"] + 10)
+            if response.return_code:
+                return json.dumps({"error": response.stderr or response.stdout})
+            return response.stdout.strip()
+
+        dispatch = {
+            name: (lambda arguments, name=name: remote_call(name, arguments))
+            for name in tools.TOOL_DISPATCH
+        }
+        llm = native("llm_client").LLMClient(
+            base_url,
+            api_key,
+            timeout_s=config["budgets"]["timeout_s"],
+            model_settings=model.get("settings"),
+            observer=trace,
+        )
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    native("react_loop").run_react_loop,
+                    [
+                        {
+                            "role": "system",
+                            "content": config.get(
+                                "system_prompt", "Complete the task using the available tools."
+                            ),
+                        },
+                        {"role": "user", "content": instruction},
+                    ],
+                    self.model_name,
+                    llm,
+                    annotation_arm=self.arm,
+                    observer=trace,
+                    toolset=(list(tools.BUILTIN_TOOL_SCHEMAS.values()), dispatch),
+                    context_limit=config["context_limit"],
+                    max_steps=config["budgets"]["max_steps"],
+                    offload_dir=str(self.logs_dir / "tool-outputs"),
+                ),
+                timeout=config["budgets"]["timeout_s"],
+            )
+            atomic_json(
+                self.logs_dir / "native-result.json",
+                {
+                    "status": result.status,
+                    "final_text": result.final_text,
+                    "error": result.message,
+                    "agent_seconds": time.monotonic() - started,
+                },
+            )
+            metrics = trace_metrics(read_events(self.logs_dir / "events.jsonl"))
+            context.n_input_tokens = metrics["input_tokens"]
+            context.n_output_tokens = metrics["output_tokens"]
+            context.metadata = {"annotation_arm": self.arm, "run_id": self.run_id, **metrics}
+            if result.status != "done":
+                raise RuntimeError(result.message)
+        finally:
+            llm.close()

@@ -1,0 +1,11 @@
+{
+  "version": "USER_SUPPLIED_DATE_AND_SOURCE",
+  "currency": "USD",
+  "models": {
+    "configure-model": {
+      "input_per_million": 0,
+      "output_per_million": 0,
+      "cached_input_per_million": 0
+    }
+  }
+}

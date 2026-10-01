@@ -1,0 +1,51 @@
+{
+  "profile": "custom",
+  "harness": "native",
+  "seed": 20261001,
+  "task_sampling_seed": 1729,
+  "repetitions": 1,
+  "models": [
+    {
+      "id": "gpt-6-luna-openai",
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "reasoning_effort": "none",
+        "max_completion_tokens": 4096,
+        "seed": 42
+      }
+    }
+  ],
+  "budgets": {
+    "max_steps": 12,
+    "timeout_s": 240
+  },
+  "context_limit": 196000,
+  "compaction_policy": "native-v1",
+  "cache_policy": "provider-managed; record cache usage when reported",
+  "profiling": {
+    "enabled": false
+  },
+  "roles": "both",
+  "contention": false,
+  "system_prompt": "Complete the task using the available tools.",
+  "base_image": "0b29d0189bfae496207b6b280864014ae2d4f55b8ff0a162414f065606be7f2c",
+  "practical_margins": {
+    "success_rate": 0.05,
+    "operation_edit_distance": 0.1
+  },
+  "suites": {
+    "rag": {
+      "sample_size": 1,
+      "task_ids": [
+        "atlas-escalation"
+      ]
+    }
+  },
+  "resource_limits": {
+    "cpus": 2,
+    "memory": "4g"
+  }
+}
