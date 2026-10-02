@@ -283,6 +283,9 @@ class harnessadapterconfig(confignamespace):
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None
     allow_subagents: bool = False
+    # Seconds of upstream silence before a streaming route sends its wire's
+    # keepalive frame; 0 = never.
+    stream_keepalive_s: float = 15.0
 
 
 @dataclass(slots=True)

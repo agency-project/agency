@@ -62,7 +62,15 @@ _mcp_server_logger.propagate = False
 # explicitly here; harmless regardless of whether that basicConfig() has
 # already fired or fires later, since an explicit level always wins over
 # inherited effective level.
-for _noisy_logger_name in ("httpx", "httpcore", "boto3", "botocore", "urllib3"):
+for _noisy_logger_name in (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "boto3",
+    "botocore",
+    "urllib3",
+):
     logging.getLogger(_noisy_logger_name).setLevel(logging.WARNING)
 
 

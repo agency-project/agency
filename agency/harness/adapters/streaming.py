@@ -3,18 +3,76 @@
 from __future__ import annotations
 
 
-async def stream_response(router, token, context, model, formatter):
-    """A TUI interrupt must close the upstream request, not just its HTTP socket."""
+_STREAM_END = object()
+
+
+async def with_keepalive(stream, interval_s: float):
+    """Yield *stream*'s items, and None after every *interval_s* of silence (0 = never).
+
+    One producer task reads the whole stream so it is never iterated from two tasks."""
+    import asyncio
+
+    if not interval_s:
+        async for item in stream:
+            yield item
+        return
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def produce():
+        try:
+            async for item in stream:
+                await queue.put((item, None))
+        except Exception as exc:
+            await queue.put((None, exc))
+        else:
+            await queue.put((_STREAM_END, None))
+
+    producer = asyncio.create_task(produce())
+    try:
+        while True:
+            try:
+                item, exc = await asyncio.wait_for(queue.get(), interval_s)
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            if exc is not None:
+                raise exc
+            if item is _STREAM_END:
+                return
+            yield item
+    finally:
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+
+
+async def stream_response(
+    router,
+    token,
+    context,
+    model,
+    formatter,
+    *,
+    keepalive_frame=None,
+    keepalive_s: float = 0,
+    **dispatch_kwargs,
+):
+    """A TUI interrupt must close the upstream request, not just its HTTP socket.
+
+    With keepalive_s set, *keepalive_frame* is sent after that long without upstream output."""
     import anyio
 
-    stream = router.dispatch_stream_async(token, context)
+    stream = router.dispatch_stream_async(token, context, **dispatch_kwargs)
+    items = with_keepalive(stream, keepalive_s if keepalive_frame else 0)
     try:
-        async for item in stream:
-            if item.get("type") == "done":
+        async for item in items:
+            if item is None:
+                yield keepalive_frame
+            elif item.get("type") == "done":
                 for frame in formatter([item], model):
                     yield frame
     finally:
         with anyio.CancelScope(shield=True):
+            await items.aclose()
             await stream.aclose()
 
 

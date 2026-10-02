@@ -53,6 +53,14 @@ def _chatcompletions_native_block_type(native_type: str) -> str:
     return f"{_CHATCOMPLETIONS_TYPE_PREFIX}{native_type}"
 
 
+def _thinking_blocks_signature(thinking_blocks) -> str:
+    return "".join(
+        b.get("signature") or ""
+        for b in thinking_blocks or []
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    )
+
+
 def _is_chatcompletions_tool_choice(tool_choice) -> bool:
     if isinstance(tool_choice, str) and tool_choice in _CHATCOMPLETIONS_TOOL_CHOICE_VALUES:
         return True
@@ -163,8 +171,12 @@ class _OpenAICompatibleBackend(agllm):
                 }
             )
         reasoning = getattr(message, "reasoning_content", None)
-        if reasoning:
-            blocks.append({"type": "thinking", "index": len(blocks), "text": reasoning})
+        signature = _thinking_blocks_signature(getattr(message, "thinking_blocks", None))
+        if reasoning or signature:
+            thinking = {"type": "thinking", "index": len(blocks), "text": reasoning or ""}
+            if signature:
+                thinking["signature"] = signature
+            blocks.append(thinking)
         message_dump = _serialize_sdk_object(message)
         if isinstance(message_dump, dict):
             for field, value in message_dump.items():
@@ -231,6 +243,14 @@ class _OpenAICompatibleBackend(agllm):
                         "block_type": "thinking",
                         "text": reasoning,
                     }
+                signature = _thinking_blocks_signature(getattr(delta, "thinking_blocks", None))
+                if signature:
+                    yield {
+                        "type": "block_delta",
+                        "index": -2,
+                        "block_type": "thinking",
+                        "signature": signature,
+                    }
                 for tc in getattr(delta, "tool_calls", None) or []:
                     fn = getattr(tc, "function", None)
                     yield {
@@ -282,12 +302,25 @@ class _OpenAICompatibleBackend(agllm):
 
 
 def _serialize_openai_usage(usage) -> "dict | None":
+    """Full copy of the SDK's usage object, not a hand-picked subset."""
     if usage is None:
         return None
-    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
-    }
+    dumped = _serialize_sdk_object(usage)
+    if not isinstance(dumped, dict):
+        return dumped
+    prompt_tokens = dumped.get("prompt_tokens") or 0
+    completion_tokens = dumped.get("completion_tokens") or 0
+    dumped["prompt_tokens"] = prompt_tokens
+    dumped["completion_tokens"] = completion_tokens
+    dumped["total_tokens"] = dumped.get("total_tokens") or (prompt_tokens + completion_tokens)
+    # Same aliases anthropic.py/bedrock.py add -- one consistent pair of names.
+    details = dumped.get("prompt_tokens_details")
+    cached_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
+    created_cache_tokens = (
+        details.get("created_cache_tokens") if isinstance(details, dict) else None
+    )
+    dumped["cache_read_tokens"] = dumped.get("cache_read_input_tokens") or cached_tokens or 0
+    dumped["cache_write_tokens"] = (
+        dumped.get("cache_creation_input_tokens") or created_cache_tokens or 0
+    )
+    return dumped
