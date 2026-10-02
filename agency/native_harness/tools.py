@@ -14,10 +14,14 @@ extension mechanism."""
 from __future__ import annotations
 
 import json
+import fnmatch
+import glob as glob_module
 import os
 import re
 import shlex
 import subprocess
+import shutil
+import time
 import uuid
 from typing import Generator
 
@@ -618,6 +622,17 @@ def _run_glob_tool(arguments_json: str) -> str:
     pattern = str(args.get("pattern", ""))
     path = str(args.get("path") or ".")
     try:
+        if shutil.which("rg") is None:
+            files = []
+            started = time.monotonic()
+            for candidate in glob_module.iglob(os.path.join(path, pattern), recursive=True):
+                if time.monotonic() - started > 30:
+                    return json.dumps({"error": "glob timed out after 30 seconds"})
+                if os.path.isfile(candidate):
+                    files.append(candidate)
+                    if len(files) > GLOB_LIMIT:
+                        break
+            return json.dumps(parse_glob_output("\n".join(files)))
         proc = subprocess.run(
             ["bash", "-c", glob_command(pattern, path)],
             capture_output=True,
@@ -629,12 +644,64 @@ def _run_glob_tool(arguments_json: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+def _visible_files(path: str):
+    for root, dirs, names in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            if not name.startswith("."):
+                yield os.path.join(root, name)
+
+
 def _run_grep_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     pattern = str(args.get("pattern", ""))
     path = str(args.get("path") or ".")
     include = args.get("include")
     try:
+        if shutil.which("rg") is None:
+            expression = re.compile(pattern)
+            matches = []
+            started = time.monotonic()
+            if os.path.isfile(path):
+                candidates = [path]
+            else:
+                candidates = _visible_files(path)
+            for candidate in candidates:
+                if time.monotonic() - started > 30:
+                    return json.dumps({"error": "grep timed out after 30 seconds"})
+                if include:
+                    rule = str(include).removeprefix("!")
+                    selected = fnmatch.fnmatch(
+                        os.path.basename(candidate), rule
+                    ) or fnmatch.fnmatch(os.path.relpath(candidate, path), rule)
+                    if selected == str(include).startswith("!"):
+                        continue
+                try:
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as stream:
+                        for number, line in enumerate(stream, 1):
+                            if time.monotonic() - started > 30:
+                                return json.dumps({"error": "grep timed out after 30 seconds"})
+                            if "\0" in line:
+                                break
+                            if expression.search(line):
+                                matches.append({"path": candidate, "line": number, "text": line})
+                                if len(matches) > GREP_LIMIT:
+                                    break
+                except (OSError, UnicodeError):
+                    continue
+                if len(matches) > GREP_LIMIT:
+                    break
+            truncated = len(matches) > GREP_LIMIT
+            for match in matches[:GREP_LIMIT]:
+                if len(match["text"]) > GREP_MAX_LINE_LEN:
+                    match["text"] = match["text"][:GREP_MAX_LINE_LEN] + "..."
+            return json.dumps(
+                {
+                    "matches": matches[:GREP_LIMIT],
+                    "count": min(len(matches), GREP_LIMIT),
+                    "truncated": truncated,
+                }
+            )
         proc = subprocess.run(
             ["bash", "-c", grep_command(pattern, path, include)],
             capture_output=True,

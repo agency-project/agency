@@ -92,3 +92,39 @@ class TestPaginateText:
         result = tools.paginate_text("a\nb\nc\n", offset=2, limit=10)
         assert result["content"] == "2: b\n3: c"
         assert result["truncated"] is False
+
+
+def test_missing_ripgrep_still_finds_nested_files_and_regex_matches(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "example.py").write_text("alpha\ncombined_queries = True\n")
+    (nested / "other.txt").write_text("combined_queries ignored by include\n")
+    found = json.loads(
+        tools._run_glob_tool(json.dumps({"path": str(tmp_path), "pattern": "**/*.py"}))
+    )
+    assert found["files"] == [str(nested / "example.py")]
+    matched = json.loads(
+        tools._run_grep_tool(
+            json.dumps(
+                {"path": str(tmp_path), "pattern": "combined_queries|combinator", "include": "*.py"}
+            )
+        )
+    )
+    assert matched["matches"] == [
+        {"path": str(nested / "example.py"), "line": 2, "text": "combined_queries = True\n"}
+    ]
+
+
+def test_fallback_grep_truncation_and_invalid_regex(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    p = tmp_path / "many.py"
+    p.write_text("match\n" * (tools.GREP_LIMIT + 1))
+    result = json.loads(tools._run_grep_tool(json.dumps({"path": str(p), "pattern": "match"})))
+    assert result["count"] == tools.GREP_LIMIT and result["truncated"]
+    bad = json.loads(tools._run_grep_tool(json.dumps({"path": str(p), "pattern": "["})))
+    assert "error" in bad

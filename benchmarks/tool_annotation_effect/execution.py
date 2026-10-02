@@ -336,7 +336,15 @@ def _execute(task, trial, model, config, directory):
             if all(phase in timings for phase in ("environment_setup", "agent_setup"))
             else None,
             "final_text": native_result.get("final_text", ""),
-            "failure": None if verified else "infrastructure",
+            "failure": (
+                "budget"
+                if "exceeded max_steps=" in native_result.get("error", "")
+                or "dispatch deadline exhausted" in native_result.get("error", "")
+                or (report.get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
+                else None
+            )
+            if verified
+            else "infrastructure",
         }
     agents = {}
     handles = {}

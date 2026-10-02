@@ -224,8 +224,11 @@ class TerminalBenchAdapter:
         if report.get("exception_info"):
             exception = report["exception_info"]
             if exception.get("exception_type") == "AgentTimeoutError" or (
-                exception.get("exception_type") == "RuntimeError"
-                and "exceeded max_steps=" in exception.get("exception_message", "")
+                exception.get("exception_type") in ("RuntimeError", "NonZeroAgentExitCodeError")
+                and (
+                    "exceeded max_steps=" in exception.get("exception_message", "")
+                    or "dispatch deadline exhausted" in exception.get("exception_message", "")
+                )
             ):
                 return {"success": False, "failure": "budget", "official": report}
             return {"success": None, "failure": "infrastructure", "official": report}

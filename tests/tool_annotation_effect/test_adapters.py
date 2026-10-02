@@ -121,6 +121,11 @@ def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
 
     base_module.BaseAgent = Base
     monkeypatch.setitem(sys.modules, "harbor.agents.base", base_module)
+    installed_module = ModuleType("harbor.agents.installed.base")
+    installed_module.NonZeroAgentExitCodeError = type(
+        "NonZeroAgentExitCodeError", (RuntimeError,), {}
+    )
+    monkeypatch.setitem(sys.modules, "harbor.agents.installed.base", installed_module)
     sys.modules.pop("benchmarks.tool_annotation_effect.harbor_agent", None)
     from benchmarks.tool_annotation_effect.harbor_agent import AgencyNativeAgent
 
@@ -128,7 +133,9 @@ def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            assert kwargs["retry_rate_limits"] is True
+            assert kwargs["max_attempts"] == 13
+            assert kwargs["model_settings"]["stream_options"] == {"include_usage": True}
 
         def dispatch(self, model, messages, tools):
             requests.append((messages.copy(), tools))
@@ -198,6 +205,15 @@ def test_harbor_agent_runs_native_loop_and_remote_tools_without_nested_sandbox(
     assert "_agency" in assistant["tool_calls"][0]["function"]["arguments"]
     assert context.n_input_tokens is None
     assert (tmp_path / "native-result.json").exists()
+
+    # A step-limited episode uses Harbor's supported nonzero-agent exit type,
+    # so SingleStepTrial proceeds to its official verifier.
+    result = SimpleNamespace(status="error", final_text="", message="exceeded max_steps=2")
+    monkeypatch.setattr(native("react_loop"), "run_react_loop", lambda *args, **kwargs: result)
+    import pytest
+
+    with pytest.raises(installed_module.NonZeroAgentExitCodeError, match="max_steps"):
+        asyncio.run(agent.run("instruction", environment, context))
 
 
 def test_migration_compilation_alone_is_not_success(tmp_path, monkeypatch):

@@ -14,6 +14,7 @@ import shlex
 import time
 
 from harbor.agents.base import BaseAgent
+from harbor.agents.installed.base import NonZeroAgentExitCodeError
 
 from .common import ROOT, atomic_json, native, read_events
 from .execution import trace_metrics
@@ -94,14 +95,17 @@ class AgencyNativeAgent(BaseAgent):
             name: (lambda arguments, name=name: remote_call(name, arguments))
             for name in tools.TOOL_DISPATCH
         }
+        started = time.monotonic()
         llm = native("llm_client").LLMClient(
             base_url,
             api_key,
             timeout_s=config["budgets"]["timeout_s"],
-            model_settings=model.get("settings"),
+            model_settings={**model.get("settings", {}), "stream_options": {"include_usage": True}},
             observer=trace,
+            retry_rate_limits=True,
+            max_attempts=13,
+            deadline=started + config["budgets"]["timeout_s"],
         )
-        started = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -140,6 +144,13 @@ class AgencyNativeAgent(BaseAgent):
             context.n_output_tokens = metrics["output_tokens"]
             context.metadata = {"annotation_arm": self.arm, "run_id": self.run_id, **metrics}
             if result.status != "done":
+                if (
+                    "exceeded max_steps=" in result.message
+                    or "dispatch deadline exhausted" in result.message
+                ):
+                    # Harbor catches this installed-agent failure and still runs
+                    # its verifier on the attempted environment.
+                    raise NonZeroAgentExitCodeError(result.message)
                 raise RuntimeError(result.message)
         finally:
             llm.close()
