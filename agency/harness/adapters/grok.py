@@ -10,7 +10,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, ChatCompletionsProtocol
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, ChatCompletionsProtocol, chat_error_frame
 from .streaming import start_streaming_response, stream_response
 
 
@@ -261,6 +261,7 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
                     self._format_agency_stream_to_harness,
                     keepalive_frame=CHAT_KEEPALIVE_FRAME,
                     keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
                 return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)

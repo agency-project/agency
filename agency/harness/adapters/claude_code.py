@@ -18,7 +18,7 @@ from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -29,6 +29,23 @@ def claude_code_available() -> bool:
 
 _DEFAULT_TIMEOUT_S = 300
 _KEEPALIVE_FRAME = 'event: ping\ndata: {"type": "ping"}\n\n'
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_frame(exc: BaseException) -> str:
+    message, status, _transient = upstream_error(exc)
+    error = {"type": _ANTHROPIC_ERROR_TYPES.get(status, "api_error"), "message": message}
+    return f"event: error\ndata: {json.dumps({'type': 'error', 'error': error})}\n\n"
+
 
 # --autocompact only accepts this range (per `claude --help`); a model with a
 # real window outside it can't be told via this flag at all, so Claude Code
@@ -639,6 +656,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                     self._format_agency_stream_to_harness,
                     keepalive_frame=_KEEPALIVE_FRAME,
                     keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=_anthropic_error_frame,
                 )
                 # Only the finalized message is published; see
                 # start_streaming_response for why the first frame comes first.

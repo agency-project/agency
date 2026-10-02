@@ -599,3 +599,34 @@ def test_reasoning_round_trips_agency_to_harness_and_back():
         0
     ]["blocks"]
     assert blocks == agency_response["message"]["blocks"]
+
+
+def test_stream_error_after_keepalive_is_an_in_stream_error_event():
+    import asyncio
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from agency.configs.agconfig import harnessadapterconfig
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    class SlowFailingRouter(_StreamRouter):
+        async def dispatch_stream_async(self, token, request):
+            await asyncio.sleep(0.15)
+            raise HostDispatchError(
+                {"message": "overloaded", "status_code": 503, "transient": True}
+            )
+            yield
+
+    app = FastAPI()
+    NativeAdapter(agconfig(harnessadapterconfig(stream_keepalive_s=0.05))).register(
+        app, SlowFailingRouter([])
+    )
+    with TestClient(app) as client:
+        response = _post_stream(client)
+    assert response.status_code == 200
+    frames = [f for f in response.text.split("\n\n") if f]
+    assert frames[0] == ": keepalive"
+    assert json.loads(frames[-1][len("data: ") :]) == {
+        "error": {"message": "overloaded", "type": "upstream_error", "transient": True}
+    }

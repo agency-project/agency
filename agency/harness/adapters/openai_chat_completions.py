@@ -15,9 +15,15 @@ import uuid
 from fastapi import Request
 
 from ..common import extract_bearer_token
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 
 CHAT_KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+def chat_error_frame(exc: BaseException) -> str:
+    message, _status, transient = upstream_error(exc)
+    error = {"message": message, "type": "upstream_error", "transient": transient}
+    return f"data: {json.dumps({'error': error})}\n\n"
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -97,6 +103,7 @@ class ChatCompletionsProtocol:
                     self._format_agency_stream_to_harness,
                     keepalive_frame=CHAT_KEEPALIVE_FRAME,
                     keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
                 return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
