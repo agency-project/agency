@@ -105,3 +105,13 @@ def test_stream_failure_after_a_chunk_is_not_retried(monkeypatch):
     assert "stream interrupted" in client.dispatch("fake", [])["error"]
     assert len(calls) == 1 and delays == []
     client.close()
+
+
+def test_direct_provider_does_not_receive_gateway_only_compaction_field(monkeypatch):
+    client, calls, _, events = client_with_responses(
+        monkeypatch, [success()], send_internal_kind=False
+    )
+    client.dispatch("fake", [], internal_kind="compaction")
+    assert "agency_internal_kind" not in calls[0]
+    assert events[-1]["internal_kind"] == "compaction"
+    client.close()

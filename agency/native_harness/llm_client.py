@@ -78,12 +78,14 @@ class LLMClient:
         retry_rate_limits: bool = False,
         max_attempts: int = _DISPATCH_MAX_RETRIES,
         deadline: float | None = None,
+        send_internal_kind: bool = True,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         self.retry_rate_limits = retry_rate_limits
         self.max_attempts = max_attempts
         self.deadline = deadline
+        self.send_internal_kind = send_internal_kind
         self.model_settings = dict(model_settings or {})
         self.observer = observer
         self._client = httpx.Client(
@@ -106,7 +108,7 @@ class LLMClient:
         kwargs = {**self.model_settings, "model": model, "messages": messages, "stream": True}
         if tools:
             kwargs["tools"] = tools
-        if internal_kind is not None:
+        if internal_kind is not None and self.send_internal_kind:
             kwargs["agency_internal_kind"] = internal_kind
 
         last_error = "dispatch failed with no attempts made"

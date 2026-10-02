@@ -105,6 +105,7 @@ class AgencyNativeAgent(BaseAgent):
             retry_rate_limits=True,
             max_attempts=13,
             deadline=started + config["budgets"]["timeout_s"],
+            send_internal_kind=False,
         )
         try:
             result = await asyncio.wait_for(
