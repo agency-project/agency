@@ -18,7 +18,7 @@ from .common import ROOT, read_events
 from .fixtures import CorpusTools, differential_inputs, rag_prompt
 from .adapters import SweBenchAdapter, TerminalBenchAdapter
 
-TRACE_PATH = "/tmp/agency-experiment-events.jsonl"
+TRACE_PATH = "/var/run/agency_logs/experiment-events.jsonl"
 
 
 def tandem_schemas():
@@ -305,7 +305,7 @@ def execute(task, trial, model, config, directory):
 
 
 def _execute(task, trial, model, config, directory):
-    from agency import Agent, agdata, agskill, agSandbox
+    from agency import Agent, agdata, agskill
 
     directory = Path(directory)
     if trial["suite"] == "terminalbench":
@@ -350,7 +350,9 @@ def _execute(task, trial, model, config, directory):
         ),
     }
     cfg = agent_config(effective_config, model, trial, directory, parent_role)
-    sandbox = agSandbox("annotation-" + trial["trial_id"], agconfig=cfg)
+    from .sandbox import EpisodeSandbox
+
+    sandbox = EpisodeSandbox("annotation-" + trial["trial_id"], agconfig=cfg)
     parent = Agent(
         "annotation-" + trial["trial_id"], sandbox=sandbox, agconfig=cfg, harness="native"
     )
@@ -383,6 +385,10 @@ def _execute(task, trial, model, config, directory):
                 worker_cfg = agent_config(config, model, trial, directory, role)
                 worker = Agent(
                     "annotation-" + trial["trial_id"] + "-" + role,
+                    sandbox=EpisodeSandbox(
+                        "annotation-" + trial["trial_id"] + "-" + role,
+                        agconfig=worker_cfg,
+                    ),
                     agconfig=worker_cfg,
                     harness="native",
                 )
@@ -490,7 +496,12 @@ def _execute(task, trial, model, config, directory):
         for role, agent in agents.items():
             if agent.sandbox is not None:
                 try:
-                    raw = agent.sandbox.read_file_bytes(TRACE_PATH)
+                    host_trace = directory / role / "logs" / "experiment-events.jsonl"
+                    raw = (
+                        host_trace.read_bytes()
+                        if host_trace.exists()
+                        else agent.sandbox.read_file_bytes(TRACE_PATH)
+                    )
                     trace_file = directory / role / "events.jsonl"
                     trace_file.parent.mkdir(parents=True, exist_ok=True)
                     trace_file.write_bytes(raw)

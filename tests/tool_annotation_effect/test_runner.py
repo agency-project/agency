@@ -112,6 +112,26 @@ def test_infrastructure_failure_is_terminal_not_selectively_retried(tmp_path, mo
     )
 
 
+def test_swebench_scores_patch_even_when_agent_hits_budget(tmp_path):
+    catalog = tmp_path / "tasks.json"
+    catalog.write_text(json.dumps([{"id": "repo__issue-1"}]))
+    cfg = config()
+    cfg["suites"] = {"swebench": {"sample_size": 1, "tasks_file": str(catalog)}}
+    directory = tmp_path / "experiment"
+    save_plan(cfg, directory)
+
+    def exhausted(*args):
+        return {"failure": "budget", "events": [], "final_text": ""}
+
+    run(directory, executor=exhausted, limit=1)
+    evaluate(directory, evaluator=lambda *args: {"success": True, "failure": None})
+    _, records = rows(directory)
+    completed = next(row for row in records if row["state"] == "completed")
+    assert completed["success"] is True
+    assert completed["failure"] is None
+    assert completed["agent_failure"] == "budget"
+
+
 @pytest.mark.parametrize(
     "update",
     [

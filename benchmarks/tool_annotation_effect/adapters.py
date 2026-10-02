@@ -211,6 +211,16 @@ class TerminalBenchAdapter:
         )
 
     def import_report(self, report):
+        rewards = (report.get("verifier_result") or {}).get("rewards")
+        if isinstance(rewards, dict) and "reward" in rewards:
+            reward = rewards["reward"]
+            return {
+                "success": reward == 1,
+                "reward": reward,
+                "failure": None if reward == 1 else "task",
+                "official": report,
+                "agent_exception": report.get("exception_info"),
+            }
         if report.get("exception_info"):
             exception = report["exception_info"]
             if exception.get("exception_type") == "AgentTimeoutError" or (
@@ -219,16 +229,7 @@ class TerminalBenchAdapter:
             ):
                 return {"success": False, "failure": "budget", "official": report}
             return {"success": None, "failure": "infrastructure", "official": report}
-        rewards = (report.get("verifier_result") or {}).get("rewards")
-        if not isinstance(rewards, dict) or "reward" not in rewards:
-            return {"success": None, "failure": "infrastructure", "official": report}
-        reward = rewards["reward"]
-        return {
-            "success": reward == 1,
-            "reward": reward,
-            "failure": None if reward == 1 else "task",
-            "official": report,
-        }
+        return {"success": None, "failure": "infrastructure", "official": report}
 
 
 def prepare(suite, directory, *, lite=False):

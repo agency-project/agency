@@ -156,7 +156,10 @@ def evaluate(directory, evaluator=None):
             )
             task = tasks[(trial["suite"], trial["task_id"])]
             started = time.monotonic()
-            if status.get("failure") in ("budget", "infrastructure"):
+            if status.get("failure") == "infrastructure" or (
+                status.get("failure") == "budget"
+                and trial["suite"] not in ("swebench", "terminalbench")
+            ):
                 result = {
                     "success": False if status["failure"] == "budget" else None,
                     "failure": status["failure"],
@@ -183,7 +186,11 @@ def evaluate(directory, evaluator=None):
                 result = TerminalBenchAdapter().import_report(execution.get("harbor_report", {}))
             atomic_json(
                 attempt / "verifier.json",
-                {**result, "evaluation_seconds": time.monotonic() - started},
+                {
+                    **result,
+                    "agent_failure": status.get("failure"),
+                    "evaluation_seconds": time.monotonic() - started,
+                },
             )
 
 
@@ -226,8 +233,13 @@ def rows(directory):
                     **execution.get("metrics", {}),
                     "success": verifier.get("success"),
                     "failure": verifier.get("failure")
-                    or status.get("failure")
-                    or ("missing_evaluation" if not verifier else None),
+                    if isinstance(verifier.get("success"), bool)
+                    else (
+                        verifier.get("failure")
+                        or status.get("failure")
+                        or ("missing_evaluation" if not verifier else None)
+                    ),
+                    "agent_failure": verifier.get("agent_failure", status.get("failure")),
                     "state": status["state"],
                     "events": execution.get("events", []),
                     "actions": read_json(attempt / "actions.json")

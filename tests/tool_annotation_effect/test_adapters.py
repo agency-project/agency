@@ -82,6 +82,13 @@ def test_official_saved_verifier_formats_are_imported():
         verdict = harbor.import_report({"exception_info": exception})
         assert verdict["failure"] == "budget"
         assert verdict["success"] is False
+    passing_after_timeout = harbor.import_report(
+        {
+            "exception_info": {"exception_type": "AgentTimeoutError"},
+            "verifier_result": {"rewards": {"reward": 1}},
+        }
+    )
+    assert passing_after_timeout["success"] is True
 
 
 def test_harbor_job_uses_agency_native_agent_and_one_owned_environment(tmp_path):
@@ -290,3 +297,29 @@ def test_agent_config_uses_explicit_container_backend(tmp_path, monkeypatch):
         "agent",
     )
     assert config.sandbox.backend == "docker"
+
+
+def test_failed_benchmark_episode_preserves_its_working_files(monkeypatch):
+    import threading
+
+    from agency.agdata import agerror
+    from agency.engine.engine import AgentEngine
+    from benchmarks.tool_annotation_effect.sandbox import EpisodeSandbox
+    from tests.engine.test_engine import _FakeAgent
+
+    sandbox = EpisodeSandbox.__new__(EpisodeSandbox)
+    sandbox._destroyed = True
+    sandbox._lock = threading.RLock()
+    files, snapshot = {}, {}
+    sandbox.commit = lambda: snapshot.update(files)
+    sandbox.stop = lambda: None
+    engine = AgentEngine(_FakeAgent())
+
+    def exhausted(*args, **kwargs):
+        files["solution.py"] = "attempted fix"
+        return agerror("exceeded max_steps=50")
+
+    monkeypatch.setattr(engine, "_execute_harness", exhausted)
+    result = engine.execute(None, None, None, None, sandbox)
+    assert isinstance(result, agerror)
+    assert snapshot["solution.py"] == "attempted fix"
