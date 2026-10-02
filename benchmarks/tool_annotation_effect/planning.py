@@ -19,8 +19,11 @@ TERMINAL_RELEASE = "terminal-bench@2.0"
 
 def validate(config):
     reject_credentials(config)
-    if config.get("harness", "native") != "native":
-        raise ValueError("Only native harness schemas and execution paths support this experiment")
+    harness = config.get("harness", "native")
+    if harness not in ("native", "codex"):
+        raise ValueError("Supported experiment harnesses are native and codex")
+    if harness == "codex" and set(config.get("suites", {})) - {"swebench", "terminalbench"}:
+        raise ValueError("Codex experiments support SWE-bench and Terminal Bench")
     profile = config.get("profile", "pilot")
     if profile not in ("pilot", "expanded", "custom"):
         raise ValueError("profile must be pilot, expanded or custom")
@@ -49,8 +52,9 @@ def validate(config):
         raise ValueError("budgets.max_steps and timeout_s must be positive")
     if "context_limit" not in config:
         raise ValueError("Declare context_limit (null means unknown)")
-    if config.get("compaction_policy", "native-v1") != "native-v1":
-        raise ValueError("Only the current native compaction policy is implemented")
+    policy = "codex-default" if harness == "codex" else "native-v1"
+    if config.get("compaction_policy", policy) != policy:
+        raise ValueError(f"{harness} harness requires {policy} compaction")
     if config.get("contention", False):
         raise ValueError(
             "Primary design uses no intentional contention; factorial extension is future work"
@@ -163,7 +167,9 @@ def build_plan(config):
             )
     schema_manifest = {}
     for suite in config["suites"]:
-        base = schemas_for(suite)
+        # Codex discovers its own tools at runtime. Record those actual schemas
+        # at the gateway rather than mislabeling native tool schemas as Codex's.
+        base = [] if config.get("harness") == "codex" else schemas_for(suite)
         schema_manifest[suite] = {
             arm: annotation.augment_schemas(base, arm) for arm in annotation.ARMS
         }

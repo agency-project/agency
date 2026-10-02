@@ -301,7 +301,12 @@ def execute(task, trial, model, config, directory):
             Path(runtime) / "agency",
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
-        return _execute(task, trial, model, {**config, "runtime_source": runtime}, directory)
+        execution_config = {**config, "runtime_source": runtime}
+        if config.get("harness") == "codex" and trial["suite"] == "swebench":
+            from .codex import execute_swebench
+
+            return execute_swebench(task, trial, model, execution_config, directory)
+        return _execute(task, trial, model, execution_config, directory)
 
 
 def _execute(task, trial, model, config, directory):
@@ -313,7 +318,10 @@ def _execute(task, trial, model, config, directory):
         report = TerminalBenchAdapter().launch(task, trial, model, config, directory)
         event_files = sorted((directory / "harbor").rglob("events.jsonl"))
         events = [event for path in event_files for event in read_events(path)]
-        native_files = sorted((directory / "harbor").rglob("native-result.json"))
+        result_name = (
+            "codex-result.json" if config.get("harness") == "codex" else "native-result.json"
+        )
+        native_files = sorted((directory / "harbor").rglob(result_name))
         native_result = json.loads(native_files[0].read_text()) if len(native_files) == 1 else {}
         treatment = [event for event in events if event["kind"] == "treatment"]
         verified = bool(treatment) and all(event["arm"] == trial["arm"] for event in treatment)

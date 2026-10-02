@@ -166,7 +166,11 @@ class TerminalBenchAdapter:
             "tasks": [{"path": str(task_path)}],
             "agents": [
                 {
-                    "import_path": "benchmarks.tool_annotation_effect.harbor_agent:AgencyNativeAgent",
+                    "import_path": (
+                        "benchmarks.tool_annotation_effect.harbor_agent:AgencyCodexAgent"
+                        if config.get("harness") == "codex"
+                        else "benchmarks.tool_annotation_effect.harbor_agent:AgencyNativeAgent"
+                    ),
                     "model_name": model["model"],
                     "override_timeout_sec": config["budgets"]["timeout_s"]
                     if config.get("budgets")

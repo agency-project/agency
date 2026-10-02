@@ -53,3 +53,39 @@ Purpose used 23.6% fewer tool calls and 0.9% fewer total tokens than baseline; p
 **Sample size:** 10 runs per arm, 40 runs total, one independent task cluster. Repetition estimates within-task variability but does not establish effects across tasks or providers. The task-clustered report correctly leaves confidence intervals unavailable with one cluster; no significance or equivalence claim is made. Passing 10/10 on this task does not establish a perfect underlying success rate.
 
 Full artifacts, raw traces, CSV/JSON exports, descriptive means/sample SDs/ranges, provenance, and blinded review packets are in `artifacts/tool-annotation-ec2/rag-repeat-10-v2/` and `/home/eric/episode-traces-results/rag-repeat-10-v2/`. A failed initial launch is preserved separately in `rag-repeat-10/`: all 40 assignments failed before model calls because the remote environment lacked `OPENAI_BASE_URL`. The corrected launch explicitly set the same `https://api.openai.com/v1` endpoint used for validation-v4. The temporary remote credential file was removed after execution.
+
+### Codex follow-up validation (2026-10-01)
+
+The user cancelled the native published-suite batches and reduced the replacement
+experiment to Codex, five tasks per arm per benchmark (40 fresh assignments).
+The native controller process group was terminated and its two owned running
+containers were stopped. Existing native results and the cancellation marker
+remain in the original EC2 cohort directory.
+
+The replacement uses Codex CLI 0.147.0, binary SHA-256
+`cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40`.
+Each fresh container receives that verified binary. Delegation, goals and code
+mode are disabled so model assignments remain single-agent episodes. Actual
+Codex tool schemas are recorded at runtime. GPT-6 Luna is routed through the
+existing Agency Responses translation and an authenticated benchmark gateway;
+no native ReAct loop is invoked. Codex 0.147.0 reports fallback model metadata
+for this model name; the configured 196,000-token context window is explicit,
+and the actual resulting toolset is saved rather than assumed.
+
+- Local and EC2 targeted tests cover the experiment and Codex wire adapter.
+- A real Codex executable ran a real shell mutation in all four arms, with fake
+  model responses and **zero provider calls**. The resulting tool arguments,
+  metadata status, tool outputs and annotated model history were verified.
+- A real SWE Docker episode with a synthetic one-dispatch budget preserved and
+  exported its attempted patch after Codex exited. No provider call was made.
+- A real Harbor Docker episode with the same synthetic budget raised Harbor's
+  supported `NonZeroAgentExitCodeError` and still ran its official verifier
+  (reward 0). No provider call was made.
+- Regression tests cover real HTTP authentication/body parsing, exact custom
+  tool input preservation, original annotations in subsequent model history,
+  budget enforcement without repeat calls, and missing final-message files.
+
+EC2 preflight artifacts are under `preflight-codex-final` and
+`preflight-codex-integration-v2`. Earlier failed diagnostic attempts are retained
+in separate preflight directories and are not benchmark assignments. These
+checks establish integration readiness, not model effectiveness.

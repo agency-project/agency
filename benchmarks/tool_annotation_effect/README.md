@@ -109,3 +109,32 @@ python -m pytest tests/tool_annotation_effect tests/test_native_harness_tools.py
 ```
 
 Official SWE-bench evaluation, Harbor jobs against published Terminal-Bench tasks, live migration compilation, and live tandem workflows require separate integration validation. Offline fake contracts do not establish those integrations work in every environment. The user-authorized four-arm EC2 RAG validation checked the actual native/daemon/MCP path only; it does not establish statistical treatment effects. See [VALIDATION.md](VALIDATION.md).
+
+### Codex follow-up (2026-10-01)
+
+The user cancelled the native SWE-bench and Terminal Bench batches and requested
+Codex with five tasks per arm: 20 assignments per benchmark, 40 total. Native
+artifacts remain separate and are not included in the Codex sample. The five
+selected tasks are the first five entries of each previously frozen published
+sample, with no filtering by outcome. All arms receive the same tasks once.
+
+Use `configs/swebench-codex-5-tasks.json` and
+`configs/terminalbench-codex-5-tasks.json`. The pinned Codex CLI 0.147.0 executable is copied into each fresh task
+container after its SHA-256 matches the frozen configuration. This experiment runs `codex exec` in the task container;
+Codex owns its built-in tools, conversation and compaction. It uses Agency's
+existing Responses-to-model translation at a benchmark gateway, with the same
+GPT-6 Luna provider, seed 42, reasoning effort none and 4096 output-token cap.
+The gateway applies the four treatments to the actual runtime Codex tool
+schemas, saves those schemas in the treatment trace, and strips metadata before
+returning tool inputs to Codex. Custom tool input strings are preserved exactly.
+Annotation omissions never trigger retries. The native ReAct loop is not used.
+
+The controller allows 50 model dispatches and 600 seconds per episode. Codex
+transport retries are disabled; the gateway records bounded provider retries.
+The CLI version, prepared image hashes, frozen plans and source hash are saved.
+`schemas` in offline Codex manifests are empty because tool discovery belongs
+to Codex; inspect each episode's runtime treatment event for the actual schemas.
+The SWE official evaluator and Harbor's Terminal verifier are retained. Raw
+Codex JSON output, stderr, final response, model exchanges and action traces are
+saved alongside each episode. These are fresh assignments, not continuations
+of the cancelled native runs.

@@ -54,6 +54,10 @@ def normalize(events):
         arguments = dict(event.get("arguments") or {})
         arguments.pop("_agency", None)
         tool = event["tool_name"]
+        operation_tool = tool
+        if tool.startswith("mcp__"):
+            parts = tool.split("__")
+            operation_tool = parts[-2] if parts[-1] == "custom" else parts[-1]
         targets = []
         for key in ("file_path", "path", "document_id", "url", "role"):
             if isinstance(arguments.get(key), str):
@@ -67,10 +71,14 @@ def normalize(events):
             "bash": "shell",
             "webfetch": "fetch",
             "validate_ledger": "validation",
-        }.get(tool, "unknown")
-        command = arguments.get("command")
+            "exec_command": "shell",
+            "shell_command": "shell",
+            "write_stdin": "shell",
+            "apply_patch": "edit",
+        }.get(operation_tool, "unknown")
+        command = arguments.get("command", arguments.get("cmd"))
         validation = operation == "validation" or (
-            tool == "bash"
+            operation == "shell"
             and isinstance(command, str)
             and bool(re.search(r"\b(pytest|rustc|gcc|clang|make|cargo\s+(test|check))\b", command))
         )
