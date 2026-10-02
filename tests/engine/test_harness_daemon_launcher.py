@@ -98,11 +98,11 @@ def test_pythonpath_is_exported_not_just_assigned(monkeypatch, tmp_path):
     )
 
 
-def test_ensure_harness_daemon_default_timeout_is_120s():
+def test_ensure_harness_daemon_default_timeout_is_300s():
     import inspect
 
     assert (
-        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 120.0
+        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 300.0
     )
 
 
@@ -293,23 +293,23 @@ def test_daemon_log_is_preclaimed_host_side_before_container_can_write_it(monkey
     assert oct(log_path.stat().st_mode)[-3:] == "666"
 
 
-def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
+def test_daemon_config_forwards_every_harness_adapter_ptrace_sandbox_field():
+    """Every field reaches the daemon -- no hand-picked subset."""
     config = agconfig(
-        harnessadapterconfig(binary_path="/bin/claude"),
+        harnessadapterconfig(binary_path="/bin/claude", stream_keepalive_s=7.5),
         llmconfig(api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
-    assert launcher._daemon_config(config) == {
-        "harness_adapter": {"binary_path": "/bin/claude"},
-        "sandbox": {"checkpoint_fast_resume": False, "harness_python_path": None},
-        "ptrace": {
-            "syscalls": list(agconfig().ptrace.syscalls),
-            "file_access": False,
-            "profiler": None,
-            "disable_harness_native_sandbox": True,
-        },
-    }
+    result = launcher._daemon_config(config)
+    assert result["harness_adapter"]["binary_path"] == "/bin/claude"
+    assert result["harness_adapter"]["stream_keepalive_s"] == 7.5
+    assert result["sandbox"]["harness_python_path"] is None
+    assert result["ptrace"]["syscalls"] == agconfig().ptrace.syscalls
+    # llmconfig isn't one of the three namespaces this function forwards at
+    # all -- its secret never has a chance to leak through here.
+    assert "llm" not in result
+    assert not any("secret" in json.dumps(section) for section in result.values())
 
 
 @pytest.mark.parametrize("harness", ["claude_code", "codex", "grok", "opencode"])

@@ -354,3 +354,49 @@ def test_fetch_context_limit_config_wins_over_vllm():
     with patch("agency.llm.agllm.openai.OpenAI", return_value=mock_client):
         result = agllm.for_config(cfg).fetch_context_limit()
     assert result == 8192
+
+
+def _assistant_with(blocks):
+    return [
+        {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "q"}]},
+        {"role": "assistant", "blocks": blocks},
+    ]
+
+
+def test_build_llm_kwargs_signed_thinking_replayed_as_thinking_blocks():
+    msgs = _assistant_with(
+        [
+            {"type": "thinking", "index": 0, "text": "plan", "signature": "sig"},
+            {"type": "text", "index": 1, "text": "answer"},
+        ]
+    )
+    wire = build_llm_kwargs(_cfg(), msgs)["messages"][1]
+    assert wire["thinking_blocks"] == [{"type": "thinking", "thinking": "plan", "signature": "sig"}]
+
+
+def test_build_llm_kwargs_signed_thinking_overrides_raw_streamed_fragments():
+    msgs = _assistant_with(
+        [
+            {"type": "thinking", "index": 0, "text": "", "signature": "sig"},
+            {
+                "type": "openai_chatcompletions_thinking_blocks",
+                "index": 1,
+                "data": [[{"type": "thinking", "thinking": ""}], [{"signature": "sig"}]],
+            },
+            {"type": "text", "index": 2, "text": "answer"},
+        ]
+    )
+    wire = build_llm_kwargs(_cfg(), msgs)["messages"][1]
+    assert wire["thinking_blocks"] == [{"type": "thinking", "thinking": "", "signature": "sig"}]
+
+
+def test_build_llm_kwargs_unsigned_thinking_is_not_replayed_as_thinking_blocks():
+    msgs = _assistant_with(
+        [
+            {"type": "thinking", "index": 0, "text": "plan"},
+            {"type": "text", "index": 1, "text": "answer"},
+        ]
+    )
+    wire = build_llm_kwargs(_cfg(), msgs)["messages"][1]
+    assert "thinking_blocks" not in wire
+    assert wire["reasoning_content"] == "plan"

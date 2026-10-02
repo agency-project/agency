@@ -9,6 +9,11 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+# Mirrors openai.py's/anthropic.py's own prefix constants (can't import
+# them: both those modules import this one). Used to reverse their
+# unknown-field fallthrough when replaying history in build_kwargs.
+_UNKNOWN_FIELD_PREFIXES = ("openai_chatcompletions_", "anthropic_")
+
 
 # Common per-call generation params every OpenAI-compatible server accepts as
 # top-level chat.completions.create() kwargs (see agllm.build_kwargs's
@@ -316,6 +321,23 @@ class agllm:
                 }
                 if tool_calls:
                     wire_msg["tool_calls"] = tool_calls
+                reasoning_text = "".join(b["text"] for b in blocks if b["type"] == "thinking")
+                if reasoning_text:
+                    wire_msg["reasoning_content"] = reasoning_text
+                # Resend extended-thinking/other unknown blocks verbatim too.
+                for b in blocks:
+                    for prefix in _UNKNOWN_FIELD_PREFIXES:
+                        if b["type"].startswith(prefix):
+                            wire_msg[b["type"][len(prefix) :]] = b.get("data")
+                            break
+                # LiteLLM's replay shape for signed (Anthropic/Bedrock) thinking; overrides
+                # any raw streamed thinking_blocks fragments resent just above.
+                signed = [b for b in blocks if b["type"] == "thinking" and b.get("signature")]
+                if signed:
+                    wire_msg["thinking_blocks"] = [
+                        {"type": "thinking", "thinking": b["text"], "signature": b["signature"]}
+                        for b in signed
+                    ]
             elif role == "tool":
                 result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
                 wire_msg = {

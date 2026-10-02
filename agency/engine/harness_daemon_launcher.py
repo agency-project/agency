@@ -88,27 +88,13 @@ def _container_socket_path(host_path: Path) -> str:
 
 
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
+    """Every field, via safe_snapshot() -- not a hand-picked subset."""
     if agconfig is None:
         return {}
-    # The daemon needs harness/ptrace knobs, not host credentials or live
-    # Python objects. Keeping this allow-list narrow also keeps secrets out
-    # of the detached process command line.
     return {
-        "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
-        "ptrace": {
-            "syscalls": list(agconfig.ptrace.syscalls),
-            "file_access": agconfig.ptrace.file_access,
-            "profiler": agconfig.ptrace.profiler,
-            "disable_harness_native_sandbox": agconfig.ptrace.disable_harness_native_sandbox,
-        },
-        "sandbox": {
-            "checkpoint_fast_resume": agconfig.sandbox.checkpoint_fast_resume,
-            # Whether the daemon may pip-install a missing required package
-            # into itself: only the unpinned default ("python3") interpreter
-            # is allowed to self-heal that way -- see HarnessManager's own
-            # bootstrap step in harness/daemon.py.
-            "harness_python_path": agconfig.sandbox.harness_python_path,
-        },
+        "harness_adapter": agconfig.harness_adapter.safe_snapshot(),
+        "ptrace": agconfig.ptrace.safe_snapshot(),
+        "sandbox": agconfig.sandbox.safe_snapshot(),
     }
 
 
@@ -256,7 +242,7 @@ def ensure_harness_daemon(
     harness: str,
     *,
     agconfig: "agconfig_cls | None" = None,
-    timeout_s: float = 120.0,
+    timeout_s: float = 300.0,
     progress_source: "HostInteractionServer | None" = None,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox.

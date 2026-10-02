@@ -6,6 +6,7 @@ its result through the common daemon adapter seam.
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ import uuid
 from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, chat_error_frame
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 from .streaming import start_streaming_response, stream_response
@@ -24,7 +26,7 @@ from .streaming import start_streaming_response, stream_response
 # activity-driven contract the PTY-based harnesses use. A genuinely slow but
 # progressing run is never punished for its total wall-clock time; only
 # actual silence for this long ends the attempt.
-_DEFAULT_TIMEOUT_S = 300
+_DEFAULT_TIMEOUT_S = 0  # 0 = no idle deadline
 _PROGRESS_POLL_INTERVAL_S = 1.0
 # Bound on reaping an already-exited process tree, matching
 # agProxyPtraceHandle.close()'s own kill()-then-join(timeout=10) sequence.
@@ -73,6 +75,15 @@ def _flatten_unknown_data(data):
     return merged
 
 
+def _forward_usage(usage: "dict | None") -> dict:
+    """Full copy of the usage dict, not a hand-picked subset."""
+    usage = dict(usage or {})
+    usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
+    usage["completion_tokens"] = usage.get("completion_tokens", 0)
+    usage["total_tokens"] = usage.get("total_tokens", 0)
+    return usage
+
+
 def _session_file_path(session_dir: str, session_id: str) -> str:
     """Must match `native_harness/session.py`'s own `session_path()`."""
     return f"{session_dir}/{session_id}.json"
@@ -106,11 +117,18 @@ class NativeAdapter(HarnessAdapter):
         )
         offload_dir = f"{scratch_dir}/long_tool_call_outputs"
         progress_path = f"{scratch_dir}/progress.json"
+        # Decided here, not left for the subprocess to invent internally --
+        # this way we always know which file to read a session out of,
+        # even from an attempt that never reaches its own clean exit (an
+        # idle timeout, say). Continuing a prior session keeps that same
+        # id; a fresh attempt still gets one up front rather than only
+        # learning it after the fact from the subprocess's own stdout.
+        session_id = resume_session_id or uuid.uuid4().hex
         handle = None
         try:
             if resume_session_id and prior_session_blob is not None:
                 sandbox.write_file_bytes(
-                    _session_file_path(scratch_dir, resume_session_id), prior_session_blob
+                    _session_file_path(scratch_dir, session_id), prior_session_blob
                 )
 
             mcp_config = agharness.mcp_config_for(
@@ -144,9 +162,14 @@ class NativeAdapter(HarnessAdapter):
                 offload_dir,
                 "--progress-file",
                 progress_path,
+                # Always passed now, resuming or not -- see session_id's
+                # own comment above. cli.py's _resolve_session() already
+                # treats --session-id and --resume identically (both just
+                # seed which id to look up), so this alone covers both
+                # cases; --resume is no longer needed.
+                "--session-id",
+                session_id,
             ]
-            if resume_session_id:
-                argv += ["--resume", resume_session_id]
 
             envp = {
                 "PATH": HARNESS_PATH,
@@ -172,8 +195,10 @@ class NativeAdapter(HarnessAdapter):
             last_progress_mtime = None
             while handle.returncode is None:
                 now = time.monotonic()
-                if now > deadline:
-                    return self._partial_result_from_progress(sandbox, progress_path)
+                if _DEFAULT_TIMEOUT_S and now > deadline:
+                    return self._partial_result_from_progress(
+                        sandbox, progress_path, scratch_dir=scratch_dir, session_id=session_id
+                    )
                 try:
                     mtime = os.stat(progress_path).st_mtime
                 except OSError:
@@ -200,15 +225,12 @@ class NativeAdapter(HarnessAdapter):
                 )
 
             payload = json.loads(stdout)
-            session_id = payload.get("session_id")
-            session_blob = None
-            if session_id:
-                try:
-                    session_blob = sandbox.read_file_bytes(
-                        _session_file_path(scratch_dir, session_id)
-                    )
-                except Exception:  # noqa: S110 - session persistence is best-effort
-                    session_blob = None
+            # session_id is ours from the start now (see above) -- no need
+            # to trust payload's own echo of it back.
+            try:
+                session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
+            except Exception:  # noqa: S110 - session persistence is best-effort
+                session_blob = None
 
             usage = payload.get("usage") or {}
             return AttemptResult(
@@ -230,7 +252,13 @@ class NativeAdapter(HarnessAdapter):
                 agharness.cleanup_config_home_in_container(sandbox, scratch_dir)
 
     @staticmethod
-    def _partial_result_from_progress(sandbox, progress_path: str) -> AttemptResult:
+    def _partial_result_from_progress(
+        sandbox,
+        progress_path: str,
+        *,
+        scratch_dir: "str | None" = None,
+        session_id: "str | None" = None,
+    ) -> AttemptResult:
         """The react loop idled past its deadline with no completion signal.
         Recover whatever it last checkpointed instead of failing an attempt
         that may still be genuinely working -- mirrors the PTY-based
@@ -238,16 +266,32 @@ class NativeAdapter(HarnessAdapter):
         `harness/adapters/pty/execution.py`), since the underlying reason is
         the same: a step-driven completion signal that can arrive late (or
         not at all) is not evidence the run itself failed.
+
+        `scratch_dir`/`session_id` are the caller's own pre-decided id (see
+        run_daemon_attempt) and its on-disk session path -- known upfront
+        now, not just learned from the subprocess's own stdout on a clean
+        exit, so a session_id/session_blob is recoverable here too. Without
+        it, engine.py's output-schema retry loop has nothing to resume
+        from and starts the next attempt from scratch, silently dropping
+        everything the run had done so far.
         """
         try:
             progress = json.loads(sandbox.read_file_bytes(progress_path))
         except Exception:  # noqa: S110 - no checkpoint yet is not an error
             progress = {}
+        session_blob = None
+        if scratch_dir is not None and session_id is not None:
+            try:
+                session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
+            except Exception:  # noqa: S110 - no checkpoint yet is not an error
+                session_blob = None
         return AttemptResult(
             ok=True,
             final_text=progress.get("final_text", ""),
             input_tokens=progress.get("total_input_tokens", 0),
             output_tokens=progress.get("total_output_tokens", 0),
+            session_id=session_id if session_blob is not None else None,
+            session_blob=session_blob,
         )
 
     def register(self, app, router) -> None:
@@ -265,10 +309,17 @@ class NativeAdapter(HarnessAdapter):
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
                 frames = stream_response(
-                    router, token, agency_context, model, self._format_agency_stream_to_harness
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
                 return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
@@ -292,6 +343,14 @@ class NativeAdapter(HarnessAdapter):
                 continue
 
             blocks: "list[dict]" = []
+            reasoning = m.get("reasoning_content")
+            signature = m.get("reasoning_signature")
+            # Unsigned reasoning stays in history; llm/anthropic.py drops it for Claude.
+            if reasoning or signature:
+                thinking = {"type": "thinking", "index": 0, "text": reasoning or ""}
+                if signature:
+                    thinking["signature"] = signature
+                blocks.append(thinking)
             content = m.get("content")
             if isinstance(content, str):
                 if content:
@@ -358,11 +417,13 @@ class NativeAdapter(HarnessAdapter):
         text_parts = []
         tool_calls = []
         reasoning_parts = []
+        signature_parts = []
         for b in message.get("blocks", []):
             if b["type"] == "text":
                 text_parts.append(b["text"])
             elif b["type"] == "thinking":
                 reasoning_parts.append(b["text"])
+                signature_parts.append(b.get("signature") or "")
             elif b["type"] == "tool_use":
                 tool_calls.append(
                     {
@@ -377,12 +438,13 @@ class NativeAdapter(HarnessAdapter):
             response_message["tool_calls"] = tool_calls
         if reasoning_parts:
             response_message["reasoning_content"] = "".join(reasoning_parts)
+        if "".join(signature_parts):
+            response_message["reasoning_signature"] = "".join(signature_parts)
         for b in message.get("blocks", []):
             if b["type"].startswith(_CHATCOMPLETIONS_TYPE_PREFIX):
                 field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
                 response_message[field] = _flatten_unknown_data(b.get("data"))
 
-        usage = agency_response.get("usage") or {}
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -394,11 +456,7 @@ class NativeAdapter(HarnessAdapter):
                     "finish_reason": _stop_reason_to_openai(agency_response.get("stop_reason")),
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": _forward_usage(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -441,23 +499,20 @@ class NativeAdapter(HarnessAdapter):
                     tool_call_index += 1
                 elif b["type"] == "thinking":
                     yield _chunk({"reasoning_content": b["text"]})
+                    if b.get("signature"):
+                        yield _chunk({"reasoning_signature": b["signature"]})
                 elif b["type"].startswith(_CHATCOMPLETIONS_TYPE_PREFIX):
                     field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
                     yield _chunk({field: _flatten_unknown_data(b.get("data"))})
 
             yield _chunk({}, finish_reason=_stop_reason_to_openai(item.get("stop_reason")))
 
-            usage = item.get("usage") or {}
             usage_payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "model": model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                },
+                "usage": _forward_usage(item.get("usage")),
             }
             yield f"data: {json.dumps(usage_payload)}\n\n"
             yield "data: [DONE]\n\n"

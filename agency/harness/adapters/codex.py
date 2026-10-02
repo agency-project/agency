@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import shutil
@@ -76,6 +77,17 @@ def _unknown_block_to_responses(b: dict) -> dict:
                 merged[k] = v
     merged["type"] = b["type"][len(_RESPONSES_TYPE_PREFIX) :]
     return merged
+
+
+def _forward_usage_to_responses(usage: "dict | None") -> dict:
+    """Full copy, plus the Responses API's own field names layered on top."""
+    usage = dict(usage or {})
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    usage["input_tokens"] = input_tokens
+    usage["output_tokens"] = output_tokens
+    usage["total_tokens"] = usage.get("total_tokens") or (input_tokens + output_tokens)
+    return usage
 
 
 def _responses_content_to_text(content) -> str:
@@ -371,11 +383,13 @@ class CodexAdapter(HarnessAdapter):
                     agency_context,
                     model,
                     partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
+                    keepalive_frame=None,
+                    keepalive_s=0,
                 )
                 # This adapter already buffers through `done`; see
                 # start_streaming_response for why the first frame comes first.
                 return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(
                 self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes
@@ -526,20 +540,13 @@ class CodexAdapter(HarnessAdapter):
             elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
                 output.append(_unknown_block_to_responses(b))
 
-        usage = agency_response.get("usage") or {}
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
         return {
             "id": f"resp_{uuid.uuid4().hex}",
             "object": "response",
             "status": "completed",
             "model": model,
             "output": output,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
+            "usage": _forward_usage_to_responses(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
@@ -684,9 +691,6 @@ class CodexAdapter(HarnessAdapter):
                         },
                     )
 
-            usage = item.get("usage") or {}
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
             yield _sse(
                 "response.completed",
                 {
@@ -696,11 +700,7 @@ class CodexAdapter(HarnessAdapter):
                         "object": "response",
                         "status": "completed",
                         "model": model,
-                        "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens,
-                        },
+                        "usage": _forward_usage_to_responses(item.get("usage")),
                     },
                 },
             )

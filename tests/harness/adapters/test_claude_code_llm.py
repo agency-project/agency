@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 
@@ -409,7 +411,13 @@ def test_agency_to_harness_text_only():
     assert out["role"] == "assistant"
     assert out["content"] == [{"type": "text", "text": "hi there"}]
     assert out["stop_reason"] == "end_turn"
-    assert out["usage"] == {"input_tokens": 5, "output_tokens": 3}
+    assert out["usage"]["input_tokens"] == 5
+    assert out["usage"]["output_tokens"] == 3
+    # The source dict's own fields survive alongside the Anthropic-native
+    # aliases -- not narrowed away, see _forward_usage_to_anthropic.
+    assert out["usage"]["prompt_tokens"] == 5
+    assert out["usage"]["completion_tokens"] == 3
+    assert out["usage"]["total_tokens"] == 8
 
 
 def test_agency_to_harness_tool_use():
@@ -825,3 +833,27 @@ def test_messages_stream_success_is_unchanged_sse():
     )
     assert text == "hello"
     assert router.closed
+
+
+@pytest.mark.parametrize(
+    "status,error_type",
+    [
+        (400, "invalid_request_error"),
+        (429, "rate_limit_error"),
+        (529, "overloaded_error"),
+        (500, "api_error"),
+    ],
+)
+def test_anthropic_error_frame_uses_the_wire_error_type_for_the_status(status, error_type):
+    from agency.harness.adapters.claude_code import _anthropic_error_frame
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    frame = _anthropic_error_frame(
+        HostDispatchError({"message": "upstream said no", "status_code": status})
+    )
+    event, data = frame.strip().split("\n")
+    assert event == "event: error"
+    assert json.loads(data[len("data: ") :]) == {
+        "type": "error",
+        "error": {"type": error_type, "message": "upstream said no"},
+    }
