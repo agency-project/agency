@@ -458,12 +458,6 @@ def _execute(task, trial, model, config, directory):
         if "error" in result_data:
             failure = "budget" if "max_steps" in str(result_data["error"]) else "infrastructure"
         final_text = json.dumps(result_data)
-        if trial["suite"] == "swebench":
-            patch = SweBenchAdapter().extract_patch(sandbox)
-            (directory / "prediction.patch").write_text(patch)
-            SweBenchAdapter().export_prediction(
-                task, patch, model["id"], directory / "prediction.jsonl"
-            )
         if trial["suite"] in ("migration", "tandem"):
             name = "solution.rs" if trial["suite"] == "migration" else "result.json"
             try:
@@ -511,6 +505,14 @@ def _execute(task, trial, model, config, directory):
                         {"kind": "trace_unavailable", "agent_id": role, "error": str(error)}
                     )
                 agent.sandbox.stop()
+    # A wall-clock timeout still has a gradeable attempted patch. Collect it
+    # after cancellation and teardown, just as for a normal or step-limited run.
+    if trial["suite"] == "swebench":
+        patch = SweBenchAdapter().extract_patch(sandbox)
+        (directory / "prediction.patch").write_text(patch)
+        SweBenchAdapter().export_prediction(
+            task, patch, model["id"], directory / "prediction.jsonl"
+        )
     events.sort(key=lambda event: event.get("timestamp_ns", 0))
     treatment_events = [event for event in events if event["kind"] == "treatment"]
     if not treatment_events or any(event["kind"] == "trace_unavailable" for event in events):
