@@ -20,6 +20,7 @@ a second route forwarding to the host's `/llm_supervisor` handler.
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import sys
@@ -31,12 +32,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .base import AdapterRuntime, AttemptResult
 from .native import NativeAdapter
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME
+from .pty.execution import stream_response
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
 # Same activity-driven idle deadline as native.py -- see that module's own
 # comment on _DEFAULT_TIMEOUT_S for the rationale.
-_DEFAULT_TIMEOUT_S = 300
+_DEFAULT_TIMEOUT_S = 0  # 0 = no idle deadline
 _PROGRESS_POLL_INTERVAL_S = 1.0
 _REAP_TIMEOUT_S = 10.0
 
@@ -116,6 +119,8 @@ class TandemAdapter(NativeAdapter):
                 ha.supervisor_model,
                 "--segment-step-cap",
                 str(ha.segment_step_cap),
+                "--worker-history-turns",
+                str(ha.worker_history_turns),
                 "--max-steps",
                 str(runtime.agconfig.skill.react_max_steps if max_steps is None else max_steps),
                 "--output-format",
@@ -167,7 +172,7 @@ class TandemAdapter(NativeAdapter):
             last_progress_mtime = None
             while handle.returncode is None:
                 now = time.monotonic()
-                if now > deadline:
+                if _DEFAULT_TIMEOUT_S and now > deadline:
                     return self._partial_result_from_progress(
                         sandbox, progress_path, scratch_dir=scratch_dir, session_id=session_id
                     )
@@ -226,15 +231,22 @@ class TandemAdapter(NativeAdapter):
             model = router.resolve_model(token, mount="llm_supervisor")
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context, mount="llm_supervisor"),
+                return StreamingResponse(
+                    stream_response(
+                        router,
+                        token,
+                        agency_context,
                         model,
-                    )
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
-            agency_response = router.dispatch(token, agency_context, mount="llm_supervisor")
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                        mount="llm_supervisor",
+                    ),
+                    media_type="text/event-stream",
+                )
+            agency_response = await anyio.to_thread.run_sync(
+                lambda: router.dispatch(token, agency_context, mount="llm_supervisor")
+            )
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
 

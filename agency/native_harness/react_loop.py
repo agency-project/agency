@@ -140,11 +140,6 @@ def run_react_loop(
             _write_progress(
                 progress_path, messages, total_input_tokens, total_output_tokens, step + 1
             )
-            if on_checkpoint is not None:
-                try:
-                    on_checkpoint(messages)
-                except Exception:  # noqa: S110 - best-effort, same as _write_progress
-                    pass
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -194,6 +189,13 @@ def run_react_loop(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )
+            # Only after every tool result is in: a resume must never start from a
+            # dangling tool_use, so a crash mid-turn reverts to the previous turn.
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint(messages)
+                except Exception:  # noqa: S110 - best-effort, same as _write_progress
+                    pass
     return ReactLoopResult(
         status="error",
         message=f"exceeded max_steps={max_steps} without a final answer",

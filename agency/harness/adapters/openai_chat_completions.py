@@ -7,6 +7,7 @@ this `/v1/chat/completions` endpoint and the same block mapping.
 
 from __future__ import annotations
 
+import anyio
 import json
 import time
 import uuid
@@ -15,6 +16,8 @@ from fastapi import Request
 
 from ..common import extract_bearer_token
 from .pty.execution import stream_response
+
+CHAT_KEEPALIVE_FRAME = ": keepalive\n\n"
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -88,11 +91,17 @@ class ChatCompletionsProtocol:
             if body.get("stream"):
                 return StreamingResponse(
                     stream_response(
-                        router, token, agency_context, model, self._format_agency_stream_to_harness
+                        router,
+                        token,
+                        agency_context,
+                        model,
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
                     ),
                     media_type="text/event-stream",
                 )
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:

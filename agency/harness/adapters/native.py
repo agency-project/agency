@@ -6,6 +6,7 @@ its result through the common daemon adapter seam.
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import sys
@@ -15,6 +16,8 @@ import uuid
 from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME
+from .pty.execution import stream_response
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -23,7 +26,7 @@ from ..executable import HARNESS_PATH
 # activity-driven contract the PTY-based harnesses use. A genuinely slow but
 # progressing run is never punished for its total wall-clock time; only
 # actual silence for this long ends the attempt.
-_DEFAULT_TIMEOUT_S = 300
+_DEFAULT_TIMEOUT_S = 0  # 0 = no idle deadline
 _PROGRESS_POLL_INTERVAL_S = 1.0
 # Bound on reaping an already-exited process tree, matching
 # agProxyPtraceHandle.close()'s own kill()-then-join(timeout=10) sequence.
@@ -192,7 +195,7 @@ class NativeAdapter(HarnessAdapter):
             last_progress_mtime = None
             while handle.returncode is None:
                 now = time.monotonic()
-                if now > deadline:
+                if _DEFAULT_TIMEOUT_S and now > deadline:
                     return self._partial_result_from_progress(
                         sandbox, progress_path, scratch_dir=scratch_dir, session_id=session_id
                     )
@@ -305,14 +308,19 @@ class NativeAdapter(HarnessAdapter):
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                def gen():
-                    yield from self._format_agency_stream_to_harness(
-                        router.dispatch_stream(token, agency_context), model
-                    )
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
-            agency_response = router.dispatch(token, agency_context)
+                return StreamingResponse(
+                    stream_response(
+                        router,
+                        token,
+                        agency_context,
+                        model,
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    ),
+                    media_type="text/event-stream",
+                )
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
@@ -336,6 +344,13 @@ class NativeAdapter(HarnessAdapter):
                 continue
 
             blocks: "list[dict]" = []
+            reasoning = m.get("reasoning_content")
+            signature = m.get("reasoning_signature")
+            if reasoning or signature:
+                thinking = {"type": "thinking", "index": 0, "text": reasoning or ""}
+                if signature:
+                    thinking["signature"] = signature
+                blocks.append(thinking)
             content = m.get("content")
             if isinstance(content, str):
                 if content:
@@ -402,11 +417,13 @@ class NativeAdapter(HarnessAdapter):
         text_parts = []
         tool_calls = []
         reasoning_parts = []
+        signature_parts = []
         for b in message.get("blocks", []):
             if b["type"] == "text":
                 text_parts.append(b["text"])
             elif b["type"] == "thinking":
                 reasoning_parts.append(b["text"])
+                signature_parts.append(b.get("signature") or "")
             elif b["type"] == "tool_use":
                 tool_calls.append(
                     {
@@ -421,6 +438,8 @@ class NativeAdapter(HarnessAdapter):
             response_message["tool_calls"] = tool_calls
         if reasoning_parts:
             response_message["reasoning_content"] = "".join(reasoning_parts)
+        if "".join(signature_parts):
+            response_message["reasoning_signature"] = "".join(signature_parts)
         for b in message.get("blocks", []):
             if b["type"].startswith(_CHATCOMPLETIONS_TYPE_PREFIX):
                 field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
@@ -480,6 +499,8 @@ class NativeAdapter(HarnessAdapter):
                     tool_call_index += 1
                 elif b["type"] == "thinking":
                     yield _chunk({"reasoning_content": b["text"]})
+                    if b.get("signature"):
+                        yield _chunk({"reasoning_signature": b["signature"]})
                 elif b["type"].startswith(_CHATCOMPLETIONS_TYPE_PREFIX):
                     field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
                     yield _chunk({field: _flatten_unknown_data(b.get("data"))})

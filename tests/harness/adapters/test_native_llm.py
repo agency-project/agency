@@ -365,3 +365,85 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
         if isinstance(e, dict) and e["choices"] and e["choices"][0]["delta"].get("refusal")
     )
     assert unknown_chunk["choices"][0]["delta"]["refusal"] == "no"
+
+
+def test_harness_to_agency_reasoning_fields_become_thinking_block():
+    raw = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_content": "plan",
+                "reasoning_signature": "sig",
+            }
+        ]
+    }
+    blocks = _backend()._format_context_harness_to_agency(raw)["messages"][0]["blocks"]
+    assert blocks == [
+        {"type": "thinking", "index": 0, "text": "plan", "signature": "sig"},
+        {"type": "text", "index": 1, "text": "answer"},
+    ]
+
+
+def test_harness_to_agency_without_reasoning_fields_has_no_thinking_block():
+    raw = {"messages": [{"role": "assistant", "content": "answer"}]}
+    blocks = _backend()._format_context_harness_to_agency(raw)["messages"][0]["blocks"]
+    assert blocks == [{"type": "text", "index": 0, "text": "answer"}]
+
+
+def test_agency_to_harness_thinking_signature_becomes_reasoning_signature():
+    agency_response = {
+        "message": {
+            "role": "assistant",
+            "blocks": [{"type": "thinking", "index": 0, "text": "", "signature": "sig"}],
+        },
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "stop_reason": "end_turn",
+    }
+    message = _backend()._format_context_agency_to_harness(agency_response, "m")["choices"][0][
+        "message"
+    ]
+    assert message["reasoning_signature"] == "sig"
+
+
+def test_agency_stream_to_harness_emits_reasoning_signature():
+    stream = [
+        {
+            "type": "done",
+            "message": {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "thinking", "index": 0, "text": "plan", "signature": "sig"},
+                    {"type": "text", "index": 1, "text": "answer"},
+                ],
+            },
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "stop_reason": "end_turn",
+        }
+    ]
+    events = _parse_sse("".join(_backend()._format_agency_stream_to_harness(iter(stream), "m")))
+    deltas = [e["choices"][0]["delta"] for e in events if e != "[DONE]" and e["choices"]]
+    assert {"reasoning_content": "plan"} in deltas
+    assert {"reasoning_signature": "sig"} in deltas
+
+
+def test_reasoning_round_trips_agency_to_harness_and_back():
+    agency_response = {
+        "message": {
+            "role": "assistant",
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "plan", "signature": "sig"},
+                {"type": "text", "index": 1, "text": "answer"},
+            ],
+        },
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "stop_reason": "end_turn",
+    }
+    backend = _backend()
+    harness_message = backend._format_context_agency_to_harness(agency_response, "m")["choices"][0][
+        "message"
+    ]
+    blocks = backend._format_context_harness_to_agency({"messages": [harness_message]})["messages"][
+        0
+    ]["blocks"]
+    assert blocks == agency_response["message"]["blocks"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import anyio
 import asyncio
 import json
 import os
@@ -385,6 +386,8 @@ class CodexAdapter(HarnessAdapter):
                     agency_context,
                     model,
                     partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
+                    keepalive_frame=None,
+                    keepalive_s=0,
                 )
 
                 # This adapter already buffers through `done`. Fetch the first
@@ -417,8 +420,6 @@ class CodexAdapter(HarnessAdapter):
                         status_code=exc.status_code,
                     )
                 finally:
-                    import anyio
-
                     # A disconnect before HTTP headers must cancel the blocked
                     # model read just as a later StreamingResponse disconnect does.
                     with anyio.CancelScope(shield=True):
@@ -440,7 +441,7 @@ class CodexAdapter(HarnessAdapter):
                     response_frames(),
                     media_type="text/event-stream",
                 )
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(
                 self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes

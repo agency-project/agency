@@ -166,6 +166,7 @@ class HostServerManager:
         supervisor_agconfig = agconfig.clone()
         ha = agconfig.harness_adapter
         supervisor_agconfig.llm.model = ha.supervisor_model
+        supervisor_agconfig.llm.extra_body = ha.supervisor_extra_body
         if ha.supervisor_base_url:
             supervisor_agconfig.llm.base_url = ha.supervisor_base_url
         if ha.supervisor_api_key:

@@ -51,18 +51,49 @@ class TestResolveSupervisorLlm:
 class TestMainRejectsEmptyModels:
     def test_supervisor_model_flag_accepts_an_empty_string_at_the_parser_level(self):
         args = _build_arg_parser().parse_args(
-            ["-p", "x", "--supervisor-model", "", "--worker-model", "w"]
+            [
+                "-p",
+                "x",
+                "--supervisor-model",
+                "",
+                "--worker-model",
+                "w",
+                "--worker-history-turns",
+                "0",
+            ]
         )
         assert args.supervisor_model == ""
 
     def test_main_still_rejects_an_empty_supervisor_model(self, capsys):
         with pytest.raises(SystemExit):
-            main(["-p", "x", "--supervisor-model", "", "--worker-model", "w"])
+            main(
+                [
+                    "-p",
+                    "x",
+                    "--supervisor-model",
+                    "",
+                    "--worker-model",
+                    "w",
+                    "--worker-history-turns",
+                    "0",
+                ]
+            )
         assert "--supervisor-model" in capsys.readouterr().err
 
     def test_main_still_rejects_an_empty_worker_model(self, capsys):
         with pytest.raises(SystemExit):
-            main(["-p", "x", "--supervisor-model", "s", "--worker-model", ""])
+            main(
+                [
+                    "-p",
+                    "x",
+                    "--supervisor-model",
+                    "s",
+                    "--worker-model",
+                    "",
+                    "--worker-history-turns",
+                    "0",
+                ]
+            )
         assert "--worker-model" in capsys.readouterr().err
 
 
@@ -106,6 +137,8 @@ def test_supervisor_and_worker_actually_dispatch_under_different_models(monkeypa
             "supervisor-real-model",
             "--worker-model",
             "worker-real-model",
+            "--worker-history-turns",
+            "0",
             "--llm-base-url",
             "http://worker-bridge",
             "--llm-api-key",

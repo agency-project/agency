@@ -57,6 +57,7 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
         assert driver.argv[-2:] == ["--max-turns", "4"]
         config = tomllib.loads((tmp_path / "config.toml").read_text())
         assert config["model"]["agency-proxy"]["api_backend"] == "chat_completions"
+        assert config["ui"]["prompt_suggestions"] is False
         assert "StopCancelled" in json.loads((tmp_path / "hooks/agency.json").read_text())["hooks"]
     else:
         config = json.loads((tmp_path / "opencode.json").read_text())
@@ -668,7 +669,8 @@ def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(r
     assert (event["input_tokens"], event["output_tokens"]) == (10, 20)
 
 
-def test_stream_cancellation_closes_upstream_generator():
+@pytest.mark.parametrize("keepalive_s", [0, 30])
+def test_stream_cancellation_closes_upstream_generator(keepalive_s):
     import asyncio
     from agency.harness.adapters.pty.execution import stream_response
 
@@ -688,6 +690,8 @@ def test_stream_cancellation_closes_upstream_generator():
             {},
             "model",
             lambda items, model: [items[0]["message"]],
+            keepalive_frame=": keepalive\n\n",
+            keepalive_s=keepalive_s,
         )
         assert await anext(stream) == "committed"
         await stream.aclose()
@@ -947,3 +951,53 @@ def test_retained_unified_pty_prepares_once_and_reuses_handle(runtime, tmp_path,
     finally:
         execution.close()
     handle.close.assert_called_once()
+
+
+def test_stream_response_sends_keepalive_frames_while_upstream_is_silent():
+    import asyncio
+    from agency.harness.adapters.pty.execution import stream_response
+
+    async def upstream():
+        await asyncio.sleep(0.35)
+        yield {"type": "done", "message": "committed"}
+
+    async def run():
+        stream = stream_response(
+            SimpleNamespace(dispatch_stream_async=lambda *args: upstream()),
+            "token",
+            {},
+            "model",
+            lambda items, model: [items[0]["message"]],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+        )
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+    assert frames[-1] == "committed"
+    assert set(frames[:-1]) == {"KA"} and len(frames[:-1]) >= 2
+
+
+def test_stream_response_raises_upstream_errors_through_keepalive():
+    import asyncio
+    from agency.harness.adapters.pty.execution import stream_response
+
+    async def upstream():
+        await asyncio.sleep(0.15)
+        raise RuntimeError("host dispatch failed")
+        yield
+
+    async def run():
+        stream = stream_response(
+            SimpleNamespace(dispatch_stream_async=lambda *args: upstream()),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+        )
+        return [frame async for frame in stream]
+
+    with pytest.raises(RuntimeError, match="host dispatch failed"):
+        asyncio.run(run())

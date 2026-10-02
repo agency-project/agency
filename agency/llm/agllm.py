@@ -295,6 +295,14 @@ class agllm:
                         if b["type"].startswith(prefix):
                             wire_msg[b["type"][len(prefix) :]] = b.get("data")
                             break
+                # LiteLLM's replay shape for signed (Anthropic/Bedrock) thinking; overrides
+                # any raw streamed thinking_blocks fragments resent just above.
+                signed = [b for b in blocks if b["type"] == "thinking" and b.get("signature")]
+                if signed:
+                    wire_msg["thinking_blocks"] = [
+                        {"type": "thinking", "thinking": b["text"], "signature": b["signature"]}
+                        for b in signed
+                    ]
             elif role == "tool":
                 result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
                 wire_msg = {

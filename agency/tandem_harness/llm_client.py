@@ -46,7 +46,7 @@ def _retry_backoff_s(attempt: int) -> float:
 
 
 class LLMClient:
-    def __init__(self, base_url: str, api_key: str, timeout_s: float = 300) -> None:
+    def __init__(self, base_url: str, api_key: str, timeout_s: float = 0) -> None:
         # dispatch() below always posts to "/v1/chat/completions" relative to
         # base_url. The bridge's own internal base_url never carries a "/v1"
         # suffix, but agconfig.llm.base_url's own convention elsewhere in
@@ -60,7 +60,8 @@ class LLMClient:
             base_url = base_url[: -len("/v1")]
         self._client = httpx.Client(
             base_url=base_url,
-            timeout=timeout_s,
+            # 0 = wait indefinitely: a bridged response arrives only once complete.
+            timeout=None if timeout_s == 0 else timeout_s,
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         )
 
@@ -84,6 +85,8 @@ class LLMClient:
         last_error = "dispatch failed with no attempts made"
         for attempt in range(_DISPATCH_MAX_RETRIES):
             content_parts: "list[str]" = []
+            reasoning_parts: "list[str]" = []
+            signature_parts: "list[str]" = []
             tool_calls_raw: "dict[int, dict]" = {}
             usage: "dict | None" = None
             try:
@@ -115,6 +118,10 @@ class LLMClient:
                         delta = choices[0].get("delta") or {}
                         if delta.get("content"):
                             content_parts.append(delta["content"])
+                        if delta.get("reasoning_content"):
+                            reasoning_parts.append(delta["reasoning_content"])
+                        if delta.get("reasoning_signature"):
+                            signature_parts.append(delta["reasoning_signature"])
                         for tc_delta in delta.get("tool_calls") or []:
                             idx = tc_delta.get("index", 0)
                             slot = tool_calls_raw.setdefault(
@@ -134,6 +141,10 @@ class LLMClient:
                                 slot["function"]["arguments"] += fn_delta["arguments"]
 
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
+                if reasoning_parts:
+                    message["reasoning_content"] = "".join(reasoning_parts)
+                if signature_parts:
+                    message["reasoning_signature"] = "".join(signature_parts)
                 if tool_calls_raw:
                     message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
                 return {"message": message, "usage": usage}

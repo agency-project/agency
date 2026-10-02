@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import anyio
 import shutil
 
 from fastapi import Request
@@ -9,7 +10,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .openai_chat_completions import ChatCompletionsProtocol
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, ChatCompletionsProtocol
 from .pty.execution import stream_response
 
 
@@ -188,6 +189,9 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
             # 200,000 tokens (per its own docs), which can be far off from
             # what the actual proxied backend supports.
             config_toml += f"context_window = {int(context_limit)}\n"
+        # Next-prompt ghost text costs a model call after every turn, and Grok
+        # exits without awaiting it, leaving an orphaned request behind.
+        config_toml += "\n[ui]\nprompt_suggestions = false\n"
         (config_home / "config.toml").write_text(config_toml)
 
     def register(self, app, router) -> None:
@@ -251,11 +255,17 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
             if body.get("stream"):
                 return StreamingResponse(
                     stream_response(
-                        router, token, agency_context, model, self._format_agency_stream_to_harness
+                        router,
+                        token,
+                        agency_context,
+                        model,
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
                     ),
                     media_type="text/event-stream",
                 )
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
 

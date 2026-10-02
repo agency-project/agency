@@ -303,7 +303,8 @@ def test_on_checkpoint_fires_after_every_step_with_the_running_transcript(tmp_pa
     a way to persist the session as it goes, not just once at a clean
     finish -- on_checkpoint is that hook. Must fire on every non-final step
     (mirrors _write_progress, called from the same spot), and each call
-    must see that step's own tool call already appended."""
+    must see that step's own tool call and its result already appended, so a
+    resumed session never starts from a dangling tool_use."""
     llm = _Llm(
         [
             _tool_call_response(name="bash", arguments={"command": "one"}),
@@ -327,12 +328,12 @@ def test_on_checkpoint_fires_after_every_step_with_the_running_transcript(tmp_pa
     # Once per tool-calling step -- not on the final, toolless step, whose
     # completion is handled by the caller's own explicit save instead.
     assert len(checkpoints) == 2
-    assert checkpoints[0][-1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
-        {"command": "one"}
-    )
-    assert checkpoints[1][-1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
-        {"command": "two"}
-    )
+    for checkpoint, command in zip(checkpoints, ("one", "two")):
+        assert checkpoint[-1]["role"] == "tool"
+        assert checkpoint[-2]["tool_calls"][0]["function"]["arguments"] == json.dumps(
+            {"command": command}
+        )
+        assert checkpoint[-1]["tool_call_id"] == checkpoint[-2]["tool_calls"][0]["id"]
 
 
 def test_on_checkpoint_failure_does_not_interrupt_the_loop(tmp_path):

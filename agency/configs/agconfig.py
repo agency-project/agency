@@ -283,6 +283,9 @@ class harnessadapterconfig(confignamespace):
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None
     allow_subagents: bool = False
+    # Seconds of upstream silence before a streaming route sends its wire's
+    # keepalive frame; 0 = never.
+    stream_keepalive_s: float = 15.0
 
     # harness == "tandem" only (agency/harness/adapters/tandem.py): the
     # supervisor model keeps the full task history and never sees a tool
@@ -298,6 +301,11 @@ class harnessadapterconfig(confignamespace):
     # several tool calls to satisfy one order before it must report back to
     # the supervisor. See tandem_harness/tandem_loop.py's docstring.
     segment_step_cap: int = 64
+    # Past worker segments replayed into each new segment; 0 = none.
+    worker_history_turns: int = 4096
+    # The supervisor's llm config is cloned from the worker's, so it must not
+    # inherit worker-only request fields such as chat_template_kwargs.
+    supervisor_extra_body: "dict | None" = None
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

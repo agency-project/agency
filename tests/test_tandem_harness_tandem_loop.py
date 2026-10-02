@@ -19,6 +19,9 @@ from agency.tandem_harness.tandem_loop import (
     RESULT_TRUNCATE_CHARS,
     _SUBMIT_OUTPUT_SCHEMA,
     _build_report,
+    _decode_args,
+    _decode_result,
+    _render_report,
     _short_call_id,
     _trim_worker_history,
     _truncate,
@@ -185,8 +188,10 @@ def test_worker_forward_tool_output_appends_the_last_calls_raw_result(monkeypatc
     )
 
     assert result.status == "done"
-    smart_tool_result = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert smart_tool_result["tool_output"] == 'done\n\n{"files": ["a.py", "b.py"]}'
+    smart_tool_result = supervisor_llm.requests[1][1][-1]["content"]
+    # Forwarded output is decoded like a preview: a list field one item per line.
+    assert "tool_output:\n  done\n\n  a.py\n  b.py\n" in smart_tool_result
+    assert "forward_tool_output" not in smart_tool_result
 
 
 def test_worker_forward_tool_output_with_no_prior_tool_call_returns_an_error(monkeypatch, tmp_path):
@@ -213,8 +218,8 @@ def test_worker_forward_tool_output_with_no_prior_tool_call_returns_an_error(mon
     # normally -- nothing here is fatal to the segment.
     worker_tool_result = json.loads(worker_llm.requests[1][1][-1]["content"])
     assert "error" in worker_tool_result
-    smart_tool_result = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert smart_tool_result["tool_output"] == "done"
+    smart_tool_result = supervisor_llm.requests[1][1][-1]["content"]
+    assert smart_tool_result == "finish_reason: tool_finished\ntool_output:\n  done"
 
 
 def test_worker_never_sees_supervisor_tool_schema_or_vice_versa(monkeypatch, tmp_path):
@@ -520,9 +525,8 @@ def test_get_tool_call_detail_reaches_a_call_from_an_earlier_segment(monkeypatch
         offload_dir=str(tmp_path),
     )
 
-    detail = json.loads(supervisor_llm.requests[3][1][-1]["content"])
-    assert detail["call_id"] == seg0_call_id
-    assert "one" in detail["arguments"]
+    detail = supervisor_llm.requests[3][1][-1]["content"]
+    assert detail.startswith(f"[{seg0_call_id}] bash: one\n")
 
 
 def test_get_tool_call_detail_returns_the_full_untruncated_entry(monkeypatch, tmp_path):
@@ -549,11 +553,9 @@ def test_get_tool_call_detail_returns_the_full_untruncated_entry(monkeypatch, tm
         offload_dir=str(tmp_path),
     )
 
-    detail = json.loads(supervisor_llm.requests[2][1][-1]["content"])
-    assert detail["call_id"] == short_call_id
-    assert detail["tool"] == "bash"
-    assert long_command in detail["arguments"]
-    assert detail["result"] == long_output  # untruncated, unlike smart_tool's own preview
+    detail = supervisor_llm.requests[2][1][-1]["content"]
+    # Untruncated, unlike smart_tool's own preview.
+    assert detail == f"[{short_call_id}] bash: {long_command}\n  -> {long_output}"
 
 
 def test_get_tool_call_detail_unknown_call_id_returns_an_error(monkeypatch, tmp_path):
@@ -577,8 +579,8 @@ def test_get_tool_call_detail_unknown_call_id_returns_an_error(monkeypatch, tmp_
         offload_dir=str(tmp_path),
     )
 
-    detail = json.loads(supervisor_llm.requests[2][1][-1]["content"])
-    assert "error" in detail
+    detail = supervisor_llm.requests[2][1][-1]["content"]
+    assert detail == "error: no tool call with call_id='does-not-exist' in this task's history"
 
 
 def test_get_tool_call_detail_before_any_smart_tool_call_returns_an_error(tmp_path):
@@ -596,15 +598,15 @@ def test_get_tool_call_detail_before_any_smart_tool_call_returns_an_error(tmp_pa
         offload_dir=str(tmp_path),
     )
 
-    detail = json.loads(supervisor_llm.requests[1][1][-1]["content"])
-    assert "error" in detail
+    detail = supervisor_llm.requests[1][1][-1]["content"]
+    assert detail.startswith("error: no tool call")
 
 
 def _seg(user_content, n_assistant_turns=1):
     """A minimal fake segment: one user task message plus n_assistant_turns
     bare assistant messages (no tool_calls -- content, not shape, is what
     these tests check)."""
-    msgs = [{"role": "user", "content": user_content}]
+    msgs = [{"role": "user", "content": f"[TANDEM WORKER segment 0] {user_content}"}]
     for i in range(n_assistant_turns):
         msgs.append({"role": "assistant", "content": f"{user_content}-reply-{i}"})
     return msgs
@@ -643,14 +645,16 @@ def test_truncate_keeps_head_and_tail_with_marker_in_the_middle():
     # Digits so head/tail slices are unambiguous -- not just a length check.
     long_text = "".join(str(i % 10) for i in range(100))
     truncated = _truncate(long_text, 50)
-    marker = " ...[TRUNCATED]... "
+    marker = " … "
     assert truncated == long_text[:25] + marker + long_text[-25:]
     assert truncated.startswith(long_text[:25])
     assert truncated.endswith(long_text[-25:])
     assert len(truncated) == 50 + len(marker)
 
 
-def test_build_report_step_cap_reached_carries_the_executed_tool_call(monkeypatch, tmp_path):
+def test_build_report_max_basic_tool_calls_reached_carries_the_executed_tool_call(
+    monkeypatch, tmp_path
+):
     monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
     llm = _Llm([_worker_tool_call_response("echo hi")])
     result = run_react_loop(
@@ -664,7 +668,7 @@ def test_build_report_step_cap_reached_carries_the_executed_tool_call(monkeypatc
     report, full_trace = _build_report(result)
     short_call_id = _short_call_id("call-0", set())
 
-    assert report["finish_reason"] == "step_cap_reached"
+    assert report["finish_reason"] == "max_basic_tool_calls_reached"
     assert report["tool_output"] is None
     assert full_trace == [
         {
@@ -674,70 +678,93 @@ def test_build_report_step_cap_reached_carries_the_executed_tool_call(monkeypatc
             "result": json.dumps({"ok": True}),
         }
     ]
-    # report's own copy is the same call, just previewed to the (possibly
-    # shorter) truncation lengths -- see test_build_report_truncates_* for
-    # the truncation behavior itself.
-    assert report["tool_calls"] == [
-        {
-            "call_id": short_call_id,
-            "tool": "bash",
-            "arguments": _truncate(json.dumps({"command": "echo hi"}), ARGUMENTS_TRUNCATE_CHARS),
-            "result": _truncate(json.dumps({"ok": True}), RESULT_TRUNCATE_CHARS),
-        }
-    ]
+    assert report["tool_calls"] == full_trace
+    assert _render_report(report) == (
+        "finish_reason: max_basic_tool_calls_reached\n"
+        "tool_output:\n"
+        "  (none)\n"
+        "tool_calls ([id] tool: args / -> status, then result preview):\n"
+        f"  [{short_call_id}] bash: echo hi\n"
+        "    -> ok=true"
+    )
 
 
-def test_build_report_truncates_long_arguments_and_results():
+def test_render_report_previews_keep_head_and_tail():
+    long_command = "x" * 100
+    lines = [f"line {i:03d}" for i in range(100)]
+    report = {
+        "finish_reason": "tool_finished",
+        "tool_output": "ok",
+        "tool_calls": [
+            {
+                "call_id": "c1",
+                "tool": "bash",
+                "arguments": json.dumps({"command": long_command}),
+                "result": json.dumps({"output": "\n".join(lines) + "\n", "returncode": 1}),
+            }
+        ],
+    }
+
+    rendered = _render_report(report).split("\n")
+
+    call_line = rendered[4]
+    assert call_line == "  [c1] bash: " + _truncate(long_command, ARGUMENTS_TRUNCATE_CHARS)
+    assert rendered[5] == "    -> returncode=1 · 100 lines, truncated"
+    preview = [line.strip() for line in rendered[6:]]
+    # Whole lines from both ends: a traceback's last line matters as much as its first.
+    assert preview[0] == "line 000"
+    assert preview[-1] == "line 099"
+    assert "…" in preview
+    assert sum(len(line) for line in preview if line != "…") <= RESULT_TRUNCATE_CHARS
+
+
+def test_decode_result_unescapes_main_text_and_lists_other_fields():
+    assert _decode_result(json.dumps({"output": "a\nb\n", "returncode": 0})) == (
+        "returncode=0",
+        "a\nb",
+    )
+    assert _decode_result(json.dumps({"error": "Not found: x.py"})) == ("error", "Not found: x.py")
+    grep = {"matches": [{"path": "a.py", "line": 3, "text": "foo\n"}], "count": 1}
+    assert _decode_result(json.dumps(grep)) == ("count=1", "a.py:3:foo")
+    assert _decode_result("plain text") == ("", "plain text")
+    echoed = json.dumps({"file_path": "/w/x.py", "old": "a", "new": "b"})
+    assert _decode_result(json.dumps({"path": "/w/x.py", "success": True}), echoed) == (
+        "success=true",
+        "",
+    )
+
+
+def test_decode_args_lone_value_bare_several_as_pairs():
+    assert _decode_args(json.dumps({"command": "ls -la"})) == "ls -la"
+    assert _decode_args(json.dumps({"path": "a.py", "old": "x y"})) == 'path=a.py old="x y"'
+    assert _decode_args("not json") == "not json"
+
+
+def test_build_report_drops_forward_tool_output_entries():
     class _FakeResult:
         status = "done"
-        final_text = ""
+        final_text = "done"
         message = ""
         messages = [
             {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
-                    {
-                        "id": "c1",
-                        "function": {
-                            "name": "bash",
-                            "arguments": json.dumps({"command": "x" * 100}),
-                        },
-                    }
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "forward_tool_output", "arguments": "{}"}},
                 ],
             },
-            {"role": "tool", "tool_call_id": "c1", "content": "y" * 500},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+            {"role": "tool", "tool_call_id": "c2", "content": "{}"},
         ]
 
     report, full_trace = _build_report(_FakeResult())
 
-    truncated = report["tool_calls"][0]
-    full_arguments = json.dumps({"command": "x" * 100})
-    full_result = "y" * 500
-    marker = " ...[TRUNCATED]... "
-    assert len(truncated["arguments"]) == ARGUMENTS_TRUNCATE_CHARS + len(marker)
-    assert "[TRUNCATED]" in truncated["arguments"]
-    # The result's tail (e.g. a traceback's actual exception line, a
-    # command's final status) is at least as informative as its head, so
-    # the preview keeps both ends rather than only the start.
-    assert truncated["arguments"].startswith(full_arguments[: ARGUMENTS_TRUNCATE_CHARS // 2])
-    assert truncated["arguments"].endswith(
-        full_arguments[-(ARGUMENTS_TRUNCATE_CHARS - ARGUMENTS_TRUNCATE_CHARS // 2) :]
-    )
-    assert len(truncated["result"]) == RESULT_TRUNCATE_CHARS + len(marker)
-    assert "[TRUNCATED]" in truncated["result"]
-    assert truncated["result"].startswith(full_result[: RESULT_TRUNCATE_CHARS // 2])
-    assert truncated["result"].endswith(
-        full_result[-(RESULT_TRUNCATE_CHARS - RESULT_TRUNCATE_CHARS // 2) :]
-    )
-
-    full = full_trace[0]
-    assert full["arguments"] == json.dumps({"command": "x" * 100})
-    assert full["result"] == "y" * 500
-    assert truncated["call_id"] == full["call_id"] == _short_call_id("c1", set())
+    assert [e["tool"] for e in report["tool_calls"]] == ["bash"]
+    assert [e["tool"] for e in full_trace] == ["bash", "forward_tool_output"]
 
 
-def test_build_report_worker_finished_with_no_tool_call():
+def test_build_report_tool_finished_with_no_tool_call():
     class _FakeResult:
         status = "done"
         messages = [{"role": "assistant", "content": "no tool needed, answer is 42"}]
@@ -746,13 +773,13 @@ def test_build_report_worker_finished_with_no_tool_call():
 
     report, full_trace = _build_report(_FakeResult())
 
-    assert report["finish_reason"] == "worker_finished"
+    assert report["finish_reason"] == "tool_finished"
     assert report["tool_calls"] == []
     assert report["tool_output"] == "no tool needed, answer is 42"
     assert full_trace == []
 
 
-def test_build_report_worker_error_folds_the_dispatch_error_into_tool_output():
+def test_build_report_tool_error_folds_the_dispatch_error_into_tool_output():
     class _FakeResult:
         status = "error"
         messages = None
@@ -761,7 +788,7 @@ def test_build_report_worker_error_folds_the_dispatch_error_into_tool_output():
 
     report, full_trace = _build_report(_FakeResult())
 
-    assert report["finish_reason"] == "worker_error"
+    assert report["finish_reason"] == "tool_error"
     assert report["tool_output"] == "llm endpoint unreachable: boom"
     assert report["tool_calls"] == []
     assert full_trace == []
@@ -776,7 +803,7 @@ def test_build_report_forwarded_tool_output_stands_alone_with_no_closing_text():
 
     report, _ = _build_report(_FakeResult(), forwarded_tool_output='{"files": ["a.py"]}')
 
-    assert report["tool_output"] == '{"files": ["a.py"]}'
+    assert report["tool_output"] == "a.py"
 
 
 def test_build_report_forwarded_tool_output_is_appended_after_closing_text():
@@ -788,4 +815,79 @@ def test_build_report_forwarded_tool_output_is_appended_after_closing_text():
 
     report, _ = _build_report(_FakeResult(), forwarded_tool_output='{"files": ["a.py"]}')
 
-    assert report["tool_output"] == 'done\n\n{"files": ["a.py"]}'
+    assert report["tool_output"] == "done\n\na.py"
+
+
+def test_trim_worker_history_does_not_split_a_segment_at_an_empty_report_reprompt():
+    conversation = (
+        [{"role": "system", "content": "sys"}]
+        + _seg("seg0")
+        + [{"role": "user", "content": "Your last message was empty"}]
+        + _seg("seg1")
+    )
+    trimmed = _trim_worker_history(conversation, 1)
+    assert "seg0" not in json.dumps(trimmed)
+    assert "Your last message was empty" not in json.dumps(trimmed)
+    assert "seg1" in json.dumps(trimmed)
+
+
+def _worker_final_response(text):
+    return {
+        "message": {"role": "assistant", "content": text},
+        "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+    }
+
+
+def _run_one_segment(worker_responses, tmp_path):
+    supervisor_llm = _Llm([_smart_tool_response("run echo"), _supervisor_final_response("ok")])
+    worker_llm = _Llm(worker_responses)
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        offload_dir=str(tmp_path),
+    )
+    return supervisor_llm.requests[1][1][-1]["content"], worker_llm
+
+
+def test_empty_worker_report_is_reprompted_once(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
+    report, worker_llm = _run_one_segment(
+        [
+            _worker_tool_call_response(),
+            _worker_final_response(None),
+            _worker_final_response("ran echo"),
+        ],
+        tmp_path,
+    )
+    assert report.startswith("finish_reason: tool_finished\ntool_output:\n  ran echo\n")
+    reprompt_request = worker_llm.requests[2][1]
+    assert reprompt_request[-2] == {"role": "assistant", "content": None}
+    assert reprompt_request[-1]["role"] == "user"
+    assert "empty" in reprompt_request[-1]["content"]
+
+
+def test_still_empty_after_reprompt_is_reported_as_empty_output(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
+    report, worker_llm = _run_one_segment(
+        [_worker_tool_call_response(), _worker_final_response(None), _worker_final_response("  ")],
+        tmp_path,
+    )
+    assert report.startswith("finish_reason: empty_output\n")
+    assert len(worker_llm.requests) == 3
+
+
+def test_forwarded_output_with_empty_text_is_not_reprompted(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
+    report, worker_llm = _run_one_segment(
+        [
+            _worker_tool_call_response(),
+            _forward_tool_output_response(),
+            _worker_final_response(None),
+        ],
+        tmp_path,
+    )
+    assert report.startswith("finish_reason: tool_finished\n")
+    assert len(worker_llm.requests) == 3

@@ -6,6 +6,7 @@ policy-aware runtime, and owns native PTY input and completion.
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
+from .pty.execution import stream_response
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -26,6 +28,7 @@ def claude_code_available() -> bool:
 
 
 _DEFAULT_TIMEOUT_S = 300
+_KEEPALIVE_FRAME = 'event: ping\ndata: {"type": "ping"}\n\n'
 
 # --autocompact only accepts this range (per `claude --help`); a model with a
 # real window outside it can't be told via this flag at all, so Claude Code
@@ -628,28 +631,19 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-
-                async def gen():
-                    # Closing Claude's request closes the upstream UDS stream,
-                    # including while the host is still generating its batch.
-                    from contextlib import aclosing
-                    import anyio
-
-                    stream = router.dispatch_stream_async(token, agency_context)
-                    try:
-                        async with aclosing(stream):
-                            async for item in stream:
-                                if item["type"] == "done":
-                                    for event in self._format_agency_stream_to_harness(
-                                        [item], model
-                                    ):
-                                        yield event
-                    finally:
-                        with anyio.CancelScope(shield=True):
-                            await stream.aclose()
-
-                return StreamingResponse(gen(), media_type="text/event-stream")
-            agency_response = router.dispatch(token, agency_context)
+                return StreamingResponse(
+                    stream_response(
+                        router,
+                        token,
+                        agency_context,
+                        model,
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    ),
+                    media_type="text/event-stream",
+                )
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
         @app.post("/v1/messages/count_tokens")

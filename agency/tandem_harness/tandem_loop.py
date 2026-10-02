@@ -50,7 +50,8 @@ harness-extracted, never model-authored: each entry has a `call_id` plus
 cross-reference), `tool_output` (the worker's own factual account of what
 it ran and what happened -- `WORKER_SYSTEM` tells it to report like a tool
 returning output, not offer its own diagnosis/beliefs), and `finish_reason`
-(`worker_finished` / `step_cap_reached` / `worker_error` / `invalid_task`).
+(`tool_finished` / `empty_output` / `max_basic_tool_calls_reached` / `tool_error` /
+`invalid_task`), rendered as plain text by `_render_report`.
 `call_id`s are unique execution-wide (see `_short_call_id`) and kept in one
 hash table (`all_calls`), so `get_tool_call_detail(call_id)` can look up any past call, not just the most recent segment's.
 
@@ -107,6 +108,12 @@ DEFAULT_SEGMENT_STEP_CAP = 64
 # pathological runs, not a tuned working set size yet.
 DEFAULT_WORKER_HISTORY_TURNS = 4096
 
+_EMPTY_REPORT_MAX_REPROMPTS = 1
+_EMPTY_REPORT_REPROMPT = (
+    "Your last message was empty, so the requester received no report. Write your report of "
+    "what you ran and what happened now, as your final answer."
+)
+
 # Preview lengths for the mechanical tool_calls cross-reference in a
 # smart_tool report. Always applied (there is no "give me the full thing in
 # this same call" flag) -- get_tool_call_detail(call_id) is the escape hatch
@@ -118,9 +125,9 @@ _SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_tool_call_detail"}
 
 SUPERVISOR_SYSTEM = """\
 You are a helpful assistant that carries out a task given to you by a user.
-You are only given the following three tools:
+You are given the following three tools:
 
-- smart_tool(task): Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason.
+- smart_tool(task): Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason: tool_finished, empty_output, max_basic_tool_calls_reached (the task needed more basic tool calls than one smart_tool call allows; split it into smaller tasks), tool_error, or invalid_task.
 
 - get_tool_call_detail(call_id): Get the full, untruncated arguments and result of ONE tool call, identified by the call_id in any smart_tool result's tool_calls entries. Works for a call from any past smart_tool call this task has made, not just the most recent one.
 
@@ -138,29 +145,31 @@ get_tool_call_detail("call_1") -> returns the full, untruncated input and output
 submit_output("field_name", "final value") -> once per required output field, when you have the confirmed final value to be reported to the user.
 ```
 
-ALL basic tools, such as "bash", "grep", "read", etc., are NOT AVAILABLE TO YOU DIRECTLY. Use the smart_tool to run them. When given a high-level task, the smart tool may have trouble decomposing the task accurately. In this case, you may need to give explicit bash commands or code snippets in your task description. You should be able to learn what the smart tool is capable of as you go along. When needed, inspect what the smart tool has executed by calling get_tool_call_detail(call_id), to have a better understanding of the smart tool's capabilities.
+ALL basic tools, such as "bash", "grep", "read", etc., are NOT AVAILABLE TO YOU DIRECTLY. Use the smart_tool to run them. When given a complex task, the smart_tool may have trouble decomposing the task accurately. In this case, you may need to give explicit bash commands or code snippets in your task description. You should be able to learn what the smart tool is capable of as you go along. When needed, inspect what the smart tool has executed by calling get_tool_call_detail(call_id), to have a better understanding of the smart tool's capabilities.
 
-If the smart tool is not returning the expected result, or only a summary of the desired result, inspect the basic tool call that contains the result yourself by calling get_tool_call_detail(call_id) to get the full, untruncated input and output of the basic tool call. Do not run the basic tool yourself, you do not have direct access to the basic tools.
+If the smart tool is not returning the expected result, or only a summary of the desired result, inspect the basic tool call that contains the result by calling get_tool_call_detail(call_id) to get the full, untruncated input and output of the basic tool call.
 
 For task execution, please keep going until the query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved.
 
 If you are working on a codebase that has tests or the ability to build or run, consider using them to verify that your work is complete. Your philosophy should be to start as specific as possible to the code you changed so that you can catch issues efficiently, then make your way to broader tests as you build confidence. Fix the problem at the root cause rather than applying surface-level patches, when possible.
 
-Once you have confirmed the final output values for every required output field, call submit_output for each field and provided a summary of the work you did (no further tool call) -- that ends the task.
+Once you have confirmed the final output values for every required output field, call submit_output for each returned output field.
 """
 
-WORKER_SYSTEM = """
-You are a tool-execution worker. You will be given a single task.
-Do as exactly what the task asks to do using the tools available to you, then stop. Report back as conscise and objectively as possible on the result, within 500 characters. DO NOT add any diagnosis, conclusions, expectations, proposals, or guesses to the output and never address "the user" directly. If you could not complete the task, report exactly what was attempted and what happened. If the task is a question you can answer directly without a tool, answer with the face-value fact only.
-If the task requires returning the full result of a tool call, such as returning the full list of files or the full grep orread output, call forward_tool_output() right after that tool call instead of retyping or summarizing its result. Never manually reproduce a tool result you can forward instead.
-"""
+# Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
+# previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.
+WORKER_SYSTEM = (
+    "You are a tool-execution worker. Do the task with the available tools, then reply with a short factual report of what you ran and what happened. "
+    "Only this final reply reaches the requester, so include the results in it. "
+    "To return a tool call's full output (a file, a listing, a grep result), call forward_tool_output() right after that call."
+)
 
 _SMART_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "smart_tool",
         "description": (
-            "Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason."
+            "Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason: tool_finished, empty_output, max_basic_tool_calls_reached (the task needed more basic tool calls than one smart_tool call allows; split it into smaller tasks), tool_error, or invalid_task."
         ),
         "parameters": {
             "type": "object",
@@ -247,7 +256,7 @@ def _parse_args(fn_args: str) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _truncate(text: str, max_chars: int) -> str:
+def _truncate(text: str, max_chars: int, marker: str = " … ") -> str:
     """Keeps the first and last half of `max_chars`, marker in between --
     not just the head. A command's arguments are usually most informative
     at the start, but a result's most informative part (a traceback's
@@ -257,7 +266,7 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     head_chars = max_chars // 2
     tail_chars = max_chars - head_chars
-    return text[:head_chars] + " ...[TRUNCATED]... " + text[len(text) - tail_chars :]
+    return text[:head_chars] + marker + text[len(text) - tail_chars :]
 
 
 def _short_call_id(real_id: str, used_ids: "set[str]") -> str:
@@ -317,37 +326,142 @@ def _build_report(
     to the supervisor, full_trace the untruncated version fed into all_calls.
     `segment_marker`/`used_short_ids` pass straight through to _extract_full_trace."""
     full_trace = _extract_full_trace(result, segment_marker, used_short_ids)
-    truncated_calls = [
-        {
-            "call_id": entry["call_id"],
-            "tool": entry["tool"],
-            "arguments": _truncate(entry["arguments"], ARGUMENTS_TRUNCATE_CHARS),
-            "result": _truncate(entry["result"], RESULT_TRUNCATE_CHARS),
-        }
-        for entry in full_trace
-    ]
 
     if result.status == "error" and (result.message or "").startswith("exceeded max_steps="):
-        finish_reason = "step_cap_reached"
+        finish_reason = "max_basic_tool_calls_reached"
         tool_output = None
     elif result.status == "error":
-        finish_reason = "worker_error"
+        finish_reason = "tool_error"
         tool_output = result.message
     else:
-        finish_reason = "worker_finished"
+        finish_reason = "tool_finished"
         tool_output = result.final_text or None
 
     if forwarded_tool_output is not None:
-        tool_output = (
-            f"{tool_output}\n\n{forwarded_tool_output}" if tool_output else forwarded_tool_output
-        )
+        status, text = _decode_result(forwarded_tool_output)
+        forwarded = text or status
+        tool_output = f"{tool_output}\n\n{forwarded}" if tool_output else forwarded
+    if finish_reason == "tool_finished" and not (tool_output or "").strip():
+        finish_reason = "empty_output"
 
     report = {
         "tool_output": tool_output,
-        "tool_calls": truncated_calls,
+        # Its content already lands in tool_output.
+        "tool_calls": [e for e in full_trace if e["tool"] != "forward_tool_output"],
         "finish_reason": finish_reason,
     }
     return report, full_trace
+
+
+_MAIN_RESULT_FIELDS = ("output", "content", "result", "error", "note")
+_TOOL_CALLS_HEADER = "tool_calls ([id] tool: args / -> status, then result preview):"
+
+
+def _field_value(value) -> str:
+    if isinstance(value, str):
+        return json.dumps(value) if (not value or any(c.isspace() for c in value)) else value
+    return json.dumps(value)
+
+
+def _decode_args(arguments: str) -> str:
+    """A lone argument as its bare value, several as k=v pairs."""
+    try:
+        value = json.loads(arguments) if arguments else {}
+    except (json.JSONDecodeError, TypeError):
+        return arguments
+    if not isinstance(value, dict):
+        return arguments
+    if len(value) == 1:
+        only = next(iter(value.values()))
+        return only if isinstance(only, str) else json.dumps(only)
+    return " ".join(f"{k}={_field_value(v)}" for k, v in value.items())
+
+
+def _decode_result(result: str, echoed: str = "") -> "tuple[str, str]":
+    """(status, text): a tool's main text field unescaped, its other fields as k=v,
+    minus fields that only echo a value already in the call's `echoed` arguments."""
+    try:
+        value = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return "", result
+    if not isinstance(value, dict):
+        return "", result
+    main_key = next((k for k in _MAIN_RESULT_FIELDS if isinstance(value.get(k), str)), None)
+    if main_key is None:
+        main_key = next((k for k, v in value.items() if isinstance(v, list)), None)
+    text = ""
+    if main_key is not None:
+        main = value[main_key]
+        if isinstance(main, str):
+            text = main
+        else:
+            text = "\n".join(
+                ":".join(str(x).rstrip("\n") for x in item.values())
+                if isinstance(item, dict)
+                else str(item)
+                for item in main
+            )
+    status = ["error"] if main_key == "error" else []
+    status += [
+        f"{k}={_field_value(v)}"
+        for k, v in value.items()
+        if k != main_key and not (isinstance(v, str) and v and json.dumps(v) in echoed)
+    ]
+    return " ".join(status), text.rstrip("\n")
+
+
+def _preview(text: str, max_chars: int) -> str:
+    """Whole head and tail lines within max_chars, a "…" line between."""
+    if len(text) <= max_chars:
+        return text
+    lines = text.split("\n")
+    half = max_chars // 2
+    head, used = [], 0
+    while lines and used + len(lines[0]) <= half:
+        used += len(lines[0]) + 1
+        head.append(lines.pop(0))
+    tail, used = [], 0
+    while lines and used + len(lines[-1]) <= half:
+        used += len(lines[-1]) + 1
+        tail.insert(0, lines.pop())
+    if not head:
+        head = [_truncate(lines.pop(0), half)]
+    if not tail and lines:
+        tail = [_truncate(lines.pop(), half)]
+    return "\n".join(head + (["…"] if lines else []) + tail)
+
+
+def _render_call(entry: dict, *, full: bool, indent: str = "  ") -> "list[str]":
+    args = _decode_args(entry["arguments"])
+    status, text = _decode_result(entry["result"], echoed=entry["arguments"])
+    if not full:
+        args = _truncate(args.replace("\n", " ⏎ "), ARGUMENTS_TRUNCATE_CHARS)
+    arg_lines = args.split("\n")
+    lines = [f"{indent}[{entry['call_id']}] {entry['tool']}: {arg_lines[0]}"]
+    lines += [f"{indent}    {line}" if line else "" for line in arg_lines[1:]]
+    arrow = f"{indent}  -> "
+    if not text:
+        lines.append(arrow + (status or "no output"))
+    elif "\n" not in text and (full or len(text) <= RESULT_TRUNCATE_CHARS):
+        lines.append(arrow + " · ".join(p for p in (status, text) if p))
+    else:
+        preview = text if full else _preview(text, RESULT_TRUNCATE_CHARS)
+        size = f"{text.count(chr(10)) + 1} lines" + (", truncated" if preview != text else "")
+        lines.append(arrow + " · ".join(p for p in (status, size) if p))
+        lines += [f"{indent}     {line}" if line else "" for line in preview.split("\n")]
+    return lines
+
+
+def _render_report(report: dict) -> str:
+    lines = [f"finish_reason: {report['finish_reason']}", "tool_output:"]
+    lines += [
+        f"  {line}" if line else "" for line in (report["tool_output"] or "(none)").split("\n")
+    ]
+    if report["tool_calls"]:
+        lines.append(_TOOL_CALLS_HEADER)
+        for entry in report["tool_calls"]:
+            lines += _render_call(entry, full=False)
+    return "\n".join(lines)
 
 
 def _trim_worker_history(conversation: "list[dict]", n: int) -> "list[dict]":
@@ -365,7 +479,11 @@ def _trim_worker_history(conversation: "list[dict]", n: int) -> "list[dict]":
     rest = conversation[1:] if has_system else conversation
     if n <= 0:
         return sys_prefix
-    segment_starts = [i for i, m in enumerate(rest) if m["role"] == "user"]
+    segment_starts = [
+        i
+        for i, m in enumerate(rest)
+        if m["role"] == "user" and str(m.get("content") or "").startswith("[TANDEM WORKER segment ")
+    ]
     if len(segment_starts) <= n:
         return conversation
     return sys_prefix + rest[segment_starts[-n] :]
@@ -413,7 +531,7 @@ def run_tandem_loop(
         args = _parse_args(args_json)
         task = (args.get("task") or "").strip()
         if not task:
-            return json.dumps(
+            return _render_report(
                 {
                     "tool_output": "smart_tool called with an empty task",
                     "tool_calls": [],
@@ -460,38 +578,54 @@ def run_tandem_loop(
                 {"result": "staged your most recent tool call's output as your final tool_output"}
             )
 
-        result = run_react_loop(
-            worker_messages,
-            worker_model,
-            worker_llm,
-            mcp=mcp,
-            bridge=bridge,
-            context_limit=worker_context_limit,
-            max_steps=segment_step_cap,
-            offload_dir=offload_dir,
-            # Without this, progress.json only refreshes on the
-            # *supervisor's* own turns -- a long worker segment (many
-            # chained tool calls with no supervisor turn in between) leaves
-            # it stale for the segment's whole duration, however long that
-            # actually is. The host-side adapter watches this file's mtime
-            # as its sole liveness signal and treats a stale one as "idled
-            # out" regardless of whether real work is still happening, so a
-            # long-but-live segment could get mistaken for a hang.
-            progress_path=progress_path,
-            span_prefix=f"worker_seg{segment_index}_turn",
-            # Only meaningful when bridged: agmanager_harness interprets/strips
-            # this field before forwarding to the real provider. Standalone
-            # (bridge is None), there's nothing to strip it, and passing it
-            # straight through to litellm/Bedrock is a bad request.
-            internal_kind=("tandem_worker" if bridge is not None else None),
-            extra_tool_schemas=[_FORWARD_TOOL_OUTPUT_SCHEMA],
-            extra_dispatch_table={"forward_tool_output": forward_tool_output_handler},
-            call_id_results=call_id_results,
-            # Keep submit_output supervisor-only, not MCP-discoverable by the worker.
-            exclude_mcp_tool_names=frozenset({"submit_output"}),
-        )
+        def run_worker(segment_messages):
+            return run_react_loop(
+                segment_messages,
+                worker_model,
+                worker_llm,
+                mcp=mcp,
+                bridge=bridge,
+                context_limit=worker_context_limit,
+                max_steps=segment_step_cap,
+                offload_dir=offload_dir,
+                # Without this, progress.json only refreshes on the
+                # *supervisor's* own turns -- a long worker segment (many
+                # chained tool calls with no supervisor turn in between) leaves
+                # it stale for the segment's whole duration, however long that
+                # actually is. The host-side adapter watches this file's mtime
+                # as its sole liveness signal and treats a stale one as "idled
+                # out" regardless of whether real work is still happening, so a
+                # long-but-live segment could get mistaken for a hang.
+                progress_path=progress_path,
+                span_prefix=f"worker_seg{segment_index}_turn",
+                # Only meaningful when bridged: agmanager_harness interprets/strips
+                # this field before forwarding to the real provider. Standalone
+                # (bridge is None), there's nothing to strip it, and passing it
+                # straight through to litellm/Bedrock is a bad request.
+                internal_kind=("tandem_worker" if bridge is not None else None),
+                extra_tool_schemas=[_FORWARD_TOOL_OUTPUT_SCHEMA],
+                extra_dispatch_table={"forward_tool_output": forward_tool_output_handler},
+                call_id_results=call_id_results,
+                # Keep submit_output supervisor-only, not MCP-discoverable by the worker.
+                exclude_mcp_tool_names=frozenset({"submit_output"}),
+            )
+
+        result = run_worker(worker_messages)
         worker_totals["input"] += result.total_input_tokens
         worker_totals["output"] += result.total_output_tokens
+        reprompts = 0
+        while (
+            result.status == "done"
+            and not (result.final_text or "").strip()
+            and forwarded["content"] is None
+            and reprompts < _EMPTY_REPORT_MAX_REPROMPTS
+        ):
+            reprompts += 1
+            result = run_worker(
+                result.messages + [{"role": "user", "content": _EMPTY_REPORT_REPROMPT}]
+            )
+            worker_totals["input"] += result.total_input_tokens
+            worker_totals["output"] += result.total_output_tokens
         if result.messages is not None:
             # Becomes the base for the next segment's dispatch (trimmed to
             # worker_history_turns at that point, not here) -- whatever
@@ -507,20 +641,19 @@ def run_tandem_loop(
         )
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry
-        _debug(f"report[{segment_index}]: {json.dumps(report)[:500]}")
-        return json.dumps(report)
+        rendered = _render_report(report)
+        _debug(f"report[{segment_index}]: {rendered[:500]}")
+        return rendered
 
     def get_tool_call_detail_handler(args_json: str) -> str:
         args = _parse_args(args_json)
         call_id = (args.get("call_id") or "").strip()
         if not call_id:
-            return json.dumps({"error": "get_tool_call_detail called with an empty call_id"})
+            return "error: get_tool_call_detail called with an empty call_id"
         entry = all_calls.get(call_id)
         if entry is None:
-            return json.dumps(
-                {"error": f"no tool call with call_id={call_id!r} in this task's history"}
-            )
-        return json.dumps(entry)
+            return f"error: no tool call with call_id={call_id!r} in this task's history"
+        return "\n".join(_render_call(entry, full=True, indent=""))
 
     supervisor_tool_schemas = [_SMART_TOOL_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
     supervisor_dispatch_table = {

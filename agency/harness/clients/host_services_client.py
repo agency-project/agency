@@ -36,12 +36,13 @@ class HostServicesClient:
     `agmanager_host` instance -- the single UDS path any harness (or a
     harness's own profiler) uses to reach the host."""
 
-    def __init__(self, uds_path: str, timeout_s: float = 300) -> None:
+    def __init__(self, uds_path: str, timeout_s: float = 0) -> None:
         self._uds_path = uds_path
-        self._timeout_s = timeout_s
+        # 0 = wait indefinitely: the host sends nothing until a response is final.
+        self._timeout_s = None if timeout_s == 0 else timeout_s
         transport = httpx.HTTPTransport(uds=uds_path)
         self.client = httpx.Client(
-            transport=transport, base_url="http://agmanager-host", timeout=timeout_s
+            transport=transport, base_url="http://agmanager-host", timeout=self._timeout_s
         )
         self._attempt_token_lock = threading.Lock()
         self._active_attempt_token: "str | None" = None
@@ -252,7 +253,7 @@ class HostServicesClient:
                 if item["type"] == "done":
                     return
 
-    async def dispatch_stream_async(self, token: str, agency_context: dict):
+    async def dispatch_stream_async(self, token: str, agency_context: dict, *, mount: str = "llm"):
         async with httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=self._uds_path),
             base_url="http://agency-host",
@@ -260,7 +261,7 @@ class HostServicesClient:
         ) as client:
             async with client.stream(
                 "POST",
-                "/llm/dispatch",
+                f"/{mount}/dispatch",
                 json={**agency_context, "stream": True},
                 headers=self._attempt_headers(token),
             ) as response:

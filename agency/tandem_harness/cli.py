@@ -66,6 +66,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "supervisor (default: %(default)s).",
     )
     p.add_argument(
+        "--worker-history-turns",
+        type=int,
+        required=True,
+        help="How many past worker segments to replay into each new segment (0 = none).",
+    )
+    p.add_argument(
         "--system",
         default=None,
         help="Supervisor system prompt override (only used for a fresh session; defaults to "
@@ -191,6 +197,7 @@ def main(argv: "list[str] | None" = None) -> int:
         worker_context_limit=worker_context_limit,
         segment_step_cap=args.segment_step_cap,
         max_segments=args.max_steps,
+        worker_history_turns=args.worker_history_turns,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own
