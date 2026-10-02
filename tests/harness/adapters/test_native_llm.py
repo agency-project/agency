@@ -502,9 +502,9 @@ def test_stream_error_after_first_frame_keeps_earlier_frames_intact():
     assert frames[-1] == "data: [DONE]\n\n"
 
 
-def test_harness_to_agency_never_turns_reasoning_content_into_thinking():
-    """reasoning_content carries no signature; an Anthropic thinking block
-    rebuilt from it would be a 400, so it is not read back at all."""
+def test_harness_to_agency_keeps_unsigned_reasoning_content_as_unsigned_thinking():
+    """Unsigned reasoning stays in history for backends that accept it; the
+    Anthropic serializer drops it (see tests/llm/test_anthropic.py)."""
     context = _backend()._format_context_harness_to_agency(
         {
             "messages": [
@@ -513,7 +513,10 @@ def test_harness_to_agency_never_turns_reasoning_content_into_thinking():
             ]
         }
     )
-    assert [b["type"] for b in context["messages"][1]["blocks"]] == ["text"]
+    assert context["messages"][1]["blocks"] == [
+        {"type": "thinking", "index": 0, "text": "thoughts"},
+        {"type": "text", "index": 1, "text": "hello"},
+    ]
 
 
 def test_harness_to_agency_reasoning_fields_become_thinking_block():

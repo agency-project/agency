@@ -344,16 +344,12 @@ class NativeAdapter(HarnessAdapter):
             blocks: "list[dict]" = []
             reasoning = m.get("reasoning_content")
             signature = m.get("reasoning_signature")
-            # Unsigned reasoning_content is not replayed: Anthropic rejects unsigned thinking.
-            if signature:
-                blocks.append(
-                    {
-                        "type": "thinking",
-                        "index": 0,
-                        "text": reasoning or "",
-                        "signature": signature,
-                    }
-                )
+            # Unsigned reasoning stays in history; llm/anthropic.py drops it for Claude.
+            if reasoning or signature:
+                thinking = {"type": "thinking", "index": 0, "text": reasoning or ""}
+                if signature:
+                    thinking["signature"] = signature
+                blocks.append(thinking)
             content = m.get("content")
             if isinstance(content, str):
                 if content:
