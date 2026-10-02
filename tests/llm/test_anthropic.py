@@ -13,6 +13,7 @@ import httpx
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.anthropic import (
     _AnthropicBackend,
+    _AnthropicModelInfo,
     _agency_messages_to_anthropic,
     _agency_tool_choice_to_anthropic,
     _agency_tools_to_anthropic,
@@ -179,6 +180,87 @@ class TestAnthropicBackend:
 
 
 # ---------------------------------------------------------------------------
+# fetch_context_limit -- aliases resolve through GET /v1/models/{id}
+# ---------------------------------------------------------------------------
+
+
+def _model_info(model_id, max_input_tokens):
+    return SimpleNamespace(id=model_id, max_input_tokens=max_input_tokens, model_extra={})
+
+
+_LIVE_LISTING = [
+    _model_info("claude-sonnet-5-5", 1_000_000),
+    _model_info("claude-opus-5-5", 1_000_000),
+    _model_info("claude-opus-4-5-20251101", 200_000),
+    _model_info("claude-haiku-4-5-20251001", 200_000),
+]
+_ALIASES = {
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+    "claude-opus-4-5": "claude-opus-4-5-20251101",
+}
+
+
+def _fake_anthropic_client():
+    import anthropic
+
+    def retrieve(model_id):
+        target = _ALIASES.get(model_id, model_id)
+        for info in _LIVE_LISTING:
+            if info.id == target:
+                return info
+        raise anthropic.NotFoundError(
+            "not found",
+            response=httpx.Response(404, request=httpx.Request("GET", "http://x")),
+            body=None,
+        )
+
+    client = MagicMock()
+    client.models.list.return_value = list(_LIVE_LISTING)
+    client.models.retrieve.side_effect = retrieve
+    return client
+
+
+class TestAnthropicFetchContextLimit:
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("claude-opus-5-5", 1_000_000),  # exact listing match
+            ("claude-haiku-4-5-20251001", 200_000),  # exact listing match
+            ("claude-haiku-4-5", 200_000),  # alias: was 1M (first listed model)
+            ("claude-opus-4-5", 200_000),  # alias: was 1M
+        ],
+    )
+    def test_listing_and_alias_resolution(self, model, expected):
+        backend = _AnthropicBackend(_cfg(model=model, api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == expected
+
+    def test_exact_match_does_not_call_retrieve(self):
+        backend = _AnthropicBackend(_cfg(model="claude-opus-5-5", api_key="k"))
+        client = _fake_anthropic_client()
+        with patch.object(backend, "make_client", return_value=client):
+            backend.fetch_context_limit()
+        client.models.retrieve.assert_not_called()
+
+    def test_typo_model_gets_default_not_first_listed_window(self):
+        backend = _AnthropicBackend(_cfg(model="claude-typo-model", api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == 200_000  # default_context_limit
+
+    def test_unlisted_model_with_static_entry_uses_table(self):
+        backend = _AnthropicBackend(_cfg(model="claude-mythos-5", api_key="k"))
+        with patch.object(backend, "make_client", return_value=_fake_anthropic_client()):
+            assert backend.fetch_context_limit() == 1_000_000
+
+    def test_bedrock_has_no_retrieve_and_uses_table(self):
+        from agency.llm.bedrock import _AnthropicBedrockBackend
+
+        backend = _AnthropicBedrockBackend(_cfg(model="us.anthropic.claude-haiku-4-5", api_key="k"))
+        assert backend.retrieve_model("us.anthropic.claude-haiku-4-5") is None
+        assert backend.fetch_context_limit() == 200_000
+
+
+# ---------------------------------------------------------------------------
 # _known_anthropic_context_window
 # ---------------------------------------------------------------------------
 
@@ -193,13 +275,53 @@ class TestKnownAnthropicContextWindow:
             ("global.anthropic.claude-fable-5", 1_000_000),
             ("apac.anthropic.claude-haiku-4-5", 200_000),
             ("anthropic.claude-haiku-4-5-20251001-v1:0", 200_000),
-            ("anthropic.claude-opus-4-5-20251101-v1:0", 1_000_000),
+            # First-party Models API reports max_input_tokens=200000 for Opus 4.5.
+            ("anthropic.claude-opus-4-5-20251101-v1:0", 200_000),
+            ("claude-opus-4-5-20251101", 200_000),
             ("claude-sonnet-5", 1_000_000),  # bare first-party ID, no Bedrock prefix
             ("claude-haiku-4-5", 200_000),
+            ("claude-fable-5-1", 1_000_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-5-5", 1_000_000),
+            ("claude-opus-5", 1_000_000),
+            ("us.anthropic.claude-opus-5-5", 1_000_000),
+            ("global.anthropic.claude-fable-5-1-v1:0", 1_000_000),
+            ("anthropic.claude-sonnet-5-5-v1", 1_000_000),
         ],
     )
     def test_known_models_resolve(self, model, expected):
         assert _known_anthropic_context_window(model) == expected
+
+    @pytest.mark.parametrize(
+        "new_model,older_model",
+        [
+            ("claude-fable-5-1", "claude-fable-5"),
+            ("claude-opus-5-5", "claude-opus-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+        ],
+    )
+    def test_new_point_release_uses_its_own_entry_not_older_model(
+        self, monkeypatch, new_model, older_model
+    ):
+        """'claude-fable-5-1' is its own model, not a dated snapshot of
+        'claude-fable-5' -- it must resolve through its own entry even when
+        the older model's entry is listed (or iterated) first."""
+        windows = {older_model: _AnthropicModelInfo(123), new_model: _AnthropicModelInfo(456)}
+        monkeypatch.setattr("agency.llm.anthropic._ANTHROPIC_MODELS", windows)
+        assert _known_anthropic_context_window(new_model) == 456
+        assert _known_anthropic_context_window(f"us.anthropic.{new_model}-v1:0") == 456
+        assert _known_anthropic_context_window(older_model) == 123
+        assert _known_anthropic_context_window(f"{older_model}-20260101") == 123
+
+    def test_unlisted_point_release_does_not_inherit_older_model_window(self, monkeypatch):
+        """A model newer than the table must fall through to None (so the
+        caller uses the live listing or default_context_limit) instead of
+        silently inheriting an older model's window via prefix matching."""
+        monkeypatch.setattr(
+            "agency.llm.anthropic._ANTHROPIC_MODELS", {"claude-fable-5": _AnthropicModelInfo(123)}
+        )
+        assert _known_anthropic_context_window("claude-fable-5-1") is None
+        assert _known_anthropic_context_window("anthropic.claude-fable-5-2-v1:0") is None
 
     @pytest.mark.parametrize(
         "model",
@@ -724,6 +846,62 @@ class TestFormatContextAgencyToBackend:
             ],
         }
 
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])
+    def test_default_config_request_is_valid_for_current_claude_models(self, model):
+        """These models 400 on explicit `thinking` configs other than
+        adaptive, on non-default temperature/top_p/top_k, and on forced
+        tool_choice. Omitting all of them (thinking then runs adaptive, effort
+        at the model's default) is the valid default request -- the model ID
+        itself must pass through untouched."""
+        backend = _AnthropicBackend(_cfg(model=model))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_choice": "auto",
+            }
+        )
+        assert kwargs["model"] == model
+        assert kwargs["tool_choice"] == {"type": "auto"}
+        for rejected in ("thinking", "temperature", "top_p", "top_k", "output_config"):
+            assert rejected not in kwargs
+
+    def test_thinking_block_replayed_with_signature_for_tool_loop(self):
+        """Current Claude models return (possibly empty-text) thinking blocks
+        whose signature must be echoed back unchanged on the next turn."""
+        backend = _AnthropicBackend(_cfg(model="claude-opus-5-5"))
+        kwargs = backend._format_context_agency_to_backend(
+            {
+                "messages": [
+                    _text_msg("user", "call f"),
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "thinking", "index": 0, "text": "", "signature": "sig"},
+                            {
+                                "type": "tool_use",
+                                "index": 1,
+                                "id": "t1",
+                                "name": "f",
+                                "arguments": "{}",
+                            },
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "blocks": [
+                            {"type": "tool_result", "index": 0, "tool_call_id": "t1", "text": "ok"}
+                        ],
+                    },
+                ]
+            }
+        )
+        assert kwargs["messages"][1]["content"][0] == {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "sig",
+        }
+
     def test_no_messages_omits_last_message_cache_control(self):
         backend = _AnthropicBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
@@ -1237,3 +1415,503 @@ class TestFormatStreamToAgency:
         stream = [_ev(type="message_start", message=_ev(usage=None))]
         items = list(_AnthropicBackend(_cfg())._format_stream_to_agency(iter(stream)))
         assert items[-1]["usage"]["prompt_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Model-scoped request policy: forced tool_choice and sampling parameters.
+# Model sets mirror the live 2026-09-29 compatibility matrix.
+# ---------------------------------------------------------------------------
+
+# Reject tool_choice {"type": "any"} / {"type": "tool"} with a 400.
+_NO_FORCED_CHOICE = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-mythos-5-1",
+    "us.anthropic.claude-opus-5-5",  # Bedrock inference-profile ID
+    "global.anthropic.claude-sonnet-5-5-v1:0",
+]
+# Accept forced tool_choice, including with adaptive thinking on.
+_FORCED_CHOICE_OK = [
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-5-20251101",
+    "claude-haiku-4-5",
+]
+# Not in the table, or in it with unverified restrictions: pass through.
+_UNVERIFIED = ["m", "claude-future-9", "claude-opus-4-1", "claude-sonnet-4-0"]
+# 400 on temperature != 1.0 and on any top_p / top_k.
+_NO_SAMPLING = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+]
+# Each sampling field accepted alone; temperature + top_p together is a 400.
+_EXCLUSIVE_SAMPLING = [
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5-20251001",
+]
+
+_TOOLS = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+_NAMED = {"type": "function", "function": {"name": "f"}}
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+
+@pytest.fixture
+def fresh_warnings(monkeypatch):
+    monkeypatch.setattr("agency.llm.anthropic._WARNED_ONCE", set())
+
+
+def _kwargs(model, tool_choice=None, **llm_fields):
+    backend = _AnthropicBackend(_cfg(model=model, **llm_fields))
+    request = {"messages": [_text_msg("user", "call f")], "tools": _TOOLS}
+    if tool_choice is not None:
+        request["tool_choice"] = tool_choice
+    return backend._format_context_agency_to_backend(request)
+
+
+class TestForcedToolChoicePolicy:
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE)
+    @pytest.mark.parametrize(
+        "tool_choice,requested", [("required", "required"), (_NAMED, "named tool 'f'")]
+    )
+    def test_restricted_models_degrade_to_auto_with_warning(
+        self, model, tool_choice, requested, capsys
+    ):
+        kwargs = _kwargs(model, tool_choice)
+        assert kwargs["tool_choice"] == {"type": "auto"}
+        warning = capsys.readouterr().out
+        assert f"{model} does not support provider-level tool enforcement" in warning
+        assert f"({requested}) was converted to `auto`" in warning
+        assert "no longer guaranteed by the provider" in warning
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    def test_degradation_warns_on_every_request(self, model, capsys):
+        _kwargs(model, "required")
+        _kwargs(model, "required")
+        assert capsys.readouterr().out.count("provider-level tool enforcement") == 2
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    def test_degradation_injects_no_messages(self, model):
+        assert (
+            _kwargs(model, "required")["messages"]
+            == _kwargs(model, "auto")["messages"]
+            == _kwargs(model)["messages"]
+        )
+
+    @pytest.mark.parametrize("model", _NO_FORCED_CHOICE[:3])
+    @pytest.mark.parametrize("tool_choice,expected", [("auto", "auto"), ("none", "none")])
+    def test_restricted_models_keep_auto_and_none(self, model, tool_choice, expected, capsys):
+        assert _kwargs(model, tool_choice)["tool_choice"] == {"type": expected}
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize("model", _FORCED_CHOICE_OK + _UNVERIFIED)
+    def test_other_models_keep_forced_choice(self, model, capsys):
+        assert _kwargs(model, "required")["tool_choice"] == {"type": "any"}
+        assert _kwargs(model, _NAMED)["tool_choice"] == {"type": "tool", "name": "f"}
+        assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestSamplingPolicy:
+    @pytest.mark.parametrize("model", _NO_SAMPLING)
+    @pytest.mark.parametrize(
+        "fields,expected",
+        [
+            ({"temperature": 0.2}, {}),
+            ({"temperature": 0.0}, {}),
+            ({"temperature": 1.0}, {"temperature": 1.0}),
+            ({"temperature": 1}, {"temperature": 1}),
+            ({"top_p": 0.9}, {}),
+            ({"top_p": 1.0}, {}),  # rejected even at its default
+            ({"extra_body": {"top_k": 40}}, {}),
+            ({"temperature": 0.2, "top_p": 0.9}, {}),
+            ({"temperature": 1.0, "top_p": 0.9}, {"temperature": 1.0}),
+        ],
+    )
+    def test_no_sampling_models(self, model, fields, expected):
+        kwargs = _kwargs(model, **fields)
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS if k in kwargs} == expected
+
+    @pytest.mark.parametrize("model", _EXCLUSIVE_SAMPLING)
+    @pytest.mark.parametrize(
+        "fields,expected",
+        [
+            ({"temperature": 0.2}, {"temperature": 0.2}),
+            ({"temperature": 1.0}, {"temperature": 1.0}),
+            ({"top_p": 0.9}, {"top_p": 0.9}),
+            ({"extra_body": {"top_k": 40}}, {"top_k": 40}),
+            ({"temperature": 0.2, "top_p": 0.9}, {"temperature": 0.2}),
+            (
+                {"temperature": 0.2, "top_p": 0.9, "extra_body": {"top_k": 40}},
+                {"temperature": 0.2, "top_k": 40},
+            ),
+        ],
+    )
+    def test_exclusive_sampling_models(self, model, fields, expected):
+        kwargs = _kwargs(model, **fields)
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS if k in kwargs} == expected
+
+    @pytest.mark.parametrize("model", _UNVERIFIED)
+    def test_unverified_models_pass_everything_through(self, model, capsys):
+        kwargs = _kwargs(model, temperature=0.2, top_p=0.9, extra_body={"top_k": 40})
+        assert {k: kwargs[k] for k in _SAMPLING_KEYS} == {
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+        }
+        assert capsys.readouterr().out == ""
+
+    def test_dropped_sampling_warns_once_per_model_and_cause(self, capsys):
+        for _ in range(3):
+            _kwargs("claude-opus-5-5", temperature=0.2, top_p=0.9)
+        out = capsys.readouterr().out
+        assert out.count("WARNING") == 1
+        assert "claude-opus-5-5 rejects sampling parameters" in out
+        assert "not sending temperature, top_p" in out
+
+    def test_exclusive_conflict_warns(self, capsys):
+        _kwargs("claude-haiku-4-5", temperature=0.2, top_p=0.9)
+        assert "sending temperature and not top_p" in capsys.readouterr().out
+
+    def test_no_warning_when_nothing_dropped(self, capsys):
+        _kwargs("claude-opus-5-5", temperature=1.0)
+        _kwargs("claude-haiku-4-5", top_p=0.9)
+        assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# developer role (Codex / Responses-style operator instructions)
+# ---------------------------------------------------------------------------
+
+
+def _assistant_tool_calls(*ids):
+    return {
+        "role": "assistant",
+        "blocks": [
+            {"type": "tool_use", "index": i, "id": tid, "name": "f", "arguments": "{}"}
+            for i, tid in enumerate(ids)
+        ],
+    }
+
+
+def _tool_result(tid, text="ok"):
+    return {
+        "role": "tool",
+        "blocks": [{"type": "tool_result", "index": 0, "tool_call_id": tid, "text": text}],
+    }
+
+
+class TestDeveloperRole:
+    def test_initial_developer_message_joins_top_level_system(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [_text_msg("developer", "Sandbox is read-only."), _text_msg("user", "hi")]
+        )
+        assert system == "Sandbox is read-only."
+        assert msgs == [{"role": "user", "content": "hi"}]
+
+    def test_system_then_developer_both_kept_in_order(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [_text_msg("system", "Base."), _text_msg("developer", "Dev."), _text_msg("user", "hi")]
+        )
+        assert system == "Base.\n\nDev."
+        assert msgs == [{"role": "user", "content": "hi"}]
+
+    def test_mid_conversation_developer_becomes_user_message_in_place(self):
+        system, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "hi"),
+                _text_msg("assistant", "hello"),
+                _text_msg("developer", "Now answer in French."),
+                _text_msg("user", "again"),
+            ]
+        )
+        assert system is None
+        assert msgs[2] == {"role": "user", "content": "Now answer in French."}
+        assert msgs[3] == {"role": "user", "content": "again"}
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_system_class_text_never_splits_tool_use_from_its_result(self, role):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "go"),
+                _assistant_tool_calls("t1"),
+                _text_msg(role, "Reminder."),
+                _tool_result("t1"),
+                _text_msg("assistant", "done"),
+            ]
+        )
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant"]
+        assert msgs[2]["content"] == [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text", "text": "Reminder."},
+        ]
+
+    def test_parallel_results_stay_together_around_system_class_text(self):
+        _, msgs = _agency_messages_to_anthropic(
+            [
+                _text_msg("user", "go"),
+                _assistant_tool_calls("t1", "t2"),
+                _tool_result("t1", "a"),
+                _text_msg("developer", "Reminder."),
+                _tool_result("t2", "b"),
+            ]
+        )
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+        assert [b.get("tool_use_id") or b["text"] for b in msgs[2]["content"]] == [
+            "t1",
+            "t2",
+            "Reminder.",
+        ]
+
+    def test_codex_developer_instructions_reach_anthropic(self):
+        from agency.harness.adapters.codex import CodexAdapter
+
+        context = CodexAdapter(agconfig())._format_context_harness_to_agency(
+            {
+                "instructions": "BASE",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "DEVELOPER RULES"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                ],
+            }
+        )
+        kwargs = _AnthropicBackend(_cfg(model="claude-opus-5-5"))._format_context_agency_to_backend(
+            context
+        )
+        assert kwargs["system"][0]["text"] == "BASE\n\nDEVELOPER RULES"
+        assert [m["role"] for m in kwargs["messages"]] == ["user"]
+
+
+# ---------------------------------------------------------------------------
+# Thinking replay: only Claude-signed blocks are sent back
+# ---------------------------------------------------------------------------
+
+
+def _thinking(text, index, **fields):
+    return {"type": "thinking", "index": index, "text": text, **fields}
+
+
+def _replayed_assistant(blocks):
+    _, msgs = _agency_messages_to_anthropic(
+        [_text_msg("user", "go"), {"role": "assistant", "blocks": blocks}]
+    )
+    return msgs[1:]
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestThinkingReplay:
+    def test_signed_blocks_replay_byte_identical_in_order_around_tool_calls(self):
+        blocks = [
+            _thinking("", 0, signature="sig-1"),
+            {"type": "text", "index": 1, "text": "Checking."},
+            _thinking("progress", 2, signature="sig-2"),
+            {"type": "tool_use", "index": 3, "id": "t1", "name": "f", "arguments": '{"a": 1}'},
+        ]
+        assert _replayed_assistant(blocks) == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig-1"},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "thinking", "thinking": "progress", "signature": "sig-2"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"a": 1}},
+                ],
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            _thinking("reasoned", 0, signature=""),  # empty signature
+            _thinking("reasoned", 0),  # missing signature
+            _thinking("", 0, signature="openai_responses:gAAAAB"),  # OpenAI Responses
+        ],
+        ids=["empty_signature", "missing_signature", "openai_responses"],
+    )
+    def test_unsigned_and_foreign_blocks_are_not_sent(self, block, capsys):
+        tool_use = {"type": "tool_use", "index": 1, "id": "t1", "name": "f", "arguments": "{}"}
+        assert _replayed_assistant([block, {**tool_use}]) == [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+            }
+        ]
+        assert "without a Claude signature" in capsys.readouterr().out
+
+    def test_foreign_provider_reasoning_content_is_never_replayed_as_thinking(self):
+        """vLLM / Chat Completions `reasoning_content` becomes an unsigned
+        agency thinking block; after a provider switch it must not reach
+        Anthropic as a thinking block."""
+        from agency.llm.openai import _OpenAICompatibleBackend
+
+        raw = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="answer",
+                        reasoning_content="private chain of thought",
+                        tool_calls=None,
+                        function_call=None,
+                        model_extra={},
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+        agency = _OpenAICompatibleBackend(
+            _cfg(provider="vllm", base_url="http://x/v1", model="m")
+        )._format_context_backend_to_agency(raw)
+        thinking = [b for b in agency["message"]["blocks"] if b["type"] == "thinking"]
+        assert thinking and not thinking[0].get("signature")
+        replayed = _replayed_assistant(
+            [b for b in agency["message"]["blocks"] if b["type"] != "metadata"]
+        )
+        assert replayed == [{"role": "assistant", "content": [{"type": "text", "text": "answer"}]}]
+
+    def test_turn_of_only_foreign_reasoning_is_omitted_not_sent_empty(self):
+        assert _replayed_assistant([_thinking("reasoned", 0, signature="")]) == []
+
+    def test_redacted_thinking_still_round_trips(self):
+        blocks = [
+            {"type": "anthropic_redacted_thinking", "index": 0, "data": {"data": "opaque"}},
+            {"type": "text", "index": 1, "text": "ok"},
+        ]
+        assert _replayed_assistant(blocks)[0]["content"] == [
+            {"data": "opaque", "type": "redacted_thinking"},
+            {"type": "text", "text": "ok"},
+        ]
+
+
+class TestStopSequences:
+    @pytest.mark.parametrize(
+        "stop,expected", [("END", ["END"]), (["a", "b"], ["a", "b"]), (("x",), ["x"])]
+    )
+    def test_stop_becomes_stop_sequences(self, stop, expected):
+        assert _kwargs("claude-opus-5-5", stop=stop)["stop_sequences"] == expected
+
+    @pytest.mark.parametrize("stop", [None, [], ""])
+    def test_no_stop_omits_stop_sequences(self, stop):
+        assert "stop_sequences" not in _kwargs("claude-opus-5-5", stop=stop)
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestReasoningEffort:
+    @pytest.mark.parametrize(
+        "model,effort",
+        [
+            ("claude-opus-5-5", "low"),
+            ("claude-opus-5-5", "xhigh"),
+            ("claude-fable-5-1", "max"),
+            ("claude-sonnet-5-5", "medium"),
+            ("claude-opus-4-8", "xhigh"),
+            ("claude-opus-4-6", "max"),
+            ("claude-opus-4-5", "high"),
+            ("us.anthropic.claude-opus-5-5", "high"),
+        ],
+    )
+    def test_supported_level_maps_to_output_config(self, model, effort, capsys):
+        assert _kwargs(model, reasoning_effort=effort)["output_config"] == {"effort": effort}
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        "model,effort,reason",
+        [
+            ("claude-haiku-4-5", "low", "does not support the effort parameter"),
+            ("claude-sonnet-4-5", "high", "does not support the effort parameter"),
+            ("claude-opus-4-6", "xhigh", "accepts only"),
+            ("claude-opus-4-5", "max", "accepts only"),
+            ("claude-opus-5-5", "none", "accepts only"),  # OpenAI-only value
+            ("claude-opus-5-5", "minimal", "accepts only"),
+            ("claude-opus-4-1", "high", "unverified"),
+            ("claude-future-9", "high", "unverified"),
+        ],
+    )
+    def test_unsupported_or_unverified_effort_is_omitted_with_warning(
+        self, model, effort, reason, capsys
+    ):
+        assert "output_config" not in _kwargs(model, reasoning_effort=effort)
+        out = capsys.readouterr().out
+        assert f"not sending reasoning_effort={effort!r} to {model}" in out
+        assert reason in out
+
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-haiku-4-5", "m"])
+    def test_unset_effort_keeps_model_default(self, model, capsys):
+        assert "output_config" not in _kwargs(model)
+        assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("fresh_warnings")
+class TestFirstClassTopK:
+    @pytest.mark.parametrize("model", _EXCLUSIVE_SAMPLING + _UNVERIFIED)
+    def test_llmconfig_top_k_is_sent(self, model):
+        assert _kwargs(model, top_k=40)["top_k"] == 40
+
+    def test_llmconfig_top_k_wins_over_extra_body(self):
+        assert _kwargs("claude-haiku-4-5", top_k=40, extra_body={"top_k": 5})["top_k"] == 40
+
+    @pytest.mark.parametrize("model", _NO_SAMPLING)
+    def test_llmconfig_top_k_dropped_where_sampling_is_rejected(self, model):
+        assert "top_k" not in _kwargs(model, top_k=40)
+
+
+class TestToolStrict:
+    _SCHEMA = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    }
+
+    def test_chat_completions_strict_is_preserved(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "w",
+                    "description": "d",
+                    "parameters": self._SCHEMA,
+                    "strict": True,
+                },
+            }
+        ]
+        assert _agency_tools_to_anthropic(tools) == [
+            {"name": "w", "description": "d", "input_schema": self._SCHEMA, "strict": True}
+        ]
+
+    def test_flat_tool_strict_is_preserved(self):
+        converted = _agency_tools_to_anthropic(
+            [{"name": "w", "parameters": self._SCHEMA, "strict": True}]
+        )
+        assert converted[0]["strict"] is True
+
+    @pytest.mark.parametrize("strict", [False, None, "true"])
+    def test_non_true_strict_is_omitted(self, strict):
+        fn = {"name": "w", "parameters": self._SCHEMA}
+        if strict is not None:
+            fn["strict"] = strict
+        assert "strict" not in _agency_tools_to_anthropic([{"type": "function", "function": fn}])[0]

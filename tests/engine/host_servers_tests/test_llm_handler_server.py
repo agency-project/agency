@@ -458,6 +458,45 @@ def test_payload_hash_distinguishes_different_tool_results():
     assert mod._payload_hash(a) != mod._payload_hash(b)
 
 
+def test_payload_hash_keeps_empty_text_thinking_blocks_with_different_signatures_distinct():
+    """Claude's default thinking display returns empty text; distinct blocks
+    differ only by signature and must not collapse into one stored payload."""
+    a = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-a"}
+    b = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-b"}
+    assert mod._payload_hash(a) != mod._payload_hash(b)
+
+
+def test_payload_hash_treats_native_and_replayed_thinking_as_the_same_block():
+    rich = {
+        "role": "assistant",
+        "type": "thinking",
+        "index": 2,
+        "text": "",
+        "signature": "sig-a",
+        "id": "",
+        "name": "",
+        "arguments": "",
+        "data": None,
+        "citations": None,
+        "ts_start": 1.0,
+        "ts_end": 2.0,
+    }
+    replayed = {
+        "role": "assistant",
+        "type": "thinking",
+        "index": 0,
+        "text": "",
+        "signature": "sig-a",
+    }
+    assert mod._payload_hash(rich) == mod._payload_hash(replayed)
+
+
+def test_payload_hash_unsigned_thinking_missing_and_empty_signature_match():
+    a = {"role": "assistant", "type": "thinking", "text": "t"}
+    b = {"role": "assistant", "type": "thinking", "text": "t", "signature": ""}
+    assert mod._payload_hash(a) == mod._payload_hash(b)
+
+
 def test_payload_hash_treats_native_and_resent_text_as_the_same_message():
     """A text block gets logged once in its rich response shape (ts_start/
     ts_end/index/etc.) and again in the reduced shape it takes when the
@@ -1200,13 +1239,13 @@ def test_controlled_paths_preserve_logger_call_labels_and_finalization():
 
 # ---------------------------------------------------------------------------
 # _display_tag / _tag_response_message_for_display / agency_internal_kind
-# threading -- the [Worker]/[Supervisor] webui tags (see tandem_harness).
+# threading -- the [Worker]/[Supervisor]-style webui tags.
 # ---------------------------------------------------------------------------
 
 
 def test_display_tag_strips_namespace_prefix_and_capitalizes():
-    assert mod._display_tag("tandem_worker") == "Worker"
-    assert mod._display_tag("tandem_supervisor") == "Supervisor"
+    assert mod._display_tag("example_worker") == "Worker"
+    assert mod._display_tag("example_supervisor") == "Supervisor"
     assert mod._display_tag("compaction") == "Compaction"
     assert mod._display_tag(None) is None
     assert mod._display_tag("") is None
@@ -1238,7 +1277,7 @@ def test_dispatch_tags_recorded_text_response_from_internal_kind():
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend)
 
-    server.dispatch({"messages": [], "agency_internal_kind": "tandem_worker"})
+    server.dispatch({"messages": [], "agency_internal_kind": "example_worker"})
 
     # The tag never reaches the actual backend -- litellm rejects it as an
     # unknown field (confirmed directly against a real provider).
@@ -1253,7 +1292,7 @@ def test_dispatch_tags_recorded_tool_use_name_from_internal_kind():
     backend = _RecordingBackend(final=False)
     server = _controlled_server(backend)
 
-    server.dispatch({"messages": [], "agency_internal_kind": "tandem_supervisor"})
+    server.dispatch({"messages": [], "agency_internal_kind": "example_supervisor"})
 
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
@@ -1275,7 +1314,7 @@ def test_start_stream_tags_recorded_response_from_internal_kind():
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend)
 
-    handle = server.start_stream({"messages": [], "agency_internal_kind": "tandem_worker"})
+    handle = server.start_stream({"messages": [], "agency_internal_kind": "example_worker"})
     assert _drain(handle)[-1]["type"] == "done"
     handle._thread.join(timeout=2.0)
 

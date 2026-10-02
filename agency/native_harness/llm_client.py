@@ -19,9 +19,10 @@ agency to one of those backends) doesn't reliably support tool calls at
 all. Streaming is the path every backend actually supports fully, so this
 loop takes it unconditionally rather than needing two code paths.
 
-Retry policy: this loop owns its own bounded retry (503 / connection
-failure only, never after a chunk has already been reassembled -- retrying
-past that point would silently corrupt the conversation), needed because
+Retry policy: this loop owns its own bounded retry (503, a transient
+in-stream error before any content, or connection failure only, never
+after a chunk has already been reassembled -- retrying past that point
+would silently corrupt the conversation), needed because
 there is no harness CLI underneath THIS loop the way there is for Claude
 Code/Codex (who have their own resilience); when bridged, `agmanager_host`'s
 own dispatch route deliberately makes exactly one attempt and classifies
@@ -78,6 +79,7 @@ class LLMClient:
             signature_parts: "list[str]" = []
             tool_calls_raw: "dict[int, dict]" = {}
             usage: "dict | None" = None
+            stream_error: "dict | None" = None
             try:
                 with self._client.stream("POST", "/v1/chat/completions", json=kwargs) as resp:
                     if resp.status_code == 503:
@@ -99,6 +101,9 @@ class LLMClient:
                         if payload == "[DONE]":
                             break
                         chunk = json.loads(payload)
+                        if chunk.get("error"):
+                            stream_error = chunk["error"]
+                            break
                         if chunk.get("usage"):
                             usage = chunk["usage"]
                         choices = chunk.get("choices") or []
@@ -128,6 +133,19 @@ class LLMClient:
                                 slot["function"]["name"] += fn_delta["name"]
                             if fn_delta.get("arguments"):
                                 slot["function"]["arguments"] += fn_delta["arguments"]
+
+                if stream_error is not None:
+                    last_error = f"dispatch failed: {stream_error.get('message', stream_error)}"
+                    assembled = content_parts or reasoning_parts or tool_calls_raw
+                    if (
+                        stream_error.get("transient")
+                        and not assembled
+                        and attempt < _DISPATCH_MAX_RETRIES - 1
+                    ):
+                        with profile_span(self, f"llm:retry_backoff[{attempt}]"):
+                            time.sleep(_retry_backoff_s(attempt))
+                        continue
+                    return {"error": last_error}
 
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
                 if reasoning_parts:

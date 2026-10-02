@@ -242,7 +242,7 @@ def ensure_harness_daemon(
     harness: str,
     *,
     agconfig: "agconfig_cls | None" = None,
-    timeout_s: float = 120.0,
+    timeout_s: float = 300.0,
     progress_source: "HostInteractionServer | None" = None,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox.

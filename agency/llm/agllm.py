@@ -125,6 +125,10 @@ class agllm:
             return _AnthropicAWSBackend(agconfig)
         if provider == "anthropic":
             return _AnthropicBackend(agconfig)
+        if provider == "openai_responses":
+            from .openai_responses import _OpenAIResponsesBackend
+
+            return _OpenAIResponsesBackend(agconfig)
         # _OpenAICompatibleBackend.__init__ -> change_config() validates the
         # required base_url -- no need to duplicate that check here just to
         # fail one call frame earlier.
@@ -150,33 +154,64 @@ class agllm:
         None if unknown -- caller falls back to agconfig.default_context_limit."""
         return None
 
+    def retrieve_model(self, model: str):
+        """Single-model lookup for an ID the listing didn't contain verbatim
+        (e.g. an alias the provider resolves server-side). None when this
+        backend has no such lookup or the model is unknown to the provider."""
+        return None
+
+    @staticmethod
+    def _context_limit_of(info) -> "int | None":
+        extra = getattr(info, "model_extra", None) or {}
+        if "max_model_len" in extra:
+            return int(extra["max_model_len"])
+        max_input_tokens = getattr(info, "max_input_tokens", None)
+        if max_input_tokens is not None:
+            return int(max_input_tokens)
+        return None
+
     def fetch_context_limit(self) -> int:
         """Return this instance's model's context window size. Always live
         (never cached) -- call it fresh whenever the current value matters.
 
         Priority:
         1. ``self.agconfig.llm.context_limit`` — explicit user override
-        2. Live API model listing — vLLM's ``max_model_len`` (a model_extra
-           field) or the Anthropic API's ``max_input_tokens`` (a typed field)
-        3. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
+        2. Live API model listing, exact ID match — vLLM's ``max_model_len``
+           (a model_extra field) or the Anthropic API's ``max_input_tokens``
+        3. ``self.retrieve_model()`` — resolves aliases the listing only
+           carries under another ID (Anthropic: "claude-haiku-4-5" is listed
+           as "claude-haiku-4-5-20251001")
+        4. A listing with exactly one model — a vLLM-style endpoint serving
+           one model under a served-model-name that may differ from ours. A
+           multi-model listing never lends another model's window.
+        5. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
            which has no model-listing API at all)
-        4. ``self.agconfig.llm.default_context_limit`` — safe fallback so compaction always runs
+        6. ``self.agconfig.llm.default_context_limit`` — safe fallback so compaction always runs
         """
         if self.agconfig.llm.context_limit is not None:
             return int(self.agconfig.llm.context_limit)
         model_id = self.agconfig.llm.model or ""
+        all_models: list = []
         try:
             all_models = self.list_models()
-            candidates = [m for m in all_models if m.id == model_id] or all_models
-            for info in candidates:
-                extra = getattr(info, "model_extra", None) or {}
-                if "max_model_len" in extra:
-                    return int(extra["max_model_len"])
-                max_input_tokens = getattr(info, "max_input_tokens", None)
-                if max_input_tokens is not None:
-                    return int(max_input_tokens)
+            for info in all_models:
+                if info.id == model_id:
+                    limit = self._context_limit_of(info)
+                    if limit is not None:
+                        return limit
         except Exception as _e:
             print(f"[agllm] WARNING: failed to retrieve max_model_len from API: {_e}")
+        try:
+            info = self.retrieve_model(model_id)
+            limit = self._context_limit_of(info) if info is not None else None
+            if limit is not None:
+                return limit
+        except Exception as _e:
+            print(f"[agllm] WARNING: failed to retrieve model {model_id!r} from API: {_e}")
+        if len(all_models) == 1:
+            limit = self._context_limit_of(all_models[0])
+            if limit is not None:
+                return limit
         known = self.known_context_limit(model_id)
         if known is not None:
             return known

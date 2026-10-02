@@ -16,10 +16,10 @@ import uuid
 from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter
-from .openai_chat_completions import CHAT_KEEPALIVE_FRAME
-from .pty.execution import stream_response
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, chat_error_frame
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
+from .streaming import start_streaming_response, stream_response
 
 # An idle deadline, not a flat one: reset whenever the react loop's progress
 # checkpoint advances (see react_loop.py's _write_progress), the same
@@ -295,7 +295,7 @@ class NativeAdapter(HarnessAdapter):
         )
 
     def register(self, app, router) -> None:
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
@@ -308,18 +308,17 @@ class NativeAdapter(HarnessAdapter):
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router,
-                        token,
-                        agency_context,
-                        model,
-                        self._format_agency_stream_to_harness,
-                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
-                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
+                return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
@@ -346,6 +345,7 @@ class NativeAdapter(HarnessAdapter):
             blocks: "list[dict]" = []
             reasoning = m.get("reasoning_content")
             signature = m.get("reasoning_signature")
+            # Unsigned reasoning stays in history; llm/anthropic.py drops it for Claude.
             if reasoning or signature:
                 thinking = {"type": "thinking", "index": 0, "text": reasoning or ""}
                 if signature:

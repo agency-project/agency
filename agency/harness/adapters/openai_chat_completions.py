@@ -15,9 +15,15 @@ import uuid
 from fastapi import Request
 
 from ..common import extract_bearer_token
-from .pty.execution import stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 
 CHAT_KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+def chat_error_frame(exc: BaseException) -> str:
+    message, _status, transient = upstream_error(exc)
+    error = {"message": message, "type": "upstream_error", "transient": transient}
+    return f"data: {json.dumps({'error': error})}\n\n"
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -76,7 +82,7 @@ class ChatCompletionsProtocol:
     """Mixin supplying the Chat Completions route and its block mapping."""
 
     def register(self, app, router) -> None:
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import JSONResponse
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
@@ -89,18 +95,17 @@ class ChatCompletionsProtocol:
             model = router.resolve_model(token)
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router,
-                        token,
-                        agency_context,
-                        model,
-                        self._format_agency_stream_to_harness,
-                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
-                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
+                return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import threading
 import time
@@ -97,11 +98,11 @@ def test_pythonpath_is_exported_not_just_assigned(monkeypatch, tmp_path):
     )
 
 
-def test_ensure_harness_daemon_default_timeout_is_120s():
+def test_ensure_harness_daemon_default_timeout_is_300s():
     import inspect
 
     assert (
-        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 120.0
+        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 300.0
     )
 
 
@@ -334,7 +335,16 @@ def test_all_external_harnesses_receive_a_resolved_absolute_binary_path(
     # The install directory is bind-mounted at its original host path, which
     # the daemon's own (deliberately narrow) PATH can't rediscover on its
     # own -- a bare default binary name (no explicit binary_path configured)
-    # must come out resolved to an absolute path.
+    # must come out resolved to an absolute path. A stand-in executable on
+    # PATH keeps this independent of which harness CLIs the host has.
+    from agency.harness.executable import external_binary
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / external_binary(harness, agconfig(agentconfig(harness=harness)))
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     sandbox = _fake_sandbox(tmp_path, agentconfig(harness=harness))
     monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: True)
     launcher.ensure_harness_daemon(
@@ -343,8 +353,7 @@ def test_all_external_harnesses_receive_a_resolved_absolute_binary_path(
     command = shlex.split(sandbox.detached[0][0])
     config = json.loads(command[command.index("--config-json") + 1])
     resolved = config["harness_adapter"]["binary_path"]
-    assert resolved is not None
-    assert resolved.startswith("/"), f"expected an absolute path, got {resolved!r}"
+    assert resolved == str(fake.resolve())
 
 
 def test_explicit_binary_path_is_resolved_the_same_way(monkeypatch, tmp_path):

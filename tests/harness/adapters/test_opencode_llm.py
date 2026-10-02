@@ -370,3 +370,34 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
         if isinstance(e, dict) and e["choices"] and e["choices"][0]["delta"].get("refusal")
     )
     assert unknown_chunk["choices"][0]["delta"]["refusal"] == "no"
+
+
+def test_stream_upstream_400_before_first_event_surfaces_provider_error():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    class Router:
+        def validate_token(self, token):
+            return True
+
+        def resolve_model(self, token):
+            return "m"
+
+        async def dispatch_stream_async(self, token, request):
+            raise HostDispatchError(
+                {"message": "bad param", "status_code": 400, "transient": False}
+            )
+            yield
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer fake"},
+            json={"stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "bad param"
+    assert response.json()["error"]["transient"] is False

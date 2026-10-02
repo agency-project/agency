@@ -10,8 +10,8 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, ChatCompletionsProtocol
-from .pty.execution import stream_response
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, ChatCompletionsProtocol, chat_error_frame
+from .streaming import start_streaming_response, stream_response
 
 
 def grok_available() -> bool:
@@ -253,18 +253,17 @@ class GrokAdapter(ChatCompletionsProtocol, HarnessAdapter):
                 return JSONResponse(self._format_context_agency_to_harness(title_response, model))
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router,
-                        token,
-                        agency_context,
-                        model,
-                        self._format_agency_stream_to_harness,
-                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
-                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
+                return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 

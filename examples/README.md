@@ -19,7 +19,7 @@ The default is the Codex harness routed through Agency to OpenAI Luna:
 ```bash
 export OPENAI_API_KEY="..."
 export AGENCY_LLM_PROVIDER="openai"
-export AGENCY_LLM_MODEL="gpt-5.6-luna"
+export AGENCY_LLM_MODEL="gpt-6-luna"
 export AGENCY_HARNESS="codex"
 export AGENCY_REASONING_EFFORT="none"
 ```
@@ -49,6 +49,21 @@ Run one lesson:
 
 ```bash
 uv run python examples/01_basic_agent.py
+```
+
+## Live model smoke test
+
+`smoke_test_models.py` is a developer check, not a lesson: it makes a few tiny,
+real API calls per model to confirm each current OpenAI/Anthropic model is
+visible, answers a streamed request through Agency's backend, and completes a
+tool call round-trip through the harness proxy path. It reads
+`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` from the environment or the repository's
+`.env`, never prints them, and is never collected by `pytest`.
+
+```bash
+uv run python examples/smoke_test_models.py
+uv run python examples/smoke_test_models.py --provider anthropic
+uv run python examples/smoke_test_models.py --model gpt-6-sol --skip-e2e
 ```
 
 ## Lessons

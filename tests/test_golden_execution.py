@@ -10,7 +10,9 @@ directly.
 
 Alternatively, install the external CLIs on the host and supply an image with
 their system runtimes through AGENCY_TEST_HARNESS_IMAGE.
-AGENCY_TEST_EXTERNAL_HARNESSES=1 makes missing prerequisites fail locally too.
+A harness whose CLI is missing from the host, or can't start inside the
+image, is skipped locally; AGENCY_TEST_EXTERNAL_HARNESSES=1 (or CI) makes any
+missing prerequisite fail instead.
 Profiler artifacts: artifacts/golden-execution/<harness>/agprof.trace.json,
 summary.json, summary.md, profile_data.sqlite3, requests.json, and logs/.
 Only model responses are synthetic; containers, daemons, PTYs, and controls are real.
@@ -43,6 +45,7 @@ from agency.configs.agconfig import (
 
 from agency.engine.host_servers import llm_handler_server
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
+from agency.harness.executable import harness_installation_mounts, resolve_harness_binary
 from agency.llm.mock import _MockBackend
 
 
@@ -81,10 +84,55 @@ def golden_image():
                 f"golden execution requires {CONTAINER_BACKEND} and the local image {image}: {exc}"
             )
     if problem:
-        if os.environ.get("CI") or os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") == "1":
-            pytest.fail(problem)
-        pytest.skip(problem)
+        _skip_or_fail(problem)
     return image
+
+
+def _skip_or_fail(problem: str) -> None:
+    if os.environ.get("CI") or os.environ.get("AGENCY_TEST_EXTERNAL_HARNESSES") == "1":
+        pytest.fail(problem)
+    pytest.skip(problem)
+
+
+def _harness_problem(harness: str, image: str) -> "str | None":
+    """Why this harness can't run in `image` on this host, or None. Mirrors a
+    real launch: the host-resolved binary, its installation mounts, and the
+    `--version` start check Agency itself runs inside the sandbox."""
+    if harness == "native":
+        return None
+    config = agconfig(agentconfig(harness=harness))
+    binary = resolve_harness_binary(harness, config)
+    if binary is None:
+        return f"the {harness} CLI is not installed on this host"
+    try:
+        mounts = harness_installation_mounts(config)
+    except ValueError as exc:
+        return str(exc)
+    volumes = [arg for src, dst, mode in mounts.values() for arg in ("-v", f"{src}:{dst}:{mode}")]
+    try:
+        proc = subprocess.run(
+            [CONTAINER_BACKEND, "run", "--rm", *volumes, image, binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not probe the {harness} CLI inside {image}: {exc}"
+    if proc.returncode != 0:
+        output = (proc.stdout + proc.stderr).strip()[-300:]
+        return (
+            f"the {harness} CLI {binary} cannot start inside {image} (exit "
+            f"{proc.returncode}); supply an image with its runtime through "
+            f"AGENCY_TEST_HARNESS_IMAGE. Output: {output}"
+        )
+    return None
+
+
+@pytest.fixture
+def harness_ready(harness, golden_image):
+    problem = _harness_problem(harness, golden_image)
+    if problem:
+        _skip_or_fail(problem)
 
 
 @pytest.fixture
@@ -200,7 +248,7 @@ class _GoldenReplay(_MockBackend):
 
 @pytest.mark.timeout(420)
 @pytest.mark.parametrize("harness", HARNESSES)
-def test_golden_execution(harness, golden_image, golden_profile, monkeypatch):
+def test_golden_execution(harness, golden_image, harness_ready, golden_profile, monkeypatch):
     # Keep the span in the call: pytest does not throw failures into yield fixtures.
     with agprof.span(f"golden-execution:{harness}"):
         _exercise_golden_lifecycle(harness, golden_image, golden_profile, monkeypatch)

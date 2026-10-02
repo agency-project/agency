@@ -672,7 +672,7 @@ def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(r
 @pytest.mark.parametrize("keepalive_s", [0, 30])
 def test_stream_cancellation_closes_upstream_generator(keepalive_s):
     import asyncio
-    from agency.harness.adapters.pty.execution import stream_response
+    from agency.harness.adapters.streaming import stream_response
 
     closed = []
 
@@ -955,7 +955,7 @@ def test_retained_unified_pty_prepares_once_and_reuses_handle(runtime, tmp_path,
 
 def test_stream_response_sends_keepalive_frames_while_upstream_is_silent():
     import asyncio
-    from agency.harness.adapters.pty.execution import stream_response
+    from agency.harness.adapters.streaming import stream_response
 
     async def upstream():
         await asyncio.sleep(0.35)
@@ -980,7 +980,7 @@ def test_stream_response_sends_keepalive_frames_while_upstream_is_silent():
 
 def test_stream_response_raises_upstream_errors_through_keepalive():
     import asyncio
-    from agency.harness.adapters.pty.execution import stream_response
+    from agency.harness.adapters.streaming import stream_response
 
     async def upstream():
         await asyncio.sleep(0.15)
@@ -1000,4 +1000,58 @@ def test_stream_response_raises_upstream_errors_through_keepalive():
         return [frame async for frame in stream]
 
     with pytest.raises(RuntimeError, match="host dispatch failed"):
+        asyncio.run(run())
+
+
+def _failing_after(delay_s, exc):
+    import asyncio
+
+    async def upstream():
+        await asyncio.sleep(delay_s)
+        raise exc
+        yield
+
+    return SimpleNamespace(dispatch_stream_async=lambda *args: upstream())
+
+
+def test_stream_response_sends_error_frame_once_a_keepalive_went_out():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def run():
+        stream = stream_response(
+            _failing_after(0.15, RuntimeError("upstream overloaded")),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+            error_frame=lambda exc: f"ERR:{exc}",
+        )
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+    assert frames[0] == "KA"
+    assert frames[-1] == "ERR:upstream overloaded"
+
+
+def test_stream_response_still_raises_errors_before_any_frame():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def run():
+        stream = stream_response(
+            _failing_after(0, RuntimeError("bad request")),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=10,
+            error_frame=lambda exc: f"ERR:{exc}",
+        )
+        return [frame async for frame in stream]
+
+    with pytest.raises(RuntimeError, match="bad request"):
         asyncio.run(run())

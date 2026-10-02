@@ -89,8 +89,20 @@ def _payload_hash(payload: dict) -> str:
         identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
     elif block_type == "tool_result" and payload.get("tool_call_id"):
         identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
-    elif block_type in ("text", "thinking"):
+    elif block_type == "text":
         identity = {"role": role, "type": block_type, "text": payload.get("text")}
+    elif block_type == "thinking":
+        # Current Claude models return thinking with empty text by default,
+        # so text alone would collapse every block of a run into one stored
+        # payload; the signature (Anthropic) / encrypted content (OpenAI
+        # Responses) is what tells them apart. Missing and "" normalize alike
+        # so a rich response block and its replay still dedupe.
+        identity = {
+            "role": role,
+            "type": block_type,
+            "text": payload.get("text"),
+            "signature": payload.get("signature") or "",
+        }
     else:
         identity = payload
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
@@ -99,7 +111,7 @@ def _payload_hash(payload: dict) -> str:
 def _display_tag(internal_kind: "str | None") -> "str | None":
     """A short, human label for the optional `agency_internal_kind` a
     caller's dispatch/check_tool_policy request carried (e.g.
-    "tandem_worker" -> "Worker") -- None when there's nothing to tag. Kept
+    "example_worker" -> "Worker") -- None when there's nothing to tag. Kept
     generic (a prefix-strip + capitalize, not a hardcoded per-harness
     mapping) so any future "<namespace>_<role>"-shaped internal_kind value
     gets a reasonable label without this file needing to know about it."""

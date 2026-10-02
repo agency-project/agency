@@ -28,12 +28,12 @@ import time
 import uuid
 
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from .base import AdapterRuntime, AttemptResult
 from .native import NativeAdapter
-from .openai_chat_completions import CHAT_KEEPALIVE_FRAME
-from .pty.execution import stream_response
+from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, chat_error_frame
+from .streaming import start_streaming_response, stream_response
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -231,19 +231,18 @@ class TandemAdapter(NativeAdapter):
             model = router.resolve_model(token, mount="llm_supervisor")
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
-                return StreamingResponse(
-                    stream_response(
-                        router,
-                        token,
-                        agency_context,
-                        model,
-                        self._format_agency_stream_to_harness,
-                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
-                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
-                        mount="llm_supervisor",
-                    ),
-                    media_type="text/event-stream",
+                frames = stream_response(
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
+                    mount="llm_supervisor",
                 )
+                return await start_streaming_response(request, frames)
             agency_response = await anyio.to_thread.run_sync(
                 lambda: router.dispatch(token, agency_context, mount="llm_supervisor")
             )

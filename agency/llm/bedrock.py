@@ -30,6 +30,7 @@ from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBackend,
     _ANTHROPIC_BEDROCK_MODEL_RE,
+    _SYSTEM_CLASS_ROLES,
     _anthropic_sdk_timeout,
     _known_anthropic_context_window,
 )
@@ -112,6 +113,9 @@ class _AnthropicBedrockBackend(_AnthropicBackend):
 
     def list_models(self) -> list:
         return []  # Bedrock's native invoke_model API has no OpenAI-style /v1/models
+
+    def retrieve_model(self, model: str):
+        return None  # ...nor a /v1/models/{id}
 
     def tokenize_url(self) -> "str | None":
         return None
@@ -207,17 +211,35 @@ def _unknown_block_to_converse(b: dict) -> dict:
     }
 
 
+def _flush_deferred_converse_text(out: list[dict], deferred: "list[str]") -> None:
+    """Converse counterpart of anthropic._flush_deferred_text: text after the
+    toolResult blocks of the preceding user message, never between a toolUse
+    and its toolResult."""
+    if not deferred:
+        return
+    if out and out[-1]["role"] == "user":
+        out[-1]["content"].extend({"text": text} for text in deferred)
+    else:
+        out.extend({"role": "user", "content": [{"text": text}]} for text in deferred)
+    deferred.clear()
+
+
 def _agency_messages_to_converse(messages: list[dict]) -> "tuple[str | None, list[dict]]":
     system_parts: list[str] = []
     out: list[dict] = []
     conversation_started = False
+    pending_tool_ids: "set[str]" = set()
+    deferred_text: "list[str]" = []
 
     for m in messages:
         role = m.get("role")
         blocks = m.get("blocks") or []
-        if role != "system":
+        if role not in _SYSTEM_CLASS_ROLES:
             conversation_started = True
-        if role == "system":
+            if role != "tool":
+                pending_tool_ids.clear()
+                _flush_deferred_converse_text(out, deferred_text)
+        if role in _SYSTEM_CLASS_ROLES:
             text = "".join(b["text"] for b in blocks if b["type"] == "text")
             if not text:
                 continue
@@ -225,13 +247,16 @@ def _agency_messages_to_converse(messages: list[dict]) -> "tuple[str | None, lis
                 system_parts.append(text)
             else:
                 print(
-                    "[bedrock] WARNING: harness emitted a mid-conversation "
-                    "system-role message -- not valid per the Converse API "
+                    f"[bedrock] WARNING: harness emitted a mid-conversation "
+                    f"{role}-role message -- not valid per the Converse API "
                     "(system must be the top-level `system` parameter, never a "
-                    "`messages` entry); sending it as a `user` message at its "
-                    "original position instead"
+                    "`messages` entry); sending it as `user` content at its "
+                    "original position instead (after any pending tool results)"
                 )
-                out.append({"role": "user", "content": [{"text": text}]})
+                if pending_tool_ids:
+                    deferred_text.append(text)
+                else:
+                    out.append({"role": "user", "content": [{"text": text}]})
         elif role == "user":
             content = []
             for b in blocks:
@@ -267,6 +292,7 @@ def _agency_messages_to_converse(messages: list[dict]) -> "tuple[str | None, lis
             # empty."), confirmed directly against Bedrock. Same fallback the
             # user-role branch above already uses.
             out.append({"role": "assistant", "content": content or [{"text": ""}]})
+            pending_tool_ids = {c["toolUse"]["toolUseId"] for c in content if "toolUse" in c}
         elif role == "tool":
             result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
             result = {
@@ -281,6 +307,10 @@ def _agency_messages_to_converse(messages: list[dict]) -> "tuple[str | None, lis
                 prev["content"].append(result)
             else:
                 out.append({"role": "user", "content": [result]})
+            pending_tool_ids.discard(result["toolResult"]["toolUseId"])
+            if not pending_tool_ids:
+                _flush_deferred_converse_text(out, deferred_text)
+    _flush_deferred_converse_text(out, deferred_text)
     return ("\n\n".join(system_parts) or None), out
 
 
