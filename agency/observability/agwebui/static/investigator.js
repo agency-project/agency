@@ -65,7 +65,6 @@ async function refresh() {
 
 async function loadRun(id, selected=null, replay=false) {
   if (!id) return;
-  programmaticScrollUntil=Date.now()+750;
   const generation = ++loadGeneration;
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
@@ -130,7 +129,6 @@ function updateUrl() {
 function render() {
   const run=state.run;
   if (!run || state.loading) return;
-  programmaticScrollUntil=Date.now()+750;
   $('views').innerHTML=views.map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">0${index+1}</span>${label}</button>`).join('');
   $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
   renderRunChrome();
@@ -220,10 +218,6 @@ function updateTrajectory(changed,resynced=false) {
   }
   if((!state.selected||changed.includes(state.selected?.id))&&!$('inspector').contains(document.activeElement))renderInspector(true);
   if(resynced)$('transport-state').textContent+=' · recovered from durable snapshot';
-  if(changed.length&&state.follow&&state.view==='trajectory'&&state.trajectoryLayout==='episodes'&&!document.hidden){
-    const last=$('activity-list')?.lastElementChild;
-    if(last){programmaticScrollUntil=Date.now()+500;last.scrollIntoView({block:'end'});}
-  }
 }
 
 function relevantEpisodes() {
@@ -235,7 +229,7 @@ function reconcileActivities(initial=false) {
   const list=$('activity-list');if(!list)return;
   const run=state.run,map=actionMap(run),episodes=relevantEpisodes();
   const end=state.windowEnd==null?episodes.length:Math.min(state.windowEnd,episodes.length);
-  const start=Math.max(0,end-50),window=episodes.slice(start,end);
+  const start=Math.max(0,end-50),window=episodes.slice(start,end).reverse();
   const existing=new Map([...list.querySelectorAll('[data-episode-card]')].map(el=>[el.dataset.episodeCard,el]));
   const ids=new Set(window.map(e=>e.id));
   for(const [id,el] of existing)if(!ids.has(id))el.remove();
@@ -243,8 +237,10 @@ function reconcileActivities(initial=false) {
   else if(!list.querySelector('.empty-state'))list.innerHTML=empty(state.agent||state.query?'No matching activities':'Waiting for recorded activity',run.status==='running'?'Execution started. Long-running calls will appear before their results.':'The event stream does not yet establish what the agent is doing.');
   for(const episode of window) {
     let card=existing.get(episode.id);
-    if(!card){card=document.createElement('details');card.className='episode activity';card.dataset.episodeCard=episode.id;card.innerHTML=`<span class="episode-number"></span><summary data-episode="${esc(episode.id)}"></summary><div class="activity-evidence"></div><div class="episode-actions"></div>`;card.open=state.expanded.has(episode.id);list.append(card);}
-    const actions=episode.actions.map(id=>map.get(id)).filter(Boolean);
+    if(!card){card=document.createElement('details');card.className='episode activity';card.dataset.episodeCard=episode.id;card.innerHTML=`<span class="episode-number"></span><summary data-episode="${esc(episode.id)}"></summary><div class="activity-evidence"></div><div class="episode-actions"></div>`;card.open=state.expanded.has(episode.id);}
+    const position=window.indexOf(episode);
+    if(list.children[position]!==card)list.insertBefore(card,list.children[position]||null);
+    const actions=episode.actions.map(id=>map.get(id)).filter(Boolean).reverse();
     card.classList.toggle('selected',state.selected?.id===episode.id||actions.some(a=>a.id===state.selected?.id));
     card.classList.toggle('new-evidence',actions.some(a=>state.unread.has(a.id)));
     card.querySelector('.episode-number').textContent=run.episodes.indexOf(episode)+1;
@@ -255,9 +251,16 @@ function reconcileActivities(initial=false) {
     const evidenceNode=card.querySelector('.activity-evidence');if(evidenceNode.innerHTML!==evidence)evidenceNode.innerHTML=evidence;
     const calls=card.querySelector('.episode-actions');
     const oldCalls=new Map([...calls.children].map(el=>[el.dataset.action,el]));
-    for(const action of actions){let button=oldCalls.get(action.id);const html=actionButton(action);if(!button){calls.insertAdjacentHTML('beforeend',html);}else{const template=document.createElement('template');template.innerHTML=html;const next=template.content.firstElementChild;button.className=next.className;if(button.innerHTML!==next.innerHTML)button.innerHTML=next.innerHTML;}}
+    for(const [position,action] of actions.entries()) {
+      let button=oldCalls.get(action.id);
+      const template=document.createElement('template');template.innerHTML=actionButton(action);
+      const next=template.content.firstElementChild;
+      if(!button)button=next;
+      else{button.className=next.className;if(button.innerHTML!==next.innerHTML)button.innerHTML=next.innerHTML;}
+      if(calls.children[position]!==button)calls.insertBefore(button,calls.children[position]||null);
+    }
   }
-  $('activity-window-label').textContent=episodes.length?`${start+1}–${end} of ${episodes.length} activities`:'No activities yet';
+  $('activity-window-label').textContent=episodes.length?`${start+1}–${end} of ${episodes.length} activities · newest first`:'No activities yet';
   $('content').querySelector('[data-older-activities]').disabled=start===0;
   const active=run.actions.filter(a=>a.outcome==='running'&&(!state.agent||a.agent===state.agent));
   const input=(run.signals||[]).find(signal=>signal.active!==false&&signal.severity==='required');
@@ -629,8 +632,6 @@ function followLatest() {
   renderRunChrome();
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') {
     reconcileActivities();
-    programmaticScrollUntil=Date.now()+500;
-    $('activity-list')?.lastElementChild?.scrollIntoView({block:'end'});
   }
 }
 
@@ -669,13 +670,6 @@ document.addEventListener('change',event=>{
   if(event.target.id==='comparison-select'){state.compareError=null;loadComparison(event.target.value);}
   else if(event.target.id==='trajectory-layout'){state.trajectoryLayout=event.target.value;updateUrl();render();}
 });
-let lastScroll=window.scrollY,programmaticScrollUntil=0,historyScrollGestureUntil=0;
-// Layout changes and browser focus scrolling are not requests to hold history.
-document.addEventListener('wheel',event=>{if(event.deltaY<0){historyScrollGestureUntil=Date.now()+1000;holdHistory();}},{passive:true});
-document.addEventListener('touchmove',()=>{historyScrollGestureUntil=Date.now()+1000;},{passive:true});
-document.addEventListener('pointerdown',event=>{if(event.clientX>=window.innerWidth-24)historyScrollGestureUntil=Date.now()+1000;},{passive:true});
-document.addEventListener('keydown',event=>{if(['PageUp','Home','ArrowUp'].includes(event.key)&&!event.target.matches('input,select,textarea')){historyScrollGestureUntil=Date.now()+1000;holdHistory();}});
-document.addEventListener('scroll',()=>{const y=window.scrollY;if(y<lastScroll-10&&Date.now()>programmaticScrollUntil&&Date.now()<historyScrollGestureUntil)holdHistory();lastScroll=y;},{passive:true});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream)followLatest();});
 window.addEventListener('pagehide',()=>state.stream?.close());
 $('open-live').onclick=()=>{state.trajectoryLayout='episodes';state.view='trajectory';loadRun('live');};
@@ -684,6 +678,6 @@ $('replay-restart').onclick=()=>loadRun(state.run.id,null,true);
 $('replay-play').onclick=()=>state.stream?.send(state.replayState?.playing?'pause':'play',{speed:Number($('replay-speed').value)});
 $('replay-step').onclick=()=>state.stream?.send('step');
 $('replay-speed').onchange=()=>{if(state.replayState?.playing)state.stream?.send('play',{speed:Number($('replay-speed').value)});};
-$('follow-live').onclick=followLatest;
+$('follow-live').onclick=()=>{followLatest();$('activity-list')?.firstElementChild?.scrollIntoView({block:'start'});};
 $('reconnect-updates').onclick=()=>state.stream?.reconnect();
 refresh();

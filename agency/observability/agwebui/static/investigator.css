@@ -762,6 +762,11 @@ small,.muted {
   font-size:10px
 }
 
+#activity-list {
+  /* New cards arrive at the top without anchoring the viewport to old cards. */
+  overflow-anchor: none;
+}
+
 .activity-window {
   display:flex;
   align-items:center;

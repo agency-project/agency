@@ -7,15 +7,39 @@ const vm = require('node:vm');
 
 function page(replay=false) {
   const listeners={}, nodes=new Map();
+  class Element {
+    constructor(){this.innerHTML='';this.value='';this.options=[];this.children=[];
+      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};}
+    contains(){return false;}
+    scrollIntoView(){throw Error('Unexpected automatic scrolling');}
+    get firstElementChild(){return this.children[0];}
+    querySelector(selector){
+      if(selector==='.empty-state')return null;
+      if(!this.parts.has(selector))this.parts.set(selector,new Element());
+      return this.parts.get(selector);
+    }
+    querySelectorAll(){return this.children;}
+    insertBefore(child,before){
+      child.remove();
+      const index=before?this.children.indexOf(before):this.children.length;
+      this.children.splice(index,0,child);child.parent=this;
+    }
+    remove(){if(this.parent){this.parent.children.splice(this.parent.children.indexOf(this),1);this.parent=null;}}
+  }
   const node=id=>{
-    if(!nodes.has(id))nodes.set(id, {
-      innerHTML:'', value:'', options:[], contains:()=>false,
-      querySelector:()=>null,
-      lastElementChild:{scrollIntoView:()=>{}},
-    });
+    if(!nodes.has(id))nodes.set(id,new Element());
     return nodes.get(id);
   };
   const document={hidden:false, activeElement:null, getElementById:node,
+    createElement:tag=>{
+      const el=new Element();
+      if(tag==='template')Object.defineProperty(el,'content',{get:()=>{
+        const button=new Element();
+        button.dataset.action=el.innerHTML.match(/data-action="([^"]+)"/)[1];
+        button.innerHTML=el.innerHTML;return {firstElementChild:button};
+      }});
+      return el;
+    },
     querySelector:()=>null, addEventListener:(name,fn)=>{
       (listeners[name]??=[]).push(fn);
     }};
@@ -42,20 +66,21 @@ function page(replay=false) {
     // real stream callback, selection handlers and updateTrajectory path.
     render=()=>{};renderRunChrome=()=>{};renderSession=()=>{};
     renderInspector=()=>{};catalogOptions=()=>{};updateUrl=()=>{};
+    var realReconcile=reconcileActivities;
     reconcileActivities=()=>{lastWindowEnd=state.windowEnd;};
     var lastWindowEnd;
     globalThis.ui={state,loadRun,selectAction,holdHistory,
-      windowEnd:()=>lastWindowEnd};
+      windowEnd:()=>lastWindowEnd,reconcile:realReconcile};
   `,context);
-  const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0}],
-    episodes:[{id:'one',actions:['old']}],agents:[]};
+  const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0,duration:1,kind:'tool'}],
+    episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
   return {ui:context.ui, document, node,
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:()=>subscription.onMessage({type:'patch', patches:[{
-      action:{id:'new-call',episode:'two',start:1},
-      episode:{id:'two',actions:['new-call']},duration:2,
+      action:{id:'new-call',episode:'two',start:1,duration:1,kind:'tool'},
+      episode:{id:'two',actions:['new-call'],status:'running'},duration:2,
     }]}),
   };
 }
@@ -93,4 +118,18 @@ test('replay selections still hold history',()=>{
   const p=page(true);p.ui.selectAction('old');p.append();
   assert.equal(p.ui.state.follow,false);
   assert.equal(p.ui.windowEnd(),1);
+});
+
+test('new activities and calls prepend without replacing expanded cards',()=>{
+  const p=page();p.ui.reconcile();
+  const list=p.node('activity-list'),old=list.firstElementChild;
+  old.open=true;
+  p.append();p.ui.reconcile();
+  assert.deepEqual(list.children.map(c=>c.dataset.episodeCard),['two','one']);
+  assert.equal(list.children[1],old);
+  assert.equal(old.open,true);
+  p.ui.state.run.actions.push({id:'third',episode:'two',start:2,duration:1,kind:'tool'});
+  p.ui.state.run.episodes[1].actions.push('third');
+  p.ui.reconcile();
+  assert.deepEqual(list.firstElementChild.querySelector('.episode-actions').children.map(c=>c.dataset.action),['third','new-call']);
 });
