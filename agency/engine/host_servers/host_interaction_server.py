@@ -119,7 +119,12 @@ class HostInteractionServer:
         call_id = uuid.uuid4().hex
         self.record_event(
             f"{kind}_call",
-            {**attributes, "call_id": call_id, "allowed": allowed},
+            {
+                **attributes,
+                "call_id": call_id,
+                "allowed": allowed,
+                **({"reason": reason} if reason is not None else {}),
+            },
         )
         label = self._ADMISSION_LABEL[kind]
         if kind == "tool":
@@ -253,6 +258,7 @@ class HostInteractionServer:
             {**attributes, **extra, "call_id": call_id},
             term_message=term_message,
             print_to_terminal=False,
+            flush=kind == "tool",
         )
         self.record_span(
             f"{kind}:{name}",
@@ -327,7 +333,9 @@ class HostInteractionServer:
         )
         return {"ok": rejected == 0, "rejected": rejected}
 
-    def admit_tool_call(self, tool_name: str, tool_input: dict) -> dict:
+    def admit_tool_call(
+        self, tool_name: str, tool_input: dict, annotation: dict | None = None
+    ) -> dict:
         """Admission + telemetry entry point for a tool call."""
         allowed, reason = self.check_tool(tool_name, tool_input)
         sandbox = self._sandbox
@@ -340,7 +348,12 @@ class HostInteractionServer:
         call_id = self._record_admission(
             "tool",
             tool_name,
-            {"tool": tool_name, "arguments": tool_input, "gpu_ids": gpu_ids},
+            {
+                "tool": tool_name,
+                "arguments": tool_input,
+                "gpu_ids": gpu_ids,
+                **({"annotation": annotation} if isinstance(annotation, dict) else {}),
+            },
             allowed,
             reason,
         )
@@ -410,7 +423,14 @@ class HostInteractionServer:
             self.last_bootstrap_ping_ts = time.monotonic()
         self._data_logger.record_event(
             type,
-            payload,
+            {
+                **payload,
+                **(
+                    {"request_id": self._profile_attributes["request_id"]}
+                    if self._profile_attributes.get("request_id")
+                    else {}
+                ),
+            },
             call_label=call_label,
             update_latest_snapshot=update_latest_snapshot,
             term_message=term_message,
@@ -494,7 +514,7 @@ class HostInteractionServer:
         def _check_tool(request: dict, http_request: Request) -> JSONResponse:
             return JSONResponse(
                 http_request.app.state.interaction_server.admit_tool_call(
-                    request["tool_name"], request["tool_input"]
+                    request["tool_name"], request["tool_input"], request.get("annotation")
                 )
             )
 

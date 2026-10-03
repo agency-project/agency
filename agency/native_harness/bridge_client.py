@@ -26,11 +26,17 @@ class BridgeClient:
         self.token = token
         self._client = httpx.Client(base_url=base_url, timeout=timeout_s)
 
-    def check_tool_policy(self, tool_name: str, tool_input: dict) -> dict:
+    def check_tool_policy(
+        self, tool_name: str, tool_input: dict, *, annotation: dict | None = None
+    ) -> dict:
         try:
             resp = self._client.post(
                 "/agpolicy/check_tool",
-                json={"tool_name": tool_name, "tool_input": tool_input},
+                json={
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    **({"annotation": annotation} if annotation is not None else {}),
+                },
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             if resp.status_code != 200:

@@ -201,6 +201,15 @@ class CodexDriver(_HookPtyDriver):
         self._trusted_directory = False
         super().__init__(adapter, runtime, root, session_id, blob, max_steps)
 
+    def prompt_matches(self, prompt, expected):
+        # Codex trims the composer before emitting UserPromptSubmit. The
+        # unique Agency marker still fences turns with identical task text.
+        return (
+            isinstance(prompt, str)
+            and isinstance(expected, str)
+            and prompt.rstrip() == expected.rstrip()
+        )
+
     def _configure(self, adapter, runtime, max_steps):
         adapter._write_codex_config(
             self.root,

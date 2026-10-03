@@ -99,6 +99,7 @@ class HostServerManager:
             parent_context=agprof.current_span_context(),
             profile_attributes={
                 **agprof.current_span_attributes(),
+                "request_id": request_id,
                 "harness": getattr(agent, "harness", "unknown"),
                 "agency.agent_id": str(agent.agname),
                 "agency.sandbox_id": agprof.sandbox_identity(sandbox),

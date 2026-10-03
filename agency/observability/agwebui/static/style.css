@@ -653,3 +653,5 @@ body.resizing-panels {
 #profiler-toolbar { display: flex; gap: 12px; align-items: center; padding: 8px 12px; font: 12px var(--font); }
 #profiler-status { flex: 1; }
 #profiler-frame { width: 100%; flex: 1; border: 0; background: var(--bg); }
+
+.investigator-link { padding: 4px 12px; color: var(--text); font: 12px var(--font); text-decoration: none; border: 1px solid var(--border); background: var(--bg2); }

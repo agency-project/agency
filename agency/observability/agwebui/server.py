@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import random
@@ -19,7 +20,9 @@ import sqlite3
 import threading
 import time as _time
 import uuid as _uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 
 # Seconds east of UTC for the server's local timezone (accounts for DST).
@@ -801,6 +804,9 @@ async def _lifespan(app: FastAPI):
     task = asyncio.create_task(_tail_and_broadcast())
     yield
     task.cancel()
+    source = _trajectory_source()
+    if source.refiner:
+        source.refiner.close()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -819,7 +825,7 @@ async def _no_cache_static(request, call_next):
     file, since a plain refresh can silently keep serving stale JS/CSS with
     no visible sign anything is wrong."""
     response = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/profiler") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -831,6 +837,268 @@ async def index():
 
 def _profile_trace_path() -> Path:
     return _profiler_dir() / "agprof.trace.json"
+
+
+@app.get("/profiler")
+async def investigator_page():
+    return FileResponse(_STATIC / "investigator.html")
+
+
+@app.get("/api/investigator/runs")
+async def investigator_runs():
+    from .investigator import catalog
+    from .investigator_demo import DEMO_ENTRIES
+    from .trajectory_scenarios import ENTRY, SCALE_ENTRY
+
+    entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
+    live = {
+        "id": "live",
+        "title": "Current live execution",
+        "subtitle": "Canonical event databases",
+        "source": "recorded",
+        "model": "Recorded in event metadata",
+        "harness": "Agency",
+        "mode": "live",
+    }
+    return {
+        "runs": [live]
+        + [{k: v for k, v in e.items() if k != "path"} for e in entries]
+        + DEMO_ENTRIES
+        + [ENTRY, SCALE_ENTRY]
+    }
+
+
+@app.get("/api/investigator/runs/{run_id}")
+async def investigator_run(run_id: str):
+    from .investigator import catalog
+    from .investigator_demo import DEMO_ENTRIES
+
+    if run_id == "live":
+        source = _trajectory_source()
+        await asyncio.to_thread(source.refresh, force=True)
+        return source.message()["run"]
+    if run_id in {"trajectory-scenarios", "trajectory-scale"}:
+        return await asyncio.to_thread(_scenario_trajectory, run_id)
+
+    if run_id in {entry["id"] for entry in DEMO_ENTRIES}:
+        return _demo_trajectory(run_id)
+    entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
+    entry = next((e for e in entries if e["id"] == run_id), None)
+    if entry is None:
+        return JSONResponse({"error": "Run not found. Refresh the run catalog."}, status_code=404)
+    try:
+        path = Path(entry["path"])
+        return await asyncio.to_thread(
+            _saved_trajectory, str(path), path.stat().st_mtime, json.dumps(entry, sort_keys=True)
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        return JSONResponse({"error": f"Could not read saved trace: {exc}"}, status_code=422)
+
+
+@lru_cache(maxsize=4)
+def _saved_trajectory(path, modified, entry):
+    from .investigator import load_run
+    from .trajectory import historical_projection
+
+    return historical_projection(copy.deepcopy(load_run(path, modified, entry)))
+
+
+@lru_cache(maxsize=2)
+def _demo_trajectory(run_id):
+    from .investigator_demo import demo_run
+    from .trajectory import historical_projection
+
+    run = demo_run(run_id)
+    run["status"] = "completed"  # Explicitly authored fixture lifecycle, not evaluator success.
+    return historical_projection(run)
+
+
+_replay_cache = OrderedDict()
+
+
+@lru_cache(maxsize=2)
+def _scenario_trajectory(run_id):
+    from .trajectory import Trajectory
+    from .trajectory_scenarios import ENTRY, SCALE_ENTRY, events, scale_events
+
+    entry = SCALE_ENTRY if run_id == SCALE_ENTRY["id"] else ENTRY
+    model = Trajectory(run_id, entry["title"], mode="review", source="synthetic")
+    model.run.update({key: entry[key] for key in ("model", "harness", "subtitle")})
+    for event in scale_events() if run_id == SCALE_ENTRY["id"] else events():
+        model.apply(event)
+    return model.snapshot()
+
+
+@lru_cache(maxsize=2)
+def _trajectory_source_for(directory: str):
+    from .trajectory import LiveSource
+
+    return LiveSource(directory)
+
+
+def _trajectory_source():
+    return _trajectory_source_for(str(_run_dir.resolve()))
+
+
+@app.get("/api/trajectory/live")
+async def trajectory_snapshot():
+    source = _trajectory_source()
+    await asyncio.to_thread(source.refresh, force=True)
+    return source.message()
+
+
+@app.get("/api/trajectory/live/events/{event_id:path}")
+async def trajectory_event(event_id: str):
+    try:
+        return await asyncio.to_thread(_trajectory_source().raw_event, event_id)
+    except (KeyError, ValueError, sqlite3.Error, OSError):
+        return JSONResponse(
+            {"error": "Source event unavailable; its summary remains in the trajectory."},
+            status_code=404,
+        )
+
+
+async def _trajectory_replay_data(run_id):
+    from .trajectory import replay_events
+    from .trajectory_scenarios import events, scale_events
+
+    run = await investigator_run(run_id)
+    if isinstance(run, JSONResponse) or run_id == "live":
+        raise ValueError("Select a saved execution for replay.")
+    cached = _replay_cache.get(run_id)
+    if cached is not None and cached[0] is run:
+        _replay_cache.move_to_end(run_id)
+        return cached
+    if run_id == "trajectory-scenarios":
+        rows = events()
+    elif run_id == "trajectory-scale":
+        rows = scale_events()
+    else:
+        rows = replay_events(run)
+    data = (run, rows)
+    _replay_cache[run_id] = data
+    if len(_replay_cache) > 4:
+        _replay_cache.popitem(last=False)
+    return data
+
+
+@app.get("/api/trajectory/replay/{run_id}/events/{event_id:path}")
+async def trajectory_replay_event(run_id: str, event_id: str):
+    try:
+        _run, events = await _trajectory_replay_data(run_id)
+        return next(event for event in events if event["id"] == event_id)
+    except (ValueError, StopIteration):
+        return JSONResponse({"error": "Replay event unavailable."}, status_code=404)
+
+
+@app.websocket("/ws/trajectory")
+async def trajectory_stream(ws: WebSocket):
+    """Snapshot and subscription use one revision journal, closing the fetch/subscribe race."""
+    await ws.accept()
+    try:
+        if ws.query_params.get("mode") == "replay":
+            await _replay_stream(ws)
+            return
+        source = _trajectory_source()
+        cursor = int(ws.query_params.get("cursor", "0"))
+        epoch = ws.query_params.get("epoch")
+        while True:
+            await asyncio.to_thread(source.refresh)
+            message = source.message(cursor, epoch)
+            await ws.send_json(message)
+            cursor, epoch = message["cursor"], message["epoch"]
+            try:
+                await asyncio.wait_for(ws.receive_json(), timeout=TAIL_POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, RuntimeError):
+        return
+    except (ValueError, OSError):
+        await ws.close(code=1008, reason="Trajectory source unavailable")
+
+
+async def _replay_stream(ws):
+    from .trajectory import Trajectory
+
+    run, events = await _trajectory_replay_data(ws.query_params.get("run", "demo-baseline"))
+    model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
+    for key in ("model", "harness", "condition", "task", "format"):
+        if key in run:
+            model.run[key] = run[key]
+    model.run["coverage"]["replay"] = (
+        "Start/end boundaries reconstructed from saved spans; results appear only at their recorded end."
+    )
+    cursor = min(max(0, int(ws.query_params.get("cursor", "0"))), len(events))
+    for event in events[:cursor]:
+        model.apply(event)
+    clock = events[cursor - 1]["ts"] if cursor else 0
+    playing, speed = False, 4.0
+
+    def replay_meta():
+        return {
+            "position": cursor,
+            "total": len(events),
+            "clock": clock,
+            "playing": playing,
+            "finished": cursor == len(events),
+            "speed": speed,
+        }
+
+    await ws.send_json(
+        {"type": "snapshot", "run": model.snapshot(), "cursor": cursor, "replay": replay_meta()}
+    )
+    model.patch()
+    previous = _time.monotonic()
+    while True:
+        command = {}
+        try:
+            command = await asyncio.wait_for(ws.receive_json(), timeout=0.2)
+        except asyncio.TimeoutError:
+            pass
+        now = _time.monotonic()
+        if command.get("type") == "play":
+            playing = True
+            speed = min(1000, max(0.1, float(command.get("speed", speed))))
+        elif command.get("type") == "pause":
+            playing = False
+        elif command.get("type") == "step" and cursor < len(events):
+            clock = max(clock, events[cursor]["ts"])
+            model.apply(events[cursor])
+            cursor += 1
+        if playing:
+            clock = min(events[-1]["ts"], clock + (now - previous) * speed)
+            for _ in range(100):
+                if cursor == len(events) or events[cursor]["ts"] > clock:
+                    break
+                model.apply(events[cursor])
+                cursor += 1
+            # A bounded batch must not advance displayed time past evidence
+            # waiting in the next batch, or inflate unfinished call durations.
+            if cursor < len(events):
+                clock = min(clock, events[cursor]["ts"])
+        previous = now
+        model.tick(clock)
+        if cursor == len(events):
+            playing = False
+        await ws.send_json(
+            {
+                "type": "updates",
+                "patches": [model.patch()],
+                "cursor": cursor,
+                "replay": replay_meta(),
+            }
+        )
+
+
+@app.get("/api/investigator/runs/{run_id}/trace")
+async def investigator_raw_trace(run_id: str):
+    from .investigator import catalog
+
+    entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
+    entry = next((e for e in entries if e["id"] == run_id), None)
+    if not entry or entry.get("format") == "native_events" or not Path(entry["path"]).is_file():
+        return JSONResponse({"error": "No raw trace available."}, status_code=404)
+    return FileResponse(entry["path"], media_type="application/json", filename="agprof.trace.json")
 
 
 @app.get("/api/profiler")
@@ -1053,9 +1321,15 @@ if __name__ == "__main__":
         "--run-dir", required=True, help="log_dir shared with the execution process's agents"
     )
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument(
+        "--no-perfetto",
+        action="store_true",
+        help="Start investigator without building the optional raw Perfetto viewer",
+    )
     parsed = parser.parse_args()
 
-    ensure_viewer()
+    if not parsed.no_perfetto:
+        ensure_viewer()
 
     _run_dir = Path(parsed.run_dir)
     _command_dir = _run_dir / "ui_commands"

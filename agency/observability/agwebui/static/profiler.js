@@ -54,8 +54,10 @@
       }
       if (file) {
         await openTrace(await file.arrayBuffer(), file.name);
-      } else if (info.trace_available) {
-        const trace = await fetch('/api/profiler/trace', {cache: 'no-store'});
+      } else if (info.trace_available || new URLSearchParams(location.search).get('trace')) {
+        const traceId = new URLSearchParams(location.search).get('trace');
+        const endpoint = traceId ? `/api/investigator/runs/${encodeURIComponent(traceId)}/trace` : '/api/profiler/trace';
+        const trace = await fetch(endpoint, {cache: 'no-store'});
         if (!trace.ok) throw new Error('Could not load this run’s trace.');
         await openTrace(await trace.arrayBuffer(), 'Current run');
       } else {
@@ -78,6 +80,7 @@
     }
     if (profiler && !initialized) load();
   }
+  if (new URLSearchParams(location.search).get('view') === 'perfetto') select(true);
   byId('view-run').onclick = () => select(false);
   byId('view-profiler').onclick = () => select(true);
   byId('profiler-reload').onclick = () => load();

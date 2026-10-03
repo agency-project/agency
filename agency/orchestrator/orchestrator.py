@@ -687,7 +687,11 @@ class GlobalAgentOrchestrator:
             local_skill_input = agdata(**dict(request.skill_input._data))
             logger.record_event(
                 type="skill_start",
-                payload={"skill": skill.name, "ts": request.ts_start},
+                payload={
+                    "skill": skill.name,
+                    "ts": request.ts_start,
+                    "request_id": request.request_id,
+                },
                 term_message=(
                     f"[{ag.agname}] SKILL ▶  {skill.name}  "
                     f"input={list(local_skill_input._data.keys())}"
@@ -755,7 +759,10 @@ class GlobalAgentOrchestrator:
         try:
             request.agent.data_logger.record_event(
                 type="skill_cancelled",
-                payload={"skill": request.skill.name if request.skill is not None else None},
+                payload={
+                    "skill": request.skill.name if request.skill is not None else None,
+                    "request_id": request.request_id,
+                },
                 term_message=f"[{request.agent.agname}] SKILL ■  cancelled",
                 flush=True,
             )
@@ -795,7 +802,11 @@ class GlobalAgentOrchestrator:
             if result_dict.get("error"):
                 logger.record_event(
                     type="skill_error",
-                    payload={"skill": skill.name, "error": str(result_dict["error"])},
+                    payload={
+                        "skill": skill.name,
+                        "error": str(result_dict["error"]),
+                        "request_id": request.request_id,
+                    },
                     term_message=(
                         f"[{ag.agname}] SKILL ✗  {skill.name}  error={result_dict['error']}"
                     ),
@@ -813,6 +824,7 @@ class GlobalAgentOrchestrator:
                 type="skill_call",
                 payload={
                     "skill": skill.name,
+                    "request_id": request.request_id,
                     "ts_start": request.ts_start,
                     "ts_end": ts_end,
                     "input": input_dict,

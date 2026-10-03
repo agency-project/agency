@@ -335,13 +335,25 @@ class agwebui:
         ).start()
 
         with sigterm_as_exit("agwebui") as sigterm_received:
+            execution_status = "completed"
             try:
+                get_orchestrator().data_logger.record_event(
+                    "workload_started",
+                    {"task": getattr(fn, "__name__", "workload")},
+                    name="webui",
+                    object="agwebui",
+                    flush=True,
+                )
                 with agprof.workload():
                     fn(*args, **kwargs)
             except Exception:
+                execution_status = "failed"
                 import traceback
 
                 traceback.print_exc()
+            except BaseException:
+                execution_status = "cancelled"
+                raise
             finally:
                 command_stop.set()
                 try:
@@ -349,7 +361,7 @@ class agwebui:
 
                     get_orchestrator().data_logger.record_event(
                         "done",
-                        {},
+                        {"status": "cancelled" if sigterm_received.is_set() else execution_status},
                         name="webui",
                         object="agwebui",
                         update_latest_snapshot=True,

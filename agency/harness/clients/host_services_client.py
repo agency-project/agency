@@ -144,7 +144,9 @@ class HostServicesClient:
         )
         response.raise_for_status()
 
-    def check_tool_policy(self, token: str, tool_name: str, tool_input: dict) -> dict:
+    def check_tool_policy(
+        self, token: str, tool_name: str, tool_input: dict, annotation: dict | None = None
+    ) -> dict:
         # A GPU-gated tool call can legitimately block on the host for as
         # long as another agent holds the GPU it reserved -- unbounded by
         # design (see agResourcePool.acquire_gpus), so this one call, unlike
@@ -153,7 +155,11 @@ class HostServicesClient:
         # `handle.client(timeout_s=None)` for run_harness_attempt.
         resp = self.client.post(
             "/interaction/check_tool",
-            json={"tool_name": tool_name, "tool_input": tool_input},
+            json={
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                **({"annotation": annotation} if annotation is not None else {}),
+            },
             headers=self._attempt_headers(token),
             timeout=None,
         )

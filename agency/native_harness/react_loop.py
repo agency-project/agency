@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from . import tools
 from .profiling import profile_run, span as profile_span
 from .compaction import maybe_compact
-from .annotations import augment_schemas, extract, instruction, event_id
+from .annotations import augment_schemas, extract, instruction, event_id, redact
 
 if TYPE_CHECKING:
     from .bridge_client import BridgeClient
@@ -199,16 +199,23 @@ def run_react_loop(
                             "call_id": None,
                         },
                     )
-                prepared_calls.append((tc, fn_name, fn_args, correlation))
+                prepared_calls.append((tc, fn_name, fn_args, correlation, annotation))
 
-            for tc, fn_name, fn_args, correlation in prepared_calls:
+            for tc, fn_name, fn_args, correlation, annotation in prepared_calls:
                 handler = dispatch_table.get(fn_name)
                 call_id = None
                 tool_duration_ns = None
                 if handler is None:
                     result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
                 elif bridge is not None:
-                    decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
+                    decision = bridge.check_tool_policy(
+                        fn_name,
+                        _parse_tool_input(fn_args),
+                        annotation=redact(
+                            {**annotation, "model_tool_call_id": tc["id"]},
+                            (getattr(bridge, "token", None),),
+                        ),
+                    )
                     call_id = decision.get("call_id")
                     if observer is not None:
                         observer(
