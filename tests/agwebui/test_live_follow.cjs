@@ -61,6 +61,9 @@ function page(replay=false) {
   const source=fs.readFileSync(path.join(__dirname,
     '../../agency/observability/agwebui/static/investigator.js'),'utf8')
     .replace(/^import .*;\n/gm,'').replace(/refresh\(\);\s*$/,'');
+  vm.runInContext(fs.readFileSync(path.join(__dirname,
+    '../../agency/observability/agwebui/static/investigator-model.js'),'utf8')
+    .replace(/export function/g,'function'),context);
   vm.runInContext(source+`
     // Isolate follow behavior from chart/inspector markup, retaining the
     // real stream callback, selection handlers and updateTrajectory path.
@@ -70,16 +73,16 @@ function page(replay=false) {
     reconcileActivities=()=>{lastWindowEnd=state.windowEnd;};
     var lastWindowEnd;
     globalThis.ui={state,loadRun,selectAction,holdHistory,
-      windowEnd:()=>lastWindowEnd,reconcile:realReconcile};
+      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack};
   `,context);
-  const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0,duration:1,kind:'tool'}],
+  const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
   return {ui:context.ui, document, node,
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:()=>subscription.onMessage({type:'patch', patches:[{
-      action:{id:'new-call',episode:'two',start:1,duration:1,kind:'tool'},
+      action:{id:'new-call',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'},
       episode:{id:'two',actions:['new-call'],status:'running'},duration:2,
     }]}),
   };
@@ -128,8 +131,49 @@ test('new activities and calls prepend without replacing expanded cards',()=>{
   assert.deepEqual(list.children.map(c=>c.dataset.episodeCard),['two','one']);
   assert.equal(list.children[1],old);
   assert.equal(old.open,true);
-  p.ui.state.run.actions.push({id:'third',episode:'two',start:2,duration:1,kind:'tool'});
+  p.ui.state.run.actions.push({id:'third',episode:'two',start:2,duration:1,kind:'tool',outcome:'success'});
   p.ui.state.run.episodes[1].actions.push('third');
   p.ui.reconcile();
   assert.deepEqual(list.firstElementChild.querySelector('.episode-actions').children.map(c=>c.dataset.action),['third','new-call']);
+});
+
+test('running overlapping calls remain pinned even after newer calls finish',()=>{
+  const p=page();
+  const calls=[
+    {id:'slow',agent:'a',kind:'tool',start:0,duration:10,outcome:'running'},
+    {id:'peer',agent:'a',kind:'tool',start:1,duration:1,outcome:'success'},
+    {id:'newer',agent:'b',kind:'tool',start:5,duration:1,outcome:'success'},
+  ];
+  const groups=p.ui.groupCallStack(calls);
+  assert.deepEqual(Array.from(groups,g=>g.id),['slow','newer']);
+  assert.deepEqual(Array.from(groups[0].actions,a=>a.id),['slow','peer']);
+  p.ui.state.run.actions=calls;p.ui.renderCallStack();
+  const stack=p.node('call-stack');
+  assert.equal(stack.firstElementChild.dataset.callGroup,'slow');
+  assert.match(stack.firstElementChild.innerHTML,/Overlapping calls/);
+  calls[0].outcome='success';p.ui.renderCallStack();
+  assert.equal(stack.firstElementChild.dataset.callGroup,'newer');
+});
+
+test('sequential calls and separate actors are not labelled concurrent',()=>{
+  const p=page();
+  const calls=[
+    {id:'first',agent:'a',kind:'tool',start:0,duration:1,outcome:'success'},
+    {id:'second',agent:'a',kind:'tool',start:1,duration:1,outcome:'success'},
+    {id:'other',agent:'b',kind:'tool',start:0,duration:2,outcome:'success'},
+    {id:'model',agent:'a',kind:'model',start:0,duration:2,outcome:'success'},
+  ];
+  assert.equal(p.ui.groupCallStack(calls).length,4);
+});
+
+test('old running calls survive the completed history limit',()=>{
+  const p=page();
+  p.ui.state.run.actions=[{id:'old-running',agent:'a',kind:'tool',start:0,duration:60,outcome:'running'},
+    ...Array.from({length:55},(_,i)=>({id:`finished-${i}`,agent:'b',kind:'tool',
+      start:i+1,duration:0.5,outcome:'success'}))];
+  p.ui.renderCallStack();
+  const stack=p.node('call-stack');
+  assert.equal(stack.children.length,51);
+  assert.equal(stack.firstElementChild.dataset.callGroup,'old-running');
+  assert.equal(stack.children[1].dataset.callGroup,'finished-54');
 });

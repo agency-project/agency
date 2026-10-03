@@ -1,4 +1,4 @@
-import {alignSequences, matchesAction, overlapDuration, packActionTracks} from './investigator-model.js';
+import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack} from './investigator-model.js';
 import {changedTrajectoryActions, mergeTrajectory, TrajectoryStream} from './trajectory-stream.js';
 
 const $ = id => document.getElementById(id);
@@ -182,7 +182,7 @@ function trajectoryView() {
   const header=heading('Execution trajectory',overlay?'Compare agent actions on a shared execution clock.':'A narrative of the run, grouped by action intent.',controls);
   const key=legend([['search','Search'],['read','Read'],['edit','Edit'],['test','Test'],['model','Model call']]);
   if(overlay) return header+trajectoryOverlay(visibleActions(state.run),key)+trajectoryWorkflow();
-  return header+`<div id="trajectory-glance"></div><div id="trajectory-signals"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div>`;
+  return header+`<div id="trajectory-signals"></div><div id="call-stack"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
 }
 
 function renderSession() {
@@ -220,6 +220,32 @@ function updateTrajectory(changed,resynced=false) {
   if(resynced)$('transport-state').textContent+=' · recovered from durable snapshot';
 }
 
+function renderCallStack() {
+  const stack=$('call-stack');if(!stack)return;
+  const groups=groupCallStack(visibleActions(state.run));
+  const running=groups.filter(group=>group.running),completed=groups.filter(group=>!group.running).slice(0,50);
+  const visible=running.concat(completed);
+  const existing=new Map([...stack.querySelectorAll('[data-call-group]')].map(el=>[el.dataset.callGroup,el]));
+  const ids=new Set(visible.map(group=>group.id));
+  for(const [id,el] of existing)if(!ids.has(id))el.remove();
+  for(const [position,group] of visible.entries()) {
+    let section=existing.get(group.id);
+    if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;}
+    section.className=`call-stack-group ${group.running?'running-group':''}`;
+    const concurrent=group.actions.length>1;
+    const title=`${group.running?'Running':'Finished'}${concurrent?' · Overlapping calls':''} · ${agentName(group.agent)}`;
+    const html=`<div class="call-group-heading">${esc(title)}</div><div class="call-group-grid">${group.actions.map(action=>`<div class="call-card">${actionButton(action)}<div class="call-card-status">${pill(action.outcome)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div></div>`).join('')}</div>`;
+    if(section.innerHTML!==html) {
+      const focused=section.contains(document.activeElement)?document.activeElement?.getAttribute('data-action'):null;
+      section.innerHTML=html;
+      if(focused)section.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
+    }
+    if(stack.children[position]!==section)stack.insertBefore(section,stack.children[position]||null);
+  }
+  if(!visible.length)stack.innerHTML=empty('Waiting for recorded calls','Calls will appear here as execution progresses.');
+  else stack.querySelector('.empty-state')?.remove();
+}
+
 function relevantEpisodes() {
   const visible=new Set(visibleActions(state.run).map(a=>a.id));
   return state.run.episodes.filter(e=>e.actions.some(id=>visible.has(id)));
@@ -227,6 +253,7 @@ function relevantEpisodes() {
 
 function reconcileActivities(initial=false) {
   const list=$('activity-list');if(!list)return;
+  renderCallStack();
   const run=state.run,map=actionMap(run),episodes=relevantEpisodes();
   const end=state.windowEnd==null?episodes.length:Math.min(state.windowEnd,episodes.length);
   const start=Math.max(0,end-50),window=episodes.slice(start,end).reverse();
@@ -678,6 +705,6 @@ $('replay-restart').onclick=()=>loadRun(state.run.id,null,true);
 $('replay-play').onclick=()=>state.stream?.send(state.replayState?.playing?'pause':'play',{speed:Number($('replay-speed').value)});
 $('replay-step').onclick=()=>state.stream?.send('step');
 $('replay-speed').onchange=()=>{if(state.replayState?.playing)state.stream?.send('play',{speed:Number($('replay-speed').value)});};
-$('follow-live').onclick=()=>{followLatest();$('activity-list')?.firstElementChild?.scrollIntoView({block:'start'});};
+$('follow-live').onclick=()=>{followLatest();$('call-stack')?.firstElementChild?.scrollIntoView({block:'start'});};
 $('reconnect-updates').onclick=()=>state.stream?.reconnect();
 refresh();

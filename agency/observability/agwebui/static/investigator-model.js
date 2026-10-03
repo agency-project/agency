@@ -51,3 +51,23 @@ export function packActionTracks(actions, minimumDuration = 0) {
   }
   return tracks;
 }
+
+export function groupCallStack(actions) {
+  // Group connected overlapping intervals for one actor. Touching endpoints
+  // are sequential, and model calls do not imply concurrent tool execution.
+  const groups=[], lanes=new Map();
+  for(const action of [...actions].sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id))) {
+    const lane=`${action.agent}:${action.kind==='model'?'model':'tool'}`;
+    const end=action.outcome==='running'?Infinity:action.start+Math.max(0,action.duration||0);
+    let group=lanes.get(lane);
+    if(!group||action.start>=group.end||end<=action.start) {
+      group={id:action.id,agent:action.agent,actions:[],end,latest:action.start,running:false};
+      groups.push(group);lanes.set(lane,group);
+    }
+    group.actions.push(action);group.end=Math.max(group.end,end);
+    group.latest=Math.max(group.latest,action.start);
+    group.running ||= action.outcome==='running';
+  }
+  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest)
+    .map(group=>({...group,actions:group.actions.sort((a,b)=>Number(b.outcome==='running')-Number(a.outcome==='running')||b.start-a.start)}));
+}
