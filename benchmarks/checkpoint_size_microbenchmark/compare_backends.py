@@ -270,7 +270,7 @@ def compare(roots, output):
         "See measurements.csv/json for every repetition, process dump, ZFS snapshot and RSS measurement; "
         "see each cohort's run.json, checkpoint report, records.json and Perfetto trace for raw evidence. "
         "Validation runs are excluded. CRIU's queued-inotify-event limitation and exact setup are documented "
-        "in docs/fast-checkpoint.md.",
+        "in docs/guides/checkpoints.md.",
         "",
         "## Source identity",
         "",

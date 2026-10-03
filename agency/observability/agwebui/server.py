@@ -810,11 +810,6 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
-app.mount(
-    "/perfetto",
-    StaticFiles(directory=str(_STATIC / "perfetto"), html=True, check_dir=False),
-    name="perfetto",
-)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
 
@@ -1105,7 +1100,6 @@ async def investigator_raw_trace(run_id: str):
 async def profiler_status():
     trace = _profile_trace_path()
     return {
-        "viewer_available": (_STATIC / "perfetto" / "index.html").is_file(),
         "trace_available": trace.is_file(),
     }
 
@@ -1311,25 +1305,12 @@ async def _tail_and_broadcast() -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    if __package__:
-        from .build_perfetto import ensure_viewer
-    else:
-        from build_perfetto import ensure_viewer
-
     parser = argparse.ArgumentParser(description="agwebui standalone server")
     parser.add_argument(
         "--run-dir", required=True, help="log_dir shared with the execution process's agents"
     )
     parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument(
-        "--no-perfetto",
-        action="store_true",
-        help="Start investigator without building the optional raw Perfetto viewer",
-    )
     parsed = parser.parse_args()
-
-    if not parsed.no_perfetto:
-        ensure_viewer()
 
     _run_dir = Path(parsed.run_dir)
     _command_dir = _run_dir / "ui_commands"

@@ -1,0 +1,84 @@
+site_name: Agency
+site_description: Python library reference for building and controlling coding agents
+repo_url: https://github.com/agency-project/agency
+repo_name: agency-project/agency
+edit_uri: edit/master/docs/
+site_dir: site
+strict: true
+theme:
+  name: mkdocs
+  color_mode: light
+  user_color_mode_toggle: true
+nav:
+  - Getting started: getting-started.md
+  - Guides:
+      - Configuration and providers: guides/configuration.md
+      - Profiling and viewing runs: guides/profiling.md
+      - Host setup: guides/host-setup.md
+      - Checkpoints: guides/checkpoints.md
+      - Development: guides/development.md
+  - API reference:
+      - Public API index: api/index.md
+      - Agents and lifecycle: api/agents.md
+      - Results and cancellation: api/results.md
+      - Skills, tools and policies: api/skills.md
+      - Schemas and types: api/types.md
+      - Workflows: api/workflows.md
+      - Configuration: api/configuration.md
+      - Sandboxes and checkpoints: api/sandboxes.md
+      - Runtime and observability: api/runtime.md
+      - Known contract issues: api/contracts.md
+  - Architecture:
+      - Overview: architecture/index.md
+      - configs: architecture/configs.md
+      - orchestrator: architecture/orchestrator.md
+      - engine: architecture/engine.md
+      - harness: architecture/harness.md
+      - native_harness: architecture/native_harness.md
+      - llm: architecture/llm.md
+      - sandbox: architecture/sandbox.md
+      - observability: architecture/observability.md
+      - host: architecture/host.md
+      - utils: architecture/utils.md
+exclude_docs: |
+  /archive/
+  /assets/figures/
+  /api/public-api.json
+not_in_nav: |
+  /index.md
+  /guides/profiling/
+extra_javascript:
+  - assets/javascripts/mermaid.js
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+hooks:
+  - scripts/docs_support.py
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [ . ]
+          options:
+            allow_inspection: false
+            members: []
+            inherited_members: false
+            show_root_heading: true
+            show_root_full_path: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_source: true
+            show_docstring_description: false
+            show_docstring_parameters: false
+            show_docstring_returns: false
+            show_docstring_raises: false
+            show_docstring_examples: false
+            show_docstring_other_parameters: false
+            docstring_style: null
+            signature_crossrefs: false
+            heading_level: 3

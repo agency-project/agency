@@ -420,7 +420,7 @@ class agsandbox_backend(AgSandboxBackendFields):
 
     def exec_detached(self, cmd: str, workdir: str = "/workspace") -> None:
         """Launch a long-lived process, returning immediately without
-        tracking output/exit code (container-backed backends only)."""
+        tracking output/exit code."""
         self._container_exec_detached(cmd, workdir=workdir)
 
     def read_file(self, path: str) -> str:

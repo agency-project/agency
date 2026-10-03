@@ -181,8 +181,6 @@ function renderRunChrome() {
   $('run-subtitle').textContent=`${run.condition?.replace('_',' ') || (run.id==='live'?'current execution':state.replay?'recorded replay':'saved execution')} / ${run.harness} / ${run.model}`;
   const agentCount=run.agents.filter(a=>a.id!=='workflow').length;
   $('run-description').textContent=`${agentCount} recorded actor${agentCount===1?'':'s'} · ${run.actions.length} observed calls · ${run.episodes.length} activities`;
-  const rawLink=document.querySelector('.side-bottom a[href*="perfetto"]');
-  rawLink.href=run.source==='recorded'&&run.id!=='live'&&run.format!=='native_events'?`/?view=perfetto&trace=${encodeURIComponent(run.id)}`:'/?view=perfetto';
   $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source)+`<div class="provenance-note">${run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.'}</div>`;
   const modelActions=run.actions.filter(a=>a.kind==='model');
   const knownTokens=modelActions.filter(a=>a.tokens!=null);

@@ -1376,10 +1376,14 @@ def test_profiler_serves_only_configured_run_trace(server, monkeypatch, tmp_path
 def test_profiler_tab_is_part_of_dashboard(server):
     client, _, _ = server
     html = client.get("/").text
-    assert 'id="view-profiler"' in html
-    assert 'id="profiler-frame"' in html
-    assert "/static/profiler.js" in html
-    assert client.get("/static/profiler.js").status_code == 200
+    assert 'href="/profiler"' in html
+    assert 'id="profiler-frame"' not in html
+    assert "/static/profiler.js" not in html
+    assert client.get("/static/profiler.js").status_code == 404
+    assert client.get("/perfetto/").status_code == 404
+    investigator = client.get("/profiler")
+    assert investigator.status_code == 200
+    assert "Raw Perfetto viewer" not in investigator.text
 
 
 def test_profiler_viewer_and_downloads_share_default_sibling_directory(server, monkeypatch):

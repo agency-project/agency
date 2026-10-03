@@ -1,0 +1,767 @@
+{
+  "root_exports": {
+    "agconfig": "agency.configs.agconfig.agconfig",
+    "agdata": "agency.agdata.agdata",
+    "agerror": "agency.agdata.agerror",
+    "agcanceled": "agency.agdata.agcanceled",
+    "agcontext": "agency.agcontext.agcontext",
+    "agschema": "agency.agschema.agschema",
+    "agtype": "agency.agtype.agtype",
+    "agfile": "agency.agtype.agfile",
+    "agbinary": "agency.agtype.agbinary",
+    "agimage": "agency.agtype.agimage",
+    "agrawstring": "agency.agtype.agrawstring",
+    "agpath": "agency.agtype.agpath",
+    "AgError": "agency.agdata.AgError",
+    "agskill": "agency.agskill.agskill",
+    "agtool": "agency.agtool.agtool",
+    "agDataLogger": "agency.observability.agdatalogger.agDataLogger",
+    "agent": "agency.agent.agent",
+    "Agent": "agency.agent.agent",
+    "agmap": "agency.utils.agmap.agmap",
+    "agtask": "agency.utils.agmap.agtask",
+    "agteam": "agency.agteam.agteam",
+    "agsync": "agency.utils.agsync.agsync",
+    "agSandbox": "agency.sandbox.agsandbox.agSandbox",
+    "agResourcePool": "agency.orchestrator.agresources.agResourcePool",
+    "GlobalAgentOrchestrator": "agency.orchestrator.orchestrator.GlobalAgentOrchestrator",
+    "ExecutionScheduler": "agency.orchestrator.scheduler.ExecutionScheduler",
+    "OrchestratorSnapshot": "agency.orchestrator.orchestrator.OrchestratorSnapshot",
+    "get_orchestrator": "agency.orchestrator.orchestrator.get_orchestrator",
+    "get_container_runtime": "agency.sandbox.container.get_container_runtime",
+    "sigterm_as_exit": "agency.utils.agutil.sigterm_as_exit",
+    "agprof": "agency.observability.profiler.agprof"
+  },
+  "objects": [
+    {
+      "object": "agency.agent.agent",
+      "page": "agents.md",
+      "members": [
+        "__init__",
+        "run",
+        "asyncio_run",
+        "queue_message",
+        "redirect",
+        "cancel",
+        "pause",
+        "resume",
+        "is_paused",
+        "history",
+        "output_path",
+        "container_output_path",
+        "change_config",
+        "get_config_copy",
+        "record_state",
+        "fork",
+        "all",
+        "save",
+        "load",
+        "save_all",
+        "load_all"
+      ]
+    },
+    {
+      "object": "agency.agdata.agdata",
+      "page": "results.md",
+      "members": [
+        "__init__",
+        "is_pending",
+        "wait",
+        "wait_all",
+        "to_dict",
+        "to_json",
+        "from_dict",
+        "from_json",
+        "resolve_input_dependencies"
+      ]
+    },
+    {
+      "object": "agency.agdata.agerror",
+      "page": "results.md",
+      "members": [
+        "__init__"
+      ]
+    },
+    {
+      "object": "agency.agdata.agcanceled",
+      "page": "results.md",
+      "members": [
+        "__init__"
+      ]
+    },
+    {
+      "object": "agency.agdata.AgError",
+      "page": "results.md",
+      "members": []
+    },
+    {
+      "object": "agency.agskill.agskill",
+      "page": "skills.md",
+      "members": [
+        "__init__",
+        "build_user_content",
+        "run",
+        "asyncio_run"
+      ]
+    },
+    {
+      "object": "agency.agtool.agtool",
+      "page": "skills.md",
+      "members": [
+        "__init__",
+        "__call__",
+        "log",
+        "to_openai_tool"
+      ]
+    },
+    {
+      "object": "agency.agpolicy.agpolicy",
+      "page": "skills.md",
+      "members": []
+    },
+    {
+      "object": "agency.harness._syscall_event.agsyscallevent",
+      "page": "skills.md",
+      "members": []
+    },
+    {
+      "object": "agency.agschema.agschema",
+      "page": "types.md",
+      "members": [
+        "__init__",
+        "to_json",
+        "check",
+        "check_field",
+        "validate_input",
+        "prepare_inputs_in_sandbox",
+        "recover_outputs",
+        "validate_outputs",
+        "validate_and_recover",
+        "raw_key",
+        "field_desc",
+        "get_return_tool_descriptions"
+      ]
+    },
+    {
+      "object": "agency.agtype.agtype",
+      "page": "types.md",
+      "members": [
+        "schema_type",
+        "needs_sandbox",
+        "prepare",
+        "recover",
+        "extra_input_prompt",
+        "extra_output_prompt",
+        "build_content_prompt",
+        "get_return_tool_description",
+        "get_return_tool_value_description",
+        "validate_output",
+        "validate_input_value",
+        "walk",
+        "in_hint",
+        "from_hint"
+      ]
+    },
+    {
+      "object": "agency.agtype.agfile",
+      "page": "types.md",
+      "members": [],
+      "excluded_members": {
+        "schema_type": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "needs_sandbox": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "prepare": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "recover": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_input_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_output_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_value_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "validate_output": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table."
+      }
+    },
+    {
+      "object": "agency.agtype.agpath",
+      "page": "types.md",
+      "members": [],
+      "excluded_members": {
+        "schema_type": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "needs_sandbox": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_input_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_output_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_value_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "validate_output": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "validate_input_value": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table."
+      }
+    },
+    {
+      "object": "agency.agtype.agbinary",
+      "page": "types.md",
+      "members": [],
+      "excluded_members": {
+        "schema_type": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "needs_sandbox": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "prepare": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "recover": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_input_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_output_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_value_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "validate_output": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table."
+      }
+    },
+    {
+      "object": "agency.agtype.agimage",
+      "page": "types.md",
+      "members": [],
+      "excluded_members": {
+        "schema_type": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "needs_sandbox": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "prepare": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "extra_input_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "build_content_prompt": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "get_return_tool_value_description": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table."
+      }
+    },
+    {
+      "object": "agency.agtype.agrawstring",
+      "page": "types.md",
+      "members": [],
+      "excluded_members": {
+        "schema_type": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table.",
+        "needs_sandbox": "Concrete type protocol override; shared signatures are documented on agtype, and marker-specific behavior in the type table."
+      }
+    },
+    {
+      "object": "agency.utils.agmap.agmap",
+      "page": "workflows.md"
+    },
+    {
+      "object": "agency.utils.agmap.agtask",
+      "page": "workflows.md",
+      "members": []
+    },
+    {
+      "object": "agency.utils.agsync.agsync",
+      "page": "workflows.md"
+    },
+    {
+      "object": "agency.agteam.agteam",
+      "page": "workflows.md",
+      "members": [
+        "__init__",
+        "setup",
+        "run",
+        "change_config",
+        "get_config_copy",
+        "agents",
+        "all"
+      ]
+    },
+    {
+      "object": "agency.utils.agutil.sigterm_as_exit",
+      "page": "workflows.md"
+    },
+    {
+      "object": "agency.configs.agconfig.agconfig",
+      "page": "configuration.md",
+      "members": [
+        "__init__",
+        "clone",
+        "update",
+        "safe_snapshot"
+      ]
+    },
+    {
+      "object": "agency.configs.agconfig.confignamespace",
+      "page": "configuration.md",
+      "members": [
+        "clone",
+        "update",
+        "safe_snapshot"
+      ]
+    },
+    {
+      "object": "agency.configs.agconfig.llmconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.sandboxconfig",
+      "page": "configuration.md",
+      "members": [
+        "add_mount",
+        "remove_mount"
+      ]
+    },
+    {
+      "object": "agency.configs.agconfig.orchestratorconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.resourcesconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.agentconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.schemaconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.skillconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.toolconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.harnessadapterconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.ptraceconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.dataloggerconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.configs.agconfig.hostserverconfig",
+      "page": "configuration.md",
+      "members": []
+    },
+    {
+      "object": "agency.sandbox.agsandbox.agSandbox",
+      "page": "sandboxes.md",
+      "members": [
+        "__init__",
+        "exec",
+        "exec_detached",
+        "read_file",
+        "read_file_bytes",
+        "write_file",
+        "write_file_bytes",
+        "update_limits",
+        "commit",
+        "checkpoint",
+        "delete_checkpoint",
+        "stop",
+        "rm_container",
+        "restore",
+        "release_daemon",
+        "get_live_pids",
+        "pid_status_summary",
+        "release_resources",
+        "remove_files",
+        "destroy",
+        "fork",
+        "image_kind",
+        "change_config",
+        "get_config_copy",
+        "current_gpu_ids",
+        "ensure_gpu_acquired",
+        "backend_for_image_kind",
+        "tag_image",
+        "delete_image",
+        "export_image",
+        "import_image",
+        "wait_for_processes"
+      ]
+    },
+    {
+      "object": "agency.sandbox.container.get_container_runtime",
+      "page": "sandboxes.md"
+    },
+    {
+      "object": "agency.sandbox.checkpoint.CheckpointHandle",
+      "page": "sandboxes.md",
+      "members": []
+    },
+    {
+      "object": "agency.sandbox.checkpoint.CheckpointCapabilityError",
+      "page": "sandboxes.md",
+      "members": []
+    },
+    {
+      "object": "agency.agcontext.agcontext",
+      "page": "runtime.md",
+      "members": [
+        "__init__",
+        "is_pending",
+        "resolve_prev_dependencies",
+        "get_resolved_transcript",
+        "set_transcript",
+        "append_retained_message",
+        "pending_retained_messages",
+        "advance_retained_cursor",
+        "copy"
+      ]
+    },
+    {
+      "object": "agency.orchestrator.orchestrator.GlobalAgentOrchestrator",
+      "page": "runtime.md",
+      "members": [
+        "__init__",
+        "change_config",
+        "submit",
+        "submit_context_message",
+        "redirect_request",
+        "cancel_request",
+        "snapshot",
+        "flush",
+        "shutdown"
+      ]
+    },
+    {
+      "object": "agency.orchestrator.orchestrator.OrchestratorSnapshot",
+      "page": "runtime.md",
+      "members": []
+    },
+    {
+      "object": "agency.orchestrator.orchestrator.get_orchestrator",
+      "page": "runtime.md"
+    },
+    {
+      "object": "agency.orchestrator.orchestrator.peek_orchestrator",
+      "page": "runtime.md"
+    },
+    {
+      "object": "agency.orchestrator.scheduler.ExecutionScheduler",
+      "page": "runtime.md",
+      "members": [
+        "__init__",
+        "execute",
+        "default_schedule",
+        "materialize_dependencies"
+      ],
+      "excluded_members": {
+        "resolve_dependency": "Scheduler protocol consumes private _ExecutionRequest records; use Agent.run().",
+        "set_agent_blocked": "Scheduler protocol consumes private _ExecutionRequest records; use snapshots for inspection."
+      }
+    },
+    {
+      "object": "agency.orchestrator.agresources.agResourcePool",
+      "page": "runtime.md",
+      "members": [
+        "__init__",
+        "change_config",
+        "get_config_copy",
+        "acquire_gpus",
+        "release_gpus",
+        "acquire_cpu_mem",
+        "release_cpu_mem"
+      ]
+    },
+    {
+      "object": "agency.orchestrator.agresources.GpuWaitCancelled",
+      "page": "runtime.md",
+      "members": []
+    },
+    {
+      "object": "agency.observability.agdatalogger.agDataLogger",
+      "page": "runtime.md",
+      "members": [
+        "__init__",
+        "db_path",
+        "change_config",
+        "start",
+        "stop",
+        "flush",
+        "read_profile_records",
+        "record_event",
+        "record_stream_delta",
+        "record_llm_exchange",
+        "record_span"
+      ]
+    },
+    {
+      "object": "agency.observability.agdatalogger.read_llm_exchanges",
+      "page": "runtime.md"
+    },
+    {
+      "object": "agency.observability.agdatalogger.reconstruct_llm_exchanges",
+      "page": "runtime.md"
+    },
+    {
+      "object": "agency.observability.agdatalogger.resolve_global_db_path",
+      "page": "runtime.md"
+    },
+    {
+      "object": "agency.observability.profiler.agprof",
+      "page": "runtime.md",
+      "members": [
+        "start",
+        "stop",
+        "session",
+        "workload",
+        "profile_scope",
+        "enabled",
+        "span",
+        "annotate",
+        "thread_name",
+        "spawn_traced",
+        "bind_execution",
+        "execution_context",
+        "current_span_context",
+        "current_span_attributes",
+        "next_index",
+        "summary_metrics",
+        "profile_records",
+        "summary_table"
+      ],
+      "excluded_members": {
+        "container_cgroup_parent": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "container_started": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "container_stopped": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "container_registered": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "detail_metadata": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "register_engine": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "telemetry_error": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "ingest_auto_samples": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "sandbox_identity": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "start_external_span": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "interrupt_external_span": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "cancel_external_span": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "gpu_lease_begin": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "gpu_lease_end": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point."
+      }
+    },
+    {
+      "object": "agency.observability.agwebui.agwebui",
+      "page": "runtime.md",
+      "members": [
+        "run"
+      ],
+      "excluded_members": {
+        "__init__": "Server instance lifecycle is managed by agwebui.run(); use the callable entry point or standalone CLI."
+      }
+    }
+  ],
+  "excluded_example_imports": {
+    "agency.engine.host_servers.host_interaction_server.HostInteractionServer": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.engine.host_servers.llm_handler_server.LlmHandlerServer": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.harness.adapters.claude_code.ClaudeCodeAdapter": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.harness.adapters.codex.CodexAdapter": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.harness.adapters.native.NativeAdapter": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.harness.clients.host_services_client.HostServicesClient": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.llm.usage_tracker.LlmUsageTracker": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.native_harness.llm_client.LLMClient": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.llm.agllm.agllm": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.observability.agwebui._flush_loop": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
+    "agency.llm.openai._OpenAICompatibleBackend": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof."
+  },
+  "subpackage_exports": {
+    "agency.configs": {
+      "agconfig": {
+        "object": "agency.configs.agconfig.agconfig",
+        "page": "configuration.md"
+      }
+    },
+    "agency.orchestrator": {
+      "GlobalAgentOrchestrator": {
+        "object": "agency.orchestrator.orchestrator.GlobalAgentOrchestrator",
+        "page": "runtime.md"
+      },
+      "ExecutionScheduler": {
+        "object": "agency.orchestrator.scheduler.ExecutionScheduler",
+        "page": "runtime.md"
+      },
+      "OrchestratorSnapshot": {
+        "object": "agency.orchestrator.orchestrator.OrchestratorSnapshot",
+        "page": "runtime.md"
+      },
+      "get_orchestrator": {
+        "object": "agency.orchestrator.orchestrator.get_orchestrator",
+        "page": "runtime.md"
+      },
+      "peek_orchestrator": {
+        "object": "agency.orchestrator.orchestrator.peek_orchestrator",
+        "page": "runtime.md"
+      }
+    },
+    "agency.sandbox": {
+      "AgSandboxBackendFields": {
+        "object": "agency.sandbox.base.AgSandboxBackendFields",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "agsandbox_backend": {
+        "object": "agency.sandbox.base.agsandbox_backend",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "backend_for_image_kind": {
+        "object": "agency.sandbox.base.backend_for_image_kind",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_ContainerAlreadyRunning": {
+        "object": "agency.sandbox.container._ContainerAlreadyRunning",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_ContainerBackendBase": {
+        "object": "agency.sandbox.container._ContainerBackendBase",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_RUN_ID": {
+        "object": "agency.sandbox.container._RUN_ID",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "get_container_runtime": {
+        "object": "agency.sandbox.container.get_container_runtime",
+        "page": "sandboxes.md"
+      },
+      "keyring_quota": {
+        "object": "agency.sandbox.container.keyring_quota",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "reap_orphaned_containers": {
+        "object": "agency.sandbox.container.reap_orphaned_containers",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "seed_cache_from_image": {
+        "object": "agency.sandbox.container.seed_cache_from_image",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_DockerBackend": {
+        "object": "agency.sandbox.docker._DockerBackend",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_PodmanBackend": {
+        "object": "agency.sandbox.podman._PodmanBackend",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "_ChrootBackend": {
+        "object": "agency.sandbox.chroot._ChrootBackend",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      },
+      "chroot_available": {
+        "object": "agency.sandbox.chroot.chroot_available",
+        "rationale": "Backend implementation, selection helper, cache/provisioning or orphan-reaper utility. Application sandbox operations use agSandbox and get_container_runtime; not a normal application API."
+      }
+    },
+    "agency.observability.profiler": {
+      "agprof": {
+        "object": "agency.observability.profiler.agprof",
+        "page": "runtime.md"
+      },
+      "annotate": {
+        "object": "agency.observability.profiler.agprof.annotate",
+        "page": "runtime.md"
+      },
+      "cancel_external_span": {
+        "object": "agency.observability.profiler.agprof.cancel_external_span",
+        "rationale": "Advanced external-span instrumentation protocol; use agprof.span/session for application tracing. Explicitly excluded in the profiler member inventory."
+      },
+      "enabled": {
+        "object": "agency.observability.profiler.agprof.enabled",
+        "page": "runtime.md"
+      },
+      "interrupt_external_span": {
+        "object": "agency.observability.profiler.agprof.interrupt_external_span",
+        "rationale": "Advanced external-span instrumentation protocol; use agprof.span/session for application tracing. Explicitly excluded in the profiler member inventory."
+      },
+      "next_index": {
+        "object": "agency.observability.profiler.agprof.next_index",
+        "page": "runtime.md"
+      },
+      "profile_records": {
+        "object": "agency.observability.profiler.agprof.profile_records",
+        "page": "runtime.md"
+      },
+      "profile_scope": {
+        "object": "agency.observability.profiler.agprof.profile_scope",
+        "page": "runtime.md"
+      },
+      "session": {
+        "object": "agency.observability.profiler.agprof.session",
+        "page": "runtime.md"
+      },
+      "spawn_traced": {
+        "object": "agency.observability.profiler.agprof.spawn_traced",
+        "page": "runtime.md"
+      },
+      "span": {
+        "object": "agency.observability.profiler.agprof.span",
+        "page": "runtime.md"
+      },
+      "start": {
+        "object": "agency.observability.profiler.agprof.start",
+        "page": "runtime.md"
+      },
+      "start_external_span": {
+        "object": "agency.observability.profiler.agprof.start_external_span",
+        "rationale": "Advanced external-span instrumentation protocol; use agprof.span/session for application tracing. Explicitly excluded in the profiler member inventory."
+      },
+      "stop": {
+        "object": "agency.observability.profiler.agprof.stop",
+        "page": "runtime.md"
+      },
+      "summary_metrics": {
+        "object": "agency.observability.profiler.agprof.summary_metrics",
+        "page": "runtime.md"
+      },
+      "summary_table": {
+        "object": "agency.observability.profiler.agprof.summary_table",
+        "page": "runtime.md"
+      },
+      "thread_name": {
+        "object": "agency.observability.profiler.agprof.thread_name",
+        "page": "runtime.md"
+      },
+      "workload": {
+        "object": "agency.observability.profiler.agprof.workload",
+        "page": "runtime.md"
+      }
+    },
+    "agency.llm": {
+      "agllm": {
+        "object": "agency.llm.agllm.agllm",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "BAD_REQUEST_EXCS": {
+        "object": "agency.llm.agllm.BAD_REQUEST_EXCS",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "API_CONN_EXCS": {
+        "object": "agency.llm.agllm.API_CONN_EXCS",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "RATE_LIMIT_EXCS": {
+        "object": "agency.llm.agllm.RATE_LIMIT_EXCS",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "API_ERROR_EXCS": {
+        "object": "agency.llm.agllm.API_ERROR_EXCS",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      }
+    },
+    "agency.engine": {
+      "AgentEngine": {
+        "object": "agency.engine.engine.AgentEngine",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "HostInteractionServer": {
+        "object": "agency.engine.host_servers.host_interaction_server.HostInteractionServer",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      }
+    },
+    "agency.harness.adapters": {
+      "HarnessAdapter": {
+        "object": "agency.harness.adapters.base.HarnessAdapter",
+        "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      }
+    }
+  }
+}

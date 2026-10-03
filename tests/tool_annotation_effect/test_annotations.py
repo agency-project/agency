@@ -56,9 +56,11 @@ class FakeBridge:
         self.denied = denied
         self.admissions = []
         self.completions = []
+        self.annotations = []
 
-    def check_tool_policy(self, name, arguments):
+    def check_tool_policy(self, name, arguments, *, annotation=None):
         self.admissions.append((name, arguments))
+        self.annotations.append(annotation)
         return {"call_id": "agency-call-1", "decision": "deny" if self.denied else "allow"}
 
     def complete_tool_policy(self, call_id, result, **kwargs):
@@ -133,6 +135,10 @@ def test_missing_or_malformed_annotations_do_not_cause_retries(metadata, status,
     assert len(llm.requests) == 2
     assert mcp.arguments == [{"x": 3}]
     assert bridge.admissions == [("custom", {"x": 3})]
+    assert bridge.annotations[0]["model_tool_call_id"] == tc["id"]
+    assert bridge.annotations[0]["status"] == status
+    if status == "valid":
+        assert bridge.annotations[0]["raw"] == metadata
     assert bridge.completions == ["agency-call-1"]
     assert (
         next(e for e in events if e["kind"] == "tool_annotation")["annotation"]["status"] == status
@@ -255,6 +261,20 @@ def test_trace_writer_redacts_echoed_credentials(tmp_path, monkeypatch):
     trace("model_exchange", {"response": {"error": "private-test-key bridge-secret"}})
     text = (tmp_path / "events.jsonl").read_text()
     assert "private-test-key" not in text and "bridge-secret" not in text
+    bridge = FakeBridge()
+    bridge.token = "bridge-secret"
+    run_react_loop(
+        [],
+        "fake",
+        FakeLLM([call({"purpose": "Check private-test-key bridge-secret"})]),
+        mcp=FakeMCP(),
+        bridge=bridge,
+        annotation_arm="purpose",
+        offload_dir=str(tmp_path),
+    )
+    forwarded = json.dumps(bridge.annotations)
+    assert "private-test-key" not in forwarded and "bridge-secret" not in forwarded
+    assert "[REDACTED]" in forwarded
 
 
 def test_builtin_arguments_are_stripped_and_nonzero_shell_exit_is_an_error(tmp_path):

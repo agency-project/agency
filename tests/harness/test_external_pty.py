@@ -29,6 +29,19 @@ def runtime():
     )
 
 
+def test_exited_harness_reports_terminal_startup_error(runtime, tmp_path):
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    execution.handle = Mock(returncode=1)
+    execution.handle.terminal_screen.return_value = (
+        ["", "Error: Codex executable path is not configured", ""],
+        0,
+        0,
+        1,
+    )
+    with pytest.raises(RuntimeError, match="Codex executable path is not configured"):
+        execution._check_alive()
+
+
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
 def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, tmp_path):
     driver = driver_for(
@@ -268,6 +281,29 @@ def test_delayed_stop_and_wrong_prompt_do_not_acknowledge_current_turn(execution
     execution._poll()
     assert execution._turn_id is None
     assert execution._stop is None
+
+
+@pytest.mark.parametrize("suffix", ["\n", "\n\n", " \t\n"])
+def test_codex_acknowledges_prompt_after_composer_trims_trailing_whitespace(execution, suffix):
+    from agency.harness.adapters.codex import CodexDriver
+
+    execution.driver.prompt_matches = CodexDriver.prompt_matches.__get__(execution.driver)
+    execution._expected_prompt = "[Agency run current]\nRepair the redirect chain" + suffix
+    execution.driver.pending = [
+        {
+            "kind": "submit",
+            "turn_id": "current",
+            "prompt": "[Agency run stale]\nRepair the redirect chain",
+        },
+    ]
+    execution._poll()
+    assert not execution._acknowledged
+    execution.driver.pending = [
+        {"kind": "submit", "turn_id": "current", "prompt": execution._expected_prompt.rstrip()},
+    ]
+    execution._poll()
+    assert execution._acknowledged
+    assert execution._turn_id == "current"
 
 
 def test_startup_failure_is_reported_before_any_turn_exists(execution):

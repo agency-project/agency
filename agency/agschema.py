@@ -309,8 +309,8 @@ class agschema:
 
         Harness adapters return one raw text blob, so this provides the
         whole-schema validation and recovery step as a pure composition of
-        `check()` (whole-schema field presence/type validation, already
-        used for input validation despite the name) and `recover_outputs()`
+        `check()` (whole-schema field presence/type validation, also available
+        through explicit validate_input() calls) and `recover_outputs()`
         (per-agtype-field `.recover()`) -- no new validation logic.
 
         Returns `(data, paths)` on success (`paths` are the sandbox paths

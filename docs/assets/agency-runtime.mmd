@@ -1,0 +1,13 @@
+---
+config:
+  theme: neutral
+  fontFamily: Arial, sans-serif
+  htmlLabels: false
+  flowchart:
+    wrappingWidth: 500
+---
+flowchart TB
+    app["Your application / orchestration"] --> runtime["Agency<br/>Execution · sandboxing · resources<br/>Observability · control"]
+    runtime --> harness["Supported harness"]
+    runtime --> model["Model backend"]
+    runtime --> tools["Tools / Linux processes"]

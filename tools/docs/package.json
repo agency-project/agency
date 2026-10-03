@@ -1,0 +1,11 @@
+{
+  "name": "agency-docs-diagrams",
+  "private": true,
+  "scripts": {
+    "check:diagrams": "node ../../scripts/check_mermaid.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "27.0.1",
+    "mermaid": "12.1.0"
+  }
+}

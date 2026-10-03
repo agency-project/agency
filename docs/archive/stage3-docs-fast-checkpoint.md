@@ -123,7 +123,7 @@ base-image import happen in `checkpoint.setup`, outside checkpoint latency.
 ## Configuration
 
 To provision a new supported Ubuntu host, use the explicit
-[`agency setup-host` command](setup-host.md). The configuration below remains
+[`agency setup-host` command](../guides/host-setup.md). The configuration below remains
 available for separately managed storage.
 
 ```python

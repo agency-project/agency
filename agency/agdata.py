@@ -242,8 +242,10 @@ class agerror(agdata):
 
         return agerror("context limit exceeded")
 
-    Callers check with ``isinstance(result, agerror)``.
-    Accessing any field other than ``.error`` raises AgError.
+    Direct instances support ``isinstance(result, agerror)`` and raise AgError
+    for missing non-error fields. Pending agdata/agtask wrappers copy the error
+    payload on resolution without changing class: inspect their to_dict() for
+    "error"; missing output fields on those wrappers raise AttributeError.
     """
 
     def __init__(self, message: str):
@@ -264,8 +266,9 @@ class agerror(agdata):
 class agcanceled(agerror):
     """Returned when an invocation was cancelled via ``agent.cancel(handle)``.
 
-    A typed subclass of ``agerror`` so callers can ``isinstance(result, agcanceled)``
-    instead of string-matching ``.error``.
+    Direct instances are typed subclasses of ``agerror``. Pending agdata
+    wrappers retain only the error payload when resolved, so their callers
+    cannot distinguish cancellation by isinstance().
     """
 
     def __init__(self, message: str = "agent invocation cancelled"):

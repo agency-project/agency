@@ -1,0 +1,35 @@
+name: Documentation
+on:
+  pull_request:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: .venv-docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v3
+      - name: Install only locked documentation dependencies
+        run: uv sync --locked --only-group docs --python 3.12
+      - name: Check API inventory, imports, links and Python examples
+        run: uv run --no-sync --only-group docs python scripts/check_docs.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tools/docs/package-lock.json
+      - name: Check canonical Mermaid diagrams
+        run: |
+          npm ci --prefix tools/docs --ignore-scripts
+          npm run --prefix tools/docs check:diagrams
+      - name: Build without runtime imports
+        run: uv run --no-sync --only-group docs mkdocs build --strict
+      - name: Check rendered links and anchors
+        run: uv run --no-sync --only-group docs python scripts/check_docs.py --site site

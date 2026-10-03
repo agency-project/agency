@@ -639,6 +639,18 @@ class _ChrootBackend(agsandbox_backend):
         # isn't itself a fresh mount and so was never nodev-flagged).
         dev_jail_path = f"{root}/dev"
         lines.append(f"mkdir -p {shlex.quote(dev_jail_path)}")
+        # Python's multiprocessing semaphores use /dev/shm even when no
+        # subprocess is spawned. Keep their files private to this jail.
+        lines.append(f"mkdir -p {shlex.quote(dev_jail_path + '/shm')}")
+        lines.append(f"chmod 1777 {shlex.quote(dev_jail_path + '/shm')}")
+        # Interactive harnesses need a private PTY allocator, not the host's
+        # terminal devices. devpts can be mounted in our user/mount namespace.
+        pts_path = dev_jail_path + "/pts"
+        lines.append(f"mkdir -p {shlex.quote(pts_path)}")
+        lines.append(
+            f"mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {shlex.quote(pts_path)}"
+        )
+        lines.append(f"ln -sfn pts/ptmx {shlex.quote(dev_jail_path + '/ptmx')}")
         dev_host_paths = [f"/dev/{name}" for name in _CHROOT_DEV_FILES] + _chroot_gpu_dev_paths(
             self._gpu_ids
         )
@@ -768,6 +780,28 @@ class _ChrootBackend(agsandbox_backend):
         script = self._build_jail_script(sh_cmd, workdir=workdir, shell=shell)
         output, rc, _pgid = self._run_unshared(script, stdin=stdin, timeout=timeout)
         return output, rc
+
+    def _container_exec_detached(
+        self,
+        sh_cmd: str,
+        workdir: str = "/workspace",
+        shell: str = "bash",
+    ) -> None:
+        """Start a daemon in the jail without waiting for its lifetime.
+
+        Use the tracked execution path so the background child retains an
+        owned process group and stop/destroy can terminate it. Redirect all
+        descriptors before backgrounding so it cannot hold the launch open.
+        Daemon readiness and later failures are checked by the caller.
+        """
+        command = (
+            f"nohup {shlex.quote(shell)} -c {shlex.quote(sh_cmd)} </dev/null >/dev/null 2>&1 &"
+        )
+        output, rc = self._exec_with_pid_tracking(
+            "", command, workdir, self._agconfig.sandbox.exec_quick_timeout_s
+        )
+        if rc != 0:
+            raise RuntimeError(f"Could not launch detached chroot command: {output}")
 
     def _read_proc_table(self, script: str, timeout: int) -> "tuple[str, int]":
         """Run a pure /proc-reading *script* directly against the real host
