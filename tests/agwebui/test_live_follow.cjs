@@ -90,7 +90,7 @@ function page(replay=false) {
     var lastWindowEnd;
     globalThis.ui={state,loadRun,selectAction,holdHistory,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
-      paints:()=>paints,visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn};
+      paints:()=>paints,visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
   const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
@@ -283,4 +283,42 @@ test('agent filtering temporarily focuses one column without losing chosen colum
   assert.deepEqual(p.node('call-stack').children.map(column=>column.dataset.agentColumn),['b']);
   p.ui.state.agent='';p.ui.renderCallStack();
   assert.deepEqual(p.node('call-stack').children.map(column=>column.dataset.agentColumn),['a','b']);
+});
+
+
+test('tandem live updates preserve expanded episodes and isolate agent calls',()=>{
+  const p=page(),run=p.ui.state.run;
+  run.agents=[{id:'a',label:'A'},{id:'b',label:'B',parent:'a'}];
+  run.episodes[0].agent='a';run.episodes[0].title='First';
+  run.counters={};run.intervals=[];
+  p.ui.state.view='agents';p.ui.renderTandemBoard();
+  const column=p.node('tandem-columns').children[0],body=column.querySelector('.col-body'),episode=body.children[0];
+  episode.open=true;
+  p.append();p.flush();
+  assert.equal(p.node('tandem-columns').children[0],column);
+  assert.equal(body.children[0],episode);
+  assert.equal(episode.open,true);
+  assert.match(p.node('tandem-system-metrics').innerHTML,/System metrics unavailable/);
+  assert.match(p.node('tandem-concurrent').innerHTML,/data-action="new-call"/);
+  p.ui.removeAgentColumn('b');
+  assert.equal(p.node('tandem-columns').children.length,1);
+});
+
+test('metric tracks share interval coordinates, filter invalid samples and never fabricate data',()=>{
+  const p=page(),run=p.ui.state.run;
+  run.duration=10;run.counters={'cpu %':[[0,5],[5,25],[10,10],[20,100],[2,null]]};
+  const chart=p.ui.systemMetricTimelines();
+  assert.match(chart,/3 samples · peak 25/);
+  assert.match(chart,/cx="439"/); // 130 + half the 618px plot
+  assert.doesNotMatch(chart,/NaN|undefined/);
+  run.counters={};assert.match(p.ui.systemMetricTimelines(),/no recorded resource samples/);
+});
+
+test('concurrent work separates overlapping calls and supports live actions without profiler spans',()=>{
+  const p=page(),run=p.ui.state.run;
+  run.duration=5;run.actions=[{id:'one',agent:'a',start:0,duration:4,kind:'tool',name:'read'},
+    {id:'two',agent:'a',start:1,duration:3,kind:'tool',name:'test'}];
+  const html=p.ui.tandemConcurrentWork([{id:'a',label:'A'}]);
+  assert.match(html,/A \/ 2/);
+  assert.match(html,/data-action="one"/);assert.match(html,/data-action="two"/);
 });

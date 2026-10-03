@@ -2007,3 +2007,47 @@ small,.muted {
   font-size:8px;
   color:var(--muted);
 }
+
+/* Tandem board: layout and trace colors adapted from the supplied board.css.
+   Scoped to keep its transcript styles separate from the profiler chrome. */
+.tandem-board { --border:var(--line);--text-dim:var(--muted);--sup:var(--amber);--wrk:var(--blue);--accent:var(--green);--sup-soft:#e8bb7214;--wrk-soft:#70b4ed12 }
+.tandem-board .task-box { padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel) }
+.tandem-board .task-box .k { font:10px var(--mono);letter-spacing:.08em;color:var(--muted);text-transform:uppercase }
+.tandem-board .task-box p { margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto }
+.tandem-board .cat-legend { display:flex;gap:16px;flex-wrap:wrap;margin:14px 0;font-size:12px;color:var(--muted) }
+.tandem-board .supervisor-key { color:var(--sup) }
+.tandem-board .worker-key { color:var(--wrk) }
+.tandem-board .mtable-wrap { margin:16px 0;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:auto }
+.tandem-board .mtable { border-collapse:collapse;width:100%;font:12px var(--mono);font-variant-numeric:tabular-nums }
+.tandem-board .mtable caption { text-align:left;padding:14px;color:var(--text);font-weight:600 }
+.tandem-board .mtable th,.tandem-board .mtable td { padding:8px 12px;text-align:right;white-space:nowrap;border-top:1px solid var(--line) }
+.tandem-board .mtable th:first-child { text-align:left }
+.tandem-board .mtable thead { color:var(--muted);font-size:10px;text-transform:uppercase }
+.tandem-board .board { display:grid;gap:14px;margin:14px 0 26px;align-items:start;overflow-anchor:none }
+.tandem-board .col { min-width:0;border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden }
+.tandem-board .col-head { padding:12px 14px;border-bottom:1px solid var(--line) }
+.tandem-board .agent { display:flex;align-items:center;justify-content:space-between;gap:8px }
+.tandem-board .agent button:first-child { border:0;background:none;font-weight:600;text-align:left;overflow-wrap:anywhere }
+.tandem-board .meta { display:flex;gap:6px;flex-wrap:wrap;margin-top:8px }
+.tandem-board .badge { font:10px var(--mono);padding:3px 7px;border-radius:6px;border:1px solid var(--line);color:var(--muted);overflow-wrap:anywhere }
+.tandem-board .badge.sup { color:var(--sup);border-color:var(--sup);background:var(--sup-soft) }
+.tandem-board .badge.wrk { color:var(--wrk);border-color:var(--wrk);background:var(--wrk-soft) }
+.tandem-board .col-body { padding:12px;display:flex;flex-direction:column;gap:10px;max-height:650px;overflow:auto;scrollbar-gutter:stable;overflow-anchor:none }
+.tandem-board .seg { border:1px solid var(--line);border-left:3px solid var(--wrk);border-radius:8px;min-width:0 }
+.tandem-board .seg summary { padding:10px;cursor:pointer;overflow-wrap:anywhere }
+.tandem-board .seg summary .pill { margin-left:6px }
+.tandem-board .seg-items { display:flex;flex-direction:column;gap:8px;padding:8px }
+.tandem-board .item { border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--wrk-soft);min-width:0 }
+.tandem-board .item.text { background:var(--sup-soft);border-color:#e8bb7240 }
+.tandem-board .item.trace-failed { border-color:var(--red) }
+.tandem-board .lbl { display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;color:var(--muted);font:10px var(--mono);margin-bottom:6px }
+.tandem-board .lbl button { font:inherit;padding:0;background:none;border:0;color:var(--blue);text-align:left;overflow-wrap:anywhere }
+.tandem-board .item p { overflow-wrap:anywhere }
+.tandem-board pre { background:var(--bg);padding:8px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;font:11px/1.5 var(--mono) }
+.tandem-board .tool-result { padding-top:8px;border-top:1px solid var(--line) }
+.tandem-board .trace-metrics { display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:var(--muted);font:10px var(--mono) }
+.tandem-board .trace-metrics button { font:inherit }
+.system-metric-track { border-top:1px solid var(--line);padding-top:12px }
+.metric-track-empty { padding:12px;color:var(--muted) }
+@media(max-width:900px) { .tandem-board .board>.col:not(.active-agent-column) { display:none } }
+.tandem-board .supervisor-column .seg { border-left-color:var(--sup) }

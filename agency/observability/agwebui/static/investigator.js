@@ -9,8 +9,8 @@ const colors = {search:'#70b4ed', read:'#89c7da', edit:'#72d6b1', test:'#9fbb84'
 const sources = {'System instructions':'#b39ee5','Original task':'#70b4ed','Supervisor instructions':'#70b4ed','Tool results':'#72d6b1','Files':'#8fc9d8','Conversation':'#e8bb72','Summary':'#d396b0'};
 const views = [
   ['trajectory','Trajectory','What did the agent do?'], ['resources','Resources & waits','Where did the time go?'],
-  ['context','Context & information','What did the model know?'], ['agents','Multi-agent','Who depended on whom?'],
-  ['compare','Compare runs','Where did behavior change?'], ['progress','Task progress','What is supported by evidence?']
+  ['context','Context & information','What did the model know?'], ['agents','Tandem trace board','How did agents work together?'],
+  ['compare','Compare runs','Where did behavior change?']
 ];
 const params = new URLSearchParams(location.search);
 const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
@@ -151,8 +151,20 @@ function render() {
   $('views').innerHTML=views.map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">0${index+1}</span>${label}</button>`).join('');
   $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
   renderRunChrome();
-  $('content').innerHTML=({trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView,progress:progressView})[state.view]();
+  const board=$('content').querySelector('#tandem-columns');
+  const held=state.view==='agents'&&board?.dataset.run===run.id?{
+    episodes:[...board.querySelectorAll('[data-tandem-episode]')].filter(el=>el.open).map(el=>el.dataset.tandemEpisode),
+    scroll:[...board.children].map(el=>[el.dataset.tandemAgent,el.querySelector('.col-body').scrollTop])
+  }:null;
+  $('content').innerHTML=({trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView})[state.view]();
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') reconcileActivities(true);
+  if(state.view==='agents'){
+    renderTandemBoard();
+    if(held){
+      for(const el of $('tandem-columns').querySelectorAll('[data-tandem-episode]'))el.open=held.episodes.includes(el.dataset.tandemEpisode);
+      for(const [id,top] of held.scroll)$('tandem-columns').querySelector(`[data-tandem-agent="${CSS.escape(id)}"] .col-body`)?.scrollTo({top});
+    }
+  }
   renderInspector();
 }
 
@@ -164,7 +176,7 @@ function renderRunChrome() {
   for(const [id,key] of [['model-filter','model'],['harness-filter','harness']]) {
     if(run[key]&&![...$(id).options].some(option=>option.value===run[key]))$(id).add(new Option(run[key],run[key]));
   }
-  $('metrics').hidden=Boolean(state.stream)&&state.view==='trajectory';
+  $('metrics').hidden=state.view!=='trajectory';
   $('run-title').textContent=run.title;
   $('run-subtitle').textContent=`${run.condition?.replace('_',' ') || (run.id==='live'?'current execution':state.replay?'recorded replay':'saved execution')} / ${run.harness} / ${run.model}`;
   const agentCount=run.agents.filter(a=>a.id!=='workflow').length;
@@ -174,9 +186,10 @@ function renderRunChrome() {
   $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source)+`<div class="provenance-note">${run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.'}</div>`;
   const modelActions=run.actions.filter(a=>a.kind==='model');
   const knownTokens=modelActions.filter(a=>a.tokens!=null);
-  const unionWait=overlapDuration(run.intervals.filter(i=>i.kind==='model'),0,run.duration);
+  const modelSpans=run.intervals.filter(i=>i.kind==='model');
+  const unionWait=overlapDuration(modelSpans.length?modelSpans:modelActions,0,run.duration);
   $('metrics').innerHTML=[
-    ['Wall time',formatTime(run.duration),'From execution start to finish'],
+    ['Wall time',formatTime(run.duration),run.status==='running'?'From execution start to now':'From execution start to finish'],
     ['Actions',String(run.actions.filter(a=>a.kind!=='model').length),`${modelActions.length} model calls · ${agentCount} agents`],
     ['Model intervals',formatTime(unionWait),`${run.duration ? Math.round(unionWait/run.duration*100) : 0}% wall time · union of observed spans`],
     ['Input tokens',knownTokens.length?count(knownTokens.reduce((sum,a)=>sum+a.tokens,0)):'n/a',knownTokens.length===modelActions.length&&modelActions.length?'Reported across all observed calls':`${knownTokens.length}/${modelActions.length} calls report usage`]
@@ -235,6 +248,7 @@ function updateTrajectory(changed,resynced=false) {
       if(focused)$('content').querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
     }
   }
+  if(state.view==='agents')renderTandemBoard();
   if((!state.selected||changed.includes(state.selected?.id))&&!$('inspector').contains(document.activeElement))renderInspector(true);
   if(resynced)$('transport-state').textContent+=' · recovered from durable snapshot';
 }
@@ -257,18 +271,18 @@ function addAgentColumn(id) {
   if(!trajectoryAgents().includes(id)||state.agentColumns.includes(id)||state.agentColumns.length>=MAX_AGENT_COLUMNS)return;
   state.columnsCustomized=true;state.agentColumns.push(id);state.activeColumn=id;
   state.agent='';$('agent-select').value='';
-  renderCallStack();
+  if(state.view==='agents')renderTandemBoard();else renderCallStack();
 }
 
 function removeAgentColumn(id) {
   if(state.agentColumns.length<=1)return;
   state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);
-  renderCallStack();
+  if(state.view==='agents')renderTandemBoard();else renderCallStack();
 }
 
 function selectAgentColumn(id) {
   if(!visibleAgentColumns().includes(id))return;
-  state.activeColumn=id;renderCallStack();
+  state.activeColumn=id;if(state.view==='agents')renderTandemBoard();else renderCallStack();
 }
 
 function agentActivityCounts(id) {
@@ -467,7 +481,10 @@ function timeline(intervals, agents, compact=false) {
   for (const agent of agents) {
     for (const kind of kinds) {
       const items=intervals.filter(i=>i.agent===agent.id && (kind==='all'||i.kind===kind) && i.start+i.duration>=start && i.start<=end);
-      if (items.length) lanes.push({label:kind==='all'?agent.label:`${agent.label.slice(0,16)} / ${kind}`,items});
+      if(items.length){
+        const tracks=compact?packActionTracks(items,(end-start)/plot*3):[items];
+        tracks.forEach((track,n)=>lanes.push({label:kind==='all'?`${agent.label}${n?' / '+(n+1):''}`:`${agent.label.slice(0,16)} / ${kind}`,items:track}));
+      }
     }
   }
   const height=32+lanes.length*32+20;
@@ -480,7 +497,7 @@ function timeline(intervals, agents, compact=false) {
     svg+=lane.items.map(i=>{
       const a=Math.max(start,i.start),b=Math.min(end,i.start+i.duration);
       const selected=state.selected?.id===i.id || state.selected?.interval===i.id || state.selected?.type==='episode' && state.run.episodes.find(e=>e.id===state.selected.id)?.actions.includes(i.action);
-      return `<rect class="event ${selected?'selected':''}" data-interval="${esc(i.id)}" x="${x(a)}" y="${y}" width="${Math.max(2,x(b)-x(a))}" height="20" rx="3" fill="${colors[i.kind]||colors.tool}" opacity="${i.kind==='unknown'?.4:.85}" tabindex="0" role="button" aria-label="${esc(i.label)}, ${formatTime(i.duration)}"><title>${esc(i.label)} · ${formatTime(i.duration)} · ${esc(i.source)}</title></rect>`;
+      return `<rect class="event ${selected?'selected':''}" ${i.direct_action?`data-action="${esc(i.action)}"`:`data-interval="${esc(i.id)}"`} x="${x(a)}" y="${y}" width="${Math.max(2,x(b)-x(a))}" height="20" rx="3" fill="${colors[i.kind]||colors.tool}" opacity="${i.kind==='unknown'?.4:.85}" tabindex="0" role="button" aria-label="${esc(i.label)}, ${formatTime(i.duration)}"><title>${esc(i.label)} · ${formatTime(i.duration)} · ${esc(i.source)}</title></rect>`;
     }).join('');
   });
   if (state.cursor>=start&&state.cursor<=end) svg+=`<line class="cursor-line" x1="${x(state.cursor)}" x2="${x(state.cursor)}" y1="20" y2="${height-10}"/>`;
@@ -510,7 +527,7 @@ function resourcesView() {
     `<div class="panel">${legend([['model','Model / API'],['tool','Tool execution'],['cpu','CPU work'],['queue','Scheduler queue'],['dependency','Dependency'],['unknown','Unattributed']])}${intervals.length?timeline(intervals,agents):empty('No intervals match','Try clearing filters.')}<div class="chart-controls"><button data-zoom>Zoom to selection</button><button data-reset-zoom>Full execution</button><span class="muted mono">${state.zoom?`${formatTime(state.zoom[0])} → ${formatTime(state.zoom[1])}`:'Select a span, then focus its interval'}</span></div></div>`+
     `<div class="two-columns">${cpu?`<div class="panel">${sampleChart(cpu[0],cpu[1],colors.cpu)}</div>`:empty('CPU samples unavailable','No utilization counter was recorded in this trace.')}${memory?`<div class="panel">${sampleChart(memory[0],memory[1],colors.tool)}</div>`:empty('Memory samples unavailable','No memory counter was recorded in this trace.')}</div>`+
     heading('Longest waits & gaps','Ranked intervals; nested or parallel spans may overlap.')+
-    waits.map(i=>`<button class="wait-item" data-interval="${esc(i.id)}"><span style="color:${colors[i.kind]}">▰</span><span class="wait-text"><strong>${esc(i.label)}</strong><small>${esc(agentName(i.agent))} · ${formatTime(i.start)} → ${formatTime(i.start+i.duration)}</small></span><span class="mono">${formatTime(i.duration)}</span></button>`).join('')+
+    waits.map(i=>`<button class="wait-item" ${i.direct_action?`data-action="${esc(i.action)}"`:`data-interval="${esc(i.id)}"`}><span style="color:${colors[i.kind]}">▰</span><span class="wait-text"><strong>${esc(i.label)}</strong><small>${esc(agentName(i.agent))} · ${formatTime(i.start)} → ${formatTime(i.start+i.duration)}</small></span><span class="mono">${formatTime(i.duration)}</span></button>`).join('')+
     `<div class="notice">Model spans include request processing and transport. Thread CPU counters are inclusive and can overlap. Samples may miss brief peaks; CPU percentages can exceed 100% across multiple cores.</div>`;
 }
 
@@ -548,21 +565,85 @@ function graphConnectors(agents, edges) {
   return paths?`<svg viewBox="0 0 660 ${100+Math.ceil((agents.length-1)/2)*150}" preserveAspectRatio="none">${paths}</svg>`:'';
 }
 
+// Adapted from the supplied tandem_trace_board.html / board.css. Recorded
+// ownership and results drive the board; concurrency never implies delegation.
+function tandemEpisodeHTML(episode, actions) {
+  return `<summary><span>${esc(episode.title)}</span>${pill(episode.status)}</summary><div class="seg-items">${actions.map(a=>`<article class="item ${a.kind==='model'?'text':'tool_call'} ${a.outcome==='failed'?'trace-failed':''}"><div class="lbl"><button data-action="${esc(a.id)}">${esc(a.kind)} · ${esc(a.name)}</button><span>${formatTime(a.start)} · ${formatTime(a.duration)}</span></div>${a.intent?`<p>${esc(a.intent)}</p>`:''}${a.command?`<pre>${esc(a.command)}</pre>`:''}${a.result?`<div class="tool-result"><span class="lbl">Observed result</span><pre>${esc(a.result)}</pre></div>`:''}<div class="trace-metrics">${pill(a.outcome)}${a.tokens!=null?`<span>${count(a.tokens)} input · ${count(a.output_tokens)} output tokens</span>`:''}<button data-action="${esc(a.id)}">Inspect evidence ↗</button></div></article>`).join('')}</div>`;
+}
+
+function tandemMetricTable(agents) {
+  return `<div class="mtable-wrap"><table class="mtable"><caption>Token & time metrics · observed calls</caption><thead><tr><th>Agent</th><th>Calls</th><th>Running</th><th>Model time¹</th><th>Input tokens</th><th>Output tokens</th><th>Usage coverage</th></tr></thead><tbody>${agents.map(id=>{
+    const actions=visibleActions(state.run).filter(a=>a.agent===id),models=actions.filter(a=>a.kind==='model'),known=models.filter(a=>a.tokens!=null);
+    const duration=overlapDuration(models,0,state.run.duration);
+    return `<tr><th scope="row">${esc(agentName(id))}</th><td>${actions.length}</td><td>${actions.filter(a=>a.outcome==='running').length}</td><td>${formatTime(duration)}</td><td>${known.length?count(known.reduce((n,a)=>n+a.tokens,0)):'n/a'}</td><td>${models.some(a=>a.output_tokens!=null)?count(models.reduce((n,a)=>n+(a.output_tokens||0),0)):'n/a'}</td><td>${known.length}/${models.length}</td></tr>`;
+  }).join('')}</tbody></table></div><p class="notice">¹ Union of model-call intervals for each agent. Token counts sum reported usage; they do not estimate unique context or cache savings.</p>`;
+}
+
+function systemMetricTimelines() {
+  const [start,end]=state.zoom||[0,state.run.duration],width=760,left=130,right=12,plot=width-left-right;
+  const x=t=>left+(t-start)/(end-start||1)*plot;
+  const series=Object.entries(state.run.counters||{}).filter(([,samples])=>Array.isArray(samples));
+  if(!series.length)return empty('System metrics unavailable','This execution has no recorded resource samples. Enable profiling for future runs; tool-call timestamps alone cannot measure CPU or memory.');
+  return series.map(([name,samples],index)=>{
+    const data=samples.filter(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&p[0]>=start&&p[0]<=end).sort((a,b)=>a[0]-b[0]);
+    if(!data.length)return `<div class="metric-track-empty">${esc(name)} · no samples in the selected interval</div>`;
+    const low=Math.min(0,...data.map(p=>p[1])),high=Math.max(1,...data.map(p=>p[1])),y=v=>70-(v-low)/(high-low)*44;
+    const color=[colors.cpu,colors.io,colors.queue][index%3],points=data.map(p=>`${x(p[0])},${y(p[1])}`).join(' ');
+    const ticks=Array.from({length:6},(_,i)=>start+(end-start)*i/5);
+    return `<div class="system-metric-track"><div class="chart-title">${esc(name)} <span class="muted">· ${data.length} samples · peak ${count(Math.max(...data.map(p=>p[1])))}</span></div><svg class="timeline-svg" viewBox="0 0 ${width} 96" role="img" aria-label="${esc(name)} on the shared execution clock">${ticks.map(t=>`<line class="gridline" x1="${x(t)}" x2="${x(t)}" y1="20" y2="72"/><text x="${x(t)}" y="90" text-anchor="${t===end?'end':'middle'}">${formatTime(t)}</text>`).join('')}<text x="0" y="30">${count(high)}</text><text x="0" y="70">${count(low)}</text><polygon points="${x(data[0][0])},70 ${points} ${x(data.at(-1)[0])},70" fill="${color}" opacity=".12"/><polyline points="${points}" stroke="${color}" stroke-width="1.7" fill="none"/>${data.map(p=>`<circle cx="${x(p[0])}" cy="${y(p[1])}" r="2" fill="${color}"><title>${esc(name)}: ${p[1]} at ${formatTime(p[0])}</title></circle>`).join('')}<line class="cursor-line" x1="${x(Math.max(start,Math.min(end,state.cursor)))}" x2="${x(Math.max(start,Math.min(end,state.cursor)))}" y1="18" y2="74"/></svg></div>`;
+  }).join('');
+}
+
+function tandemConcurrentWork(agents) {
+  // Canonical live actions carry timing even when profiler spans are absent.
+  const actions=visibleActions(state.run).filter(a=>agents.some(agent=>agent.id===a.agent));
+  const intervals=actions.map(a=>({id:a.id,action:a.id,agent:a.agent,start:a.start,duration:a.duration,kind:a.kind==='model'?'model':'tool',label:a.intent||a.name,direct_action:true,source:a.source}));
+  return timeline(intervals,agents,true);
+}
+
 function agentsView() {
-  const run=state.run;
-  const agents=run.agents.filter(a=>!state.agent||a.id===state.agent||a.parent===state.agent||a.id===run.agents.find(b=>b.id===state.agent)?.parent);
-  const duplicate=new Map();
-  for (const a of run.actions.filter(a=>a.command)) {
-    const list=duplicate.get(a.command)||[];list.push(a);duplicate.set(a.command,list);
+  return heading('Tandem trace board','Side-by-side agent traces, recorded handoffs and a shared execution clock.')+
+    `<div class="tandem-board"><div class="task-box"><span class="k">Requested task</span><p>${esc(state.run.task||state.run.title)}</p></div><div class="cat-legend"><span class="supervisor-key">● Supervisor / parent</span><span class="worker-key">● Worker</span><span>Roles follow recorded ownership</span></div><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span></div><div id="hidden-agents"></div><div id="tandem-metrics"></div><div class="section-heading"><h3>Agent transcripts</h3><span class="muted">Newest activity first · expand to inspect calls</span></div><div id="tandem-columns" class="board agent-columns"></div><div class="panel"><div class="panel-heading"><h3>Concurrent work</h3><span class="mono muted">SHARED TIME AXIS</span></div>${legend([['model','Model'],['tool','Tool']])}<div id="tandem-concurrent"></div><div class="panel-heading"><h3>System metrics</h3><span class="mono muted">SAME TIME AXIS</span></div><div id="tandem-system-metrics"></div><p class="notice">Sampled counters retain their recorded scope and units. Overlap shows concurrency; it does not establish causality.</p></div><div id="tandem-handoffs"></div></div>`;
+}
+
+function renderTandemBoard() {
+  const host=$('tandem-columns');if(!host)return;
+  const focused=document.activeElement?.getAttribute('data-action');
+  const columns=visibleAgentColumns(),run=state.run;
+  renderAgentColumnControls(columns);
+  host.dataset.run=run.id;
+  host.style.setProperty('--agent-column-count',columns.length||1);
+  const agents=columns.map(id=>run.agents.find(a=>a.id===id)||{id,label:id});
+  const existing=new Map([...host.children].map(el=>[el.dataset.tandemAgent,el]));
+  for(const [id,el] of existing)if(!columns.includes(id))el.remove();
+  agents.forEach((agent,index)=>{
+    let col=existing.get(agent.id);
+    if(!col){col=document.createElement('section');col.dataset.tandemAgent=agent.id;col.className='col';col.innerHTML='<header class="col-head"></header><div class="col-body"></div>';}
+    col.classList.toggle('active-agent-column',agent.id===state.activeColumn);
+    if(host.children[index]!==col)host.insertBefore(col,host.children[index]||null);
+    const parent=run.agents.some(a=>a.parent===agent.id),role=parent?'Supervisor':agent.parent?'Worker':'Agent';
+    col.classList.toggle('supervisor-column',parent);
+    const header=`<div class="agent"><button data-agent="${esc(agent.id)}">${esc(agent.label)}</button><button data-remove-column="${esc(agent.id)}" ${state.agent||columns.length===1?'disabled':''}>Hide</button></div><div class="meta"><span class="badge ${parent?'sup':'wrk'}">${role}</span><span class="badge">${esc(agent.model||run.model)}</span></div><p class="muted">${agentActivityCounts(agent.id)}${agent.parent?` · parent ${esc(agentName(agent.parent))}`:''}</p>`;
+    const head=col.querySelector('.col-head');if(head.innerHTML!==header)head.innerHTML=header;
+    const body=col.querySelector('.col-body'),actions=visibleActions(run).filter(a=>a.agent===agent.id),map=new Map(actions.map(a=>[a.id,a])),ids=new Set(map.keys());
+    const episodes=run.episodes.filter(e=>e.agent===agent.id&&e.actions.some(id=>ids.has(id))).slice().reverse();
+    const old=new Map([...body.children].map(el=>[el.dataset.tandemEpisode,el]));
+    for(const [id,el] of old)if(!episodes.some(e=>e.id===id))el.remove();
+    episodes.forEach((episode,n)=>{
+      let seg=old.get(episode.id);if(!seg){seg=document.createElement('details');seg.className='seg';seg.dataset.tandemEpisode=episode.id;seg.open=episode.status==='running';}
+      const html=tandemEpisodeHTML(episode,episode.actions.filter(id=>ids.has(id)).map(id=>map.get(id)).reverse());
+      if(seg.innerHTML!==html){
+        const scroll=[...seg.querySelectorAll('pre')].map(el=>[el.scrollTop,el.scrollLeft]);
+        seg.innerHTML=html;
+        [...seg.querySelectorAll('pre')].forEach((el,i)=>{if(scroll[i])[el.scrollTop,el.scrollLeft]=scroll[i];});
+      }
+      if(body.children[n]!==seg)body.insertBefore(seg,body.children[n]||null);
+    });
+  });
+  for(const [id,html] of [['tandem-metrics',tandemMetricTable(columns)],['tandem-concurrent',tandemConcurrentWork(agents)],['tandem-system-metrics',systemMetricTimelines()],['tandem-handoffs',heading('Communication & handoffs','Explicitly recorded relationships.')+(run.edges.length?run.edges.map(edge=>`<button class="communication-item" ${edge.action?`data-action="${esc(edge.action)}"`:`data-agent="${esc(edge.to)}"`}><span>${edge.time==null?'—':formatTime(edge.time)}</span><div><strong>${esc(agentName(edge.from))} → ${esc(agentName(edge.to))}</strong><p>${esc(edge.label)} · ${esc(edge.source)}</p></div></button>`).join(''):empty('No handoff events','Parallel execution does not imply delegation.'))]]) {
+    const node=$(id);if(node.innerHTML!==html)node.innerHTML=html;
   }
-  const duplicates=[...duplicate.values()].filter(list=>new Set(list.map(a=>a.agent)).size>1);
-  return heading('Multi-agent workflow','Ownership, delegation and concurrent execution.',`<span class="mono">${run.agents.length} AGENTS</span>`)+
-    insight(run.edges.length?'<strong>Follow a relationship to its evidence.</strong> Agent selection carries into trajectory, context and resource views.': '<strong>No explicit communication edges were recorded.</strong> Overlapping execution shows concurrency, but does not establish delegation or messages.')+
-    `<div class="panel"><div class="panel-heading"><h3>Agent relationships</h3>${pill(run.source==='synthetic'?'Synthetic relationships':'Recorded ownership',run.source)}</div><div class="agent-graph">${graphConnectors(agents,run.edges)}${agents.map(a=>`<button class="agent-node ${state.agent===a.id?'selected':''}" data-agent="${esc(a.id)}"><strong>${esc(a.label)}</strong><small>${esc(a.role)}</small><span class="mono">${esc(a.model||'Model unavailable')} · ${esc(a.harness||'Harness unavailable')}</span>${a.parent?`<small>↳ parent: ${esc(agentName(a.parent))}</small>`:''}</button>`).join('')}</div><div class="notice">${esc(run.coverage.relationships)}</div></div>`+
-    `<div class="panel"><div class="panel-heading"><h3>Concurrent work</h3><span class="mono muted">SHARED TIME AXIS</span></div>${legend([['model','Model'],['tool','Tool'],['cpu','CPU'],['dependency','Dependency'],['queue','Queue']])}${timeline(run.intervals.filter(i=>i.kind!=='unknown'),agents,true)}</div>`+
-    heading('Communication & handoffs','Recorded or explicitly synthetic relationships.')+
-    (run.edges.length?run.edges.map(edge=>`<button class="communication-item" ${edge.action?`data-action="${esc(edge.action)}"`:`data-agent="${esc(edge.to)}"`}><span class="mono muted">${edge.time==null?'—':formatTime(edge.time)}</span><div><strong>${esc(agentName(edge.from))} → ${esc(agentName(edge.to))}</strong><p>${esc(edge.label)} · ${esc(edge.kind)} · ${esc(edge.source)}</p></div></button>`).join(''):empty('No handoff events','Instrument delegation and communication to reveal causal relationships.'))+
-    `<div class="notice">${duplicates.length?`${duplicates.length} identical command${duplicates.length===1?'':'s'} observed across different agents: ${duplicates.map(list=>esc(list[0].command.slice(0,100))).join('; ')}. This suggests duplicated work, not its intent.`:'No identical commands across different agents were observed.'} Concurrent resource pressure is a hypothesis unless corroborated by counters and attribution.</div>`;
+  if(focused)host.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
 }
 
 function chooseComparison() {
@@ -618,18 +699,6 @@ function compareView() {
     `<div class="panel">${field('Category similarity',similarity==null?'n/a':`${Math.round(similarity*100)}% · 2 × matched / total actions`)}${field('Wall-time change',`${delta>=0?'+':'−'}${formatTime(Math.abs(delta))}`)}${field('Different referenced paths',fileDelta.length?fileDelta.slice(0,4).join(', '):'Same observed path set')}${resourceField('CPU utilization A → B',cpuA,cpuB,'%')}${resourceField('Memory A → B',memA,memB,'MB')}</div>`+
     `<div class="alignment"><div class="alignment-heading"><span>A · current execution</span><span></span><span>B · comparison</span></div>${rows.length?rows.map((row,index)=>`<div class="alignment-row ${row.match?'':'divergent'} ${row.reconverged?'reconverged':''}" title="${row.reconverged?'Categories reconverge':row.match?'Matching action category':'Trajectory divergence'}">${cell(row.left,'a')}<div class="alignment-connector"><span>${row.reconverged?'↔':row.match?'=':'≠'}</span>${row.left&&row.right?`<small>${row.right.duration>=row.left.duration?'+':'−'}${formatTime(Math.abs(row.right.duration-row.left.duration))}</small>`:''}</div>${cell(row.right,'b')}</div>`).join(''):empty('No comparable actions','Clear search and agent filters.')}</div>`+
     `<div class="notice">Alignment uses the longest common subsequence of tool action categories, following the saved experiment’s category comparison. Matching categories do not imply identical commands, behavior or correctness. Different tasks can be compared; interpretation requires care. Referenced file paths are extracted from command text, not a verified artifact inventory.</div>`;
-}
-
-function progressView() {
-  const run=state.run,map=actionMap(run),visible=new Set(visibleActions(run).map(a=>a.id));
-  const obligations=run.obligations.filter(o=>!state.agent&&!state.query||o.evidence.some(id=>visible.has(id)));
-  const complete=obligations.filter(o=>o.status==='completed').length;
-  const artifacts=[...new Set(visibleActions(run).flatMap(a=>a.files))];
-  return heading('Task progress','Workflow obligations, each supported by execution evidence.',`<span class="mono">${complete}/${obligations.length} SUPPORTED</span>`)+
-    insight(`<strong>${complete} obligations have completion evidence.</strong> ${obligations.length-complete} remain failed or unvalidated. Inspect the evidence before treating tool success as a solved task.`)+
-    `<div class="progress-map">${obligations.map(o=>`<button class="obligation ${state.selected?.id===o.id?'selected':''}" data-obligation="${esc(o.id)}"><span class="obligation-symbol ${o.status}">${o.status==='completed'?'✓':o.status==='failed'?'×':'?'}</span><div><h3>${esc(o.title)}</h3><p>${esc(o.note)}</p>${o.evidence.length?`<div class="evidence-strip">${o.evidence.slice(0,5).map(id=>`<span class="evidence-chip">${esc(map.get(id)?.kind||id)} @ ${formatTime(map.get(id)?.start||0)}</span>`).join('')}${o.evidence.length>5?`<span class="evidence-chip">+${o.evidence.length-5}</span>`:''}</div>`:''}</div>${pill(o.status)}</button>`).join('')||empty('No obligations match','Clear the current filters.')}</div>`+
-    `<div style="margin-top:24px">${heading('Referenced artifacts','Paths mentioned in commands, linked to the actions that use them.')}<div class="artifact-grid">${artifacts.map(file=>`<button class="artifact-card" data-artifact="${esc(file)}">${esc(file)}<small>${run.actions.filter(a=>a.files.includes(file)).length} supporting actions ↗</small></button>`).join('')}</div>${artifacts.length?'':empty('No file paths recorded','Artifact inventory is unavailable for this execution.')}</div>`+
-    `<div class="notice">${run.source==='synthetic'?'Demo obligations are explicitly authored.':'Obligations are inferred from tool action categories. “Completed” means supporting tools completed successfully; validate the result contents for semantic success.'} Independent evaluator outcomes, when present in the saved campaign, are shown separately.</div>`;
 }
 
 function selectedInterval() {
@@ -703,6 +772,7 @@ function selectAction(id, comparison=false, intervalId=null) {
 }
 
 function setView(view) {
+  if(!views.some(v=>v[0]===view))return;
   if(state.selected?.run==='b'&&view!=='compare') {
     const runId=state.comparison.id,id=state.selected.id;
     state.view=view;loadRun(runId,{type:'action',id});return;
@@ -772,6 +842,7 @@ function followLatest() {
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') {
     reconcileActivities();
   }
+  if(state.view==='agents')renderTandemBoard();
 }
 
 async function showRawEvidence(id) {
@@ -796,7 +867,7 @@ document.addEventListener('keydown',event=>{
     return;
   }
   if(event.target.matches('input,select,textarea')) return;
-  if(event.key>='1'&&event.key<='6'&&!event.metaKey&&!event.ctrlKey) {event.preventDefault();setView(views[Number(event.key)-1][0]);}
+  if(event.key>='1'&&Number(event.key)<=views.length&&!event.metaKey&&!event.ctrlKey) {event.preventDefault();setView(views[Number(event.key)-1][0]);}
   if(event.key==='Escape') {state.selected=null;state.contextBlock=null;render();}
   if((event.key==='Enter'||event.key===' ')&&event.target.matches('[data-interval],.trajectory-action')) {event.preventDefault();event.target.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
 });
