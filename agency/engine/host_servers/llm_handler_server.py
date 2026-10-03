@@ -893,10 +893,14 @@ class LlmHandlerServer:
         internal_kind: "str | None" = None,
     ) -> None:
         tag = _display_tag(internal_kind)
-        if tag is not None:
-            response_message = _tag_response_message_for_display(response_message, tag)
         prompt_chain = self._prompt_chain(request)
         response_chain = self._response_chain(response_message)
+        if tag is not None:
+            # Keep the untagged hash so the block's later replay in a prompt dedupes against it.
+            tagged = self._response_chain(_tag_response_message_for_display(response_message, tag))
+            response_chain = [
+                (digest, payload) for (digest, _), (_, payload) in zip(response_chain, tagged)
+            ]
         if prompt_chain or response_chain:
             self._data_logger.record_llm_exchange(
                 call_label,
@@ -1100,10 +1104,13 @@ class LlmHandlerServer:
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
                         return
+                    # Classify like a pre-stream failure; the client decides whether
+                    # a retry is safe from what it has already received.
+                    classified = _classify_dispatch_exception(e)
                     publish_error(
                         e,
                         status_code=500,
-                        transient=False,
+                        transient=bool(classified and classified[1]),
                         streaming=False,
                         error=f"{type(e).__name__}: {e}",
                     )

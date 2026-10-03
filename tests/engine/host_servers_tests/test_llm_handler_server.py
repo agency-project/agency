@@ -1196,6 +1196,26 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     ]
 
 
+def test_start_stream_mid_stream_transient_exception_is_marked_transient(monkeypatch):
+    monkeypatch.setattr(mod, "TRANSIENT_DISPATCH_EXCS", (ConnectionError,))
+
+    def gen():
+        yield _FakeChunk([_FakeChoice(delta=_FakeDelta(content="ok"))])
+        raise ConnectionError("provider 500 mid-stream")
+
+    server, _ = _make_server(create_fn=lambda **kwargs: gen())
+    handle = server.start_stream({"messages": []})
+    assert _drain(handle) == [
+        {
+            "type": "error",
+            "message": "provider 500 mid-stream",
+            "transient": True,
+            "status_code": 500,
+        }
+    ]
+    handle._thread.join(timeout=2.0)
+
+
 def test_unclassified_first_stream_read_error_always_wakes_consumer():
     def create(**kwargs):
         del kwargs
@@ -1286,6 +1306,18 @@ def test_dispatch_tags_recorded_text_response_from_internal_kind():
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
     assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "[Worker] done"}]
+
+
+def test_tagged_response_text_hashes_like_its_untagged_replay():
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend)
+
+    server.dispatch({"messages": [], "agency_internal_kind": "example_worker"})
+
+    [(digest, payload)] = server._data_logger.finalized[-1][3]
+    assert payload["text"] == "[Worker] done"
+    replay = {"role": "assistant", "type": "text", "index": 0, "text": "done"}
+    assert digest == mod._payload_hash(replay)
 
 
 def test_dispatch_tags_recorded_tool_use_name_from_internal_kind():
