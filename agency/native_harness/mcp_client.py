@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 
 def _decode_tool_result(result) -> dict:
@@ -127,7 +128,10 @@ class McpToolset:
             try:
                 tools = asyncio.run(_list_tools_async(url, headers))
             except Exception as e:
-                print(f"[native_harness] WARNING: MCP server {url!r} unreachable: {e}")
+                print(
+                    f"[native_harness] WARNING: MCP server {url!r} unreachable: {e}",
+                    file=sys.stderr,
+                )
                 continue
             for schema in tools:
                 tool_name = schema["function"]["name"]

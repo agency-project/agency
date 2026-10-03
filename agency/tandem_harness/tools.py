@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import uuid
 from typing import Generator
 
@@ -767,7 +768,8 @@ def offload_if_oversized(fn_name: str, tc_id: str, result_content: str, offload_
         )
     except Exception as e:
         print(
-            f"[tandem_harness] WARNING: failed to offload large tool output to {offload_path}: {e}"
+            f"[tandem_harness] WARNING: failed to offload large tool output to {offload_path}: {e}",
+            file=sys.stderr,
         )
         return result_content
 

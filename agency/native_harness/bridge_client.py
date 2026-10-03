@@ -18,6 +18,8 @@ compact" (context_limit=None), not an error."""
 
 from __future__ import annotations
 
+import sys
+
 import httpx
 
 
@@ -73,7 +75,7 @@ class BridgeClient:
             profiler = getattr(self, "_profiler", None)
             if profiler is not None:
                 profiler.dropped += 1
-            print(f"[bridge_client] complete_tool_policy request failed: {exc!r}")
+            print(f"[bridge_client] complete_tool_policy request failed: {exc!r}", file=sys.stderr)
 
     def context_limit(self) -> "int | None":
         try:
