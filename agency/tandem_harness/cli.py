@@ -157,7 +157,7 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # stopgap so a human reading the bridged live transcript can tell
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
-    system = args.system or f"[TANDEM SUPERVISOR]\n{SUPERVISOR_SYSTEM}"
+    system = args.system or SUPERVISOR_SYSTEM
     return session_id, [{"role": "system", "content": system}]
 
 

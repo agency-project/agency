@@ -300,7 +300,7 @@ class harnessadapterconfig(confignamespace):
     # A soft ceiling, not a tight per-order budget: the worker may make
     # several tool calls to satisfy one order before it must report back to
     # the supervisor. See tandem_harness/tandem_loop.py's docstring.
-    segment_step_cap: int = 64
+    segment_step_cap: int = 32
     # Past worker segments replayed into each new segment; 0 = none.
     worker_history_turns: int = 4096
     # The supervisor's llm config is cloned from the worker's, so it must not

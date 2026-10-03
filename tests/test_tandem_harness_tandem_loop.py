@@ -15,12 +15,18 @@ import json
 
 from agency.tandem_harness import tools
 from agency.tandem_harness.tandem_loop import (
+    _EMPTY_REPORT_REPROMPT,
+    _STEP_LIMIT_REPORT_PROMPT,
+    _FORWARD_TOOL_OUTPUT_SCHEMA,
+    _GET_TOOL_CALL_DETAIL_SCHEMA,
+    SUPERVISOR_SYSTEM,
     ARGUMENTS_TRUNCATE_CHARS,
-    RESULT_TRUNCATE_CHARS,
+    _SMART_TOOL_SCHEMA,
     _SUBMIT_OUTPUT_SCHEMA,
     _build_report,
     _decode_args,
     _decode_result,
+    _render_call_list,
     _render_report,
     _short_call_id,
     _trim_worker_history,
@@ -48,23 +54,35 @@ def _tool_call(name, arguments, call_id="call-0"):
     }
 
 
-def _smart_tool_response(task):
+def _smart_tool_response(task, report=None):
+    arguments = {"task": task} if report is None else {"task": task, "report": report}
     return {
         "message": {
             "role": "assistant",
             "content": None,
-            "tool_calls": [_tool_call("smart_tool", {"task": task})],
+            "tool_calls": [_tool_call("smart_tool", arguments)],
         },
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     }
 
 
-def _get_tool_call_detail_response(call_id):
+def _get_tool_call_detail_response(call_id, **selection):
     return {
         "message": {
             "role": "assistant",
             "content": None,
-            "tool_calls": [_tool_call("get_tool_call_detail", {"call_id": call_id})],
+            "tool_calls": [_tool_call("get_tool_call_detail", {"call_id": call_id, **selection})],
+        },
+        "usage": {"prompt_tokens": 6, "completion_tokens": 2},
+    }
+
+
+def _get_tool_call_list_response():
+    return {
+        "message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [_tool_call("get_tool_call_list", {})],
         },
         "usage": {"prompt_tokens": 6, "completion_tokens": 2},
     }
@@ -79,12 +97,12 @@ def _supervisor_final_response(text):
     }
 
 
-def _worker_tool_call_response(command="echo hi"):
+def _worker_tool_call_response(command="echo hi", call_id="call-0"):
     return {
         "message": {
             "role": "assistant",
             "content": None,
-            "tool_calls": [_tool_call("bash", {"command": command})],
+            "tool_calls": [_tool_call("bash", {"command": command}, call_id)],
         },
         "usage": {"prompt_tokens": 20, "completion_tokens": 7},
     }
@@ -219,7 +237,7 @@ def test_worker_forward_tool_output_with_no_prior_tool_call_returns_an_error(mon
     worker_tool_result = json.loads(worker_llm.requests[1][1][-1]["content"])
     assert "error" in worker_tool_result
     smart_tool_result = supervisor_llm.requests[1][1][-1]["content"]
-    assert smart_tool_result == "finish_reason: tool_finished\ntool_output:\n  done"
+    assert smart_tool_result == "finish_reason: tool_finished\ntool_output:\n  done\ntool_calls: 0"
 
 
 def test_worker_never_sees_supervisor_tool_schema_or_vice_versa(monkeypatch, tmp_path):
@@ -238,7 +256,7 @@ def test_worker_never_sees_supervisor_tool_schema_or_vice_versa(monkeypatch, tmp
     )
 
     supervisor_tool_names = {s["function"]["name"] for s in supervisor_llm.requests[0][2]}
-    assert supervisor_tool_names == {"smart_tool", "get_tool_call_detail"}
+    assert supervisor_tool_names == {"smart_tool", "get_tool_call_list", "get_tool_call_detail"}
 
     worker_tool_names = {s["function"]["name"] for s in worker_llm.requests[0][2]}
     assert not worker_tool_names & supervisor_tool_names
@@ -382,7 +400,14 @@ def test_each_task_by_default_carries_the_prior_segments_own_messages(monkeypatc
             _supervisor_final_response("done"),
         ]
     )
-    worker_llm = _Llm([_worker_tool_call_response("one"), _worker_tool_call_response("two")])
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response("one"),
+            _supervisor_final_response("ran one"),
+            _worker_tool_call_response("two"),
+            _supervisor_final_response("ran two"),
+        ]
+    )
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -390,12 +415,12 @@ def test_each_task_by_default_carries_the_prior_segments_own_messages(monkeypatc
         "worker-model",
         supervisor_llm,
         worker_llm,
-        segment_step_cap=1,
+        segment_step_cap=2,
         offload_dir=str(tmp_path),
     )
 
     first_segment_messages = worker_llm.requests[0][1]
-    second_segment_messages = worker_llm.requests[1][1]
+    second_segment_messages = worker_llm.requests[2][1]
     assert len(first_segment_messages) == 2  # system + the task, nothing else
     assert second_segment_messages[-1]["content"].endswith("second")
     assert "first" in json.dumps(second_segment_messages)
@@ -413,7 +438,14 @@ def test_worker_history_turns_zero_gives_no_carryover(monkeypatch, tmp_path):
             _supervisor_final_response("done"),
         ]
     )
-    worker_llm = _Llm([_worker_tool_call_response("one"), _worker_tool_call_response("two")])
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response("one"),
+            _supervisor_final_response("ran one"),
+            _worker_tool_call_response("two"),
+            _supervisor_final_response("ran two"),
+        ]
+    )
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -421,13 +453,13 @@ def test_worker_history_turns_zero_gives_no_carryover(monkeypatch, tmp_path):
         "worker-model",
         supervisor_llm,
         worker_llm,
-        segment_step_cap=1,
+        segment_step_cap=2,
         worker_history_turns=0,
         offload_dir=str(tmp_path),
     )
 
     first_segment_messages = worker_llm.requests[0][1]
-    second_segment_messages = worker_llm.requests[1][1]
+    second_segment_messages = worker_llm.requests[2][1]
     assert len(first_segment_messages) == 2  # system + the task, nothing else
     assert len(second_segment_messages) == 2
     assert second_segment_messages[-1]["content"].endswith("second")
@@ -446,7 +478,14 @@ def test_worker_task_is_tagged_with_its_segment_index_on_the_user_turn(monkeypat
             _supervisor_final_response("done"),
         ]
     )
-    worker_llm = _Llm([_worker_tool_call_response("one"), _worker_tool_call_response("two")])
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response("one"),
+            _supervisor_final_response("ran one"),
+            _worker_tool_call_response("two"),
+            _supervisor_final_response("ran two"),
+        ]
+    )
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -454,15 +493,15 @@ def test_worker_task_is_tagged_with_its_segment_index_on_the_user_turn(monkeypat
         "worker-model",
         supervisor_llm,
         worker_llm,
-        segment_step_cap=1,
+        segment_step_cap=2,
         offload_dir=str(tmp_path),
     )
 
     first_task_message = worker_llm.requests[0][1][-1]
-    second_task_message = worker_llm.requests[1][1][-1]
+    second_task_message = worker_llm.requests[2][1][-1]
     assert first_task_message["role"] == "user"
-    assert first_task_message["content"] == "[TANDEM WORKER segment 0] first"
-    assert second_task_message["content"] == "[TANDEM WORKER segment 1] second"
+    assert first_task_message["content"] == "first"
+    assert second_task_message["content"] == "second"
 
 
 def test_smart_tool_with_empty_task_short_circuits_without_invoking_worker(tmp_path):
@@ -541,7 +580,9 @@ def test_get_tool_call_detail_returns_the_full_untruncated_entry(monkeypatch, tm
             _supervisor_final_response("done"),
         ]
     )
-    worker_llm = _Llm([_worker_tool_call_response(long_command)])
+    worker_llm = _Llm(
+        [_worker_tool_call_response(long_command), _supervisor_final_response("ran it")]
+    )
 
     run_tandem_loop(
         [{"role": "user", "content": "task"}],
@@ -549,7 +590,7 @@ def test_get_tool_call_detail_returns_the_full_untruncated_entry(monkeypatch, tm
         "worker-model",
         supervisor_llm,
         worker_llm,
-        segment_step_cap=1,
+        segment_step_cap=2,
         offload_dir=str(tmp_path),
     )
 
@@ -606,7 +647,7 @@ def _seg(user_content, n_assistant_turns=1):
     """A minimal fake segment: one user task message plus n_assistant_turns
     bare assistant messages (no tool_calls -- content, not shape, is what
     these tests check)."""
-    msgs = [{"role": "user", "content": f"[TANDEM WORKER segment 0] {user_content}"}]
+    msgs = [{"role": "user", "content": user_content}]
     for i in range(n_assistant_turns):
         msgs.append({"role": "assistant", "content": f"{user_content}-reply-{i}"})
     return msgs
@@ -616,7 +657,7 @@ def test_trim_worker_history_keeps_system_and_last_n_whole_segments():
     conversation = (
         [{"role": "system", "content": "sys"}] + _seg("seg0") + _seg("seg1") + _seg("seg2")
     )
-    trimmed = _trim_worker_history(conversation, 2)
+    trimmed = _trim_worker_history(conversation, 2, {"seg0", "seg1", "seg2"})
     assert trimmed[0] == {"role": "system", "content": "sys"}
     assert "seg0" not in json.dumps(trimmed)
     assert "seg1" in json.dumps(trimmed)
@@ -625,13 +666,13 @@ def test_trim_worker_history_keeps_system_and_last_n_whole_segments():
 
 def test_trim_worker_history_n_zero_drops_all_segments():
     conversation = [{"role": "system", "content": "sys"}] + _seg("seg0") + _seg("seg1")
-    trimmed = _trim_worker_history(conversation, 0)
+    trimmed = _trim_worker_history(conversation, 0, {"seg0", "seg1"})
     assert trimmed == [{"role": "system", "content": "sys"}]
 
 
 def test_trim_worker_history_under_the_cap_is_unchanged():
     conversation = [{"role": "system", "content": "sys"}] + _seg("seg0")
-    assert _trim_worker_history(conversation, 4096) == conversation
+    assert _trim_worker_history(conversation, 4096, {"seg0"}) == conversation
 
 
 def test_trim_worker_history_empty_conversation():
@@ -680,16 +721,16 @@ def test_build_report_max_basic_tool_calls_reached_carries_the_executed_tool_cal
     ]
     assert report["tool_calls"] == full_trace
     assert _render_report(report) == (
-        "finish_reason: max_basic_tool_calls_reached\n"
-        "tool_output:\n"
-        "  (none)\n"
-        "tool_calls ([id] tool: args / -> status, then result preview):\n"
+        "finish_reason: max_basic_tool_calls_reached\ntool_output:\n  (none)\ntool_calls: 1"
+    )
+    assert _render_call_list(report["tool_calls"]) == (
+        "tool_calls ([id] tool: args / -> status · output size; get_tool_call_detail(call_id) for the output):\n"
         f"  [{short_call_id}] bash: echo hi\n"
         "    -> ok=true"
     )
 
 
-def test_render_report_previews_keep_head_and_tail():
+def test_render_report_counts_calls_and_failures_without_listing_them():
     long_command = "x" * 100
     lines = [f"line {i:03d}" for i in range(100)]
     report = {
@@ -701,21 +742,73 @@ def test_render_report_previews_keep_head_and_tail():
                 "tool": "bash",
                 "arguments": json.dumps({"command": long_command}),
                 "result": json.dumps({"output": "\n".join(lines) + "\n", "returncode": 1}),
-            }
+            },
+            {
+                "call_id": "c2",
+                "tool": "bash",
+                "arguments": json.dumps({"command": "echo hi"}),
+                "result": json.dumps({"output": "hi\n", "returncode": 0}),
+            },
         ],
     }
 
-    rendered = _render_report(report).split("\n")
+    assert _render_report(report) == (
+        "finish_reason: tool_finished\ntool_output:\n  ok\ntool_calls: 2 (1 failed)"
+    )
+    rendered = _render_call_list(report["tool_calls"]).split("\n")
 
-    call_line = rendered[4]
-    assert call_line == "  [c1] bash: " + _truncate(long_command, ARGUMENTS_TRUNCATE_CHARS)
-    assert rendered[5] == "    -> returncode=1 · 100 lines, truncated"
-    preview = [line.strip() for line in rendered[6:]]
-    # Whole lines from both ends: a traceback's last line matters as much as its first.
-    assert preview[0] == "line 000"
-    assert preview[-1] == "line 099"
-    assert "…" in preview
-    assert sum(len(line) for line in preview if line != "…") <= RESULT_TRUNCATE_CHARS
+    assert rendered[1:] == [
+        "  [c1] bash: " + _truncate(long_command, ARGUMENTS_TRUNCATE_CHARS),
+        "    -> returncode=1 · 100 lines",
+        "  [c2] bash: echo hi",
+        "    -> returncode=0 · 1 line",
+    ]
+
+
+def test_get_tool_call_list_returns_only_the_last_smart_tool_calls_entries(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"ok": True}))
+    supervisor_llm = _Llm(
+        [
+            _get_tool_call_list_response(),
+            _smart_tool_response("first"),
+            _smart_tool_response("second"),
+            _get_tool_call_list_response(),
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response("echo one", call_id="call-1"),
+            _supervisor_final_response("ran one"),
+            _worker_tool_call_response("echo two", call_id="call-2"),
+            _supervisor_final_response("ran two"),
+        ]
+    )
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        segment_step_cap=2,
+        offload_dir=str(tmp_path),
+    )
+
+    assert supervisor_llm.requests[1][1][-1]["content"] == (
+        "error: no smart_tool call has been made yet"
+    )
+    listing = supervisor_llm.requests[4][1][-1]["content"]
+    assert "echo two" in listing
+    assert "echo one" not in listing
+
+
+def test_decode_result_collapses_structured_fields_to_a_count():
+    todos = [{"content": "a", "status": "pending"}, {"content": "b", "status": "done"}]
+    assert _decode_result(json.dumps({"result": "saved", "todos": todos})) == (
+        "todos=<2 items>",
+        "saved",
+    )
 
 
 def test_decode_result_unescapes_main_text_and_lists_other_fields():
@@ -825,7 +918,7 @@ def test_trim_worker_history_does_not_split_a_segment_at_an_empty_report_repromp
         + [{"role": "user", "content": "Your last message was empty"}]
         + _seg("seg1")
     )
-    trimmed = _trim_worker_history(conversation, 1)
+    trimmed = _trim_worker_history(conversation, 1, {"seg0", "seg1"})
     assert "seg0" not in json.dumps(trimmed)
     assert "Your last message was empty" not in json.dumps(trimmed)
     assert "seg1" in json.dumps(trimmed)
@@ -891,3 +984,142 @@ def test_forwarded_output_with_empty_text_is_not_reprompted(monkeypatch, tmp_pat
     )
     assert report.startswith("finish_reason: tool_finished\n")
     assert len(worker_llm.requests) == 3
+
+
+def test_smart_tool_report_request_reaches_the_worker_order(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    supervisor_llm = _Llm(
+        [
+            _smart_tool_response("run the tests", report="the names of failing tests"),
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm([_worker_tool_call_response("pytest")])
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        segment_step_cap=1,
+        offload_dir=str(tmp_path),
+    )
+
+    order = worker_llm.requests[0][1][-1]["content"]
+    assert order == ("run the tests\n\nIn your reply, include: the names of failing tests")
+
+
+def test_smart_tool_schema_requires_a_report():
+    params = _SMART_TOOL_SCHEMA["function"]["parameters"]
+    assert params["required"] == ["task", "report"]
+
+
+def _detail_after_one_call(monkeypatch, tmp_path, output, **selection):
+    monkeypatch.setitem(
+        tools.TOOL_DISPATCH, "bash", lambda args: json.dumps({"output": output, "returncode": 0})
+    )
+    short_call_id = _short_call_id("call-0", set())
+    supervisor_llm = _Llm(
+        [
+            _smart_tool_response("show the file", report="the parse function"),
+            _get_tool_call_detail_response(short_call_id, **selection),
+            _supervisor_final_response("done"),
+        ]
+    )
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        _Llm([_worker_tool_call_response("cat f.py"), _supervisor_final_response("shown")]),
+        segment_step_cap=2,
+        offload_dir=str(tmp_path),
+    )
+    return short_call_id, supervisor_llm.requests[2][1][-1]["content"]
+
+
+def test_step_limit_gets_one_tool_less_turn_for_a_partial_report(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    supervisor_llm = _Llm([_smart_tool_response("dig in"), _supervisor_final_response("done")])
+    worker_llm = _Llm(
+        [_worker_tool_call_response("one"), _supervisor_final_response("found X; Y is left")]
+    )
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        segment_step_cap=1,
+        offload_dir=str(tmp_path),
+    )
+
+    assert worker_llm.requests[1][1][-1] == {"role": "user", "content": _STEP_LIMIT_REPORT_PROMPT}
+    smart_tool_result = supervisor_llm.requests[1][1][-1]["content"]
+    assert "finish_reason: max_basic_tool_calls_reached" in smart_tool_result
+    assert "tool_output:\n  found X; Y is left" in smart_tool_result
+
+
+def test_get_tool_call_detail_returns_a_line_range(monkeypatch, tmp_path):
+    output = "\n".join(f"line {i}" for i in range(1, 11)) + "\n"
+    call_id, detail = _detail_after_one_call(monkeypatch, tmp_path, output, lines="3-5")
+
+    assert detail == (
+        f"[{call_id}] bash: cat f.py\n"
+        "  -> returncode=0 · lines 3-5 of 10 lines\n"
+        "     3: line 3\n"
+        "     4: line 4\n"
+        "     5: line 5"
+    )
+
+
+def test_get_tool_call_detail_returns_grep_matches(monkeypatch, tmp_path):
+    output = "import os\ndef parse(x):\n    return x\ndef parse_all(xs):\n    pass\n"
+    call_id, detail = _detail_after_one_call(monkeypatch, tmp_path, output, grep="^def parse")
+
+    assert detail == (
+        f"[{call_id}] bash: cat f.py\n"
+        "  -> returncode=0 · 2 lines matching '^def parse' of 5 lines\n"
+        "     2: def parse(x):\n"
+        "     4: def parse_all(xs):"
+    )
+
+
+def test_get_tool_call_detail_rejects_a_malformed_line_range(monkeypatch, tmp_path):
+    call_id, detail = _detail_after_one_call(monkeypatch, tmp_path, "a\nb\n", lines="three")
+
+    assert (
+        detail
+        == f"[{call_id}] bash: cat f.py\n  -> returncode=0 · invalid lines 'three'; use e.g. \"120-180\""
+    )
+
+
+def test_neither_model_is_told_about_the_tandem_design(monkeypatch, tmp_path):
+    supervisor_view = json.dumps(
+        [SUPERVISOR_SYSTEM, _SMART_TOOL_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
+    ).lower()
+    assert "worker" not in supervisor_view and "tandem" not in supervisor_view
+
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    worker_llm = _Llm([_worker_tool_call_response("pytest")])
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        _Llm(
+            [
+                _smart_tool_response("run the tests", report="failures"),
+                _supervisor_final_response("done"),
+            ]
+        ),
+        worker_llm,
+        segment_step_cap=1,
+        offload_dir=str(tmp_path),
+    )
+    worker_view = json.dumps(
+        [worker_llm.requests[0][1], _FORWARD_TOOL_OUTPUT_SCHEMA, _EMPTY_REPORT_REPROMPT]
+    ).lower()
+    for word in ("tandem", "worker", "supervisor", "smart_tool"):
+        assert word not in worker_view, word

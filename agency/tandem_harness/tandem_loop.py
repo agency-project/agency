@@ -40,14 +40,14 @@ a turn with no tool call -- so a stray toolless turn and a deliberate
 finish aren't different code paths, just like they aren't for
 native/codex/claude_code today.
 
-`segment_step_cap` (default 64) is a soft ceiling, not a tight per-task
+`segment_step_cap` (default 32) is a soft ceiling, not a tight per-task
 budget: the worker may make several tool calls to satisfy one task if it
 needs to, and `WORKER_SYSTEM` instructs it to finish with a concise
 natural-language summary once it's done rather than trailing off. Each
-`smart_tool` call returns exactly three fields -- `tool_calls` (mechanical,
-harness-extracted, never model-authored: each entry has a `call_id` plus
-`arguments`/`result` truncated to a fixed preview length as a cheap
-cross-reference), `tool_output` (the worker's own factual account of what
+`smart_tool` call returns `tool_calls` as a count only (mechanical,
+harness-extracted, never model-authored; `get_tool_call_list` returns the
+last call's entries: a `call_id`, its `arguments` truncated to a fixed
+preview length, and its result's status and size), `tool_output` (the worker's own factual account of what
 it ran and what happened -- `WORKER_SYSTEM` tells it to report like a tool
 returning output, not offer its own diagnosis/beliefs), and `finish_reason`
 (`tool_finished` / `empty_output` / `max_basic_tool_calls_reached` / `tool_error` /
@@ -77,8 +77,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 _DEBUG = bool(os.environ.get("TANDEM_DEBUG"))
@@ -98,7 +99,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAX_SEGMENTS = 4096
 # A soft ceiling, not a tight per-order budget -- see this module's docstring.
-DEFAULT_SEGMENT_STEP_CAP = 64
+DEFAULT_SEGMENT_STEP_CAP = 32
 
 # How many previous smart_tool segments' own messages (task line through
 # that segment's concluding turn) get replayed into a fresh segment's
@@ -110,57 +111,49 @@ DEFAULT_WORKER_HISTORY_TURNS = 4096
 
 _EMPTY_REPORT_MAX_REPROMPTS = 1
 _EMPTY_REPORT_REPROMPT = (
-    "Your last message was empty, so the requester received no report. Write your report of "
-    "what you ran and what happened now, as your final answer."
+    "Your last message was empty. Please reply with your report of what you ran and what happened."
+)
+_STEP_LIMIT_REPORT_PROMPT = (
+    "You've used all the tool calls available for this task. Don't call any more tools. "
+    "Reply now with your report: what the task asked for that you found or did, and what is left unfinished."
 )
 
-# Preview lengths for the mechanical tool_calls cross-reference in a
-# smart_tool report. Always applied (there is no "give me the full thing in
-# this same call" flag) -- get_tool_call_detail(call_id) is the escape hatch
-# for full detail on any one of them.
+# Argument preview length for the tool_calls index in a smart_tool report; a
+# result is listed only by status and size. get_tool_call_detail serves either in full.
 ARGUMENTS_TRUNCATE_CHARS = 80
-RESULT_TRUNCATE_CHARS = 160
 
-_SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_tool_call_detail"}
+_SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_tool_call_list", "get_tool_call_detail"}
 
 SUPERVISOR_SYSTEM = """\
-You are a helpful assistant that carries out a task given to you by a user.
-You are given the following three tools:
+You complete the user's task using four tools:
 
-- smart_tool(task): Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason: tool_finished, empty_output, max_basic_tool_calls_reached (the task needed more basic tool calls than one smart_tool call allows; split it into smaller tasks), tool_error, or invalid_task.
+- smart_tool(task, report): carries out `task`, a task written in natural language, using basic tools such as bash, read and edit, and returns what you asked for in `report`, how many basic tool calls it made, and a finish_reason.
+- get_tool_call_list(): the basic tool calls the last smart_tool call made, each with its call_id, arguments, status and output size. Use it only when you need a call's raw output that the report didn't give you.
+- get_tool_call_detail(call_id, lines, grep): the arguments and output of one basic tool call from any earlier smart_tool call. Pass `lines` (e.g. "120-180") or `grep` (a regex) to get the information you need from the call.
+- submit_output(field, value): submit one required output field, using the exact field name from the task. Call it once per field, when its value is confirmed.
 
-- get_tool_call_detail(call_id): Get the full, untruncated arguments and result of ONE tool call, identified by the call_id in any smart_tool result's tool_calls entries. Works for a call from any past smart_tool call this task has made, not just the most recent one.
+Writing a smart_tool call:
+- `task`: the goal, in a sentence or two. Leave out steps that follow from the goal, and don't paste content smart_tool can read for itself. Group related steps into one call, such as reading several related places, or making an edit and rerunning the check that verifies it. Describe a code change by what should change and how to verify it; give exact code only if smart_tool got it wrong.
+- `report`: Ask for information from the tool calls that you need to complete the task, e.g. "the column names". Don't ask for what you already have, such as the query you just gave it. Be precise and do not ask for more than you need. Think what you need to know to complete the task and ask for that.
+- If smart_tool gets a task wrong, say what was wrong and what you want instead in the next call.
 
-- submit_output(field, value): Submit one required output field's value to the user. Use the exact field name and description given to you in this task's own instructions. Call it once per required field.
+Examples:
+smart_tool(task="Find where parse_json is defined and called.", report="File:line of the definition and of each call, one per line.")
+smart_tool(task="Find how config.py picks the cache directory when HOME is unset.", report="The function and lines that do it, and the rule in one sentence.")
+smart_tool(task="Run the tests in tests/test_api.py.", report="Pass/fail, and the name and error of each failing test.")
+smart_tool(task="Make parse_json in util.py return None on empty input, then run tests/test_util.py.", report="The git diff and the test result.")
+get_tool_call_list()
+get_tool_call_detail("a1b2", grep="def parse_json")
 
-Example:
-```
-smart_tool("Find files that contain the string 'JSON' using glob.")
-smart_tool("Read file ./file.json and return the keys using grep.")
-smart_tool("Show me the function parse_json in the file ./file.json.")
-smart_tool("Replace the function parse_json in the file ./file.json with ...")
-smart_tool("Run JSONFieldTests.test_has_key_number via runtests.py")
-get_tool_call_detail("call_1") -> returns the full, untruncated input and output of that one tool call, wherever it happened.
-... more smart_tool calls ...
-submit_output("field_name", "final value") -> once per required output field, when you have the confirmed final value to be reported to the user.
-```
-
-ALL basic tools, such as "bash", "grep", "read", etc., are NOT AVAILABLE TO YOU DIRECTLY. Use the smart_tool to run them. When given a complex task, the smart_tool may have trouble decomposing the task accurately. In this case, you may need to give explicit bash commands or code snippets in your task description. You should be able to learn what the smart tool is capable of as you go along. When needed, inspect what the smart tool has executed by calling get_tool_call_detail(call_id), to have a better understanding of the smart tool's capabilities.
-
-If the smart tool is not returning the expected result, or only a summary of the desired result, inspect the basic tool call that contains the result by calling get_tool_call_detail(call_id) to get the full, untruncated input and output of the basic tool call.
-
-For task execution, please keep going until the query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved.
-
-If you are working on a codebase that has tests or the ability to build or run, consider using them to verify that your work is complete. Your philosophy should be to start as specific as possible to the code you changed so that you can catch issues efficiently, then make your way to broader tests as you build confidence. Fix the problem at the root cause rather than applying surface-level patches, when possible.
-
-Once you have confirmed the final output values for every required output field, call submit_output for each returned output field.
+Keep going until the task is fully resolved. When working on code, verify your change with the most specific test first, then broader ones, and fix the root cause rather than the symptom. Once every required output value is confirmed, call submit_output for each field.
 """
 
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
 # previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.
 WORKER_SYSTEM = (
-    "You are a tool-execution worker. Do the task with the available tools, then reply with a short factual report of what you ran and what happened. "
-    "Only this final reply reaches the requester, so include the results in it. "
+    "You are a helpful assistant. Do the task with the available tools, then reply with a short report on what the task requested. "
+    "Write the report in plain text, without headings, tables or bold. "
+    "Note that only the final report reaches the user. If there is anything you changed from the user request, include it in the report. "
     "To return a tool call's full output (a file, a listing, a grep result), call forward_tool_output() right after that call."
 )
 
@@ -169,7 +162,7 @@ _SMART_TOOL_SCHEMA = {
     "function": {
         "name": "smart_tool",
         "description": (
-            "Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls. Returns the tool_output of the task, the list of basic tool calls performed, and a finish_reason: tool_finished, empty_output, max_basic_tool_calls_reached (the task needed more basic tool calls than one smart_tool call allows; split it into smaller tasks), tool_error, or invalid_task."
+            "Execute a task expressed in natural language on the harness by decomposing it into a list of basic tool calls."
         ),
         "parameters": {
             "type": "object",
@@ -178,8 +171,14 @@ _SMART_TOOL_SCHEMA = {
                     "type": "string",
                     "description": "The task to carry out.",
                 },
+                "report": {
+                    "type": "string",
+                    "description": (
+                        "What you want reported back from the tool: the specific information you are looking for. "
+                    ),
+                },
             },
-            "required": ["task"],
+            "required": ["task", "report"],
         },
     },
 }
@@ -189,18 +188,38 @@ _GET_TOOL_CALL_DETAIL_SCHEMA = {
     "function": {
         "name": "get_tool_call_detail",
         "description": (
-            "Get the full, untruncated arguments and result of ONE tool call, identified by the call_id in any smart_tool result's tool_calls entries. Works for a call from any past smart_tool call this task has made, not just the most recent one."
+            "Get the arguments and result of a tool call, identified by its call_id from get_tool_call_list. Pass lines or grep to get the information you need from the call, leave empty to get the full call."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "call_id": {
                     "type": "string",
-                    "description": "The call_id of the tool call, from a smart_tool tool_calls entry.",
+                    "description": "The call_id of the tool call, from get_tool_call_list.",
+                },
+                "lines": {
+                    "type": "string",
+                    "description": 'Optional 1-based inclusive line range of the result, e.g. "120-180" or "42".',
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "Optional regular expression; returns only the result lines that match, with line numbers.",
                 },
             },
             "required": ["call_id"],
         },
+    },
+}
+
+_GET_TOOL_CALL_LIST_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_tool_call_list",
+        "description": (
+            "List the basic tool calls the most recent smart_tool call made: each one's call_id, "
+            "arguments (shortened), status and output size. To see a call's output, pass its call_id to get_tool_call_detail."
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
 }
 
@@ -209,10 +228,9 @@ _FORWARD_TOOL_OUTPUT_SCHEMA = {
     "function": {
         "name": "forward_tool_output",
         "description": (
-            "Stage your most recently completed tool call's full, untruncated result as "
-            "your final tool_output, instead of retyping or summarizing it yourself. Takes "
-            "no arguments -- call it right after the tool call whose result you want to "
-            "forward, then finish with a short closing message (no further tool call)."
+            "Stage your most recently completed tool call's full, untruncated result "
+            "into your report. Call it right after the tool call whose result you want to "
+            "forward."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -329,7 +347,7 @@ def _build_report(
 
     if result.status == "error" and (result.message or "").startswith("exceeded max_steps="):
         finish_reason = "max_basic_tool_calls_reached"
-        tool_output = None
+        tool_output = result.final_text or None
     elif result.status == "error":
         finish_reason = "tool_error"
         tool_output = result.message
@@ -354,7 +372,7 @@ def _build_report(
 
 
 _MAIN_RESULT_FIELDS = ("output", "content", "result", "error", "note")
-_TOOL_CALLS_HEADER = "tool_calls ([id] tool: args / -> status, then result preview):"
+_TOOL_CALLS_HEADER = "tool_calls ([id] tool: args / -> status · output size; get_tool_call_detail(call_id) for the output):"
 
 
 def _field_value(value) -> str:
@@ -403,32 +421,11 @@ def _decode_result(result: str, echoed: str = "") -> "tuple[str, str]":
             )
     status = ["error"] if main_key == "error" else []
     status += [
-        f"{k}={_field_value(v)}"
+        f"{k}=<{len(v)} items>" if isinstance(v, (list, dict)) else f"{k}={_field_value(v)}"
         for k, v in value.items()
         if k != main_key and not (isinstance(v, str) and v and json.dumps(v) in echoed)
     ]
     return " ".join(status), text.rstrip("\n")
-
-
-def _preview(text: str, max_chars: int) -> str:
-    """Whole head and tail lines within max_chars, a "…" line between."""
-    if len(text) <= max_chars:
-        return text
-    lines = text.split("\n")
-    half = max_chars // 2
-    head, used = [], 0
-    while lines and used + len(lines[0]) <= half:
-        used += len(lines[0]) + 1
-        head.append(lines.pop(0))
-    tail, used = [], 0
-    while lines and used + len(lines[-1]) <= half:
-        used += len(lines[-1]) + 1
-        tail.insert(0, lines.pop())
-    if not head:
-        head = [_truncate(lines.pop(0), half)]
-    if not tail and lines:
-        tail = [_truncate(lines.pop(), half)]
-    return "\n".join(head + (["…"] if lines else []) + tail)
 
 
 def _render_call(entry: dict, *, full: bool, indent: str = "  ") -> "list[str]":
@@ -442,14 +439,51 @@ def _render_call(entry: dict, *, full: bool, indent: str = "  ") -> "list[str]":
     arrow = f"{indent}  -> "
     if not text:
         lines.append(arrow + (status or "no output"))
-    elif "\n" not in text and (full or len(text) <= RESULT_TRUNCATE_CHARS):
+    elif not full:
+        lines.append(arrow + " · ".join(p for p in (status, _size(text)) if p))
+    elif "\n" not in text:
         lines.append(arrow + " · ".join(p for p in (status, text) if p))
     else:
-        preview = text if full else _preview(text, RESULT_TRUNCATE_CHARS)
-        size = f"{text.count(chr(10)) + 1} lines" + (", truncated" if preview != text else "")
-        lines.append(arrow + " · ".join(p for p in (status, size) if p))
-        lines += [f"{indent}     {line}" if line else "" for line in preview.split("\n")]
+        lines.append(arrow + " · ".join(p for p in (status, _size(text)) if p))
+        lines += [f"{indent}     {line}" if line else "" for line in text.split("\n")]
     return lines
+
+
+def _size(text: str) -> str:
+    n = text.count("\n") + 1
+    return f"{n} line" if n == 1 else f"{n} lines"
+
+
+def _select_lines(text: str, lines_spec: str, pattern: str) -> "tuple[list[str], str]":
+    """The result lines a get_tool_call_detail range/grep asks for, numbered, plus a note on what they are."""
+    numbered = list(enumerate(text.split("\n"), 1))
+    notes = []
+    if lines_spec:
+        m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", lines_spec)
+        if m is None:
+            return [], f'invalid lines {lines_spec!r}; use e.g. "120-180"'
+        start, end = int(m.group(1)), int(m.group(2) or m.group(1))
+        numbered = [(i, line) for i, line in numbered if start <= i <= end]
+        notes.append(f"lines {start}-{end}")
+    if pattern:
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            regex = re.compile(re.escape(pattern))
+        numbered = [(i, line) for i, line in numbered if regex.search(line)]
+        notes.append(f"{len(numbered)} lines matching {pattern!r}")
+    note = f"{' within '.join(reversed(notes))} of {_size(text)}"
+    return [f"{i}: {line}" for i, line in numbered], note
+
+
+def _failed(entry: dict) -> bool:
+    try:
+        value = json.loads(entry["result"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    return "error" in value or value.get("returncode") not in (None, 0)
 
 
 def _render_report(report: dict) -> str:
@@ -457,18 +491,28 @@ def _render_report(report: dict) -> str:
     lines += [
         f"  {line}" if line else "" for line in (report["tool_output"] or "(none)").split("\n")
     ]
-    if report["tool_calls"]:
-        lines.append(_TOOL_CALLS_HEADER)
-        for entry in report["tool_calls"]:
-            lines += _render_call(entry, full=False)
+    calls = report["tool_calls"]
+    failed = sum(1 for entry in calls if _failed(entry))
+    lines.append(f"tool_calls: {len(calls)}" + (f" ({failed} failed)" if failed else ""))
     return "\n".join(lines)
 
 
-def _trim_worker_history(conversation: "list[dict]", n: int) -> "list[dict]":
+def _render_call_list(calls: "list[dict]") -> str:
+    if not calls:
+        return "The last smart_tool call made no basic tool calls."
+    lines = [_TOOL_CALLS_HEADER]
+    for entry in calls:
+        lines += _render_call(entry, full=False)
+    return "\n".join(lines)
+
+
+def _trim_worker_history(
+    conversation: "list[dict]", n: int, orders: "frozenset[str] | set[str]" = frozenset()
+) -> "list[dict]":
     """Keeps the leading system message (if any) plus at most the last *n*
     segments of the rest -- a segment is one smart_tool task's messages,
-    starting at the "[TANDEM WORKER segment N] ..." user message that
-    opens it. Whole segments are dropped from the front, oldest first;
+    starting at the user message that opens it, one of the order texts in
+    `orders`. Whole segments are dropped from the front, oldest first;
     never split mid-segment, since a segment's own tool calls/results only
     make sense together. n <= 0 means no replayed history at all (the old
     fresh-worker-per-segment behavior)."""
@@ -480,9 +524,7 @@ def _trim_worker_history(conversation: "list[dict]", n: int) -> "list[dict]":
     if n <= 0:
         return sys_prefix
     segment_starts = [
-        i
-        for i, m in enumerate(rest)
-        if m["role"] == "user" and str(m.get("content") or "").startswith("[TANDEM WORKER segment ")
+        i for i, m in enumerate(rest) if m["role"] == "user" and m.get("content") in orders
     ]
     if len(segment_starts) <= n:
         return conversation
@@ -515,21 +557,26 @@ def run_tandem_loop(
     segment_counter = {"n": 0}
     # Every tool-call entry from every segment so far, keyed by call_id.
     all_calls: "dict[str, dict]" = {}
+    # The most recent smart_tool call's entries, for get_tool_call_list; None before the first call.
+    last_calls: "dict[str, list[dict] | None]" = {"calls": None}
     # Persistent execution-wide set -- see _short_call_id.
     used_short_ids: "set[str]" = set()
     # The worker's own running conversation, carried across segments so it
     # isn't rediscovering things (like where the repo actually lives) a
     # prior segment already found -- system prompt at index 0, then each
-    # segment's "[TANDEM WORKER segment N] <task>" user message through
+    # segment's order (a plain user message, recorded in sent_orders) through
     # that segment's concluding turn, one after another. None until the
     # first smart_tool call. Trimmed to worker_history_turns segments (see
     # _trim_worker_history) before each new segment is appended, so it
     # never grows past that bound going into a dispatch.
     worker_conversation: "dict[str, list[dict] | None]" = {"messages": None}
+    sent_orders: "set[str]" = set()
 
     def smart_tool_handler(args_json: str) -> str:
         args = _parse_args(args_json)
         task = (args.get("task") or "").strip()
+        report_request = (args.get("report") or "").strip()
+        last_calls["calls"] = []
         if not task:
             return _render_report(
                 {
@@ -556,9 +603,13 @@ def run_tandem_loop(
             # single leading one.
             worker_conversation["messages"] = [{"role": "system", "content": WORKER_SYSTEM}]
         worker_conversation["messages"] = _trim_worker_history(
-            worker_conversation["messages"], worker_history_turns
+            worker_conversation["messages"], worker_history_turns, sent_orders
         )
-        segment_marker = f"[TANDEM WORKER segment {segment_index}] {task}"
+        # Plain user text: the worker sees an ordinary request, no marker; sent_orders finds it again.
+        segment_marker = (
+            f"{task}\n\nIn your reply, include: {report_request}" if report_request else task
+        )
+        sent_orders.add(segment_marker)
         worker_conversation["messages"].append({"role": "user", "content": segment_marker})
         worker_messages = worker_conversation["messages"]
         # Populated by react_loop.py with every tool call this segment makes,
@@ -578,7 +629,7 @@ def run_tandem_loop(
                 {"result": "staged your most recent tool call's output as your final tool_output"}
             )
 
-        def run_worker(segment_messages):
+        def run_worker(segment_messages, max_steps=segment_step_cap):
             return run_react_loop(
                 segment_messages,
                 worker_model,
@@ -586,7 +637,7 @@ def run_tandem_loop(
                 mcp=mcp,
                 bridge=bridge,
                 context_limit=worker_context_limit,
-                max_steps=segment_step_cap,
+                max_steps=max_steps,
                 offload_dir=offload_dir,
                 # Without this, progress.json only refreshes on the
                 # *supervisor's* own turns -- a long worker segment (many
@@ -626,6 +677,20 @@ def run_tandem_loop(
             )
             worker_totals["input"] += result.total_input_tokens
             worker_totals["output"] += result.total_output_tokens
+        if (
+            result.status == "error"
+            and (result.message or "").startswith("exceeded max_steps=")
+            and forwarded["content"] is None
+        ):
+            # One tool-less turn so the supervisor gets a partial report instead of nothing.
+            wrap_up = run_worker(
+                result.messages + [{"role": "user", "content": _STEP_LIMIT_REPORT_PROMPT}],
+                max_steps=1,
+            )
+            worker_totals["input"] += wrap_up.total_input_tokens
+            worker_totals["output"] += wrap_up.total_output_tokens
+            if wrap_up.status == "done" and (wrap_up.final_text or "").strip():
+                result = replace(wrap_up, status="error", message=result.message)
         if result.messages is not None:
             # Becomes the base for the next segment's dispatch (trimmed to
             # worker_history_turns at that point, not here) -- whatever
@@ -641,6 +706,7 @@ def run_tandem_loop(
         )
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry
+        last_calls["calls"] = report["tool_calls"]
         rendered = _render_report(report)
         _debug(f"report[{segment_index}]: {rendered[:500]}")
         return rendered
@@ -653,11 +719,29 @@ def run_tandem_loop(
         entry = all_calls.get(call_id)
         if entry is None:
             return f"error: no tool call with call_id={call_id!r} in this task's history"
-        return "\n".join(_render_call(entry, full=True, indent=""))
+        lines_spec = str(args.get("lines") or "").strip()
+        pattern = str(args.get("grep") or "")
+        if not lines_spec and not pattern:
+            return "\n".join(_render_call(entry, full=True, indent=""))
+        header = _render_call({**entry, "result": ""}, full=True, indent="")[:-1]
+        status, text = _decode_result(entry["result"], echoed=entry["arguments"])
+        selected, note = _select_lines(text, lines_spec, pattern)
+        out = header + ["  -> " + " · ".join(p for p in (status, note) if p)]
+        return "\n".join(out + [f"     {line}" for line in selected])
 
-    supervisor_tool_schemas = [_SMART_TOOL_SCHEMA, _GET_TOOL_CALL_DETAIL_SCHEMA]
+    def get_tool_call_list_handler(_args_json: str) -> str:
+        if last_calls["calls"] is None:
+            return "error: no smart_tool call has been made yet"
+        return _render_call_list(last_calls["calls"])
+
+    supervisor_tool_schemas = [
+        _SMART_TOOL_SCHEMA,
+        _GET_TOOL_CALL_LIST_SCHEMA,
+        _GET_TOOL_CALL_DETAIL_SCHEMA,
+    ]
     supervisor_dispatch_table = {
         "smart_tool": smart_tool_handler,
+        "get_tool_call_list": get_tool_call_list_handler,
         "get_tool_call_detail": get_tool_call_detail_handler,
     }
     if mcp is not None:
