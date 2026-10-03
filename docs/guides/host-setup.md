@@ -109,7 +109,7 @@ and clears inherited remote Docker/Podman endpoint settings.
 
 The design follows [OpenZFS's Ubuntu installation guidance](https://openzfs.github.io/openzfs-docs/Getting%20Started/Ubuntu/index.html)
 and [Docker's multiple-daemon guidance](https://docs.docker.com/reference/cli/dockerd/#run-multiple-daemons).
-See [checkpoint semantics](fast-checkpoint.md) for snapshot scope and limitations.
+See [checkpoint semantics](checkpoints.md) for snapshot scope and limitations.
 
 ## Live six-harness validation
 

@@ -78,3 +78,9 @@ filterwarnings = [
     # is safe here because workers are short-lived and do no lock-protected work.
     "ignore:This process.*multi-threaded.*fork:DeprecationWarning",
 ]
+
+[dependency-groups]
+docs = [
+    "mkdocs>=1.6.1,<2",
+    "mkdocstrings-python>=1.16,<3",
+]

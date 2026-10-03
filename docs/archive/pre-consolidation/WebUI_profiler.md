@@ -1,6 +1,10 @@
+> Preserved before the documentation structure consolidation, October 3, 2026.
+> Original location: `docs/WebUI_profiler.md`. Relative prose links were relocated.
+
 # Profiler in the Agency web UI
 
-The **Profiler** tab embeds actual Perfetto, served by the same FastAPI server
+The **Profiler** link opens the [six-view execution investigator](../../guides/profiling/views.md).
+The **Raw trace** tab embeds actual Perfetto, served by the same FastAPI server
 as the run dashboard. The local build changes the flow renderer to connect
 source-span starts to destination-span starts, including across tracks.
 Exported traces stay compatible with stock Perfetto. Its public website still
@@ -30,7 +34,7 @@ Use `--force` to rebuild a current viewer. `--skip-deps` skips dependency instal
 
 ## Open a trace
 
-Start applications with `agwebui.run(...)`, then click **Profiler**. The web UI
+Start applications with `agwebui.run(...)`, then click **Raw trace**. The web UI
 uses the same profiler output directory as the application, including an
 `AGENCY_PROFILE_DIR` override. Traces are available after the profiler writes
 them; click **Reload trace** after completion. This is a completed-trace viewer,

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 .venv/
+/.claude/
 *.egg-info/
 .pytest_cache/
 .DS_Store
@@ -12,3 +13,9 @@ benchmarks/checkpoint_size_microbenchmark/results
 
 # Generated embedded Perfetto build
 agency/observability/agwebui/static/perfetto/
+
+# Documentation environment and generated site
+.venv-docs/
+site/
+# Mermaid syntax-check dependencies
+/tools/docs/node_modules/

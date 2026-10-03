@@ -270,6 +270,29 @@ def test_delayed_stop_and_wrong_prompt_do_not_acknowledge_current_turn(execution
     assert execution._stop is None
 
 
+@pytest.mark.parametrize("suffix", ["\n", "\n\n", " \t\n"])
+def test_codex_acknowledges_prompt_after_composer_trims_trailing_whitespace(execution, suffix):
+    from agency.harness.adapters.codex import CodexDriver
+
+    execution.driver.prompt_matches = CodexDriver.prompt_matches.__get__(execution.driver)
+    execution._expected_prompt = "[Agency run current]\nRepair the redirect chain" + suffix
+    execution.driver.pending = [
+        {
+            "kind": "submit",
+            "turn_id": "current",
+            "prompt": "[Agency run stale]\nRepair the redirect chain",
+        },
+    ]
+    execution._poll()
+    assert not execution._acknowledged
+    execution.driver.pending = [
+        {"kind": "submit", "turn_id": "current", "prompt": execution._expected_prompt.rstrip()},
+    ]
+    execution._poll()
+    assert execution._acknowledged
+    assert execution._turn_id == "current"
+
+
 def test_startup_failure_is_reported_before_any_turn_exists(execution):
     execution._turn_id = None
     execution._turn_started = False
