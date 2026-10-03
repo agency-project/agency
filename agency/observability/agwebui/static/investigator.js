@@ -16,6 +16,22 @@ const params = new URLSearchParams(location.search);
 const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
 let loadGeneration = 0;
 let compareGeneration = 0;
+let trajectoryUpdateTimer=null;
+const pendingTrajectoryChanges=new Set();
+let pendingResync=false;
+
+function scheduleTrajectoryUpdate(changed,resynced=false) {
+  for(const id of changed)pendingTrajectoryChanges.add(id);
+  pendingResync ||= resynced;
+  // A bounded batch rather than a debounce: a busy stream still paints.
+  if(trajectoryUpdateTimer!==null)return;
+  trajectoryUpdateTimer=setTimeout(()=>{
+    trajectoryUpdateTimer=null;
+    const changes=[...pendingTrajectoryChanges],resync=pendingResync;
+    pendingTrajectoryChanges.clear();pendingResync=false;
+    updateTrajectory(changes,resync);
+  },120);
+}
 Object.assign(state, {stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null});
 const actionMap = run => new Map((run?.actions || []).map(a=>[a.id,a]));
 const visibleActions = run => (run?.actions || []).filter(a=>matchesAction(a,state.agent,state.query));
@@ -65,6 +81,8 @@ async function refresh() {
 
 async function loadRun(id, selected=null, replay=false) {
   if (!id) return;
+  clearTimeout(trajectoryUpdateTimer);trajectoryUpdateTimer=null;
+  pendingTrajectoryChanges.clear();pendingResync=false;
   const generation = ++loadGeneration;
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
@@ -89,7 +107,7 @@ async function loadRun(id, selected=null, replay=false) {
       if(!state.follow) for(const actionId of changed) state.unread.add(actionId);
       if(state.follow) state.cursor=message.replay?.clock??state.run.duration;
       if(first){catalogOptions();updateUrl();render();}
-      else updateTrajectory(changed,message.resynced);
+      else scheduleTrajectoryUpdate(changed,message.resynced);
     }});
     return;
   }
@@ -223,27 +241,45 @@ function updateTrajectory(changed,resynced=false) {
 function renderCallStack() {
   const stack=$('call-stack');if(!stack)return;
   const groups=groupCallStack(visibleActions(state.run));
-  const running=groups.filter(group=>group.running),completed=groups.filter(group=>!group.running).slice(0,50);
-  const visible=running.concat(completed);
+  const visible=groups.filter(group=>group.running).concat(groups.filter(group=>!group.running).slice(0,50));
   const existing=new Map([...stack.querySelectorAll('[data-call-group]')].map(el=>[el.dataset.callGroup,el]));
-  const ids=new Set(visible.map(group=>group.id));
-  for(const [id,el] of existing)if(!ids.has(id))el.remove();
+  const cards=new Map([...stack.querySelectorAll('[data-call-card]')].map(el=>[el.dataset.callCard,el]));
+  const positions=new Map([...cards].map(([id,el])=>[id,el.getBoundingClientRect?.()]));
+  const focused=stack.contains(document.activeElement)?document.activeElement?.getAttribute('data-action'):null;
+  const visibleCards=new Set();
   for(const [position,group] of visible.entries()) {
     let section=existing.get(group.id);
-    if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;}
+    if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;section.innerHTML='<div class="call-group-heading"></div><div class="call-group-grid"></div>';}
     section.className=`call-stack-group ${group.running?'running-group':''}`;
-    const concurrent=group.actions.length>1;
-    const title=`${group.running?'Running':'Finished'}${concurrent?' · Overlapping calls':''} · ${agentName(group.agent)}`;
-    const html=`<div class="call-group-heading">${esc(title)}</div><div class="call-group-grid">${group.actions.map(action=>`<div class="call-card">${actionButton(action)}<div class="call-card-status">${pill(action.outcome)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div></div>`).join('')}</div>`;
-    if(section.innerHTML!==html) {
-      const focused=section.contains(document.activeElement)?document.activeElement?.getAttribute('data-action'):null;
-      section.innerHTML=html;
-      if(focused)section.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
+    section.querySelector('.call-group-heading').textContent=`${group.running?'Running':'Finished'}${group.actions.length>1?' · Concurrent calls':''} · ${agentName(group.agent)}`;
+    const grid=section.querySelector('.call-group-grid');
+    for(const [index,action] of group.actions.entries()) {
+      visibleCards.add(action.id);
+      let card=cards.get(action.id);
+      if(!card){card=document.createElement('div');card.className='call-card';card.dataset.callCard=action.id;cards.set(action.id,card);}
+      const html=actionButton(action)+`<div class="call-card-status">${pill(action.outcome)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div>`;
+      if(card.innerHTML!==html)card.innerHTML=html;
+      if(grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);
     }
     if(stack.children[position]!==section)stack.insertBefore(section,stack.children[position]||null);
   }
+  const ids=new Set(visible.map(group=>group.id));
+  for(const [id,el] of existing)if(!ids.has(id))el.remove();
+  for(const [id,card] of cards)if(!visibleCards.has(id))card.remove();
   if(!visible.length)stack.innerHTML=empty('Waiting for recorded calls','Calls will appear here as execution progresses.');
   else stack.querySelector('.empty-state')?.remove();
+  if(focused)stack.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
+  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
+  for(const id of visibleCards) {
+    const card=cards.get(id),before=positions.get(id);
+    if(!card.animate||!card.getBoundingClientRect)continue;
+    card.getAnimations?.().forEach(animation=>animation.cancel());
+    const after=card.getBoundingClientRect();
+    if(before) {
+      const x=before.left-after.left,y=before.top-after.top;
+      if(Math.abs(x)+Math.abs(y)>1)card.animate([{transform:`translate(${x}px,${y}px)`},{transform:'translate(0,0)'}],{duration:220,easing:'ease-out'});
+    } else card.animate([{opacity:0,transform:'translateY(-6px)'},{opacity:1,transform:'translateY(0)'}],{duration:180,easing:'ease-out'});
+  }
 }
 
 function relevantEpisodes() {

@@ -7,24 +7,36 @@ const vm = require('node:vm');
 
 function page(replay=false) {
   const listeners={}, nodes=new Map();
+  const timers=new Map(),delays=[];let timerId=0;
+  const flush=()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());};
   class Element {
     constructor(){this.innerHTML='';this.value='';this.options=[];this.children=[];
-      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};}
+      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];}
     contains(){return false;}
     scrollIntoView(){throw Error('Unexpected automatic scrolling');}
     get firstElementChild(){return this.children[0];}
     querySelector(selector){
       if(selector==='.empty-state')return null;
-      if(!this.parts.has(selector))this.parts.set(selector,new Element());
+      if(!this.parts.has(selector)){const part=new Element();part.host=this;this.parts.set(selector,part);}
       return this.parts.get(selector);
     }
-    querySelectorAll(){return this.children;}
+    querySelectorAll(selector){
+      const key={'[data-call-group]':'callGroup','[data-call-card]':'callCard','[data-episode-card]':'episodeCard'}[selector];
+      const descendants=[...this.children,...this.parts.values()];
+      return descendants.flatMap(child=>[...(child.dataset[key]?[child]:[]),...child.querySelectorAll(selector)]);
+    }
     insertBefore(child,before){
       child.remove();
       const index=before?this.children.indexOf(before):this.children.length;
       this.children.splice(index,0,child);child.parent=this;
     }
     remove(){if(this.parent){this.parent.children.splice(this.parent.children.indexOf(this),1);this.parent=null;}}
+    getBoundingClientRect(){
+      let top=0,current=this;
+      while(current){if(current.parent)top+=Math.max(0,current.parent.children.indexOf(current))*100;current=current.parent||current.host;}
+      return {left:0,top};
+    }
+    animate(frames,options){this.animations.push({frames,options});}
   }
   const node=id=>{
     if(!nodes.has(id))nodes.set(id,new Element());
@@ -45,6 +57,8 @@ function page(replay=false) {
     }};
   let subscription;
   const context=vm.createContext({document, URLSearchParams, URL, Date,
+    setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
+    clearTimeout:id=>timers.delete(id),
     location:{search:replay?'?mode=replay':''},
     window:{scrollY:0, addEventListener:()=>{}},
     TrajectoryStream:class {
@@ -71,20 +85,23 @@ function page(replay=false) {
     renderInspector=()=>{};catalogOptions=()=>{};updateUrl=()=>{};
     var realReconcile=reconcileActivities;
     reconcileActivities=()=>{lastWindowEnd=state.windowEnd;};
+    var paints=0,realUpdate=updateTrajectory;
+    updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
     globalThis.ui={state,loadRun,selectAction,holdHistory,
-      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack};
+      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
+      paints:()=>paints};
   `,context);
   const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, document, node,
+  return {ui:context.ui, document, node,flush,delays,window:context.window,
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
-    append:()=>subscription.onMessage({type:'patch', patches:[{
+    append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
       action:{id:'new-call',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'},
       episode:{id:'two',actions:['new-call'],status:'running'},duration:2,
-    }]}),
+    }]});if(paint)flush();},
   };
 }
 
@@ -145,13 +162,13 @@ test('running overlapping calls remain pinned even after newer calls finish',()=
     {id:'newer',agent:'b',kind:'tool',start:5,duration:1,outcome:'success'},
   ];
   const groups=p.ui.groupCallStack(calls);
-  assert.deepEqual(Array.from(groups,g=>g.id),['slow','newer']);
-  assert.deepEqual(Array.from(groups[0].actions,a=>a.id),['slow','peer']);
+  assert.deepEqual(Array.from(groups,g=>g.id),['running:a:tool','newer','peer']);
+  assert.deepEqual(Array.from(groups[0].actions,a=>a.id),['slow']);
   p.ui.state.run.actions=calls;p.ui.renderCallStack();
   const stack=p.node('call-stack');
-  assert.equal(stack.firstElementChild.dataset.callGroup,'slow');
-  assert.match(stack.firstElementChild.innerHTML,/Overlapping calls/);
-  calls[0].outcome='success';p.ui.renderCallStack();
+  assert.equal(stack.firstElementChild.dataset.callGroup,'running:a:tool');
+  assert.equal(stack.firstElementChild.querySelector('.call-group-grid').children.length,1);
+  calls[0].outcome='success';calls[0].duration=2;p.ui.renderCallStack();
   assert.equal(stack.firstElementChild.dataset.callGroup,'newer');
 });
 
@@ -174,6 +191,45 @@ test('old running calls survive the completed history limit',()=>{
   p.ui.renderCallStack();
   const stack=p.node('call-stack');
   assert.equal(stack.children.length,51);
-  assert.equal(stack.firstElementChild.dataset.callGroup,'old-running');
+  assert.equal(stack.firstElementChild.dataset.callGroup,'running:a:tool');
   assert.equal(stack.children[1].dataset.callGroup,'finished-54');
+});
+
+test('a finished call leaves its running peers and reuses its card in serial history',()=>{
+  const p=page();
+  const calls=[
+    {id:'a',agent:'agent',kind:'tool',start:0,duration:5,outcome:'running'},
+    {id:'b',agent:'agent',kind:'tool',start:1,duration:2,outcome:'running'},
+  ];
+  p.ui.state.run.actions=calls;p.ui.renderCallStack();
+  const stack=p.node('call-stack');
+  const grid=stack.firstElementChild.querySelector('.call-group-grid');
+  const card=grid.children.find(c=>c.dataset.callCard==='b');
+  assert.equal(grid.children.length,2);
+  calls[1].outcome='success';p.ui.renderCallStack();
+  assert.equal(grid.children.length,1);
+  assert.equal(grid.firstElementChild.dataset.callCard,'a');
+  assert.equal(stack.children[1].dataset.callGroup,'b');
+  assert.equal(stack.children[1].querySelector('.call-group-grid').firstElementChild,card);
+  assert.ok(card.animations.some(animation=>animation.options.duration===220));
+});
+
+test('rapid stream messages render once per bounded UI batch',()=>{
+  const p=page();p.append(false);p.append(false);
+  assert.equal(p.ui.paints(),0);
+  assert.deepEqual(p.delays,[120]);
+  p.flush();assert.equal(p.ui.paints(),1);
+  p.append(false);p.flush();assert.equal(p.ui.paints(),2);
+});
+
+test('switching runs cancels a pending UI batch',()=>{
+  const p=page();p.append(false);p.ui.loadRun('live');p.flush();
+  assert.equal(p.ui.paints(),0);
+});
+
+test('reduced motion skips card animations',()=>{
+  const p=page();p.window.matchMedia=()=>({matches:true});
+  p.ui.renderCallStack();
+  const card=p.node('call-stack').firstElementChild.querySelector('.call-group-grid').firstElementChild;
+  assert.equal(card.animations.length,0);
 });

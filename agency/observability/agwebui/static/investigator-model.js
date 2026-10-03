@@ -53,21 +53,20 @@ export function packActionTracks(actions, minimumDuration = 0) {
 }
 
 export function groupCallStack(actions) {
-  // Group connected overlapping intervals for one actor. Touching endpoints
-  // are sequential, and model calls do not imply concurrent tool execution.
-  const groups=[], lanes=new Map();
-  for(const action of [...actions].sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id))) {
-    const lane=`${action.agent}:${action.kind==='model'?'model':'tool'}`;
-    const end=action.outcome==='running'?Infinity:action.start+Math.max(0,action.duration||0);
-    let group=lanes.get(lane);
-    if(!group||action.start>=group.end||end<=action.start) {
-      group={id:action.id,agent:action.agent,actions:[],end,latest:action.start,running:false};
-      groups.push(group);lanes.set(lane,group);
+  const groups=[],running=new Map();
+  for(const action of actions) {
+    if(action.outcome!=='running') {
+      groups.push({id:action.id,agent:action.agent,actions:[action],running:false,
+        latest:action.start+Math.max(0,action.duration||0)});
+      continue;
     }
-    group.actions.push(action);group.end=Math.max(group.end,end);
-    group.latest=Math.max(group.latest,action.start);
-    group.running ||= action.outcome==='running';
+    // Only still-running calls share a box. All open intervals for this
+    // actor overlap now; model calls remain separate from tool calls.
+    const lane=`running:${action.agent}:${action.kind==='model'?'model':'tool'}`;
+    let group=running.get(lane);
+    if(!group){group={id:lane,agent:action.agent,actions:[],running:true,latest:action.start};running.set(lane,group);groups.push(group);}
+    group.actions.push(action);group.latest=Math.max(group.latest,action.start);
   }
-  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest)
-    .map(group=>({...group,actions:group.actions.sort((a,b)=>Number(b.outcome==='running')-Number(a.outcome==='running')||b.start-a.start)}));
+  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest||a.id.localeCompare(b.id))
+    .map(group=>({...group,actions:group.actions.sort((a,b)=>b.start-a.start||a.id.localeCompare(b.id))}));
 }
