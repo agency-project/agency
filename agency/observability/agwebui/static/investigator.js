@@ -32,7 +32,7 @@ function scheduleTrajectoryUpdate(changed,resynced=false) {
     updateTrajectory(changes,resync);
   },120);
 }
-Object.assign(state, {stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null});
+Object.assign(state, {stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null});
 const actionMap = run => new Map((run?.actions || []).map(a=>[a.id,a]));
 const visibleActions = run => (run?.actions || []).filter(a=>matchesAction(a,state.agent,state.query));
 const agentName = (id, run=state.run) => run?.agents.find(a=>a.id===id)?.label || id;
@@ -86,6 +86,7 @@ async function loadRun(id, selected=null, replay=false) {
   const generation = ++loadGeneration;
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
+  state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;
   state.run=null;state.agent='';state.cursor=0;state.selected=selected;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
   state.comparison=null;state.compareId=null;state.compareError=null;compareGeneration++;
   $('agent-select').innerHTML='<option value="">All agents</option>';
@@ -200,7 +201,7 @@ function trajectoryView() {
   const header=heading('Execution trajectory',overlay?'Compare agent actions on a shared execution clock.':'A narrative of the run, grouped by action intent.',controls);
   const key=legend([['search','Search'],['read','Read'],['edit','Edit'],['test','Test'],['model','Model call']]);
   if(overlay) return header+trajectoryOverlay(visibleActions(state.run),key)+trajectoryWorkflow();
-  return header+`<div id="trajectory-signals"></div><div id="call-stack"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
+  return header+`<div id="trajectory-signals"></div><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span></div><div id="hidden-agents" aria-label="Hidden agent activity"></div><div id="call-stack" class="agent-columns"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
 }
 
 function renderSession() {
@@ -238,35 +239,107 @@ function updateTrajectory(changed,resynced=false) {
   if(resynced)$('transport-state').textContent+=' · recovered from durable snapshot';
 }
 
+const MAX_AGENT_COLUMNS=3;
+function trajectoryAgents() {
+  return [...new Set([...state.run.agents.map(agent=>agent.id),...state.run.actions.map(action=>action.agent)])].filter(id=>id&&id!=='workflow');
+}
+
+function visibleAgentColumns() {
+  const agents=trajectoryAgents();
+  state.agentColumns=state.agentColumns.filter(id=>agents.includes(id));
+  if(!state.columnsCustomized)for(const id of agents)if(state.agentColumns.length<2&&!state.agentColumns.includes(id))state.agentColumns.push(id);
+  const columns=state.agent?[state.agent]:state.agentColumns;
+  if(!columns.includes(state.activeColumn))state.activeColumn=columns[0]||null;
+  return columns;
+}
+
+function addAgentColumn(id) {
+  if(!trajectoryAgents().includes(id)||state.agentColumns.includes(id)||state.agentColumns.length>=MAX_AGENT_COLUMNS)return;
+  state.columnsCustomized=true;state.agentColumns.push(id);state.activeColumn=id;
+  state.agent='';$('agent-select').value='';
+  renderCallStack();
+}
+
+function removeAgentColumn(id) {
+  if(state.agentColumns.length<=1)return;
+  state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);
+  renderCallStack();
+}
+
+function selectAgentColumn(id) {
+  if(!visibleAgentColumns().includes(id))return;
+  state.activeColumn=id;renderCallStack();
+}
+
+function agentActivityCounts(id) {
+  const actions=state.run.actions.filter(action=>action.agent===id);
+  return `${actions.filter(action=>action.outcome==='running').length} running · ${actions.filter(action=>action.outcome==='failed').length} failed`;
+}
+
+function renderAgentColumnControls(columns) {
+  const agents=trajectoryAgents(),hidden=agents.filter(id=>!columns.includes(id));
+  const full=state.agentColumns.length>=MAX_AGENT_COLUMNS;
+  const picker=$('add-agent-column');
+  const options='<option value="">Add agent…</option>'+hidden.map(id=>`<option value="${esc(id)}">${esc(agentName(id))}</option>`).join('');
+  if(picker.innerHTML!==options)picker.innerHTML=options;
+  picker.disabled=full||!hidden.length;
+  $('agent-column-limit').textContent=`${columns.length} visible · max ${MAX_AGENT_COLUMNS}`;
+  const tabs=columns.map(id=>`<button role="tab" aria-selected="${id===state.activeColumn}" tabindex="${id===state.activeColumn?0:-1}" data-agent-tab="${esc(id)}">${esc(agentName(id))}<small>${agentActivityCounts(id)}</small></button>`).join('');
+  if($('agent-tabs').innerHTML!==tabs)$('agent-tabs').innerHTML=tabs;
+  const badges=hidden.map(id=>{
+    return `<button data-add-column="${esc(id)}" ${full?'disabled':''}>${esc(agentName(id))} · ${agentActivityCounts(id)}</button>`;
+  }).join('');
+  if($('hidden-agents').innerHTML!==badges)$('hidden-agents').innerHTML=badges;
+}
+
 function renderCallStack() {
   const stack=$('call-stack');if(!stack)return;
-  const groups=groupCallStack(visibleActions(state.run));
-  const visible=groups.filter(group=>group.running).concat(groups.filter(group=>!group.running).slice(0,50));
+  const columns=visibleAgentColumns();
+  renderAgentColumnControls(columns);
+  stack.style.setProperty('--agent-column-count',Math.max(1,columns.length));
+  const oldColumns=new Map([...stack.querySelectorAll('[data-agent-column]')].map(el=>[el.dataset.agentColumn,el]));
   const existing=new Map([...stack.querySelectorAll('[data-call-group]')].map(el=>[el.dataset.callGroup,el]));
   const cards=new Map([...stack.querySelectorAll('[data-call-card]')].map(el=>[el.dataset.callCard,el]));
   const positions=new Map([...cards].map(([id,el])=>[id,el.getBoundingClientRect?.()]));
   const focused=stack.contains(document.activeElement)?document.activeElement?.getAttribute('data-action'):null;
-  const visibleCards=new Set();
-  for(const [position,group] of visible.entries()) {
-    let section=existing.get(group.id);
-    if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;section.innerHTML='<div class="call-group-heading"></div><div class="call-group-grid"></div>';}
-    section.className=`call-stack-group ${group.running?'running-group':''}`;
-    section.querySelector('.call-group-heading').textContent=`${group.running?'Running':'Finished'}${group.actions.length>1?' · Concurrent calls':''} · ${agentName(group.agent)}`;
-    const grid=section.querySelector('.call-group-grid');
-    for(const [index,action] of group.actions.entries()) {
-      visibleCards.add(action.id);
-      let card=cards.get(action.id);
-      if(!card){card=document.createElement('div');card.className='call-card';card.dataset.callCard=action.id;cards.set(action.id,card);}
-      const html=actionButton(action)+`<div class="call-card-status">${pill(action.outcome)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div>`;
-      if(card.innerHTML!==html)card.innerHTML=html;
-      if(grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);
+  const visibleCards=new Set(),visibleGroups=new Set();
+  const actions=visibleActions(state.run);
+  for(const [columnIndex,agent] of columns.entries()) {
+    let column=oldColumns.get(agent);
+    if(!column){column=document.createElement('section');column.dataset.agentColumn=agent;column.innerHTML='<header class="agent-column-heading"></header><div class="agent-call-stack"></div>';}
+    column.className=`agent-column ${agent===state.activeColumn?'active-agent-column':''}`;
+    const heading=column.querySelector('.agent-column-heading');
+    const running=state.run.actions.filter(action=>action.agent===agent&&action.outcome==='running').length;
+    const html=`<strong>${esc(agentName(agent))}</strong><span>${running} running</span><button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}" ${state.agent||columns.length<=1?'disabled':''}>Hide</button>`;
+    if(heading.innerHTML!==html)heading.innerHTML=html;
+    if(stack.children[columnIndex]!==column)stack.insertBefore(column,stack.children[columnIndex]||null);
+    const feed=column.querySelector('.agent-call-stack');
+    const groups=groupCallStack(actions.filter(action=>action.agent===agent));
+    const visible=groups.filter(group=>group.running).concat(groups.filter(group=>!group.running).slice(0,50));
+    for(const [position,group] of visible.entries()) {
+      visibleGroups.add(group.id);
+      let section=existing.get(group.id);
+      if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;section.innerHTML='<div class="call-group-heading"></div><div class="call-group-grid"></div>';}
+      section.className=`call-stack-group ${group.running?'running-group':''}`;
+      section.querySelector('.call-group-heading').textContent=`${group.running?'Running':'Finished'}${group.actions.length>1?' · Concurrent calls':''}`;
+      const grid=section.querySelector('.call-group-grid');
+      for(const [index,action] of group.actions.entries()) {
+        visibleCards.add(action.id);
+        let card=cards.get(action.id);
+        if(!card){card=document.createElement('div');card.className='call-card';card.dataset.callCard=action.id;cards.set(action.id,card);}
+        const html=actionButton(action)+`<div class="call-card-status">${pill(action.outcome)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div>`;
+        if(card.innerHTML!==html)card.innerHTML=html;
+        if(grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);
+      }
+      if(feed.children[position]!==section)feed.insertBefore(section,feed.children[position]||null);
     }
-    if(stack.children[position]!==section)stack.insertBefore(section,stack.children[position]||null);
+    if(!visible.length)feed.innerHTML=empty('No matching calls','Waiting for recorded activity for this agent.');
+    else feed.querySelector('.empty-state')?.remove();
   }
-  const ids=new Set(visible.map(group=>group.id));
-  for(const [id,el] of existing)if(!ids.has(id))el.remove();
+  for(const [id,column] of oldColumns)if(!columns.includes(id))column.remove();
+  for(const [id,el] of existing)if(!visibleGroups.has(id))el.remove();
   for(const [id,card] of cards)if(!visibleCards.has(id))card.remove();
-  if(!visible.length)stack.innerHTML=empty('Waiting for recorded calls','Calls will appear here as execution progresses.');
+  if(!columns.length)stack.innerHTML=empty('Waiting for recorded agents','Agent columns will appear when execution begins.');
   else stack.querySelector('.empty-state')?.remove();
   if(focused)stack.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
   if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
@@ -639,9 +712,12 @@ function setView(view) {
 }
 
 function handleClick(event) {
-  const el=event.target.closest('[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
+  const el=event.target.closest('[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
   if(!el||!state.run&&!(el.hasAttribute('data-retry')||el.hasAttribute('data-demo'))) return;
-  if(el.dataset.view) setView(el.dataset.view);
+  if(el.dataset.addColumn)addAgentColumn(el.dataset.addColumn);
+  else if(el.dataset.removeColumn)removeAgentColumn(el.dataset.removeColumn);
+  else if(el.dataset.agentTab)selectAgentColumn(el.dataset.agentTab);
+  else if(el.dataset.view) setView(el.dataset.view);
   else if(el.dataset.action) selectAction(el.dataset.action);
   else if(el.dataset.episode) {
     event.preventDefault();
@@ -711,6 +787,14 @@ async function showRawEvidence(id) {
 
 document.addEventListener('click',handleClick);
 document.addEventListener('keydown',event=>{
+  if(event.target.dataset.agentTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
+    event.preventDefault();
+    const columns=visibleAgentColumns(),index=columns.indexOf(state.activeColumn);
+    const next=event.key==='Home'?0:event.key==='End'?columns.length-1:(index+(event.key==='ArrowRight'?1:-1)+columns.length)%columns.length;
+    selectAgentColumn(columns[next]);
+    $('agent-tabs').querySelector(`[data-agent-tab="${CSS.escape(columns[next])}"]`)?.focus({preventScroll:true});
+    return;
+  }
   if(event.target.matches('input,select,textarea')) return;
   if(event.key>='1'&&event.key<='6'&&!event.metaKey&&!event.ctrlKey) {event.preventDefault();setView(views[Number(event.key)-1][0]);}
   if(event.key==='Escape') {state.selected=null;state.contextBlock=null;render();}
@@ -730,7 +814,8 @@ $('export').onclick=()=>{
   const anchor=document.createElement('a');anchor.href=url;anchor.download=`agency-${state.run.id}.json`;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
 document.addEventListener('change',event=>{
-  if(event.target.id==='comparison-select'){state.compareError=null;loadComparison(event.target.value);}
+  if(event.target.id==='add-agent-column'){addAgentColumn(event.target.value);event.target.value='';}
+  else if(event.target.id==='comparison-select'){state.compareError=null;loadComparison(event.target.value);}
   else if(event.target.id==='trajectory-layout'){state.trajectoryLayout=event.target.value;updateUrl();render();}
 });
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream)followLatest();});

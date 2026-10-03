@@ -768,6 +768,25 @@ small,.muted {
 }
 
 #call-stack {overflow-anchor:none}
+.agent-columns {display:grid;grid-template-columns:repeat(var(--agent-column-count,1),minmax(0,1fr));gap:14px;align-items:start}
+.agent-column {min-width:0}
+.agent-column-heading {display:flex;align-items:center;gap:8px;padding:12px 0;font-size:11px;flex-wrap:wrap}
+.agent-column-heading strong {overflow-wrap:anywhere;min-width:0;flex-basis:100%}
+.agent-column-heading span {color:var(--muted);white-space:nowrap}
+.agent-column-heading button {margin-left:auto;font-size:10px}
+.agent-column-controls {display:flex;align-items:center;gap:12px;margin:12px 0;font-size:11px;flex-wrap:wrap}
+.agent-column-controls label {display:flex;align-items:center;gap:8px}
+#hidden-agents {display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+#hidden-agents button {font-size:10px}
+#agent-tabs {display:none}
+#agent-tabs small {display:block;margin-top:4px;font-size:9px;color:var(--muted)}
+#agent-tabs button[aria-selected="true"] {border-color:#70b4ed;color:#a6cde9}
+@media(max-width:900px) {
+  .agent-columns {grid-template-columns:minmax(0,1fr)}
+  .agent-column {display:none}
+  .agent-column.active-agent-column {display:block}
+  #agent-tabs {display:flex;flex-wrap:wrap;gap:8px;width:100%}
+}
 .call-stack-group {margin:0 0 14px;padding:14px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
 .running-group {border-color:#4d8baf}
 .call-group-heading {margin-bottom:10px;color:var(--muted);font-size:11px}
@@ -778,6 +797,12 @@ small,.muted {
 .call-card .action-duration {grid-column:3;grid-row:2}
 .call-card .status-icon {grid-column:4;grid-row:1}
 .call-card .action-label,.call-card .action-label small {white-space:normal;overflow-wrap:anywhere}
+.agent-column .call-card .action-row {grid-template-columns:48px minmax(0,1fr) 48px 15px;align-items:start}
+.agent-column .call-card .action-time {grid-column:1;grid-row:1}
+.agent-column .call-card .action-kind {grid-column:2;grid-row:1}
+.agent-column .call-card .action-duration {grid-column:3;grid-row:1}
+.agent-column .call-card .status-icon {grid-column:4;grid-row:1}
+.agent-column .call-card .action-label {grid-column:1/-1;grid-row:2}
 .call-card-status {padding:0 8px;font-size:11px}
 .call-card-status p {color:var(--muted);overflow-wrap:anywhere}
 .activity-history>summary {cursor:pointer;padding:12px 0;color:var(--muted);font-size:12px}

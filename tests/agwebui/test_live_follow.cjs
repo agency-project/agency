@@ -11,7 +11,7 @@ function page(replay=false) {
   const flush=()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());};
   class Element {
     constructor(){this.innerHTML='';this.value='';this.options=[];this.children=[];
-      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];}
+      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];this.style={setProperty:()=>{}};}
     contains(){return false;}
     scrollIntoView(){throw Error('Unexpected automatic scrolling');}
     get firstElementChild(){return this.children[0];}
@@ -21,7 +21,7 @@ function page(replay=false) {
       return this.parts.get(selector);
     }
     querySelectorAll(selector){
-      const key={'[data-call-group]':'callGroup','[data-call-card]':'callCard','[data-episode-card]':'episodeCard'}[selector];
+      const key={'[data-agent-column]':'agentColumn','[data-call-group]':'callGroup','[data-call-card]':'callCard','[data-episode-card]':'episodeCard'}[selector];
       const descendants=[...this.children,...this.parts.values()];
       return descendants.flatMap(child=>[...(child.dataset[key]?[child]:[]),...child.querySelectorAll(selector)]);
     }
@@ -90,16 +90,17 @@ function page(replay=false) {
     var lastWindowEnd;
     globalThis.ui={state,loadRun,selectAction,holdHistory,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
-      paints:()=>paints};
+      paints:()=>paints,visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn};
   `,context);
-  const run={id:'live',duration:1,actions:[{id:'old',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
+  const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
   return {ui:context.ui, document, node,flush,delays,window:context.window,
+    feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');return (agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');},
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
-      action:{id:'new-call',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'},
+      action:{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'},
       episode:{id:'two',actions:['new-call'],status:'running'},duration:2,
     }]});if(paint)flush();},
   };
@@ -165,11 +166,12 @@ test('running overlapping calls remain pinned even after newer calls finish',()=
   assert.deepEqual(Array.from(groups,g=>g.id),['running:a:tool','newer','peer']);
   assert.deepEqual(Array.from(groups[0].actions,a=>a.id),['slow']);
   p.ui.state.run.actions=calls;p.ui.renderCallStack();
-  const stack=p.node('call-stack');
+  const stack=p.feed();
   assert.equal(stack.firstElementChild.dataset.callGroup,'running:a:tool');
   assert.equal(stack.firstElementChild.querySelector('.call-group-grid').children.length,1);
   calls[0].outcome='success';calls[0].duration=2;p.ui.renderCallStack();
-  assert.equal(stack.firstElementChild.dataset.callGroup,'newer');
+  assert.equal(p.feed('b').firstElementChild.dataset.callGroup,'newer');
+  assert.ok(stack.children.every(group=>!group.className.includes('running-group')));
 });
 
 test('sequential calls and separate actors are not labelled concurrent',()=>{
@@ -189,10 +191,11 @@ test('old running calls survive the completed history limit',()=>{
     ...Array.from({length:55},(_,i)=>({id:`finished-${i}`,agent:'b',kind:'tool',
       start:i+1,duration:0.5,outcome:'success'}))];
   p.ui.renderCallStack();
-  const stack=p.node('call-stack');
-  assert.equal(stack.children.length,51);
+  const stack=p.feed();
+  assert.equal(stack.children.length,1);
+  assert.equal(p.feed('b').children.length,50);
   assert.equal(stack.firstElementChild.dataset.callGroup,'running:a:tool');
-  assert.equal(stack.children[1].dataset.callGroup,'finished-54');
+  assert.equal(p.feed('b').firstElementChild.dataset.callGroup,'finished-54');
 });
 
 test('a finished call leaves its running peers and reuses its card in serial history',()=>{
@@ -202,7 +205,7 @@ test('a finished call leaves its running peers and reuses its card in serial his
     {id:'b',agent:'agent',kind:'tool',start:1,duration:2,outcome:'running'},
   ];
   p.ui.state.run.actions=calls;p.ui.renderCallStack();
-  const stack=p.node('call-stack');
+  const stack=p.feed();
   const grid=stack.firstElementChild.querySelector('.call-group-grid');
   const card=grid.children.find(c=>c.dataset.callCard==='b');
   assert.equal(grid.children.length,2);
@@ -230,6 +233,54 @@ test('switching runs cancels a pending UI batch',()=>{
 test('reduced motion skips card animations',()=>{
   const p=page();p.window.matchMedia=()=>({matches:true});
   p.ui.renderCallStack();
-  const card=p.node('call-stack').firstElementChild.querySelector('.call-group-grid').firstElementChild;
+  const card=p.feed().firstElementChild.querySelector('.call-group-grid').firstElementChild;
   assert.equal(card.animations.length,0);
+});
+
+test('defaults to two stable columns and caps manual additions at three',()=>{
+  const p=page();
+  p.ui.state.run.agents=['workflow','a','b','c','d'].map(id=>({id}));
+  p.ui.renderCallStack();
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b']);
+  const original=p.node('call-stack').firstElementChild;
+  p.ui.state.run.agents.unshift({id:'new'});p.ui.renderCallStack();
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b']);
+  assert.equal(p.node('call-stack').firstElementChild,original);
+  p.ui.addAgentColumn('c');p.ui.addAgentColumn('d');
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c']);
+  assert.equal(p.node('add-agent-column').disabled,true);
+  p.ui.removeAgentColumn('b');p.ui.renderCallStack();
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','c']);
+  p.ui.addAgentColumn('d');
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','c','d']);
+});
+
+test('hidden agents show activity counts and each column contains its own calls',()=>{
+  const p=page();p.ui.state.run.agents=['a','b','c'].map(id=>({id}));
+  p.ui.state.run.actions=[
+    {id:'one',agent:'a',kind:'tool',start:0,duration:1,outcome:'running'},
+    {id:'two',agent:'b',kind:'tool',start:1,duration:1,outcome:'success'},
+    {id:'hidden-running',agent:'c',kind:'tool',start:2,duration:1,outcome:'running'},
+    {id:'hidden-failed',agent:'c',kind:'tool',start:3,duration:1,outcome:'failed'},
+  ];
+  p.ui.renderCallStack();
+  assert.equal(p.feed('a').firstElementChild.dataset.callGroup,'running:a:tool');
+  assert.equal(p.feed('b').firstElementChild.dataset.callGroup,'two');
+  assert.match(p.node('hidden-agents').innerHTML,/c · 1 running · 1 failed/);
+  p.ui.selectAgentColumn('b');
+  assert.equal(p.ui.state.activeColumn,'b');
+  const columns=p.node('call-stack').querySelectorAll('[data-agent-column]');
+  assert.equal(columns.filter(column=>column.className.includes('active-agent-column')).length,1);
+  assert.equal(columns[1].className,'agent-column active-agent-column');
+  p.ui.addAgentColumn('c');
+  assert.equal(p.ui.state.activeColumn,'c');
+  assert.match(p.node('agent-tabs').innerHTML,/1 running · 1 failed/);
+});
+
+test('agent filtering temporarily focuses one column without losing chosen columns',()=>{
+  const p=page();p.ui.state.run.agents=['a','b'].map(id=>({id}));
+  p.ui.renderCallStack();p.ui.state.agent='b';p.ui.renderCallStack();
+  assert.deepEqual(p.node('call-stack').children.map(column=>column.dataset.agentColumn),['b']);
+  p.ui.state.agent='';p.ui.renderCallStack();
+  assert.deepEqual(p.node('call-stack').children.map(column=>column.dataset.agentColumn),['a','b']);
 });
