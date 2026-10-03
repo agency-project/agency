@@ -554,7 +554,7 @@ function selectAction(id, comparison=false, intervalId=null) {
   const run=comparison?state.comparison:state.run;
   const action=actionMap(run).get(id);
   if(!action) return;
-  holdHistory();
+  holdSelection();
   const episodeIndex=relevantEpisodes().findIndex(e=>e.id===action.episode);
   if(episodeIndex>=0&&state.windowEnd!=null&&(episodeIndex>=state.windowEnd||episodeIndex<state.windowEnd-50))state.windowEnd=episodeIndex+1;
   state.selected={type:'action',id,run:comparison?'b':'a',interval:intervalId};state.cursor=intervalId?state.run.intervals.find(i=>i.id===intervalId).start:action.start;state.contextBlock=null;
@@ -579,7 +579,7 @@ function handleClick(event) {
   else if(el.dataset.action) selectAction(el.dataset.action);
   else if(el.dataset.episode) {
     event.preventDefault();
-    holdHistory();
+    holdSelection();
     const id=el.dataset.episode;
     state.expanded.has(id)?state.expanded.delete(id):state.expanded.add(id);
     state.selected={type:'episode',id};state.cursor=state.run.episodes.find(e=>e.id===id).start;state.contextBlock=null;render();
@@ -617,8 +617,25 @@ function holdHistory() {
   renderSession();
 }
 
+// Inspecting evidence should not stop a live task from appearing as it runs.
+// Replays retain their historical selection behavior.
+function holdSelection() {
+  if(state.replay)holdHistory();
+}
+
+function followLatest() {
+  state.follow=true;state.windowEnd=null;state.unread.clear();
+  if(state.run)state.cursor=state.replayState?.clock??state.run.duration;
+  renderRunChrome();
+  if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') {
+    reconcileActivities();
+    programmaticScrollUntil=Date.now()+500;
+    $('activity-list')?.lastElementChild?.scrollIntoView({block:'end'});
+  }
+}
+
 async function showRawEvidence(id) {
-  holdHistory();
+  holdSelection();
   const runId=state.run.id;
   const url=runId==='live'?`/api/trajectory/live/events/${encodeURIComponent(id)}`:`/api/trajectory/replay/${encodeURIComponent(runId)}/events/${encodeURIComponent(id)}`;
   let panel=$('raw-evidence');
@@ -637,9 +654,9 @@ document.addEventListener('keydown',event=>{
 });
 $('run-select').onchange=event=>loadRun(event.target.value);
 for(const id of ['model-filter','harness-filter']) $(id).onchange=()=>{const runs=catalogOptions();if(runs.length&&!runs.some(r=>r.id===state.run?.id)) loadRun(runs[0].id);else if(!runs.length){$('status').textContent='No executions match these model and harness filters.';}};
-$('agent-select').onchange=event=>{holdHistory();state.agent=event.target.value;state.selected=state.agent?{type:'agent',id:state.agent}:null;render();};
-$('search').oninput=event=>{holdHistory();state.query=event.target.value;render();};
-$('cursor').oninput=event=>{state.cursor=Number(event.target.value);state.model=null;$('cursor-value').textContent=formatTime(state.cursor);if(state.view==='resources'||state.view==='agents'||state.view==='context'||state.view==='trajectory'&&state.trajectoryLayout==='overlay') render();};
+$('agent-select').onchange=event=>{holdSelection();state.agent=event.target.value;state.selected=state.agent?{type:'agent',id:state.agent}:null;render();};
+$('search').oninput=event=>{holdSelection();state.query=event.target.value;render();};
+$('cursor').oninput=event=>{holdHistory();state.cursor=Number(event.target.value);state.model=null;$('cursor-value').textContent=formatTime(state.cursor);if(state.view==='resources'||state.view==='agents'||state.view==='context'||state.view==='trajectory'&&state.trajectoryLayout==='overlay') render();};
 $('clear-selection').onclick=()=>{state.selected=null;state.contextBlock=null;state.zoom=null;render();};
 $('demo').onclick=()=>{state.view='trajectory';$('model-filter').value='';$('harness-filter').value='';loadRun('demo-baseline');};
 $('refresh').onclick=refresh;
@@ -659,7 +676,7 @@ document.addEventListener('touchmove',()=>{historyScrollGestureUntil=Date.now()+
 document.addEventListener('pointerdown',event=>{if(event.clientX>=window.innerWidth-24)historyScrollGestureUntil=Date.now()+1000;},{passive:true});
 document.addEventListener('keydown',event=>{if(['PageUp','Home','ArrowUp'].includes(event.key)&&!event.target.matches('input,select,textarea')){historyScrollGestureUntil=Date.now()+1000;holdHistory();}});
 document.addEventListener('scroll',()=>{const y=window.scrollY;if(y<lastScroll-10&&Date.now()>programmaticScrollUntil&&Date.now()<historyScrollGestureUntil)holdHistory();lastScroll=y;},{passive:true});
-document.addEventListener('visibilitychange',()=>{if(document.hidden)holdHistory();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream)followLatest();});
 window.addEventListener('pagehide',()=>state.stream?.close());
 $('open-live').onclick=()=>{state.trajectoryLayout='episodes';state.view='trajectory';loadRun('live');};
 $('start-replay').onclick=()=>{state.trajectoryLayout='episodes';state.view='trajectory';loadRun(state.run.id,null,true);};
@@ -667,6 +684,6 @@ $('replay-restart').onclick=()=>loadRun(state.run.id,null,true);
 $('replay-play').onclick=()=>state.stream?.send(state.replayState?.playing?'pause':'play',{speed:Number($('replay-speed').value)});
 $('replay-step').onclick=()=>state.stream?.send('step');
 $('replay-speed').onchange=()=>{if(state.replayState?.playing)state.stream?.send('play',{speed:Number($('replay-speed').value)});};
-$('follow-live').onclick=()=>{state.follow=true;state.windowEnd=null;state.unread.clear();renderSession();if(state.view==='trajectory'&&state.trajectoryLayout==='episodes'){reconcileActivities();programmaticScrollUntil=Date.now()+500;$('activity-list')?.lastElementChild?.scrollIntoView({block:'end'});}};
+$('follow-live').onclick=followLatest;
 $('reconnect-updates').onclick=()=>state.stream?.reconnect();
 refresh();
