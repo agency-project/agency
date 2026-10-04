@@ -126,7 +126,7 @@ class _PodmanBackend(_ContainerBackendBase):
             return False
         try:
             return bool(info["host"]["security"]["rootless"])
-        except Exception:
+        except Exception:  # swallow-ok: rootless detection probe
             return False
 
     def _rootless_id_maps(self) -> "tuple[list, list] | None":

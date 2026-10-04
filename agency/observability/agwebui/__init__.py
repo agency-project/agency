@@ -272,7 +272,7 @@ class agwebui:
             try:
                 urllib.request.urlopen(health_url, timeout=1)
                 break
-            except Exception:
+            except Exception:  # swallow-ok: readiness poll; warns after the last try
                 time.sleep(0.2)
         else:
             print(
@@ -308,7 +308,7 @@ class agwebui:
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
-                except Exception:
+                except Exception:  # swallow-ok: terminate timed out, so kill
                     proc.kill()
 
         atexit.register(_kill_server)

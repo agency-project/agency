@@ -120,7 +120,7 @@ def _runtime_works(runtime: str) -> bool:
             timeout=agconfig_cls().sandbox.inspect_timeout_s,
         )
         return proc.returncode == 0
-    except Exception:
+    except Exception:  # swallow-ok: runtime availability probe
         return False
 
 
@@ -501,7 +501,7 @@ def _semaphore_held_count() -> str:
     try:
         available = _container_semaphore._semlock._get_value()
         held = limit - available
-    except Exception:
+    except Exception:  # swallow-ok: debug string only
         held = "?"
     return f"{held}/{limit}"
 

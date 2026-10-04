@@ -384,7 +384,7 @@ def _read_schedstat() -> "int | None":
             _tls.schedstat = f
         f.seek(0)
         return int(f.read().split()[1])
-    except Exception:
+    except Exception:  # swallow-ok: /proc read; sample skipped
         return None
 
 
@@ -1484,7 +1484,7 @@ def _os_thread_name() -> str:
     try:
         with open(f"/proc/self/task/{threading.get_native_id()}/comm", "rb") as f:
             return f.read().decode().strip()
-    except Exception:
+    except Exception:  # swallow-ok: /proc read; falls back to the tid
         return f"tid{threading.get_native_id()}"
 
 
@@ -1570,7 +1570,7 @@ class _Sampler(threading.Thread):
                 self._handles = [
                     pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())
                 ]
-            except Exception:
+            except Exception:  # swallow-ok: counted in _health['gpu_initialization_failures']
                 _health["gpu_initialization_failures"] += 1
                 self._nvml = None
         self._proc_root = Path("/proc")
@@ -1728,7 +1728,7 @@ class _Sampler(threading.Thread):
                     break
             else:
                 label = Path(f"/proc/{pid}/comm").read_text().strip() or label
-        except Exception:
+        except Exception:  # swallow-ok: /proc read; label not cached
             cacheable = False
         # comm names may contain ':' (e.g. "VLLM::EngineCor") — keep series
         # names parseable as gpu{i}:{label}:{metric}.
@@ -1797,7 +1797,7 @@ class _Sampler(threading.Thread):
                 _samples.append((t, f"cg:{label}:cpu_us", float(int(f.readline().split()[1]))))
             with open(f"{cdir}/memory.current", "rb") as f:
                 _samples.append((t, f"sandbox:{label}:mem_mb", int(f.read()) / 2**20))
-        except Exception:
+        except Exception:  # swallow-ok: cgroup vanished (container stopped)
             return  # cgroup vanished (container stopped/hibernated) — skip all
         # Disk IO, tier 1: the cgroup's own io.stat (exact; present under
         # rootful docker and io-delegated rootless slices).
@@ -1836,7 +1836,7 @@ class _Sampler(threading.Thread):
                 if "cgroup.procs" in files:
                     with open(f"{root}/cgroup.procs", "rb") as f:
                         pids.extend(int(x) for x in f.read().split())
-        except Exception:
+        except Exception:  # swallow-ok: cgroup vanished (container stopped)
             return
         if not pids:
             return

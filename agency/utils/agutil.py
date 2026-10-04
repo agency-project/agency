@@ -791,7 +791,7 @@ def amd_render_node_paths_by_pci_bus(candidates: "list[str]") -> "list[str] | No
             text=True,
             timeout=GPU_DETECT_TIMEOUT_S,
         )
-    except Exception:
+    except Exception:  # swallow-ok: GPU detection probe
         return None
     if result.returncode != 0 or not result.stdout.strip():
         return None

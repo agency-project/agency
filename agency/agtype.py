@@ -340,7 +340,7 @@ class agfile(agtype):
                 f"field_name '{field_name}': file at '{value}' contains binary data "
                 f"and cannot be read as text. Write a UTF-8 text file instead."
             )
-        except Exception:
+        except Exception:  # swallow-ok: reported to the agent as a tool error
             return (
                 f"field_name '{field_name}': no file found at path '{value}'. "
                 f"Write your output to a file first, then call this tool with that file's path."

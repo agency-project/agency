@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -253,8 +254,11 @@ def run_react_loop(
             if on_checkpoint is not None:
                 try:
                     on_checkpoint(messages)
-                except Exception:  # noqa: S110 - best-effort, same as _write_progress
-                    pass
+                except Exception as exc:
+                    print(
+                        f"[tandem_harness] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} WARNING: checkpoint write failed: {exc!r}",
+                        file=sys.stderr,
+                    )
     return ReactLoopResult(
         status="error",
         messages=messages,

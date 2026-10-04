@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Callable
 
 from ...configs.agconfig import agconfig as agconfig_cls
 from .._syscall_event import agsyscallevent
+from ...utils.failure_report import report_failure
 
 if TYPE_CHECKING:
     from ...agent import agent
@@ -87,7 +88,7 @@ def _probe_ptrace_available() -> bool:
         return False
     try:
         from . import _ctypes_defs as pt
-    except Exception:
+    except Exception:  # swallow-ok: availability probe
         return False
     try:
         pid = os.fork()
@@ -104,7 +105,7 @@ def _probe_ptrace_available() -> bool:
             # synchronize with the parent before installing a seccomp
             # filter). Raise SIGSTOP on ourselves to produce one.
             os.kill(os.getpid(), signal.SIGSTOP)
-        except Exception:
+        except Exception:  # swallow-ok: probe child; exit code 1 reports the failure
             os._exit(1)
         os._exit(0)
     try:
@@ -116,7 +117,7 @@ def _probe_ptrace_available() -> bool:
     try:
         pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
         os.waitpid(pid, 0)
-    except Exception:  # noqa: S110 - availability-probe cleanup is best-effort
+    except Exception:  # swallow-ok: availability-probe cleanup
         pass
     return True
 
@@ -350,7 +351,8 @@ def _isolated_profiler_callback(callback: Callable) -> Callable:
     def invoke(*args) -> None:
         try:
             callback(*args)
-        except Exception:
+        except Exception as exc:
+            report_failure("agproxy_ptrace", "telemetry callback failed", exc)
             # These callbacks run synchronously while a tracee is stopped. If
             # optional agprof/OTel code escapes, the tracer thread dies and the
             # child remains stopped forever. User callbacks are intentionally

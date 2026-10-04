@@ -932,7 +932,7 @@ class GlobalAgentOrchestrator:
         if predecessor_future is None or predecessor_future.done():
             try:
                 context = predecessor.copy()
-            except BaseException:
+            except BaseException:  # swallow-ok: a failed predecessor passes on an empty context; its own future carries the error
                 context = agcontext()
             self._settle_future(request.context_future, context, "pass-through context")
             return True
@@ -951,7 +951,7 @@ class GlobalAgentOrchestrator:
         if not request.context_future.done():
             try:
                 context = finished.result().copy()
-            except BaseException:
+            except BaseException:  # swallow-ok: a failed predecessor passes on an empty context; its own future carries the error
                 context = agcontext()
             self._settle_future(request.context_future, context, "pass-through context")
         self._finish_terminal_request_locked(request)
@@ -1209,7 +1209,7 @@ class GlobalAgentOrchestrator:
                 if predecessor_future is None or predecessor_future.done():
                     try:
                         context = request.context_dependency.copy()
-                    except BaseException:
+                    except BaseException:  # swallow-ok: a failed predecessor passes on an empty context; its own future carries the error
                         context = agcontext()
                 else:
                     producer_id = self._future_producers.get(predecessor_future)
@@ -1256,7 +1256,7 @@ def _reset_orchestrator_for_tests() -> None:
     if orchestrator is not None:
         try:
             orchestrator.shutdown(timeout_s=10)
-        except Exception:  # noqa: S110 - test cleanup is best effort
+        except Exception:  # swallow-ok: test cleanup
             pass
 
 
@@ -1265,7 +1265,7 @@ def _shutdown_at_exit() -> None:
     if orchestrator is not None:
         try:
             orchestrator.shutdown(wait=False)
-        except Exception:  # noqa: S110 - interpreter teardown is best effort
+        except Exception:  # swallow-ok: interpreter teardown
             pass
 
 

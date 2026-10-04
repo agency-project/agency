@@ -198,7 +198,7 @@ class TandemAdapter(NativeAdapter):
             # to trust payload's own echo of it back.
             try:
                 session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
-            except Exception:  # noqa: S110 - session persistence is best-effort
+            except Exception:  # swallow-ok: session persistence is best-effort
                 session_blob = None
 
             usage = payload.get("usage") or {}

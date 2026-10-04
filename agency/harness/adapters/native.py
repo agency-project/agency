@@ -229,7 +229,7 @@ class NativeAdapter(HarnessAdapter):
             # to trust payload's own echo of it back.
             try:
                 session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
-            except Exception:  # noqa: S110 - session persistence is best-effort
+            except Exception:  # swallow-ok: session persistence is best-effort
                 session_blob = None
 
             usage = payload.get("usage") or {}
@@ -277,13 +277,13 @@ class NativeAdapter(HarnessAdapter):
         """
         try:
             progress = json.loads(sandbox.read_file_bytes(progress_path))
-        except Exception:  # noqa: S110 - no checkpoint yet is not an error
+        except Exception:  # swallow-ok: no checkpoint yet is not an error
             progress = {}
         session_blob = None
         if scratch_dir is not None and session_id is not None:
             try:
                 session_blob = sandbox.read_file_bytes(_session_file_path(scratch_dir, session_id))
-            except Exception:  # noqa: S110 - no checkpoint yet is not an error
+            except Exception:  # swallow-ok: no checkpoint yet is not an error
                 session_blob = None
         return AttemptResult(
             ok=True,

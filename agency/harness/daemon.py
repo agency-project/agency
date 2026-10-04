@@ -40,6 +40,7 @@ from .common import extract_bearer_token
 from .executable import prepare_harness_executable_local
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import HarnessInteractionServer
+from ..utils.failure_report import report_failure
 
 _HARNESS_API_PORT = 8766
 
@@ -67,12 +68,6 @@ _REQUIRED_HARNESS_PACKAGES = (
 _SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="syscall-admission-log"
 )
-
-
-def _report_log_failure(stage: str, exc: Exception) -> None:
-    # Every failure, timestamped: a run of these is a record of when the host was unreachable.
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    print(f"[daemon] {stamp} syscall admission logging failed at {stage}: {exc!r}", file=sys.stderr)
 
 
 class _HostSyscallPolicy:
@@ -138,7 +133,7 @@ class _HostSyscallPolicy:
                 self._attempt_token, syscall
             )
         except Exception as exc:
-            _report_log_failure("check", exc)
+            report_failure("daemon", "syscall admission logging failed at check", exc)
             return  # best-effort logging only -- never affects the syscall's outcome
         if not call_id:
             return
@@ -147,7 +142,7 @@ class _HostSyscallPolicy:
                 self._attempt_token, call_id, return_value=None
             )
         except Exception as exc:  # best-effort logging cleanup only, never the syscall's outcome
-            _report_log_failure("complete", exc)
+            report_failure("daemon", "syscall admission logging failed at complete", exc)
 
     def check_completion(self, _agent, call_id: "str | None", return_value: int) -> None:
         # A denied (never admitted) syscall has no call_id -- the ptrace
@@ -799,8 +794,8 @@ def _ping_daemon_lifecycle(
                     "print_to_terminal": True,
                 },
             )
-    except Exception:  # noqa: S110 - best-effort ping, never the daemon's own outcome
-        pass
+    except Exception as exc:
+        report_failure("daemon", "event ping to host failed", exc)
 
 
 def main(argv: "list[str] | None" = None) -> None:

@@ -17,3 +17,12 @@ repos:
       - id: ruff
         args: ["--fix"]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: check-swallows
+        name: no silent exception swallows
+        entry: python scripts/check_swallows.py
+        language: system
+        files: ^agency/.*\.py$
+        pass_filenames: false

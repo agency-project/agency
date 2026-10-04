@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 import httpx
 
 from ..protocol import ATTEMPT_TOKEN_HEADER
+from ...utils.failure_report import report_failure
 
 if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
@@ -127,7 +128,8 @@ class HostServicesClient:
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
-        except Exception:
+        except Exception as exc:
+            report_failure("host_services", "context_limit lookup failed", exc)
             return None
 
     def log_warning(self, token: str, message: str) -> None:

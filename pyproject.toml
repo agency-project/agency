@@ -61,9 +61,9 @@ line-length = 100
 # deliberately later rather than fixing/suppressing a wall of pre-existing
 # style findings just to turn a rule on.
 #
-# S110/S112 catch silent exception swallowing. Intentional best-effort
-# cleanup sites carry local explanations or report the failure.
-select = ["F", "S110", "S112"]
+# Silent exception swallowing is checked by scripts/check_swallows.py instead
+# of S110/S112, which only see `pass`/`continue` bodies.
+select = ["F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

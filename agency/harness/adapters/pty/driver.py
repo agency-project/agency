@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ...executable import HARNESS_PATH
 from .execution import MAX_SESSION_BYTES, PtyExecution, restore_session, snapshot_session
+from ....utils.failure_report import report_failure
 
 _PROFILER_BRIDGE_TIMEOUT_S = 10.0
 
@@ -50,7 +51,10 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
             profiler = NativeProfiler(bridge)
             try:
                 profiler.enabled = bool(bridge.profiler_settings().get("enabled"))
-            except Exception:
+            except Exception as exc:
+                report_failure(
+                    "pty_driver", "profiler settings lookup failed, profiling disabled", exc
+                )
                 profiler.enabled = False
             driver.profile_span = profiler.span
             return PtyExecution(driver, runtime, cleanup_callbacks=(bridge.close,))

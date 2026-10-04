@@ -192,7 +192,7 @@ def _is_ready(handle: DaemonHandle, timeout_s: float = 0.5) -> bool:
     try:
         with handle.client(timeout_s=timeout_s) as client:
             return client.is_ready()
-    except Exception:
+    except Exception:  # swallow-ok: readiness probe, polled until ready
         return False
 
 

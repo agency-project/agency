@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, ClassVar, Protocol
+from ...utils.failure_report import report_failure
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
@@ -46,7 +47,8 @@ def fetch_context_limit(
         if resp.status_code != 200:
             return None
         return resp.json().get("context_limit")
-    except Exception:
+    except Exception as exc:
+        report_failure("harness", "context_limit lookup failed", exc)
         return None
 
 

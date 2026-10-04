@@ -354,7 +354,7 @@ def _known_agents(global_path: Path) -> "dict[str, str]":
             "SELECT name, payload FROM latest_values WHERE type='agent_registered'"
         ).fetchall()
         con.close()
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return {}
     agents: "dict[str, str]" = {}
     for name, payload in rows:
@@ -415,7 +415,7 @@ def _fetch_new_term_messages(path: Path, after_id: str) -> list[tuple[str, str]]
             (event_id, _build_envelope(event_type, timestamp, name, payload, term_message))
             for event_id, event_type, timestamp, name, payload, term_message in rows
         ]
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return []
 
 
@@ -471,7 +471,7 @@ def _fetch_new_events(path: Path, after_id: str) -> list[tuple[str, str]]:
             (event_id, _build_envelope(event_type, timestamp, name, payload, term_message))
             for event_id, event_type, timestamp, name, payload, term_message in rows
         ]
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return []
 
 
@@ -492,7 +492,7 @@ def _fetch_tail_events(path: Path, n: int = TAIL_EVENTS) -> list[str]:
             _build_envelope(event_type, timestamp, name, payload, term_message)
             for event_type, timestamp, name, payload, term_message in rows
         ]
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return []
 
 
@@ -522,7 +522,7 @@ def _fetch_timeline(path: Path) -> dict:
             "last_ts": last_ts,
             "samples": samples,
         }
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return {"index_len": 0, "first_ts": None, "last_ts": None, "samples": []}
 
 
@@ -542,7 +542,7 @@ def _fetch_events_range(path: Path, start_ts: float, end_ts: float) -> list[str]
             _build_envelope(event_type, timestamp, name, payload, term_message)
             for event_type, timestamp, name, payload, term_message in rows
         ]
-    except Exception:
+    except Exception:  # swallow-ok: UI poll; empty until the DB is readable
         return []
 
 
@@ -554,7 +554,7 @@ def _json_object(value: str) -> dict:
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except Exception:  # swallow-ok: malformed payload reads as empty
         return {}
 
 
@@ -948,7 +948,7 @@ async def websocket_endpoint(ws: WebSocket):
             # Per-agent shared-log backlog (see _fetch_agent_log_backlog).
             for line in agent_log_backlog:
                 await ws.send_text(line)
-        except Exception:
+        except Exception:  # swallow-ok: client went away during the handshake
             return
         _clients.add(ws)
 
@@ -1029,7 +1029,7 @@ async def _tail_and_broadcast() -> None:
                     for ws in list(_clients):
                         try:
                             await ws.send_text(data)
-                        except Exception:
+                        except Exception:  # swallow-ok: send failure marks the client dead
                             dead.add(ws)
                 _clients.difference_update(dead)
 

@@ -12,6 +12,7 @@ from ..observability.profiler import agprof
 from ..sandbox.agsandbox import agSandbox
 from .harness_daemon_launcher import ensure_harness_daemon
 from .host_servers.host_server_manager import HostServerManager
+from ..utils.failure_report import report_failure
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
@@ -542,7 +543,8 @@ class AgentEngine:
                 with handle.client(timeout_s=_HEALTH_CHECK_TIMEOUT_S) as health_client:
                     health_client.is_ready()
                 consecutive_failures = 0
-            except Exception:
+            except Exception as exc:
+                report_failure("engine", "harness daemon health check failed", exc)
                 consecutive_failures += 1
                 if consecutive_failures >= _HEALTH_CHECK_FAILURE_LIMIT:
                     return HarnessAttemptResult(

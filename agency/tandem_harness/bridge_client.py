@@ -19,6 +19,7 @@ compact" (context_limit=None), not an error."""
 from __future__ import annotations
 
 import sys
+import time
 
 import httpx
 
@@ -83,7 +84,11 @@ class BridgeClient:
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
-        except Exception:
+        except Exception as exc:
+            print(
+                f"[tandem_harness] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} WARNING: context_limit lookup failed: {exc!r}",
+                file=sys.stderr,
+            )
             return None
 
     def profiler_settings(self) -> dict:
