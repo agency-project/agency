@@ -867,7 +867,11 @@ class TracerLoop:
         regs = pt.get_regs(pid)
         nr = regs.orig_rax
         name = pt.SYSCALL_NAMES_BY_NUMBER.get(nr, f"nr:{nr}")
-        argv, envp, path, address, port = _resolve_syscall_args(pid, regs, nr)
+        try:
+            argv, envp, path, address, port = _resolve_syscall_args(pid, regs, nr)
+        except OSError:
+            # Unreadable argument memory (a bad pointer, or a tracee mid-exit) must not kill the tracer thread.
+            argv = envp = path = address = port = None
         stop = SeccompStop(
             pid=pid,
             syscall=name,

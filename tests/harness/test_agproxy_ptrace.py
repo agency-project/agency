@@ -770,6 +770,19 @@ def test_launch_deny_blocks_execve():
 
 
 @ptrace
+def test_execve_with_unreadable_path_does_not_stall_tracer():
+    script = (
+        "import ctypes; libc = ctypes.CDLL(None, use_errno=True); "
+        "r = libc.execve(ctypes.c_void_p(8), None, None); print(r, ctypes.get_errno())"
+    )
+    px = agProxyPtrace()
+    handle = px.launch([sys.executable, "-c", script], {}, cwd="/tmp", policy=_AllowPolicy())
+    stdout, _stderr, rc = handle.wait(timeout=20)
+    assert rc == 0
+    assert stdout.strip() == "-1 14"  # the kernel's own EFAULT
+
+
+@ptrace
 def test_launch_uses_peekdata_fallback_when_vm_readv_unavailable(monkeypatch):
     """Forces process_vm_readv to fail so read_bytes() falls back to
     PTRACE_PEEKDATA -- both paths must resolve argv identically."""
