@@ -67,15 +67,12 @@ _REQUIRED_HARNESS_PACKAGES = (
 _SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="syscall-admission-log"
 )
-# Error types already reported by _report_log_failure; one line each keeps a host outage from flooding the log.
-_REPORTED_LOG_FAILURES: "set[str]" = set()
 
 
 def _report_log_failure(stage: str, exc: Exception) -> None:
-    key = f"{stage}:{type(exc).__name__}"
-    if key not in _REPORTED_LOG_FAILURES:
-        _REPORTED_LOG_FAILURES.add(key)
-        print(f"[daemon] syscall admission logging failed at {stage} (further ones not shown): {exc!r}", file=sys.stderr)
+    # Every failure, timestamped: a run of these is a record of when the host was unreachable.
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    print(f"[daemon] {stamp} syscall admission logging failed at {stage}: {exc!r}", file=sys.stderr)
 
 
 class _HostSyscallPolicy:

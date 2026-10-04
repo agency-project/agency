@@ -892,7 +892,7 @@ class TracerLoop:
             decision = self._syscall_hook(stop)
         except Exception as exc:
             # Fail closed: a policy check that errors (e.g. a dropped host bridge) must not kill the tracer.
-            print(f"[agproxy_ptrace] policy check for {name} failed, denying it: {exc!r}", file=sys.stderr)
+            print(f"[agproxy_ptrace] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} policy check for {name} failed, denying it: {exc!r}", file=sys.stderr)
             decision = StopDecision(kind="deny")
         is_exec = nr in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"])
         if decision.kind == "deny":
@@ -978,7 +978,7 @@ class TracerLoop:
             try:
                 self._syscall_exit_hook(stop, call_id, return_value)
             except Exception as exc:
-                print(f"[agproxy_ptrace] syscall completion report failed: {exc!r}", file=sys.stderr)
+                print(f"[agproxy_ptrace] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} syscall completion report failed: {exc!r}", file=sys.stderr)
 
     def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         with self._lock:

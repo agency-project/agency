@@ -825,22 +825,20 @@ def test_host_syscall_policy_short_circuits_to_deny_when_default_to_deny_set():
     assert policy.check(None, event) == (False, None, None, None)
 
 
-def test_host_syscall_policy_logging_failure_is_reported_once(monkeypatch, capsys):
+def test_host_syscall_policy_logging_failure_is_reported_every_time(capsys):
     from types import SimpleNamespace
 
-    from agency.harness import daemon
     from agency.harness.daemon import _HostSyscallPolicy
 
     class _FakeHostServices:
         def check_syscall_policy(self, token, syscall):
             raise RuntimeError("host unreachable")
 
-    monkeypatch.setattr(daemon, "_REPORTED_LOG_FAILURES", set())
     policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token")
     policy._log_admission_best_effort(SimpleNamespace(syscall="open"))
     policy._log_admission_best_effort(SimpleNamespace(syscall="open"))
     err = capsys.readouterr().err
-    assert err.count("syscall admission logging failed at check") == 1
+    assert err.count("syscall admission logging failed at check") == 2
     assert "host unreachable" in err
 
 
