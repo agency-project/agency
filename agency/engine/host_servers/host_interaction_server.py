@@ -396,6 +396,15 @@ class HostInteractionServer:
     ) -> None:
         self._record_completion("syscall", call_id, {"return_value": return_value, "error": error})
 
+    def record_harness_output(self, chunks: list, call_label: "str | None" = None) -> None:
+        for chunk in chunks:
+            self._data_logger.record_harness_output(
+                chunk["stream"],
+                chunk["text"],
+                timestamp=chunk.get("timestamp"),
+                call_label=call_label,
+            )
+
     def record_event(
         self,
         type: str,
@@ -519,6 +528,13 @@ class HostInteractionServer:
         def _complete_syscall(request: dict, http_request: Request) -> JSONResponse:
             http_request.app.state.interaction_server.complete_syscall(
                 request["call_id"], request.get("return_value"), request.get("error")
+            )
+            return JSONResponse({"ok": True})
+
+        @app.post("/record_harness_output")
+        def _record_harness_output(request: dict, http_request: Request) -> JSONResponse:
+            http_request.app.state.interaction_server.record_harness_output(
+                request.get("chunks") or [], request.get("call_label")
             )
             return JSONResponse({"ok": True})
 

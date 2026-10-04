@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from agency.configs.agconfig import agconfig
@@ -96,9 +97,12 @@ def test_persistent_adapter_uses_the_restored_process_token(monkeypatch):
             seen.append(("policy", token))
             return object()
 
+        def output_forwarder(self, token):
+            return SimpleNamespace(close=lambda: None)
+
     manager._harness_api = HarnessApi()
 
-    def run_adapter(*args):
+    def run_adapter(*args, **_kwargs):
         seen.append(("adapter", args[-1]))
         return HarnessAttemptResult(ok=True)
 

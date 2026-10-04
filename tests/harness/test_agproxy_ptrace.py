@@ -792,10 +792,29 @@ class _RaisingPolicy:
 @ptrace
 def test_policy_check_error_denies_the_call_instead_of_stalling_tracer():
     px = agProxyPtrace()
-    handle = px.launch(["/bin/sh", "-c", "/bin/true; echo rc=$?"], {}, cwd="/tmp", policy=_RaisingPolicy())
+    handle = px.launch(
+        ["/bin/sh", "-c", "/bin/true; echo rc=$?"], {}, cwd="/tmp", policy=_RaisingPolicy()
+    )
     stdout, _stderr, rc = handle.wait(timeout=20)
     assert rc == 0
     assert stdout.startswith("rc=") and stdout.strip() != "rc=0"
+
+
+@ptrace
+def test_launch_streams_stdout_and_stderr_to_output_callback():
+    seen = []
+    px = agProxyPtrace()
+    handle = px.launch(
+        ["/bin/sh", "-c", "echo out; echo err >&2"],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+        output_callback=lambda stream, chunk: seen.append((stream, chunk)),
+    )
+    stdout, stderr, rc = handle.wait(timeout=10)
+    assert (stdout, stderr, rc) == ("out\n", "err\n", 0)
+    assert b"".join(c for s, c in seen if s == "stdout") == b"out\n"
+    assert b"".join(c for s, c in seen if s == "stderr") == b"err\n"
 
 
 @ptrace

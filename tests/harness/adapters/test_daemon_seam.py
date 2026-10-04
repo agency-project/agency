@@ -127,7 +127,7 @@ class _NativeSandbox:
 
 
 def _native_launch(captured: dict, stdout: str):
-    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None, output_callback=None):
         import sys
 
         assert argv[0] == sys.executable
@@ -245,7 +245,7 @@ def test_native_idle_deadline_recovers_partial_output_from_progress_checkpoint(m
     sandbox = _NativeSandbox()
     captured = {}
 
-    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None, output_callback=None):
         captured["progress_path"] = argv[argv.index("--progress-file") + 1]
         sandbox.files[captured["progress_path"]] = json.dumps(
             {
@@ -315,7 +315,7 @@ def test_native_idle_deadline_also_recovers_the_session_for_resume(monkeypatch):
     monkeypatch.setattr(native_module, "_PROGRESS_POLL_INTERVAL_S", 0.01)
     sandbox = _NativeSandbox()
 
-    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None):
+    def launch(_self, argv, envp, *, cwd, policy, ag, stdin_data=None, output_callback=None):
         scratch_dir = argv[argv.index("--session-dir") + 1]
         session_id = argv[argv.index("--session-id") + 1]
         sandbox.files[argv[argv.index("--progress-file") + 1]] = json.dumps({})

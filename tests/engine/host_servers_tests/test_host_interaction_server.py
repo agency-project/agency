@@ -805,3 +805,27 @@ def test_check_syscall_has_no_env_overrides_when_sandbox_never_reserved_a_gpu():
     allowed, reason, env_overrides = server.check_syscall(_make_syscall(syscall="execve"))
     assert (allowed, reason) == (True, None)
     assert env_overrides is None
+
+
+def test_record_harness_output_route_writes_each_chunk():
+    class _OutputLogger(_FakeDataLogger):
+        def __init__(self):
+            super().__init__()
+            self.chunks = []
+
+        def record_harness_output(self, stream, text, *, timestamp=None, call_label=None):
+            self.chunks.append((stream, text, timestamp, call_label))
+
+    logger = _OutputLogger()
+    client = TestClient(_make_server(data_logger=logger).build_app())
+    response = client.post(
+        "/record_harness_output",
+        json={
+            "chunks": [
+                {"stream": "stdout", "text": "a", "timestamp": 1.0},
+                {"stream": "stderr", "text": "b", "timestamp": 2.0},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert logger.chunks == [("stdout", "a", 1.0, None), ("stderr", "b", 2.0, None)]

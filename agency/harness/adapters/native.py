@@ -189,6 +189,7 @@ class NativeAdapter(HarnessAdapter):
                 cwd="/workspace",
                 policy=runtime.syscall_policy,
                 ag=None,
+                output_callback=runtime.output_sink,
             )
             runtime.register_control_handle(handle)
             deadline = time.monotonic() + _DEFAULT_TIMEOUT_S

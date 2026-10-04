@@ -198,8 +198,11 @@ class TracerLoop:
         syscall_exit_hook: "Callable[[SeccompStop, str | None, int], None] | None" = None,
         file_access: bool = False,
         checkpointable: bool = False,
+        output_callback: "Callable[[str, bytes], None] | None" = None,
     ) -> None:
         self._syscalls = tuple(syscalls)
+        # Called (stream, chunk) from the reader threads as the process writes output.
+        self._output_callback = output_callback
         self._syscall_hook = syscall_hook
         self._poll_interval_s = poll_interval_s
         # Called (stop, call_id, return_value) after an admitted syscall's
@@ -411,13 +414,13 @@ class TracerLoop:
 
         self._stdout_reader = threading.Thread(
             target=self._drain_pipe,
-            args=(stdout_r, self._stdout_buf),
+            args=(stdout_r, self._stdout_buf, "stdout"),
             name=f"agproxy_ptrace-{pid}-stdout",
             daemon=True,
         )
         self._stderr_reader = threading.Thread(
             target=self._drain_pipe,
-            args=(stderr_r, self._stderr_buf),
+            args=(stderr_r, self._stderr_buf, "stderr"),
             name=f"agproxy_ptrace-{pid}-stderr",
             daemon=True,
         )
@@ -488,7 +491,7 @@ class TracerLoop:
         # Keep the master alive for writes; the reader owns a duplicate.
         self._stdout_reader = threading.Thread(
             target=self._drain_pipe,
-            args=(os.dup(master), self._stdout_buf),
+            args=(os.dup(master), self._stdout_buf, "terminal"),
             name=f"agproxy_ptrace-{pid}-terminal",
             daemon=True,
         )
@@ -552,7 +555,7 @@ class TracerLoop:
             except OSError:
                 pass
 
-    def _drain_pipe(self, fd: int, buf: bytearray) -> None:
+    def _drain_pipe(self, fd: int, buf: bytearray, stream: str) -> None:
         """Runs on a dedicated reader thread for the lifetime of the launch
         -- reads until the write end closes (the traced process, and every
         process that inherited the fd, has exited), appending under
@@ -570,6 +573,11 @@ class TracerLoop:
                 break
             if not chunk:
                 break
+            if self._output_callback is not None:
+                try:
+                    self._output_callback(stream, chunk)
+                except Exception as exc:
+                    report_failure("agproxy_ptrace", f"{stream} output callback failed", exc)
             with self._lock:
                 buf += chunk
                 if self._pty_size is not None:

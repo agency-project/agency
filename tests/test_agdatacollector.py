@@ -163,6 +163,7 @@ def test_start_creates_schema_tables(tmp_path):
             "blocks",
             "exchanges",
             "exchange_chain",
+            "harness_output",
         } <= tables
     finally:
         dc.stop()
@@ -782,3 +783,21 @@ def test_second_connection_can_read_while_writer_stays_open(tmp_path):
     finally:
         reader.close()
     dc.stop()
+
+
+def test_record_harness_output_writes_rows_on_flush(tmp_path):
+    dc, db_path = _make_logger(tmp_path)
+    dc.start()
+    try:
+        dc.record_harness_output("stderr", "WARNING: x\n", timestamp=12.5, call_label="attempt-1")
+        dc.record_harness_output("stdout", '{"result": "ok"}')
+        dc.flush()
+    finally:
+        dc.stop()
+    con = sqlite3.connect(db_path)
+    rows = con.execute(
+        "SELECT timestamp, call_label, stream, text FROM harness_output ORDER BY id"
+    ).fetchall()
+    con.close()
+    assert rows[0] == (12.5, "attempt-1", "stderr", "WARNING: x\n")
+    assert rows[1][1:] == (None, "stdout", '{"result": "ok"}')

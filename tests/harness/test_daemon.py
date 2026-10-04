@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 
 from agency.configs.agconfig import agconfig
 from agency.engine.clients import HarnessInteractionClient
@@ -258,6 +259,9 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
             self.events.append(("policy", token))
             return policy
 
+        def output_forwarder(self, token):
+            return SimpleNamespace(close=lambda: None)
+
     manager._harness_api = HarnessApi()
     manager._attempt_handler = manager._run_adapter_request
 
@@ -270,6 +274,7 @@ def test_daemon_dispatch_selects_adapter_from_request(monkeypatch):
         syscall_policy,
         register_control_handle,
         register_redirect,
+        output_sink=None,
     ):
         seen.append((got_request, config, base_url, model, engine_name, syscall_policy))
         return expected
@@ -479,6 +484,7 @@ def _adapter_request_manager(*, bootstrapped: bool):
         (),
         {
             "base_url": "http://127.0.0.1:8766",
+            "output_forwarder": lambda self, token: SimpleNamespace(close=lambda: None),
             "resolve_model": (lambda self, token: "model") if bootstrapped else _unexpected,
             "syscall_policy": (lambda self, token, **kw: object()) if bootstrapped else _unexpected,
         },
@@ -702,7 +708,9 @@ def test_syscall_policy_check_retries_a_dropped_bridge_connection(monkeypatch):
         calls.append(url)
         if len(calls) < 3:
             raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
-        return httpx.Response(200, json={"allowed": True, "call_id": "c1"}, request=httpx.Request("POST", url))
+        return httpx.Response(
+            200, json={"allowed": True, "call_id": "c1"}, request=httpx.Request("POST", url)
+        )
 
     monkeypatch.setattr(bridge.client, "post", flaky_post)
     monkeypatch.setattr(host_services_client.time, "sleep", lambda _s: None)
@@ -860,3 +868,49 @@ def test_host_syscall_policy_logging_failure_never_raises():
 
     assert policy.check(None, event) == (True, None, None, None)
     assert attempted.wait(timeout=5)
+
+
+def test_harness_output_forwarder_batches_chunks_and_keeps_split_utf8(monkeypatch):
+    from agency.harness.daemon import _HarnessOutputForwarder
+
+    class _Host:
+        def __init__(self):
+            self.batches = []
+
+        def record_harness_output(self, token, chunks):
+            self.batches.append((token, chunks))
+
+    host = _Host()
+    forwarder = _HarnessOutputForwarder(host, "attempt-token")
+    snowman = "\u2603".encode()
+    forwarder("stderr", b"warn " + snowman[:1])
+    forwarder("stderr", snowman[1:] + b"\n")
+    forwarder("stdout", b"{}")
+    forwarder.close()
+    chunks = [c for _token, batch in host.batches for c in batch]
+    assert {token for token, _ in host.batches} == {"attempt-token"}
+    assert "".join(c["text"] for c in chunks if c["stream"] == "stderr") == "warn \u2603\n"
+    assert [c["text"] for c in chunks if c["stream"] == "stdout"] == ["{}"]
+
+
+def test_harness_output_forwarder_retries_after_a_failed_post(capsys):
+    from agency.harness.daemon import _HarnessOutputForwarder
+
+    class _FlakyHost:
+        def __init__(self):
+            self.calls = 0
+            self.delivered = []
+
+        def record_harness_output(self, token, chunks):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("host unreachable")
+            self.delivered.extend(chunks)
+
+    host = _FlakyHost()
+    forwarder = _HarnessOutputForwarder(host, "attempt-token")
+    forwarder("stdout", b"line\n")
+    forwarder._send()
+    forwarder.close()
+    assert [c["text"] for c in host.delivered] == ["line\n"]
+    assert "harness output forward failed" in capsys.readouterr().err

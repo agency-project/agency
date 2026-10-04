@@ -494,6 +494,7 @@ class agProxyPtrace:
         pty_size: "tuple[int, int] | None" = None,
         policy: "agpolicy",
         ag: "agent | None" = None,
+        output_callback: "Callable[[str, bytes], None] | None" = None,
     ) -> agProxyPtraceHandle:
         """Launch one process tree under the daemon's local tracer.
 
@@ -595,8 +596,12 @@ class agProxyPtrace:
             check_completion(ag, call_id, return_value)
 
         loop_args = dict(
-            syscalls=syscalls, syscall_hook=syscall_hook, syscall_exit_hook=syscall_exit_hook
+            syscalls=syscalls,
+            syscall_hook=syscall_hook,
+            syscall_exit_hook=syscall_exit_hook,
         )
+        if output_callback is not None:
+            loop_args["output_callback"] = output_callback
         if self._agconfig is not None and self._agconfig.sandbox.checkpoint_fast_resume:
             loop_args["checkpointable"] = True
         if track_access:

@@ -49,6 +49,7 @@ class agDataLogger:
         self._span_rows: list[tuple] = []
         self._latest_value_rows: list[tuple] = []
         self._stream_delta_rows: list[tuple] = []
+        self._harness_output_rows: list[tuple] = []
         self._block_rows: list[tuple] = []
         self._exchange_rows: list[tuple] = []
         self._exchange_chain_rows: list[tuple] = []
@@ -246,6 +247,27 @@ class agDataLogger:
                 self._flush_locked()
             else:
                 self._maybe_flush_locked()
+
+    def record_harness_output(
+        self,
+        stream: str,
+        text: str,
+        *,
+        timestamp: "float | None" = None,
+        name: "str | None" = None,
+        object: "str | None" = None,
+        call_label: "str | None" = None,
+    ) -> None:
+        """Append one chunk of a harness process's stdout/stderr to `harness_output`."""
+        timestamp = time.time() if timestamp is None else timestamp
+        name = self._default_name if name is None else name
+        object = self._default_object if object is None else object
+        with self._lock:
+            self._harness_output_rows.append(
+                (self._next_id_locked(), timestamp, name, object, call_label, stream, text)
+            )
+            self._pending_count += 1
+            self._maybe_flush_locked()
 
     def record_llm_exchange(
         self,
@@ -450,6 +472,22 @@ class agDataLogger:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_stream_deltas_call_label ON stream_deltas(call_label)"
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS harness_output (
+                id TEXT PRIMARY KEY,
+                timestamp REAL NOT NULL,
+                name TEXT,
+                object TEXT,
+                call_label TEXT,
+                stream TEXT NOT NULL,
+                text TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_harness_output_timestamp ON harness_output(timestamp)"
+        )
         # Content-addressable LLM transcript storage: each distinct block is
         # stored once in `blocks`, keyed by its content hash (computed by
         # the caller -- see `_payload_hash` in llm_handler_server.py); each
@@ -514,6 +552,7 @@ class agDataLogger:
             and not self._span_rows
             and not self._latest_value_rows
             and not self._stream_delta_rows
+            and not self._harness_output_rows
             and not self._block_rows
             and not self._exchange_rows
             and not self._exchange_chain_rows
@@ -554,6 +593,12 @@ class agDataLogger:
                     "payload, term_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     self._stream_delta_rows,
                 )
+            if self._harness_output_rows:
+                self._conn.executemany(
+                    "INSERT INTO harness_output (id, timestamp, name, object, call_label, stream, "
+                    "text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    self._harness_output_rows,
+                )
             if self._block_rows:
                 # OR IGNORE: the hash *is* the dedup key -- a block already
                 # stored by an earlier exchange (e.g. resent conversation
@@ -582,6 +627,7 @@ class agDataLogger:
         self._span_rows.clear()
         self._latest_value_rows.clear()
         self._stream_delta_rows.clear()
+        self._harness_output_rows.clear()
         self._block_rows.clear()
         self._exchange_rows.clear()
         self._exchange_chain_rows.clear()

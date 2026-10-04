@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import codecs
 import concurrent.futures
 import json
 import os
@@ -68,6 +69,72 @@ _REQUIRED_HARNESS_PACKAGES = (
 _SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="syscall-admission-log"
 )
+
+
+class _HarnessOutputForwarder:
+    """Batches a harness process's stdout/stderr chunks to the host's data logger.
+
+    The tracer's reader threads call it per chunk; a background thread posts
+    roughly once a second, so output survives a run that crashes or hangs.
+    """
+
+    _INTERVAL_S = 1.0
+    _MAX_PENDING_BYTES = 64 * 1024
+    # Kept for retry while the host is unreachable; older output is dropped past this.
+    _MAX_RETAINED_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, host_services: HostServicesClient, attempt_token: str) -> None:
+        self._host_services = host_services
+        self._attempt_token = attempt_token
+        self._pending: "list[dict]" = []
+        self._pending_bytes = 0
+        # One incremental decoder per stream keeps a UTF-8 character split across reads intact.
+        self._decoders: "dict[str, codecs.IncrementalDecoder]" = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="harness-output-forwarder", daemon=True
+        )
+        self._thread.start()
+
+    def __call__(self, stream: str, chunk: bytes) -> None:
+        with self._lock:
+            decoder = self._decoders.get(stream)
+            if decoder is None:
+                decoder = self._decoders[stream] = codecs.getincrementaldecoder("utf-8")("replace")
+            text = decoder.decode(chunk)
+            self._pending.append({"stream": stream, "text": text, "timestamp": time.time()})
+            self._pending_bytes += len(chunk)
+            if self._pending_bytes >= self._MAX_PENDING_BYTES:
+                self._wake.set()
+
+    def _send(self) -> None:
+        with self._lock:
+            batch, self._pending, self._pending_bytes = self._pending, [], 0
+        if not batch:
+            return
+        try:
+            self._host_services.record_harness_output(self._attempt_token, batch)
+        except Exception as exc:
+            report_failure("daemon", "harness output forward failed", exc)
+            with self._lock:
+                self._pending[:0] = batch
+                self._pending_bytes = sum(len(c["text"]) for c in self._pending)
+                while self._pending and self._pending_bytes > self._MAX_RETAINED_BYTES:
+                    self._pending_bytes -= len(self._pending.pop(0)["text"])
+
+    def _run(self) -> None:
+        while not self._closed:
+            self._wake.wait(self._INTERVAL_S)
+            self._wake.clear()
+            self._send()
+
+    def close(self) -> None:
+        self._closed = True
+        self._wake.set()
+        self._thread.join(timeout=5)
+        self._send()
 
 
 class _HostSyscallPolicy:
@@ -318,6 +385,9 @@ class _HarnessApiServer:
     def resolve_model(self, token: str) -> str:
         return self._bridge.resolve_model(token)
 
+    def output_forwarder(self, token: str) -> _HarnessOutputForwarder:
+        return _HarnessOutputForwarder(self._bridge, token)
+
     def syscall_policy(
         self,
         token: str,
@@ -358,6 +428,7 @@ def _run_adapter_attempt(
     register_redirect: "Callable[[Callable[[str], bool]], None]",
     run_pty_execution=None,
     local_attempt_token: "str | None" = None,
+    output_sink: "Callable[[str, bytes], None] | None" = None,
 ) -> HarnessAttemptResult:
     attempt_token = local_attempt_token or request.attempt_token
     if not isinstance(attempt_token, str) or not attempt_token:
@@ -395,6 +466,7 @@ def _run_adapter_attempt(
             register_control_handle=register_control_handle,
             register_redirect=register_redirect,
             run_pty_execution=run_pty_execution,
+            output_sink=output_sink,
         )
         result: AttemptResult = adapter.run_daemon_attempt(
             runtime,
@@ -713,8 +785,15 @@ class HarnessManager:
                 runner = lambda key, factory, prompt: self._run_pty_execution(
                     (policy_key, key), factory, prompt
                 )
-                return _run_adapter_attempt(*arguments, runner, local_token)
-            return _run_adapter_attempt(*arguments)
+            forwarder = self._harness_api.output_forwarder(local_token)
+            try:
+                if getattr(self, "_persistent", False):
+                    return _run_adapter_attempt(
+                        *arguments, runner, local_token, output_sink=forwarder
+                    )
+                return _run_adapter_attempt(*arguments, output_sink=forwarder)
+            finally:
+                forwarder.close()
         except Exception as exc:
             return HarnessAttemptResult(ok=False, error_message=f"{type(exc).__name__}: {exc}")
 

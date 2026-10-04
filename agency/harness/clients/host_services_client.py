@@ -141,6 +141,15 @@ class HostServicesClient:
             headers=self._attempt_headers(token),
         )
 
+    def record_harness_output(self, token: str, chunks: list) -> None:
+        response = self.client.post(
+            "/interaction/record_harness_output",
+            json={"chunks": chunks},
+            headers=self._attempt_headers(token),
+            timeout=10,
+        )
+        response.raise_for_status()
+
     def record_file_access(self, token: str, payload: dict) -> None:
         response = self.client.post(
             "/interaction/record_event",

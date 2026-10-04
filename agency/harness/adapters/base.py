@@ -106,6 +106,9 @@ class AdapterRuntime:
     run_pty_execution: "Callable[[object, Callable[[], object], str], AttemptResult]" = (
         _run_one_pty_execution
     )
+    # Receives (stream, chunk) as the harness process writes stdout/stderr; the
+    # daemon forwards it to the agent's data logger (`harness_output` table).
+    output_sink: "Callable[[str, bytes], None] | None" = None
 
 
 class HarnessAdapter:
