@@ -140,11 +140,18 @@ def _tag_response_message_for_display(response_message: "dict | None", tag: str)
     return tagged
 
 
+# Client errors that can succeed on a retry; any other 4xx fails the same way every time.
+_RETRYABLE_CLIENT_STATUSES = frozenset({408, 409, 429})
+
+
 def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
     """(status_code, transient) for a known LLM-backend failure category, or
     None if *error* isn't one of them (caller re-raises it unmodified)."""
     if isinstance(error, BAD_REQUEST_EXCS):
         return 400, False
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500 and status not in _RETRYABLE_CLIENT_STATUSES:
+        return status, False
     if isinstance(error, TRANSIENT_DISPATCH_EXCS):
         return 503, True
     return None

@@ -862,6 +862,21 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
     ]
 
 
+class _StatusError(ConnectionError):
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(403, (403, False)), (401, (401, False)), (429, (503, True)), (500, (503, True))],
+)
+def test_client_errors_other_than_retryable_ones_are_not_transient(monkeypatch, status, expected):
+    monkeypatch.setattr(mod, "TRANSIENT_DISPATCH_EXCS", (ConnectionError,))
+    assert mod._classify_dispatch_exception(_StatusError(status)) == expected
+
+
 def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
     def create(**kwargs):
         raise RuntimeError("boom")

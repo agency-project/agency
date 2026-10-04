@@ -302,7 +302,7 @@ class harnessadapterconfig(confignamespace):
     # the supervisor. See tandem_harness/tandem_loop.py's docstring.
     segment_step_cap: int = 32
     # Past worker segments replayed into each new segment; 0 = none.
-    worker_history_turns: int = 4096
+    worker_history_turns: int = 3
     # The supervisor's llm config is cloned from the worker's, so it must not
     # inherit worker-only request fields such as chat_template_kwargs.
     supervisor_extra_body: "dict | None" = None

@@ -4,7 +4,7 @@ carries out one smart_tool task per segment, and reports back a small
 structured result built directly from its own transcript, plus its own
 natural-language summary of what it did. The worker's own conversation
 carries forward across segments by default -- up to `worker_history_turns`
-(4096) past segments' worth of its own messages replayed as the start of
+(3) past segments' worth of its own messages replayed as the start of
 the next one's context (see `_trim_worker_history`) -- rather than each
 segment being a wholly fresh session; a worker that already found where
 the repo lives doesn't need the supervisor to keep re-stating it every
@@ -101,13 +101,9 @@ _DEFAULT_MAX_SEGMENTS = 4096
 # A soft ceiling, not a tight per-order budget -- see this module's docstring.
 DEFAULT_SEGMENT_STEP_CAP = 32
 
-# How many previous smart_tool segments' own messages (task line through
-# that segment's concluding turn) get replayed into a fresh segment's
-# starting context, oldest dropped first once the cap is exceeded. Large by
-# default -- for a real run this is well above the segment count most tasks
-# ever reach, so in practice nothing gets dropped; it's a bound for
-# pathological runs, not a tuned working set size yet.
-DEFAULT_WORKER_HISTORY_TURNS = 4096
+# How many previous smart_tool segments get replayed into a new segment, oldest
+# dropped first; replayed tool outputs otherwise grow every worker call's input.
+DEFAULT_WORKER_HISTORY_TURNS = 3
 
 _EMPTY_REPORT_MAX_REPROMPTS = 1
 _EMPTY_REPORT_REPROMPT = (
@@ -127,15 +123,17 @@ _SUPERVISOR_TOOL_NAMES = {"smart_tool", "get_tool_call_list", "get_tool_call_det
 SUPERVISOR_SYSTEM = """\
 You complete the user's task using four tools:
 
-- smart_tool(task, report): carries out `task`, a task written in natural language, using basic tools such as bash, read and edit, and returns what you asked for in `report`, how many basic tool calls it made, and a finish_reason.
-- get_tool_call_list(): the basic tool calls the last smart_tool call made, each with its call_id, arguments, status and output size. Use it only when you need a call's raw output that the report didn't give you.
-- get_tool_call_detail(call_id, lines, grep): the arguments and output of one basic tool call from any earlier smart_tool call. Pass `lines` (e.g. "120-180") or `grep` (a regex) to get the information you need from the call.
+- smart_tool(task, report): carries out `task`, a task written in natural language, using basic tools such as bash, read and edit, and returns what you asked for in `report`. Diagonose your task and decompose it into operations that can be carried out by the smart tool.
+- get_tool_call_list(): the basic tool calls the last smart_tool call made, each with its call_id, arguments, status and output size. Use it only when you need to inspect the tool calls to see what was done.
+- get_tool_call_detail(call_id, lines, grep): the arguments and output of one basic tool call from an earlier smart_tool call. Use get_tool_call_list() first to get the call_id.
 - submit_output(field, value): submit one required output field, using the exact field name from the task. Call it once per field, when its value is confirmed.
 
 Writing a smart_tool call:
-- `task`: the goal, in a sentence or two. Leave out steps that follow from the goal, and don't paste content smart_tool can read for itself. Group related steps into one call, such as reading several related places, or making an edit and rerunning the check that verifies it. Describe a code change by what should change and how to verify it; give exact code only if smart_tool got it wrong.
-- `report`: Ask for information from the tool calls that you need to complete the task, e.g. "the column names". Don't ask for what you already have, such as the query you just gave it. Be precise and do not ask for more than you need. Think what you need to know to complete the task and ask for that.
+- `task`: what to do, in a sentence or two. Don't paste content smart_tool can read for itself. Group related steps into one call, such as reading several related places, or making an edit and rerunning the check that verifies it. Describe a code change by what should change and how to verify it; give exact code only if smart_tool got it wrong.
+- `report`: Ask for information from the tool calls that you need to complete the task, e.g. "the column names of a table". Don't ask for what you already have, such as the query you just gave. Be precise and do not ask for more than you need. Think what you need to know to complete the task and ask for that.
+- If you know something that saves trial and error (which command or library works, how to run the tests, where a file is), say it in task.
 - If smart_tool gets a task wrong, say what was wrong and what you want instead in the next call.
+- After you have the information you need, decide what to do next. Don't give the smart tool open-ended goals like "find the bug and fix it".
 
 Examples:
 smart_tool(task="Find where parse_json is defined and called.", report="File:line of the definition and of each call, one per line.")
@@ -151,8 +149,8 @@ Keep going until the task is fully resolved. When working on code, verify your c
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
 # previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.
 WORKER_SYSTEM = (
-    "You are a helpful assistant. Do the task with the available tools, then reply with a short report on what the task requested. "
-    "Write the report in plain text, without headings, tables or bold. "
+    "You are a helpful assistant. Do the task with the available tools, then reply with a short report. "
+    "Report must present the requested information in plain text, without headings, tables or bold. "
     "Note that only the final report reaches the user. If there is anything you changed from the user request, include it in the report. "
     "To return a tool call's full output (a file, a listing, a grep result), call forward_tool_output() right after that call."
 )
