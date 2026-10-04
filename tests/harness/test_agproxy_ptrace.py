@@ -782,6 +782,22 @@ def test_execve_with_unreadable_path_does_not_stall_tracer():
     assert stdout.strip() == "-1 14"  # the kernel's own EFAULT
 
 
+class _RaisingPolicy:
+    def check(self, _ag, event):
+        if event.path == "/bin/true":
+            raise RuntimeError("policy bridge dropped")
+        return True
+
+
+@ptrace
+def test_policy_check_error_denies_the_call_instead_of_stalling_tracer():
+    px = agProxyPtrace()
+    handle = px.launch(["/bin/sh", "-c", "/bin/true; echo rc=$?"], {}, cwd="/tmp", policy=_RaisingPolicy())
+    stdout, _stderr, rc = handle.wait(timeout=20)
+    assert rc == 0
+    assert stdout.startswith("rc=") and stdout.strip() != "rc=0"
+
+
 @ptrace
 def test_launch_uses_peekdata_fallback_when_vm_readv_unavailable(monkeypatch):
     """Forces process_vm_readv to fail so read_bytes() falls back to

@@ -33,6 +33,7 @@ import termios
 import os
 import select
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -887,7 +888,12 @@ class TracerLoop:
             from .file_access import fd_metadata
 
             stop.file_access = fd_metadata(pid, regs.rdi)
-        decision = self._syscall_hook(stop)
+        try:
+            decision = self._syscall_hook(stop)
+        except Exception as exc:
+            # Fail closed: a policy check that errors (e.g. a dropped host bridge) must not kill the tracer.
+            print(f"[agproxy_ptrace] policy check for {name} failed, denying it: {exc!r}", file=sys.stderr)
+            decision = StopDecision(kind="deny")
         is_exec = nr in (pt.SYSCALL_NUMBERS["execve"], pt.SYSCALL_NUMBERS["execveat"])
         if decision.kind == "deny":
             # Skip the syscall (orig_rax=-1) and make it appear to have
@@ -969,7 +975,10 @@ class TracerLoop:
         finally:
             _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
         if self._syscall_exit_hook is not None and return_value is not None:
-            self._syscall_exit_hook(stop, call_id, return_value)
+            try:
+                self._syscall_exit_hook(stop, call_id, return_value)
+            except Exception as exc:
+                print(f"[agproxy_ptrace] syscall completion report failed: {exc!r}", file=sys.stderr)
 
     def _remember_spawn(self, pid: int, *, is_process: "bool | None" = True) -> None:
         with self._lock:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import json
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import TYPE_CHECKING, AsyncIterator
@@ -20,6 +21,8 @@ from ..protocol import ATTEMPT_TOKEN_HEADER
 
 if TYPE_CHECKING:
     from .._syscall_event import agsyscallevent
+
+_SYSCALL_POLICY_ATTEMPTS = 4
 
 
 class HostDispatchError(RuntimeError):
@@ -194,12 +197,20 @@ class HostServicesClient:
         # See check_tool_policy's comment above -- execve/execveat are
         # exactly the syscalls a GPU reservation gates, so this call can
         # also legitimately block on the host for an unbounded time.
-        response = self.client.post(
-            "/interaction/check_syscall",
-            json=asdict(syscall),
-            headers=self._attempt_headers(token),
-            timeout=None,
-        )
+        for attempt in range(_SYSCALL_POLICY_ATTEMPTS):
+            try:
+                response = self.client.post(
+                    "/interaction/check_syscall",
+                    json=asdict(syscall),
+                    headers=self._attempt_headers(token),
+                    timeout=None,
+                )
+                break
+            except httpx.TransportError:
+                # A dropped bridge connection; the tracer denies the call if every attempt fails.
+                if attempt == _SYSCALL_POLICY_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.5 * 2**attempt)
         response.raise_for_status()
         result = response.json()
         return (

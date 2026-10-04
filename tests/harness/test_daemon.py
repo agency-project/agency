@@ -687,6 +687,35 @@ def test_syscall_racing_attempt_retirement_preserves_the_tracer(monkeypatch, com
         bridge.close()
 
 
+def test_syscall_policy_check_retries_a_dropped_bridge_connection(monkeypatch):
+    import httpx
+
+    from agency.harness._syscall_event import agsyscallevent
+    from agency.harness.clients import host_services_client
+    from agency.harness.clients.host_services_client import HostServicesClient
+
+    bridge = HostServicesClient("/unused/host.sock")
+    bridge.register_attempt_token("attempt-token")
+    calls = []
+
+    def flaky_post(url, **kwargs):
+        calls.append(url)
+        if len(calls) < 3:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"allowed": True, "call_id": "c1"}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(bridge.client, "post", flaky_post)
+    monkeypatch.setattr(host_services_client.time, "sleep", lambda _s: None)
+    event = agsyscallevent(
+        syscall="execve", pid=1, tid=1, argv=[], envp={}, path="/bin/true", timestamp=0
+    )
+    try:
+        assert bridge.check_syscall_policy("attempt-token", event) == (True, None, "c1", None)
+        assert len(calls) == 3
+    finally:
+        bridge.close()
+
+
 def test_pause_finishes_before_a_concurrent_redirect_can_start():
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
