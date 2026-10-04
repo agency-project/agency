@@ -33,6 +33,10 @@ _BARE_THREAD_ALLOWLIST = {
         "_HarnessApiServer.start",
     ): (1, "harness API server"),
     (
+        "agency/harness/daemon.py",
+        "_HarnessOutputForwarder.__init__",
+    ): (1, "harness stdout/stderr forwarder"),
+    (
         "agency/harness/servers/harness_interaction_server.py",
         "HarnessInteractionServer.start",
     ): (1, "sandbox interaction server"),
