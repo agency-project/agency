@@ -67,6 +67,15 @@ _REQUIRED_HARNESS_PACKAGES = (
 _SYSCALL_LOG_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="syscall-admission-log"
 )
+# Error types already reported by _report_log_failure; one line each keeps a host outage from flooding the log.
+_REPORTED_LOG_FAILURES: "set[str]" = set()
+
+
+def _report_log_failure(stage: str, exc: Exception) -> None:
+    key = f"{stage}:{type(exc).__name__}"
+    if key not in _REPORTED_LOG_FAILURES:
+        _REPORTED_LOG_FAILURES.add(key)
+        print(f"[daemon] syscall admission logging failed at {stage} (further ones not shown): {exc!r}", file=sys.stderr)
 
 
 class _HostSyscallPolicy:
@@ -128,10 +137,11 @@ class _HostSyscallPolicy:
 
     def _log_admission_best_effort(self, syscall) -> None:
         try:
-            _allowed, _reason, call_id = self._host_services.check_syscall_policy(
+            _allowed, _reason, call_id, _env = self._host_services.check_syscall_policy(
                 self._attempt_token, syscall
             )
-        except Exception:
+        except Exception as exc:
+            _report_log_failure("check", exc)
             return  # best-effort logging only -- never affects the syscall's outcome
         if not call_id:
             return
@@ -139,8 +149,8 @@ class _HostSyscallPolicy:
             self._host_services.complete_syscall_policy(
                 self._attempt_token, call_id, return_value=None
             )
-        except Exception:  # noqa: S110 - best-effort logging cleanup only, never the syscall's outcome
-            pass
+        except Exception as exc:  # best-effort logging cleanup only, never the syscall's outcome
+            _report_log_failure("complete", exc)
 
     def check_completion(self, _agent, call_id: "str | None", return_value: int) -> None:
         # A denied (never admitted) syscall has no call_id -- the ptrace

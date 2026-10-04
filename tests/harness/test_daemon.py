@@ -611,7 +611,7 @@ def test_host_syscall_policy_check_forwards_hooked_syscalls_to_host_services():
 
         def check_syscall_policy(self, token, syscall):
             self.check_calls.append((token, syscall))
-            return (True, None, "call-1")
+            return (True, None, "call-1", None)
 
         def complete_syscall_policy(self, token, call_id, return_value):
             self.complete_calls.append((token, call_id, return_value))
@@ -623,7 +623,7 @@ def test_host_syscall_policy_check_forwards_hooked_syscalls_to_host_services():
     event = SimpleNamespace(syscall="openat")
 
     decision = policy.check(None, event)
-    assert decision == (True, None, "call-1")
+    assert decision == (True, None, "call-1", None)
     assert host_services.check_calls == [("attempt-token", event)]
 
     policy.check_completion(None, "call-1", 3)
@@ -780,7 +780,7 @@ def test_host_syscall_policy_short_circuits_unhooked_syscalls_by_default():
             entered_rpc.set()
             assert release_rpc.wait(timeout=5), "test never released the blocked RPC"
             self.check_calls.append((token, syscall))
-            return (True, None, "call-1")
+            return (True, None, "call-1", None)
 
         def complete_syscall_policy(self, token, call_id, return_value):
             self.complete_calls.append((token, call_id, return_value))
@@ -823,6 +823,25 @@ def test_host_syscall_policy_short_circuits_to_deny_when_default_to_deny_set():
     event = SimpleNamespace(syscall="open")
 
     assert policy.check(None, event) == (False, None, None, None)
+
+
+def test_host_syscall_policy_logging_failure_is_reported_once(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from agency.harness import daemon
+    from agency.harness.daemon import _HostSyscallPolicy
+
+    class _FakeHostServices:
+        def check_syscall_policy(self, token, syscall):
+            raise RuntimeError("host unreachable")
+
+    monkeypatch.setattr(daemon, "_REPORTED_LOG_FAILURES", set())
+    policy = _HostSyscallPolicy(_FakeHostServices(), "attempt-token")
+    policy._log_admission_best_effort(SimpleNamespace(syscall="open"))
+    policy._log_admission_best_effort(SimpleNamespace(syscall="open"))
+    err = capsys.readouterr().err
+    assert err.count("syscall admission logging failed at check") == 1
+    assert "host unreachable" in err
 
 
 def test_host_syscall_policy_logging_failure_never_raises():
