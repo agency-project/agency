@@ -22,7 +22,7 @@ import sys
 import uuid
 from typing import Generator
 
-from .canonicalize import canonicalize_run, is_run_command
+from .canonicalize import canonicalize_run, compact_code_read, is_code_read_command, is_run_command
 
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
@@ -37,6 +37,8 @@ _WEBFETCH_MAX_TIMEOUT = 120
 _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
 # Set by cli.py from --canonicalize-run-output; off unless the caller asks for it.
 CANONICALIZE_RUN_OUTPUT = False
+# Set by cli.py from --compact-code-reads.
+COMPACT_CODE_READS = False
 
 _WANT_PARAM = {
     "type": "string",
@@ -565,6 +567,13 @@ def _run_bash_tool(arguments_json: str) -> str:
                     f"{stats['lines_out']}, chars {stats['chars_in']} -> {len(output)}",
                     file=sys.stderr,
                 )
+        if COMPACT_CODE_READS and is_code_read_command(command):
+            output, stats = compact_code_read(output)
+            if stats["chars_out"] < stats["chars_in"]:
+                print(
+                    f"[native_harness] compacted code read: chars {stats['chars_in']} -> {stats['chars_out']}",
+                    file=sys.stderr,
+                )
         return json.dumps({"output": output, "returncode": proc.returncode})
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"command timed out after {timeout}s"})
@@ -897,16 +906,25 @@ BUILTIN_TOOL_SCHEMAS = {
 }
 
 
-def enable_code_read_tools() -> None:
+CODE_READ_HINT = (
+    "To look at a Python function, method or class, use read(file_path, symbol='Class.method') "
+    "rather than printing line ranges. On bash, read and grep calls, set `want` to what you need "
+    "from the output."
+)
+
+
+def enable_code_read_tools(want_required: bool = False) -> None:
     """Add `want` to bash/read/grep and `symbol` to read in the advertised schemas."""
     import copy
 
     for name in ("bash", "read", "grep"):
         schema = copy.deepcopy(BUILTIN_TOOL_SCHEMAS[name])
-        props = schema["function"]["parameters"]["properties"]
+        params = schema["function"]["parameters"]
         if name == "read":
-            props["symbol"] = _SYMBOL_PARAM
-        props["want"] = _WANT_PARAM
+            params["properties"]["symbol"] = _SYMBOL_PARAM
+        params["properties"]["want"] = _WANT_PARAM
+        if want_required and name == "bash":
+            params["required"] = [*params["required"], "want"]
         BUILTIN_TOOL_SCHEMAS[name] = schema
 
 

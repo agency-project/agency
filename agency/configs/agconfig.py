@@ -311,6 +311,11 @@ class harnessadapterconfig(confignamespace):
     canonicalize_run_output: bool = False
     # Native harness: offer read(symbol=...) and an optional `want` on bash/read/grep.
     code_read_tools: bool = False
+    # Make `want` required on bash; start sessions with a note pointing at symbol reads.
+    want_required: bool = False
+    code_read_hint: bool = False
+    # Drop content-free lines from bash file reads, with markers keeping line counts exact.
+    compact_code_reads: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

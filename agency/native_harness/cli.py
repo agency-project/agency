@@ -83,6 +83,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Offer read(symbol=...) and an optional `want` on bash/read/grep.",
     )
+    p.add_argument("--want-required", action="store_true", help="Make `want` required on bash.")
+    p.add_argument(
+        "--code-read-hint",
+        action="store_true",
+        help="Start a fresh session with a system note pointing at read(symbol=...) and `want`.",
+    )
+    p.add_argument(
+        "--compact-code-reads",
+        action="store_true",
+        help="Drop content-free lines (license header, blank runs) from bash file reads, with markers.",
+    )
     p.add_argument(
         "--progress-file",
         default=None,
@@ -115,8 +126,9 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 def main(argv: "list[str] | None" = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
-    if args.code_read_tools:
-        tools.enable_code_read_tools()
+    if args.code_read_tools or args.want_required or args.code_read_hint:
+        tools.enable_code_read_tools(want_required=args.want_required)
+    tools.COMPACT_CODE_READS = args.compact_code_reads
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     llm = LLMClient(llm_base_url, llm_api_key)
@@ -132,6 +144,8 @@ def main(argv: "list[str] | None" = None) -> int:
     mcp = McpToolset(mcp_config) if mcp_config else None
 
     session_id, messages = _resolve_session(args)
+    if args.code_read_hint and not any(m.get("role") != "system" for m in messages):
+        messages = [{"role": "system", "content": tools.CODE_READ_HINT}] + messages
     messages = messages + [{"role": "user", "content": args.prompt}]
 
     result = run_react_loop(

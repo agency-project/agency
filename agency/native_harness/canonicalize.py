@@ -134,3 +134,46 @@ def canonicalize_run(output: str) -> tuple[str, dict]:
         out.append(f"[... {len(lines) - 1 - prev} lines omitted ...]")
     stats.update(lines_out=len(selected), omitted=len(lines) - len(selected))
     return "\n".join(out), stats
+
+
+_CODE_READ_RE = re.compile(r"\bsed -n|\bcat |\bhead |\btail |\bnl ")
+_LICENSE_RE = re.compile(r"copyright|licen[cs]e|warrant", re.I)
+
+
+def is_code_read_command(command: str) -> bool:
+    """A command that prints file contents (and is not a search, query or program run)."""
+    return (
+        bool(_CODE_READ_RE.search(command))
+        and not is_run_command(command)
+        and not _QUERY_RE.search(command)
+    )
+
+
+def compact_code_read(output: str) -> tuple[str, dict]:
+    """Drop only content-free lines from a code read, with markers that keep line counts exact.
+
+    Trailing whitespace goes; a leading license/copyright comment block and runs of
+    3+ blank lines become markers stating how many lines they replace, so line
+    numbers the reader derives from the output stay correct.
+    """
+    lines = [line.rstrip() for line in output.split("\n")]
+    out = []
+    i = 0
+    header = 0
+    while header < len(lines) and lines[header].lstrip().startswith("#"):
+        header += 1
+    if header >= 5 and any(_LICENSE_RE.search(line) for line in lines[:header]):
+        out.append(f"[{header} lines of license header omitted]")
+        i = header
+    while i < len(lines):
+        j = i
+        while j < len(lines) and not lines[j]:
+            j += 1
+        if j - i >= 3:
+            out.append(f"[{j - i} blank lines]")
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    text = "\n".join(out)
+    return text, {"chars_in": len(output), "chars_out": len(text)}

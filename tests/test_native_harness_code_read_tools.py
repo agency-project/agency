@@ -79,3 +79,35 @@ def test_tandem_worker_bash_compacts_run_output_when_enabled(monkeypatch):
     monkeypatch.setattr(tandem_tools, "CANONICALIZE_RUN_OUTPUT", True)
     out = json.loads(tandem_tools._run_bash_tool(json.dumps({"command": command})))["output"]
     assert "-74.94" in out and "lines omitted" in out
+
+
+def test_want_required_only_on_bash(monkeypatch):
+    monkeypatch.setattr(tools, "BUILTIN_TOOL_SCHEMAS", copy.deepcopy(tools.BUILTIN_TOOL_SCHEMAS))
+    tools.enable_code_read_tools(want_required=True)
+    required = {
+        n: s["function"]["parameters"]["required"] for n, s in tools.BUILTIN_TOOL_SCHEMAS.items()
+    }
+    assert "want" in required["bash"] and "want" not in required["read"]
+
+
+def test_compact_code_read_keeps_line_accounting_exact():
+    from agency.native_harness.canonicalize import compact_code_read
+
+    header = [f"# Copyright 2014 Authors, licensed under Apache {i}" for i in range(6)]
+    body = ["import numpy", "", "", "", "", "def f(x):   ", "    return x"]
+    out, stats = compact_code_read("\n".join(header + body))
+    lines = out.split("\n")
+    assert lines[0] == "[6 lines of license header omitted]"
+    assert "[4 blank lines]" in lines and "def f(x):" in lines
+    counted = sum(int(line.split()[0][1:]) if line.startswith("[") else 1 for line in lines)
+    assert counted == len(header) + len(body)
+    assert stats["chars_out"] < stats["chars_in"]
+
+
+def test_code_read_commands_are_told_apart():
+    from agency.native_harness.canonicalize import is_code_read_command
+
+    assert is_code_read_command("cd pyscf/md; sed -n 420,607p integrators.py")
+    assert is_code_read_command("cat -n django/db/models/fields/json.py")
+    assert not is_code_read_command("PYTHONPATH=. python /tmp/t.py")
+    assert not is_code_read_command("grep -n HasKeyLookup -r django")
