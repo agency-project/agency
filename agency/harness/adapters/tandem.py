@@ -149,6 +149,8 @@ class TandemAdapter(NativeAdapter):
                 "--supervisor-llm-api-key",
                 runtime.token,
             ]
+            if ha.canonicalize_run_output:
+                argv.append("--canonicalize-run-output")
 
             envp = {
                 "PATH": HARNESS_PATH,

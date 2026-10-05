@@ -306,9 +306,11 @@ class harnessadapterconfig(confignamespace):
     # The supervisor's llm config is cloned from the worker's, so it must not
     # inherit worker-only request fields such as chat_template_kwargs.
     supervisor_extra_body: "dict | None" = None
-    # Native harness: compact large program/test-run output from bash before the
+    # Native/tandem harness: compact large program/test-run output from bash before the
     # model sees it (see native_harness/canonicalize.py). Off by default.
     canonicalize_run_output: bool = False
+    # Native harness: offer read(symbol=...) and an optional `want` on bash/read/grep.
+    code_read_tools: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

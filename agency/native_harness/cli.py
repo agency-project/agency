@@ -79,6 +79,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Compact large program/test-run output from bash (repeated blocks, head/tail, errors).",
     )
     p.add_argument(
+        "--code-read-tools",
+        action="store_true",
+        help="Offer read(symbol=...) and an optional `want` on bash/read/grep.",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -110,6 +115,8 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 def main(argv: "list[str] | None" = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
+    if args.code_read_tools:
+        tools.enable_code_read_tools()
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     llm = LLMClient(llm_base_url, llm_api_key)

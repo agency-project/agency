@@ -172,6 +172,8 @@ class NativeAdapter(HarnessAdapter):
             ]
             if runtime.agconfig.harness_adapter.canonicalize_run_output:
                 argv.append("--canonicalize-run-output")
+            if runtime.agconfig.harness_adapter.code_read_tools:
+                argv.append("--code-read-tools")
 
             envp = {
                 "PATH": HARNESS_PATH,

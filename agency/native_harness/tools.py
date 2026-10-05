@@ -38,6 +38,18 @@ _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
 # Set by cli.py from --canonicalize-run-output; off unless the caller asks for it.
 CANONICALIZE_RUN_OUTPUT = False
 
+_WANT_PARAM = {
+    "type": "string",
+    "description": "Optional: what you need from this output, e.g. 'the body of VelocityVerlet._next' "
+    "or 'whether the tests pass and the names of failing tests'. The output may be trimmed to it.",
+}
+_SYMBOL_PARAM = {
+    "type": "string",
+    "description": "Optional: a Python definition to return instead of the whole file, as a dotted "
+    "name such as 'VelocityVerlet._next' or 'compile_json_path'. Returns just that function, method "
+    "or class, with line numbers.",
+}
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas (OpenAI function-calling `parameters` shape) -- single
@@ -560,6 +572,53 @@ def _run_bash_tool(arguments_json: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+def _python_definitions(source: str) -> "list[tuple[str, int, int]]":
+    """(qualified name, first line, last line) of every function, method and class."""
+    import ast
+
+    out = []
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{child.name}"
+                first = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                out.append((name, first, child.end_lineno))
+                visit(child, name + ".")
+
+    visit(ast.parse(source), "")
+    return out
+
+
+def _read_symbol(file_path: str, content: str, symbol: str) -> str:
+    try:
+        defs = _python_definitions(content)
+    except SyntaxError as e:
+        return json.dumps({"error": f"cannot parse {file_path} as Python: {e}"})
+    matches = [d for d in defs if d[0] == symbol] or [
+        d for d in defs if d[0].endswith("." + symbol) or d[0].split(".")[-1] == symbol
+    ]
+    if not matches:
+        import difflib
+
+        want = symbol.split(".")[-1].lower().strip("_")
+        tails = {d[0]: d[0].split(".")[-1].lower().strip("_") for d in defs}
+        close = [n for n, t in tails.items() if t and (want in t or t in want)]
+        for near in difflib.get_close_matches(want, list(tails.values()), n=5):
+            close += [name for name, tail in tails.items() if tail == near]
+        close = list(dict.fromkeys(close))[:10]
+        return json.dumps(
+            {"error": f"no definition named {symbol!r} in {file_path}", "close_matches": close}
+        )
+    parts = []
+    for name, first, last_line in matches[:3]:
+        page = paginate_text(content, first, last_line - first + 1)
+        parts.append(page["content"])
+    return json.dumps(
+        {"path": file_path, "type": "symbol", "symbol": symbol, "content": "\n".join(parts)}
+    )
+
+
 def _run_read_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     file_path = str(args.get("file_path", ""))
@@ -592,6 +651,8 @@ def _run_read_tool(arguments_json: str) -> str:
             content = f.read()
     except Exception as e:
         return json.dumps({"error": str(e)})
+    if args.get("symbol"):
+        return _read_symbol(file_path, content, str(args["symbol"]))
     result = paginate_text(content, offset, limit)
     result["path"] = file_path
     return json.dumps(result)
@@ -834,6 +895,19 @@ BUILTIN_TOOL_SCHEMAS = {
         "todowrite", "Update the todo list with a new set of items.", TODOWRITE_PARAMS
     ),
 }
+
+
+def enable_code_read_tools() -> None:
+    """Add `want` to bash/read/grep and `symbol` to read in the advertised schemas."""
+    import copy
+
+    for name in ("bash", "read", "grep"):
+        schema = copy.deepcopy(BUILTIN_TOOL_SCHEMAS[name])
+        props = schema["function"]["parameters"]["properties"]
+        if name == "read":
+            props["symbol"] = _SYMBOL_PARAM
+        props["want"] = _WANT_PARAM
+        BUILTIN_TOOL_SCHEMAS[name] = schema
 
 
 __all__ = ["TOOL_DISPATCH", "BUILTIN_TOOL_SCHEMAS", "offload_if_oversized"]

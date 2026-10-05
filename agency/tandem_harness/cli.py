@@ -48,6 +48,7 @@ from .llm_client import LLMClient
 from .mcp_client import McpToolset
 from .tandem_loop import SUPERVISOR_SYSTEM, DEFAULT_SEGMENT_STEP_CAP, run_tandem_loop
 from . import session as session_store
+from . import tools
 
 _DEFAULT_SESSION_DIR = os.path.join(os.path.expanduser("~"), ".tandem_harness", "sessions")
 _DEFAULT_OFFLOAD_DIR = "./long_tool_call_outputs"
@@ -111,6 +112,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--offload-dir", default=_DEFAULT_OFFLOAD_DIR)
     p.add_argument(
+        "--canonicalize-run-output",
+        action="store_true",
+        help="Compact large program/test-run output from the worker's bash (repeated blocks, head/tail, errors).",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -164,6 +170,7 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 def main(argv: "list[str] | None" = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+    tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
     if not args.supervisor_model:
         parser.error("--supervisor-model must not be empty")
     if not args.worker_model:
