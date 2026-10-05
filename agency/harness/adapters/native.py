@@ -170,6 +170,8 @@ class NativeAdapter(HarnessAdapter):
                 "--session-id",
                 session_id,
             ]
+            if runtime.agconfig.harness_adapter.canonicalize_run_output:
+                argv.append("--canonicalize-run-output")
 
             envp = {
                 "PATH": HARNESS_PATH,

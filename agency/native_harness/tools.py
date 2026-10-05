@@ -22,6 +22,8 @@ import sys
 import uuid
 from typing import Generator
 
+from .canonicalize import canonicalize_run, is_run_command
+
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
 _WEBFETCH_DEFAULT_TIMEOUT = 30
@@ -33,6 +35,8 @@ _WEBFETCH_MAX_TIMEOUT = 120
 # `__init__.py` docstring on why it avoids the `agency.*` import chain
 # entirely).
 _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
+# Set by cli.py from --canonicalize-run-output; off unless the caller asks for it.
+CANONICALIZE_RUN_OUTPUT = False
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +545,14 @@ def _run_bash_tool(arguments_json: str) -> str:
             cwd=workdir,
         )
         output = proc.stdout + proc.stderr
+        if CANONICALIZE_RUN_OUTPUT and is_run_command(command):
+            output, stats = canonicalize_run(output)
+            if stats["omitted"]:
+                print(
+                    f"[native_harness] canonicalized run output: lines {stats['lines_in']} -> "
+                    f"{stats['lines_out']}, chars {stats['chars_in']} -> {len(output)}",
+                    file=sys.stderr,
+                )
         return json.dumps({"output": output, "returncode": proc.returncode})
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"command timed out after {timeout}s"})

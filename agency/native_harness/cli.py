@@ -40,6 +40,7 @@ from .llm_client import LLMClient
 from .mcp_client import McpToolset
 from .react_loop import run_react_loop
 from . import session as session_store
+from . import tools
 
 _DEFAULT_SESSION_DIR = os.path.join(os.path.expanduser("~"), ".native_harness", "sessions")
 _DEFAULT_OFFLOAD_DIR = "./long_tool_call_outputs"
@@ -73,6 +74,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--offload-dir", default=_DEFAULT_OFFLOAD_DIR)
     p.add_argument(
+        "--canonicalize-run-output",
+        action="store_true",
+        help="Compact large program/test-run output from bash (repeated blocks, head/tail, errors).",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -103,6 +109,7 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 
 def main(argv: "list[str] | None" = None) -> int:
     args = _build_arg_parser().parse_args(argv)
+    tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     llm = LLMClient(llm_base_url, llm_api_key)
