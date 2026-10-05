@@ -320,6 +320,10 @@ class harnessadapterconfig(confignamespace):
     compact_tables: bool = False
     # Tandem: supervisor prompt variant that asks for precise reports over whole files.
     brief_reports: bool = False
+    # Tandem: a locate-then-read-then-fix step in the supervisor prompt.
+    workflow_prompt: bool = False
+    # Tandem: list functions a code-heavy report's request didn't name as one-line outlines.
+    outline_reports: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

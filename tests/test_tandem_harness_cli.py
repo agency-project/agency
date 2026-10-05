@@ -182,3 +182,14 @@ def test_brief_reports_picks_the_supervisor_prompt_for_a_fresh_session(tmp_path,
     _, messages = cli._resolve_session(args)
     assert messages[0]["content"] == (SUPERVISOR_SYSTEM_BRIEF if flag else SUPERVISOR_SYSTEM)
     assert SUPERVISOR_SYSTEM_BRIEF != SUPERVISOR_SYSTEM
+
+
+def test_workflow_prompt_adds_the_locate_step(tmp_path):
+    from agency.tandem_harness.tandem_loop import SUPERVISOR_SYSTEM, SUPERVISOR_SYSTEM_WORKFLOW
+
+    argv = ["-p", "x", "--supervisor-model", "s", "--worker-model", "w", "--worker-history-turns", "0"]
+    args = _build_arg_parser().parse_args(argv + ["--session-dir", str(tmp_path), "--workflow-prompt"])
+    _, messages = cli._resolve_session(args)
+    assert messages[0]["content"] == SUPERVISOR_SYSTEM_WORKFLOW
+    assert SUPERVISOR_SYSTEM_WORKFLOW.startswith(SUPERVISOR_SYSTEM.split("Examples:")[0][:200])
+    assert "first ask smart_tool to locate" in SUPERVISOR_SYSTEM_WORKFLOW

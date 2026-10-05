@@ -90,6 +90,7 @@ def _debug(msg: str) -> None:
         print(f"[tandem_debug] {msg}", file=sys.stderr, flush=True)
 
 
+from .outline import outline_report, paths_from_calls
 from .react_loop import run_react_loop
 
 if TYPE_CHECKING:
@@ -163,9 +164,22 @@ _BRIEF_EXAMPLE = (
     'smart_tool(task="Read how cache.py evicts entries when it is full.", report="File:line of each function '
     'involved, and only the lines that choose what to evict.")\n'
 )
+_WORKFLOW_BULLET = (
+    "- To work on code, go in steps: first ask smart_tool to locate what you need (the name and file:line of "
+    "each function involved, one line each), then ask for the code of the ones you want by name, then describe "
+    "the fix. Ask for a whole file only when you need all of it.\n"
+)
+_WORKFLOW_EXAMPLES = (
+    'smart_tool(task="Find the functions in cache.py that decide which entries to evict.", report="Name and '
+    'file:line of each, one line each.")\n'
+    'smart_tool(task="Show Cache._evict and Cache._score.", report="Their code with line numbers.")\n'
+)
 assert _REPORT_BULLET in SUPERVISOR_SYSTEM
 SUPERVISOR_SYSTEM_BRIEF = SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _BRIEF_REPORT_BULLET).replace(
     "get_tool_call_list()\n", _BRIEF_EXAMPLE + "get_tool_call_list()\n", 1
+)
+SUPERVISOR_SYSTEM_WORKFLOW = SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _REPORT_BULLET + _WORKFLOW_BULLET).replace(
+    "get_tool_call_list()\n", _WORKFLOW_EXAMPLES + "get_tool_call_list()\n", 1
 )
 
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
@@ -361,6 +375,7 @@ def _build_report(
     forwarded_tool_output: "str | None" = None,
     segment_marker: "str | None" = None,
     used_short_ids: "set[str] | None" = None,
+    outline_request: "str | None" = None,
 ) -> "tuple[dict, list[dict]]":
     """Returns (report, full_trace): report is smart_tool's truncated reply
     to the supervisor, full_trace the untruncated version fed into all_calls.
@@ -377,6 +392,14 @@ def _build_report(
         finish_reason = "tool_finished"
         tool_output = result.final_text or None
 
+    if outline_request is not None and tool_output:
+        tool_output, stats = outline_report(tool_output, paths_from_calls(full_trace), outline_request)
+        if stats["outlined"]:
+            print(
+                f"[tandem_harness] outlined report: {stats['outlined']} functions not named in the request, "
+                f"{stats['kept']} kept, {stats['code_lines']} code lines",
+                file=sys.stderr,
+            )
     if forwarded_tool_output is not None:
         status, text = _decode_result(forwarded_tool_output)
         forwarded = text or status
@@ -568,6 +591,8 @@ def run_tandem_loop(
     worker_history_turns: int = DEFAULT_WORKER_HISTORY_TURNS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
+    # Outline unnamed functions in code-heavy reports (outline.py).
+    outline_reports: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -725,6 +750,7 @@ def run_tandem_loop(
             forwarded_tool_output=forwarded["content"],
             segment_marker=segment_marker,
             used_short_ids=used_short_ids,
+            outline_request=segment_marker if outline_reports else None,
         )
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry

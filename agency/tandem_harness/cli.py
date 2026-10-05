@@ -46,7 +46,13 @@ import sys
 from .bridge_client import BridgeClient
 from .llm_client import LLMClient
 from .mcp_client import McpToolset
-from .tandem_loop import SUPERVISOR_SYSTEM, SUPERVISOR_SYSTEM_BRIEF, DEFAULT_SEGMENT_STEP_CAP, run_tandem_loop
+from .tandem_loop import (
+    DEFAULT_SEGMENT_STEP_CAP,
+    SUPERVISOR_SYSTEM,
+    SUPERVISOR_SYSTEM_BRIEF,
+    SUPERVISOR_SYSTEM_WORKFLOW,
+    run_tandem_loop,
+)
 from . import session as session_store
 from . import tools
 
@@ -122,6 +128,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Default supervisor prompt with guidance against whole-file and full-function reports.",
     )
     p.add_argument(
+        "--workflow-prompt",
+        action="store_true",
+        help="Default supervisor prompt plus a locate-then-read-then-fix step for code work.",
+    )
+    p.add_argument(
+        "--outline-reports",
+        action="store_true",
+        help="In code-heavy reports, list functions the request didn't name as one-line outlines.",
+    )
+    p.add_argument(
         "--compact-tables",
         action="store_true",
         help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
@@ -173,7 +189,14 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # stopgap so a human reading the bridged live transcript can tell
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
-    system = args.system or (SUPERVISOR_SYSTEM_BRIEF if args.brief_reports else SUPERVISOR_SYSTEM)
+    default = (
+        SUPERVISOR_SYSTEM_WORKFLOW
+        if args.workflow_prompt
+        else SUPERVISOR_SYSTEM_BRIEF
+        if args.brief_reports
+        else SUPERVISOR_SYSTEM
+    )
+    system = args.system or default
     return session_id, [{"role": "system", "content": system}]
 
 
@@ -216,6 +239,7 @@ def main(argv: "list[str] | None" = None) -> int:
         segment_step_cap=args.segment_step_cap,
         max_segments=args.max_steps,
         worker_history_turns=args.worker_history_turns,
+        outline_reports=args.outline_reports,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

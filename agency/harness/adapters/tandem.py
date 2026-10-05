@@ -155,6 +155,10 @@ class TandemAdapter(NativeAdapter):
                 argv.append("--compact-tables")
             if ha.brief_reports:
                 argv.append("--brief-reports")
+            if ha.workflow_prompt:
+                argv.append("--workflow-prompt")
+            if ha.outline_reports:
+                argv.append("--outline-reports")
 
             envp = {
                 "PATH": HARNESS_PATH,
