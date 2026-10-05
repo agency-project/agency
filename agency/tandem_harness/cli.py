@@ -52,6 +52,7 @@ from .tandem_loop import (
     SUPERVISOR_SYSTEM_BRIEF,
     SUPERVISOR_SYSTEM_WORKFLOW,
     BATCH_MODES,
+    LIST_SCHEMA_MODES,
     run_tandem_loop,
 )
 from . import session as session_store
@@ -250,7 +251,7 @@ def main(argv: "list[str] | None" = None) -> int:
         max_segments=args.max_steps,
         worker_history_turns=args.worker_history_turns,
         outline_reports=args.outline_reports,
-        smart_tool_lists=args.batch_mode in ("list", "list_cond"),
+        smart_tool_lists=args.batch_mode in LIST_SCHEMA_MODES,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

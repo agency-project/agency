@@ -195,7 +195,7 @@ def test_workflow_prompt_adds_the_locate_step(tmp_path):
     assert "first ask smart_tool to locate" in SUPERVISOR_SYSTEM_WORKFLOW
 
 
-@pytest.mark.parametrize("mode", ["prompt", "list", "list_cond"])
+@pytest.mark.parametrize("mode", ["prompt", "list", "list_cond", "list_guide", "list_schema"])
 def test_batch_mode_picks_its_supervisor_prompt(tmp_path, mode):
     from agency.tandem_harness.tandem_loop import BATCH_MODES
 

@@ -244,7 +244,11 @@ BATCH_MODES = {
     "prompt": SUPERVISOR_SYSTEM_BATCH,
     "list": SUPERVISOR_SYSTEM_LIST,
     "list_cond": SUPERVISOR_SYSTEM_LIST_COND,
+    # Ablations of "list": its guidance with the single-task schema, and its schema without the guidance.
+    "list_guide": SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _REPORT_BULLET + _LIST_BULLET),
+    "list_schema": SUPERVISOR_SYSTEM_LIST.replace(_LIST_BULLET, ""),
 }
+LIST_SCHEMA_MODES = ("list", "list_cond", "list_schema")
 
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
 # previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.

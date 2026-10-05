@@ -1179,3 +1179,11 @@ def test_batch_mode_prompts_keep_the_rest_of_the_default_prompt():
         assert prompt.endswith(tail), mode
         assert prompt != SUPERVISOR_SYSTEM
     assert 'smart_tool(task="' not in BATCH_MODES["list"]
+
+
+def test_list_ablations_split_guidance_from_schema():
+    from agency.tandem_harness.tandem_loop import _LIST_BULLET, BATCH_MODES, LIST_SCHEMA_MODES
+
+    assert _LIST_BULLET in BATCH_MODES["list_guide"] and "smart_tool(tasks)" not in BATCH_MODES["list_guide"]
+    assert _LIST_BULLET not in BATCH_MODES["list_schema"] and "smart_tool(tasks)" in BATCH_MODES["list_schema"]
+    assert "list_schema" in LIST_SCHEMA_MODES and "list_guide" not in LIST_SCHEMA_MODES
