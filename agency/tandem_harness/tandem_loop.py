@@ -182,6 +182,70 @@ SUPERVISOR_SYSTEM_WORKFLOW = SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _REPORT_B
     "get_tool_call_list()\n", _WORKFLOW_EXAMPLES + "get_tool_call_list()\n", 1
 )
 
+# Batching variants: several independent checks per smart_tool call, as one numbered task or as a list.
+_BATCH_PROMPT_BULLET = (
+    "- When you have several questions or checks that don't depend on each other's results, put them in one "
+    "smart_tool call as a numbered list in `task`, and ask for each one's result in `report`. Use separate calls "
+    "only for steps that need an earlier result.\n"
+)
+_BATCH_PROMPT_EXAMPLE = (
+    'smart_tool(task="In app/: (1) run tests/test_api.py; (2) print the default of TIMEOUT in config.py; (3) time '
+    'bench.py with workers=1, 2 and 4.", report="For each numbered item, its result.")\n'
+)
+_SMART_TOOL_LINE = (
+    "- smart_tool(task, report): carries out `task`, a task written in natural language, using basic tools such "
+    "as bash, read and edit, and returns what you asked for in `report`."
+)
+_SMART_TOOL_LIST_LINE = (
+    "- smart_tool(tasks): carries out a list of tasks in order. Each item has a `task`, written in natural "
+    "language and done with basic tools such as bash, read and edit, and a `report`, what you want back from it."
+)
+_LIST_BULLET = (
+    "- Put several tasks in one call when they don't depend on each other's results, such as independent checks "
+    "or variants of one experiment. Use separate calls only for steps that need an earlier result.\n"
+)
+_COND_BULLET = (
+    "- A task can also depend on an earlier task in the same call when you can say in advance what to do with "
+    'its result, e.g. "If the tests in the previous task failed, show the function each failure is in."\n'
+)
+_LIST_EXAMPLE = (
+    'smart_tool(tasks=[{"task": "Run tests/test_api.py.", "report": "Pass/fail and each failing test\'s error."}, '
+    '{"task": "Print the default of TIMEOUT in config.py.", "report": "The value."}])\n'
+)
+_COND_EXAMPLE = (
+    'smart_tool(tasks=[{"task": "Run tests/test_util.py.", "report": "Pass/fail."}, {"task": "If the tests in the '
+    'previous task failed, show the function each failure is in.", "report": "Each function\'s code with line '
+    'numbers, or \\"not needed\\"."}])\n'
+)
+assert _SMART_TOOL_LINE in SUPERVISOR_SYSTEM
+
+
+def _as_list_calls(prompt: str) -> str:
+    """Example calls rewritten from smart_tool(task=..., report=...) to the list form."""
+    return re.sub(
+        r'smart_tool\(task="(.*)", report="(.*)"\)',
+        lambda m: f'smart_tool(tasks=[{{"task": "{m.group(1)}", "report": "{m.group(2)}"}}])',
+        prompt,
+    )
+
+
+SUPERVISOR_SYSTEM_BATCH = SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _REPORT_BULLET + _BATCH_PROMPT_BULLET).replace(
+    "get_tool_call_list()\n", _BATCH_PROMPT_EXAMPLE + "get_tool_call_list()\n", 1
+)
+SUPERVISOR_SYSTEM_LIST = _as_list_calls(
+    SUPERVISOR_SYSTEM.replace(_SMART_TOOL_LINE, _SMART_TOOL_LIST_LINE).replace(
+        _REPORT_BULLET, _REPORT_BULLET + _LIST_BULLET
+    )
+).replace("get_tool_call_list()\n", _LIST_EXAMPLE + "get_tool_call_list()\n", 1)
+SUPERVISOR_SYSTEM_LIST_COND = SUPERVISOR_SYSTEM_LIST.replace(_LIST_BULLET, _LIST_BULLET + _COND_BULLET).replace(
+    "get_tool_call_list()\n", _COND_EXAMPLE + "get_tool_call_list()\n", 1
+)
+BATCH_MODES = {
+    "prompt": SUPERVISOR_SYSTEM_BATCH,
+    "list": SUPERVISOR_SYSTEM_LIST,
+    "list_cond": SUPERVISOR_SYSTEM_LIST_COND,
+}
+
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
 # previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.
 WORKER_SYSTEM = (
@@ -215,6 +279,35 @@ _SMART_TOOL_SCHEMA = {
                 },
             },
             "required": ["task", "report"],
+        },
+    },
+}
+
+_SMART_TOOL_LIST_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "smart_tool",
+        "description": (
+            "Execute a list of tasks expressed in natural language on the harness, in order, by decomposing each into "
+            "a list of basic tool calls. Returns each task's report."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "The tasks to carry out, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": _SMART_TOOL_SCHEMA["function"]["parameters"]["properties"]["task"],
+                            "report": _SMART_TOOL_SCHEMA["function"]["parameters"]["properties"]["report"],
+                        },
+                        "required": ["task", "report"],
+                    },
+                },
+            },
+            "required": ["tasks"],
         },
     },
 }
@@ -593,6 +686,8 @@ def run_tandem_loop(
     progress_path: "str | None" = None,
     # Outline unnamed functions in code-heavy reports (outline.py).
     outline_reports: bool = False,
+    # smart_tool takes a list of {task, report} items, run in order.
+    smart_tool_lists: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -621,8 +716,21 @@ def run_tandem_loop(
 
     def smart_tool_handler(args_json: str) -> str:
         args = _parse_args(args_json)
-        task = (args.get("task") or "").strip()
-        report_request = (args.get("report") or "").strip()
+        items = args.get("tasks")
+        if not isinstance(items, list):
+            return run_order((args.get("task") or "").strip(), (args.get("report") or "").strip())
+        parts, calls = [], []
+        # One worker segment per item, in order: items share the sandbox, and a later
+        # item may depend on an earlier one, which the worker sees in its history.
+        for k, item in enumerate(items, 1):
+            item = item if isinstance(item, dict) else {"task": str(item)}
+            rendered = run_order(str(item.get("task") or "").strip(), str(item.get("report") or "").strip())
+            calls += last_calls["calls"]
+            parts.append(f"task {k} of {len(items)}:\n{rendered}")
+        last_calls["calls"] = calls
+        return "\n\n".join(parts) if parts else run_order("", "")
+
+    def run_order(task: str, report_request: str) -> str:
         last_calls["calls"] = []
         if not task:
             return _render_report(
@@ -783,7 +891,7 @@ def run_tandem_loop(
         return _render_call_list(last_calls["calls"])
 
     supervisor_tool_schemas = [
-        _SMART_TOOL_SCHEMA,
+        _SMART_TOOL_LIST_SCHEMA if smart_tool_lists else _SMART_TOOL_SCHEMA,
         _GET_TOOL_CALL_LIST_SCHEMA,
         _GET_TOOL_CALL_DETAIL_SCHEMA,
     ]

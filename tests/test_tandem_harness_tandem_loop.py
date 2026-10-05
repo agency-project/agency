@@ -1123,3 +1123,59 @@ def test_neither_model_is_told_about_the_tandem_design(monkeypatch, tmp_path):
     ).lower()
     for word in ("tandem", "worker", "supervisor", "smart_tool"):
         assert word not in worker_view, word
+
+
+def test_list_valued_smart_tool_runs_each_item_in_order_and_joins_reports(monkeypatch, tmp_path):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    items = [{"task": "first", "report": "r1"}, {"task": "second", "report": "r2"}]
+    supervisor_llm = _Llm(
+        [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call("smart_tool", {"tasks": items})],
+                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response("one", "w-1"),
+            _supervisor_final_response("ran one"),
+            _worker_tool_call_response("two", "w-2"),
+            _supervisor_final_response("ran two"),
+        ]
+    )
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        segment_step_cap=2,
+        offload_dir=str(tmp_path),
+        smart_tool_lists=True,
+    )
+
+    schema = next(t for t in supervisor_llm.requests[0][2] if t["function"]["name"] == "smart_tool")
+    assert "tasks" in schema["function"]["parameters"]["properties"]
+    assert worker_llm.requests[0][1][-1]["content"] == "first\n\nIn your reply, include: r1"
+    # The second item's segment sees the first one in its history, so it can depend on it.
+    assert "ran one" in json.dumps(worker_llm.requests[2][1])
+    report = supervisor_llm.requests[1][1][-1]["content"]
+    assert report.index("task 1 of 2:") < report.index("ran one") < report.index("task 2 of 2:")
+    assert report.index("task 2 of 2:") < report.index("ran two")
+
+
+def test_batch_mode_prompts_keep_the_rest_of_the_default_prompt():
+    from agency.tandem_harness.tandem_loop import BATCH_MODES
+
+    tail = SUPERVISOR_SYSTEM.split("Keep going until")[1]
+    for mode, prompt in BATCH_MODES.items():
+        assert prompt.endswith(tail), mode
+        assert prompt != SUPERVISOR_SYSTEM
+    assert 'smart_tool(task="' not in BATCH_MODES["list"]

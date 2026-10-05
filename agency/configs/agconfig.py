@@ -324,6 +324,8 @@ class harnessadapterconfig(confignamespace):
     workflow_prompt: bool = False
     # Tandem: list functions a code-heavy report's request didn't name as one-line outlines.
     outline_reports: bool = False
+    # Tandem: batching of independent checks ("prompt", "list" or "list_cond"; "" = off).
+    batch_mode: str = ""
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

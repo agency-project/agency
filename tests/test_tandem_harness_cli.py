@@ -193,3 +193,12 @@ def test_workflow_prompt_adds_the_locate_step(tmp_path):
     assert messages[0]["content"] == SUPERVISOR_SYSTEM_WORKFLOW
     assert SUPERVISOR_SYSTEM_WORKFLOW.startswith(SUPERVISOR_SYSTEM.split("Examples:")[0][:200])
     assert "first ask smart_tool to locate" in SUPERVISOR_SYSTEM_WORKFLOW
+
+
+@pytest.mark.parametrize("mode", ["prompt", "list", "list_cond"])
+def test_batch_mode_picks_its_supervisor_prompt(tmp_path, mode):
+    from agency.tandem_harness.tandem_loop import BATCH_MODES
+
+    argv = ["-p", "x", "--supervisor-model", "s", "--worker-model", "w", "--worker-history-turns", "0"]
+    args = _build_arg_parser().parse_args(argv + ["--session-dir", str(tmp_path), "--batch-mode", mode])
+    assert cli._resolve_session(args)[1][0]["content"] == BATCH_MODES[mode]

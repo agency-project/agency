@@ -51,6 +51,7 @@ from .tandem_loop import (
     SUPERVISOR_SYSTEM,
     SUPERVISOR_SYSTEM_BRIEF,
     SUPERVISOR_SYSTEM_WORKFLOW,
+    BATCH_MODES,
     run_tandem_loop,
 )
 from . import session as session_store
@@ -133,6 +134,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Default supervisor prompt plus a locate-then-read-then-fix step for code work.",
     )
     p.add_argument(
+        "--batch-mode",
+        choices=sorted(BATCH_MODES),
+        default=None,
+        help="Supervisor prompt for batching independent checks: as a numbered task (prompt), or with a "
+        "list-valued smart_tool (list), optionally with conditional items (list_cond).",
+    )
+    p.add_argument(
         "--outline-reports",
         action="store_true",
         help="In code-heavy reports, list functions the request didn't name as one-line outlines.",
@@ -190,7 +198,9 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
     default = (
-        SUPERVISOR_SYSTEM_WORKFLOW
+        BATCH_MODES[args.batch_mode]
+        if args.batch_mode
+        else SUPERVISOR_SYSTEM_WORKFLOW
         if args.workflow_prompt
         else SUPERVISOR_SYSTEM_BRIEF
         if args.brief_reports
@@ -240,6 +250,7 @@ def main(argv: "list[str] | None" = None) -> int:
         max_segments=args.max_steps,
         worker_history_turns=args.worker_history_turns,
         outline_reports=args.outline_reports,
+        smart_tool_lists=args.batch_mode in ("list", "list_cond"),
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

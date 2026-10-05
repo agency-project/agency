@@ -159,6 +159,8 @@ class TandemAdapter(NativeAdapter):
                 argv.append("--workflow-prompt")
             if ha.outline_reports:
                 argv.append("--outline-reports")
+            if ha.batch_mode:
+                argv += ["--batch-mode", ha.batch_mode]
 
             envp = {
                 "PATH": HARNESS_PATH,
