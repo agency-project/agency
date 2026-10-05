@@ -95,6 +95,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Drop content-free lines (license header, blank runs) from bash file reads, with markers.",
     )
     p.add_argument(
+        "--compact-tables",
+        action="store_true",
+        help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -126,6 +131,7 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
 def main(argv: "list[str] | None" = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
+    tools.COMPACT_TABLES = args.compact_tables
     if args.code_read_tools or args.want_required or args.code_read_hint:
         tools.enable_code_read_tools(want_required=args.want_required)
     tools.COMPACT_CODE_READS = args.compact_code_reads

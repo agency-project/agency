@@ -316,6 +316,8 @@ class harnessadapterconfig(confignamespace):
     code_read_hint: bool = False
     # Drop content-free lines from bash file reads, with markers keeping line counts exact.
     compact_code_reads: bool = False
+    # Native/tandem harness: box-drawn result tables as plain rows, progress bars dropped.
+    compact_tables: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

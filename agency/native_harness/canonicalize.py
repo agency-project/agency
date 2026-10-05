@@ -2,6 +2,7 @@
 
     is_run_command(command) -> bool
     canonicalize_run(output) -> (text, stats)
+    compact_tables(output) -> (text, stats)
 
 Applied by the bash tool, when enabled, to commands that run a program or a
 test suite (not to file reads, searches or queries, whose content the caller
@@ -177,3 +178,77 @@ def compact_code_read(output: str) -> tuple[str, dict]:
         i += 1
     text = "\n".join(out)
     return text, {"chars_in": len(output), "chars_out": len(text)}
+
+
+_PROGRESS_RE = re.compile(r"^\s*\d{1,3}% ▕[^▏]*▏.*$")
+_BOX_TOP_RE = re.compile(r"^\s*┌[─┬]+┐$")
+_BOX_RULE_RE = re.compile(r"^\s*├[─┼┬┴]+┤$")
+_BOX_BOTTOM_RE = re.compile(r"^\s*└[─┴]+┘$")
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip()[1:-1].split("│")]
+
+
+def _table_rows(body: list[str]) -> "list[str] | None":
+    """A box table's inner lines as `a | b` rows, or None if it isn't one we understand."""
+    rules = [k for k, line in enumerate(body) if _BOX_RULE_RE.match(line)]
+    if not rules or any(
+        not line.strip().startswith("│") for k, line in enumerate(body) if k not in rules
+    ):
+        return None
+    head = [_cells(line) for line in body[: rules[0]]]
+    if len(head) == 2 and len(head[0]) == len(head[1]):
+        rows = [
+            " | ".join(name if name == kind else f"{name} ({kind})" for name, kind in zip(*head))
+        ]
+    else:
+        rows = [" | ".join(cells) for cells in head]
+    footer = False
+    for k in range(rules[0] + 1, len(body)):
+        if k in rules:
+            # A rule closing the columns (├──┴──┤) starts a free-text footer.
+            footer = footer or "┴" in body[k]
+            continue
+        row = " ".join(body[k].strip()[1:-1].split()) if footer else " | ".join(_cells(body[k]))
+        if not (rows and row == rows[-1] and set(row) <= {"·", "|", " "}):
+            rows.append(row)
+    return rows
+
+
+def compact_tables(output: str) -> tuple[str, dict]:
+    """Box-drawn result tables (DuckDB) as plain `a | b` rows; progress-bar lines dropped.
+
+    Every cell value is kept verbatim, with its column name and type in the header
+    row. Padding, borders and repeated `·` elision rows are the only things removed.
+    """
+    lines = [line for line in clean(output).split("\n") if not _PROGRESS_RE.match(line)]
+    progress = len(clean(output).split("\n")) - len(lines)
+    out, tables, i = [], 0, 0
+    while i < len(lines):
+        if not _BOX_TOP_RE.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and not _BOX_BOTTOM_RE.match(lines[j]):
+            j += 1
+        rows = _table_rows(lines[i + 1 : j]) if j < len(lines) else None
+        if rows is None:
+            out.extend(lines[i : j + 1])
+            i = j + 1
+            continue
+        out.extend(rows)
+        tables += 1
+        i = j + 1
+        # DuckDB prints the row/column counts under the box, padded to its width.
+        while i < len(lines) and lines[i].startswith("  ") and lines[i].strip():
+            out.append(" ".join(lines[i].split()))
+            i += 1
+    text = "\n".join(out)
+    return text, {
+        "chars_in": len(output),
+        "chars_out": len(text),
+        "tables": tables,
+        "progress_lines": progress,
+    }

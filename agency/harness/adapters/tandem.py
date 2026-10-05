@@ -151,6 +151,8 @@ class TandemAdapter(NativeAdapter):
             ]
             if ha.canonicalize_run_output:
                 argv.append("--canonicalize-run-output")
+            if ha.compact_tables:
+                argv.append("--compact-tables")
 
             envp = {
                 "PATH": HARNESS_PATH,

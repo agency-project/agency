@@ -22,7 +22,7 @@ import sys
 import uuid
 from typing import Generator
 
-from .canonicalize import canonicalize_run, is_run_command
+from .canonicalize import canonicalize_run, compact_tables, is_code_read_command, is_run_command
 
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
@@ -37,6 +37,7 @@ _WEBFETCH_MAX_TIMEOUT = 120
 _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
 # Set by cli.py from --canonicalize-run-output; off unless the caller asks for it.
 CANONICALIZE_RUN_OUTPUT = False
+COMPACT_TABLES = False
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +552,14 @@ def _run_bash_tool(arguments_json: str) -> str:
                 print(
                     f"[tandem_harness] canonicalized run output: lines {stats['lines_in']} -> "
                     f"{stats['lines_out']}, chars {stats['chars_in']} -> {len(output)}",
+                    file=sys.stderr,
+                )
+        if COMPACT_TABLES and not is_code_read_command(command):
+            output, stats = compact_tables(output)
+            if stats["tables"] or stats["progress_lines"]:
+                print(
+                    f"[tandem_harness] compacted tables: {stats['tables']} tables, "
+                    f"{stats['progress_lines']} progress lines, chars {stats['chars_in']} -> {stats['chars_out']}",
                     file=sys.stderr,
                 )
         return json.dumps({"output": output, "returncode": proc.returncode})

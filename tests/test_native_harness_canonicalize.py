@@ -1,7 +1,8 @@
 import json
 
 from agency.native_harness import tools
-from agency.native_harness.canonicalize import canonicalize_run, clean, is_run_command
+from agency.native_harness.canonicalize import canonicalize_run, clean, compact_tables, is_run_command
+from agency.tandem_harness import tools as tandem_tools
 
 
 def _kept_lines(out: str) -> list[str]:
@@ -84,3 +85,78 @@ def test_bash_tool_leaves_large_file_reads_alone(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "CANONICALIZE_RUN_OUTPUT", True)
     out = json.loads(tools._run_bash_tool(json.dumps({"command": f"cat {path}"})))["output"]
     assert len(out.splitlines()) == 600
+
+
+BOX = """ 66% ▕█████████████████████████             ▏ (~1 second remaining)     
+100% ▕██████████████████████████████████████▏ (00:00:04.06 elapsed)     
+┌─────────────────────┬───────┐
+│         hr          │   n   │
+│      timestamp      │ int64 │
+├─────────────────────┼───────┤
+│ 2026-09-12 15:00:00 │ 82239 │
+│ 2026-09-12 14:00:00 │  NULL │
+│ 2026-09-12 10:00:00 │       │
+└─────────────────────┴───────┘
+"""
+
+TRUNCATED = """┌───────┬───────┐
+│   i   │   j   │
+│ int64 │ int64 │
+├───────┼───────┤
+│     0 │     0 │
+│     · │     · │
+│     · │     · │
+│  9999 │ 19998 │
+└───────┴───────┘
+  ? rows       2 columns
+  (>9999 rows, 20 shown) 
+"""
+
+
+def test_box_table_becomes_plain_rows_with_types_and_no_progress():
+    out, stats = compact_tables(BOX)
+    assert out.split("\n")[:4] == [
+        "hr (timestamp) | n (int64)",
+        "2026-09-12 15:00:00 | 82239",
+        "2026-09-12 14:00:00 | NULL",
+        "2026-09-12 10:00:00 | ",
+    ]
+    assert stats["tables"] == 1 and stats["progress_lines"] == 2
+    assert "▕" not in out and "│" not in out
+
+
+def test_every_cell_value_survives_table_compaction():
+    out, _ = compact_tables(BOX + TRUNCATED)
+    cells = {
+        c.strip() for line in (BOX + TRUNCATED).split("\n") if line.startswith("│")
+        for c in line.strip("│").split("│") if c.strip()
+    }
+    assert all(cell in out for cell in cells)
+
+
+def test_truncated_table_keeps_one_elision_row_and_its_footer():
+    out, _ = compact_tables(TRUNCATED)
+    assert out.split("\n") == [
+        "i (int64) | j (int64)",
+        "0 | 0",
+        "· | ·",
+        "9999 | 19998",
+        "? rows 2 columns",
+        "(>9999 rows, 20 shown)",
+        "",
+    ]
+
+
+def test_text_without_tables_is_unchanged():
+    text = "Ran 3 tests in 0.1s\n│ not a table\nOK\n"
+    assert compact_tables(text)[0] == text
+
+
+def test_bash_tool_compacts_tables_only_when_enabled(monkeypatch):
+    command = "printf '%s\\n' '┌───┐' '│ a │' '│ int │' '├───┤' '│ 1 │' '└───┘'"
+    monkeypatch.setattr(tools, "COMPACT_TABLES", False)
+    assert "┌" in json.loads(tools._run_bash_tool(json.dumps({"command": command})))["output"]
+    for module in (tools, tandem_tools):
+        monkeypatch.setattr(module, "COMPACT_TABLES", True)
+        out = json.loads(module._run_bash_tool(json.dumps({"command": command})))["output"]
+        assert out == "a (int)\n1\n"
