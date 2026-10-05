@@ -146,6 +146,28 @@ get_tool_call_detail("a1b2", grep="def parse_json")
 Keep going until the task is fully resolved. When working on code, verify your change with the most specific test first, then broader ones, and fix the root cause rather than the symptom. Once every required output value is confirmed, call submit_output for each field.
 """
 
+# Same prompt, with `report` guidance against whole-file and full-function reports.
+_REPORT_BULLET = (
+    '- `report`: Ask for information from the tool calls that you need to complete the task, e.g. "the column '
+    'names of a table". Don\'t ask for what you already have, such as the query you just gave. Be precise and do '
+    "not ask for more than you need. Think what you need to know to complete the task and ask for that.\n"
+)
+_BRIEF_REPORT_BULLET = (
+    '- `report`: Ask for exactly the information you will use, e.g. "the column names of a table". Don\'t ask for '
+    "what you already have, such as the query you just gave. Avoid asking for whole files or full function bodies: "
+    "ask for the few lines that matter (file:line and those lines) or for the facts you need from them, and ask for "
+    "more in a later call if you need it. Everything in the report takes up your context, so a short, precise "
+    "report is better than a complete one.\n"
+)
+_BRIEF_EXAMPLE = (
+    'smart_tool(task="Read how cache.py evicts entries when it is full.", report="File:line of each function '
+    'involved, and only the lines that choose what to evict.")\n'
+)
+assert _REPORT_BULLET in SUPERVISOR_SYSTEM
+SUPERVISOR_SYSTEM_BRIEF = SUPERVISOR_SYSTEM.replace(_REPORT_BULLET, _BRIEF_REPORT_BULLET).replace(
+    "get_tool_call_list()\n", _BRIEF_EXAMPLE + "get_tool_call_list()\n", 1
+)
+
 # Qwen3.5 workers ended ~50% of turns inside <think> (no report) under the
 # previous, rule-heavy prompt; short prompts measure ~4% (9B) / ~30% (4B) in replay.
 WORKER_SYSTEM = (

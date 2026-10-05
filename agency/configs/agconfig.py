@@ -318,6 +318,8 @@ class harnessadapterconfig(confignamespace):
     compact_code_reads: bool = False
     # Native/tandem harness: box-drawn result tables as plain rows, progress bars dropped.
     compact_tables: bool = False
+    # Tandem: supervisor prompt variant that asks for precise reports over whole files.
+    brief_reports: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

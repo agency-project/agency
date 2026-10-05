@@ -170,3 +170,15 @@ def test_supervisor_and_worker_actually_dispatch_under_different_models(monkeypa
     }
     assert supervisor_endpoints == {("http://supervisor-real-endpoint", "supervisor-key")}
     assert worker_endpoints == {("http://worker-bridge", "worker-key")}
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_brief_reports_picks_the_supervisor_prompt_for_a_fresh_session(tmp_path, flag):
+    from agency.tandem_harness.tandem_loop import SUPERVISOR_SYSTEM, SUPERVISOR_SYSTEM_BRIEF
+
+    argv = ["-p", "x", "--supervisor-model", "s", "--worker-model", "w", "--worker-history-turns", "0"]
+    argv += ["--session-dir", str(tmp_path)]
+    args = _build_arg_parser().parse_args(argv + (["--brief-reports"] if flag else []))
+    _, messages = cli._resolve_session(args)
+    assert messages[0]["content"] == (SUPERVISOR_SYSTEM_BRIEF if flag else SUPERVISOR_SYSTEM)
+    assert SUPERVISOR_SYSTEM_BRIEF != SUPERVISOR_SYSTEM

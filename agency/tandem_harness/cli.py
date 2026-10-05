@@ -46,7 +46,7 @@ import sys
 from .bridge_client import BridgeClient
 from .llm_client import LLMClient
 from .mcp_client import McpToolset
-from .tandem_loop import SUPERVISOR_SYSTEM, DEFAULT_SEGMENT_STEP_CAP, run_tandem_loop
+from .tandem_loop import SUPERVISOR_SYSTEM, SUPERVISOR_SYSTEM_BRIEF, DEFAULT_SEGMENT_STEP_CAP, run_tandem_loop
 from . import session as session_store
 from . import tools
 
@@ -117,6 +117,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Compact large program/test-run output from the worker's bash (repeated blocks, head/tail, errors).",
     )
     p.add_argument(
+        "--brief-reports",
+        action="store_true",
+        help="Default supervisor prompt with guidance against whole-file and full-function reports.",
+    )
+    p.add_argument(
         "--compact-tables",
         action="store_true",
         help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
@@ -168,7 +173,7 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # stopgap so a human reading the bridged live transcript can tell
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
-    system = args.system or SUPERVISOR_SYSTEM
+    system = args.system or (SUPERVISOR_SYSTEM_BRIEF if args.brief_reports else SUPERVISOR_SYSTEM)
     return session_id, [{"role": "system", "content": system}]
 
 
