@@ -1247,3 +1247,24 @@ def test_coverage_check_appends_what_the_worker_adds(monkeypatch, tmp_path):
 def test_coverage_check_complete_leaves_the_report(monkeypatch, tmp_path):
     report = _run_with_coverage(tmp_path, monkeypatch, "COMPLETE")
     assert "a.py b.py" in report and "COMPLETE" not in report
+
+
+def test_dual_mode_lets_the_supervisor_call_basic_tools_directly(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: calls.append(args) or '{"output": "hi"}')
+    supervisor_llm = _Llm(
+        [
+            {"message": {"role": "assistant", "content": None, "tool_calls": [_tool_call("bash", {"command": "echo hi"})]},
+             "usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm([])
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}], "supervisor-model", "worker-model", supervisor_llm, worker_llm,
+        segment_step_cap=2, offload_dir=str(tmp_path), dual_mode=True,
+    )
+    names = {t["function"]["name"] for t in supervisor_llm.requests[0][2]}
+    assert {"smart_tool", "bash", "read", "edit"} <= names
+    assert calls and supervisor_llm.requests[1][1][-1]["content"] == '{"output": "hi"}'
+    assert not worker_llm.requests

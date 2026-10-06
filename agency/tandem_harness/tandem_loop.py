@@ -90,6 +90,7 @@ def _debug(msg: str) -> None:
         print(f"[tandem_debug] {msg}", file=sys.stderr, flush=True)
 
 
+from . import tools
 from .outline import outline_report, paths_from_calls
 from .review import HEADER as REVIEW_HEADER
 from .review import review_report
@@ -247,6 +248,16 @@ SUPERVISOR_SYSTEM_LIST = _as_list_calls(
 SUPERVISOR_SYSTEM_LIST_COND = SUPERVISOR_SYSTEM_LIST.replace(_LIST_BULLET, _LIST_BULLET + _COND_BULLET).replace(
     "get_tool_call_list()\n", _COND_EXAMPLE + "get_tool_call_list()\n", 1
 )
+DUAL_TOOL_NAMES = ("bash", "read", "write", "edit", "glob", "grep")
+_DUAL_BULLET = (
+    "- bash, read, write, edit, glob, grep: basic tools you can also call directly. Use one when a single command "
+    "gives you what you need; use smart_tool for work that takes several steps.\n"
+)
+SUPERVISOR_SYSTEM_DUAL = SUPERVISOR_SYSTEM.replace("using four tools:", "using these tools:", 1).replace(
+    "- submit_output(field, value)", _DUAL_BULLET + "- submit_output(field, value)", 1
+)
+assert SUPERVISOR_SYSTEM_DUAL.count("basic tools you can also call directly") == 1
+
 BATCH_MODES = {
     "prompt": SUPERVISOR_SYSTEM_BATCH,
     "list": SUPERVISOR_SYSTEM_LIST,
@@ -703,6 +714,8 @@ def run_tandem_loop(
     review_reports: bool = False,
     # After each report, one worker turn to fetch any requested item the report lacks.
     coverage_check: bool = False,
+    # The supervisor also gets the basic tools, dispatched directly (no worker).
+    dual_mode: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -940,6 +953,10 @@ def run_tandem_loop(
         "get_tool_call_list": get_tool_call_list_handler,
         "get_tool_call_detail": get_tool_call_detail_handler,
     }
+    if dual_mode:
+        for name in DUAL_TOOL_NAMES:
+            supervisor_tool_schemas.append(tools.BUILTIN_TOOL_SCHEMAS[name])
+            supervisor_dispatch_table[name] = tools.TOOL_DISPATCH[name]
     if mcp is not None:
         # Discover once up front, not lazily inside the lambda below: the
         # supervisor may call submit_output as its very first action (there's

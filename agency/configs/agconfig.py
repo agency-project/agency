@@ -330,6 +330,8 @@ class harnessadapterconfig(confignamespace):
     review_reports: bool = False
     # Tandem: one worker self-check turn per report for requested items it lacks.
     coverage_check: bool = False
+    # Tandem: supervisor gets the basic tools as well as smart_tool.
+    dual_mode: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

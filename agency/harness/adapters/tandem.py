@@ -165,6 +165,8 @@ class TandemAdapter(NativeAdapter):
                 argv.append("--review-reports")
             if ha.coverage_check:
                 argv.append("--coverage-check")
+            if ha.dual_mode:
+                argv.append("--dual-mode")
 
             envp = {
                 "PATH": HARNESS_PATH,

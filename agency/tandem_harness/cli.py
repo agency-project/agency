@@ -50,6 +50,7 @@ from .tandem_loop import (
     DEFAULT_SEGMENT_STEP_CAP,
     SUPERVISOR_SYSTEM,
     SUPERVISOR_SYSTEM_BRIEF,
+    SUPERVISOR_SYSTEM_DUAL,
     SUPERVISOR_SYSTEM_WORKFLOW,
     BATCH_MODES,
     LIST_SCHEMA_MODES,
@@ -142,6 +143,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "list-valued smart_tool (list), optionally with conditional items (list_cond).",
     )
     p.add_argument(
+        "--dual-mode",
+        action="store_true",
+        help="Also give the supervisor the basic tools (bash, read, edit, ...), dispatched directly.",
+    )
+    p.add_argument(
         "--coverage-check",
         action="store_true",
         help="After each report, one worker turn to fetch any requested item the report lacks.",
@@ -209,7 +215,9 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
     default = (
-        BATCH_MODES[args.batch_mode]
+        SUPERVISOR_SYSTEM_DUAL
+        if args.dual_mode
+        else BATCH_MODES[args.batch_mode]
         if args.batch_mode
         else SUPERVISOR_SYSTEM_WORKFLOW
         if args.workflow_prompt
@@ -264,6 +272,7 @@ def main(argv: "list[str] | None" = None) -> int:
         smart_tool_lists=args.batch_mode in LIST_SCHEMA_MODES,
         review_reports=args.review_reports,
         coverage_check=args.coverage_check,
+        dual_mode=args.dual_mode,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own
