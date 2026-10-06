@@ -51,6 +51,8 @@ from .tandem_loop import (
     SUPERVISOR_SYSTEM,
     SUPERVISOR_SYSTEM_BRIEF,
     SUPERVISOR_SYSTEM_DUAL,
+    SUPERVISOR_SYSTEM_TYPED,
+    TYPED_MODES,
     SUPERVISOR_SYSTEM_WORKFLOW,
     BATCH_MODES,
     LIST_SCHEMA_MODES,
@@ -173,6 +175,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
     )
     p.add_argument(
+        "--compact-tests",
+        action="store_true",
+        help="Cut test-runner output from bash to failures, summaries and the last lines.",
+    )
+    p.add_argument(
+        "--typed-reports",
+        choices=TYPED_MODES,
+        default=None,
+        help="smart_tool takes typed items answered in per-type formats; 'render' forwards outputs instead of copying.",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -220,7 +233,9 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
     # supervisor turns from worker-segment turns on sight. Only applied to
     # the default prompt -- an explicit --system override is left untouched.
     default = (
-        SUPERVISOR_SYSTEM_DUAL
+        SUPERVISOR_SYSTEM_TYPED
+        if args.typed_reports
+        else SUPERVISOR_SYSTEM_DUAL
         if args.dual_mode
         else BATCH_MODES[args.batch_mode]
         if args.batch_mode
@@ -239,6 +254,7 @@ def main(argv: "list[str] | None" = None) -> int:
     args = parser.parse_args(argv)
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
     tools.COMPACT_TABLES = args.compact_tables
+    tools.COMPACT_TESTS = args.compact_tests
     if not args.supervisor_model:
         parser.error("--supervisor-model must not be empty")
     if not args.worker_model:
@@ -279,6 +295,7 @@ def main(argv: "list[str] | None" = None) -> int:
         coverage_check=args.coverage_check,
         dual_mode=args.dual_mode,
         delta_reports=args.delta_reports,
+        typed_reports=args.typed_reports or "",
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

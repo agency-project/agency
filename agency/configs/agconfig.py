@@ -334,6 +334,10 @@ class harnessadapterconfig(confignamespace):
     dual_mode: bool = False
     # Tandem: replace report lines the supervisor already has with a marker.
     delta_reports: bool = False
+    # Tandem: typed smart_tool items in per-type formats ("dense" or "render"; "" = off).
+    typed_reports: str = ""
+    # Native/tandem harness: test-runner output cut to failures and summaries.
+    compact_tests: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

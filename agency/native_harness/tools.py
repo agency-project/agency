@@ -22,7 +22,7 @@ import sys
 import uuid
 from typing import Generator
 
-from .canonicalize import canonicalize_run, compact_code_read, compact_tables, is_code_read_command, is_run_command
+from .canonicalize import canonicalize_run, is_test_command, summarize_tests, compact_code_read, compact_tables, is_code_read_command, is_run_command
 
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
@@ -38,6 +38,7 @@ _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
 # Set by cli.py from --canonicalize-run-output; off unless the caller asks for it.
 CANONICALIZE_RUN_OUTPUT = False
 COMPACT_TABLES = False
+COMPACT_TESTS = False
 # Set by cli.py from --compact-code-reads.
 COMPACT_CODE_READS = False
 
@@ -574,6 +575,14 @@ def _run_bash_tool(arguments_json: str) -> str:
             if stats["chars_out"] < stats["chars_in"]:
                 print(
                     f"[native_harness] compacted code read: chars {stats['chars_in']} -> {stats['chars_out']}",
+                    file=sys.stderr,
+                )
+        if COMPACT_TESTS and is_test_command(command):
+            output, stats = summarize_tests(output)
+            if stats["omitted"]:
+                print(
+                    f"[native_harness] summarized test output: lines {stats['lines_in']} -> "
+                    f"{stats['lines_in'] - stats['omitted']}, chars {stats['chars_in']} -> {len(output)}",
                     file=sys.stderr,
                 )
         if COMPACT_TABLES and not is_code_read_command(command):

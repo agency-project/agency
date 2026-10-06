@@ -100,6 +100,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
     )
     p.add_argument(
+        "--compact-tests",
+        action="store_true",
+        help="Cut test-runner output from bash to failures, summaries and the last lines.",
+    )
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -132,6 +137,7 @@ def main(argv: "list[str] | None" = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
     tools.COMPACT_TABLES = args.compact_tables
+    tools.COMPACT_TESTS = args.compact_tests
     if args.code_read_tools or args.want_required or args.code_read_hint:
         tools.enable_code_read_tools(want_required=args.want_required)
     tools.COMPACT_CODE_READS = args.compact_code_reads

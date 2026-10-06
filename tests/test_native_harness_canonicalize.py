@@ -178,3 +178,19 @@ def test_canonicalizers_handle_empty_and_huge_output():
 def test_multi_file_diff_is_left_alone():
     diff = "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/y b/y\n@@ -2 +2 @@\n-c\n+d\n"
     assert canonicalize_run(diff)[0] == diff and compact_tables(diff)[0] == diff
+
+
+def test_is_test_command_needs_a_runner_invocation():
+    from agency.native_harness.canonicalize import is_test_command
+    assert is_test_command("cd /repo && python -m pytest tests/ -x")
+    assert is_test_command("PYTHONPATH=. pytest -q") and is_test_command("python tests/runtests.py queries")
+    assert not is_test_command("grep -rn pytest setup.cfg") and not is_test_command("pip show pytest")
+    assert not is_test_command("cat runtests.py")
+
+
+def test_summarize_tests_keeps_failures_and_summary():
+    from agency.native_harness.canonicalize import summarize_tests
+    out = "\n".join(["test_a ... ok"] * 30 + ["FAIL: test_b", "AssertionError: 1 != 2", "Ran 31 tests in 0.1s", "FAILED (failures=1)"])
+    text, stats = summarize_tests(out)
+    assert "FAIL: test_b" in text and "Ran 31 tests" in text and stats["omitted"] > 20
+    assert summarize_tests("no runner here\nat all")[0] == "no runner here\nat all"

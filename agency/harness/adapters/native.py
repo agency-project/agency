@@ -179,6 +179,7 @@ class NativeAdapter(HarnessAdapter):
                 ("--code-read-hint", ha.code_read_hint),
                 ("--compact-code-reads", ha.compact_code_reads),
                 ("--compact-tables", ha.compact_tables),
+                ("--compact-tests", ha.compact_tests),
             ):
                 if on:
                     argv.append(flag)

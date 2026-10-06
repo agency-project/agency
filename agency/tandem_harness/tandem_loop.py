@@ -91,6 +91,7 @@ def _debug(msg: str) -> None:
 
 
 from . import tools
+from .canonicalize import canonicalize_run, summarize_tests
 from .outline import outline_report, paths_from_calls
 from .review import HEADER as REVIEW_HEADER
 from .review import review_report
@@ -286,6 +287,69 @@ SUPERVISOR_SYSTEM_DUAL = SUPERVISOR_SYSTEM.replace("using four tools:", "using t
 )
 assert SUPERVISOR_SYSTEM_DUAL.count("basic tools you can also call directly") == 1
 
+# Typed requests: smart_tool(task, items), each item a {type, what}; the worker answers each in a fixed format.
+TYPE_FORMATS = {
+    "location": "path:line, one per line",
+    "code": "only the requested lines, each prefixed with its line number; no commentary",
+    "file": "the requested lines, each prefixed with its line number",
+    "listing": "one entry per line",
+    "schema": "table(column type, ...), one table per line",
+    "rows": "a header line `col | col`, then one row per line",
+    "output": "only the relevant output lines, verbatim",
+    "test_result": "`N passed, M failed`, then `FAIL test_name: one-line error` per failure",
+    "diff": "unified diff",
+    "value": "`name = value`",
+    "error": "exception type and message, and the innermost frame in the project's own code",
+    "yes_no": "`yes` or `no`, plus at most one short clause",
+    "explanation": "at most two sentences",
+}
+# Types the worker can hand over as a tool call's output instead of copying it (typed_reports="render").
+RENDER_TYPES = ("file", "listing", "schema", "rows", "output", "test_result", "diff")
+_SMART_TOOL_TYPED_LINE = (
+    "- smart_tool(task, items): carries out `task`, a task written in natural language, using basic tools such "
+    "as bash, read and edit, and returns each piece of information you ask for in `items`."
+)
+_TYPED_BULLET = (
+    "- `items`: the information you need back, one entry per piece, each with a `type` and `what`. Types: "
+    "location (file:line), code, file (lines of a file), listing, schema, rows (query results), output (program "
+    "output), test_result, diff, value, error, yes_no, explanation. Don't ask for what you already have, such as "
+    "the query you just gave. Be precise and do not ask for more than you need.\n"
+)
+_TYPED_EXAMPLES = {
+    'smart_tool(task="Find where parse_json is defined and called.", report="File:line of the definition and of each call, one per line.")':
+        'smart_tool(task="Find where parse_json is defined and called.", items=[{"type": "location", "what": "the definition of parse_json"}, {"type": "location", "what": "each call of parse_json"}])',
+    'smart_tool(task="Find how config.py picks the cache directory when HOME is unset.", report="The function and lines that do it, and the rule in one sentence.")':
+        'smart_tool(task="Find how config.py picks the cache directory when HOME is unset.", items=[{"type": "code", "what": "the lines that pick the cache directory"}, {"type": "explanation", "what": "the rule when HOME is unset"}])',
+    'smart_tool(task="Run the tests in tests/test_api.py.", report="Pass/fail, and the name and error of each failing test.")':
+        'smart_tool(task="Run the tests in tests/test_api.py.", items=[{"type": "test_result", "what": "tests/test_api.py"}])',
+    'smart_tool(task="Make parse_json in util.py return None on empty input, then run tests/test_util.py.", report="The git diff and the test result.")':
+        'smart_tool(task="Make parse_json in util.py return None on empty input, then run tests/test_util.py.", items=[{"type": "diff", "what": "the change to util.py"}, {"type": "test_result", "what": "tests/test_util.py"}])',
+}
+SUPERVISOR_SYSTEM_TYPED = SUPERVISOR_SYSTEM.replace(_SMART_TOOL_LINE, _SMART_TOOL_TYPED_LINE, 1).replace(
+    _REPORT_BULLET, _TYPED_BULLET, 1
+)
+for _old, _new in _TYPED_EXAMPLES.items():
+    assert _old in SUPERVISOR_SYSTEM_TYPED
+    SUPERVISOR_SYSTEM_TYPED = SUPERVISOR_SYSTEM_TYPED.replace(_old, _new, 1)
+assert "report=" not in SUPERVISOR_SYSTEM_TYPED and "`report`" not in SUPERVISOR_SYSTEM_TYPED
+TYPED_MODES = ("dense", "render")
+
+
+def _typed_request(items: list, render: bool) -> str:
+    """The worker's reply instructions for typed items: numbered, each in its type's format."""
+    lines = []
+    for k, item in enumerate(items, 1):
+        kind = item["type"] if item["type"] in TYPE_FORMATS else "explanation"
+        lines.append(f"{k}. [{kind}] {item['what']} — format: {TYPE_FORMATS[kind]}")
+    text = "In your reply, give exactly these items, numbered, each in its format:\n" + "\n".join(lines)
+    if render and any(i["type"] in RENDER_TYPES for i in items):
+        text += (
+            "\nFor an item of type " + ", ".join(t for t in RENDER_TYPES) + ": if one tool call printed it, call "
+            "forward_tool_output(item=N) right after that call instead of copying it, and write `N. (forwarded)`."
+        )
+    return text
+
+
 BATCH_MODES = {
     "prompt": SUPERVISOR_SYSTEM_BATCH,
     "list": SUPERVISOR_SYSTEM_LIST,
@@ -362,6 +426,33 @@ _SMART_TOOL_LIST_SCHEMA = {
     },
 }
 
+_SMART_TOOL_TYPED_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "smart_tool",
+        "description": _SMART_TOOL_SCHEMA["function"]["description"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": _SMART_TOOL_SCHEMA["function"]["parameters"]["properties"]["task"],
+                "items": {
+                    "type": "array",
+                    "description": "The information you want back, one entry per piece.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": list(TYPE_FORMATS)},
+                            "what": {"type": "string", "description": "What exactly, e.g. which function, file or test."},
+                        },
+                        "required": ["type", "what"],
+                    },
+                },
+            },
+            "required": ["task", "items"],
+        },
+    },
+}
+
 _GET_TOOL_CALL_DETAIL_SCHEMA = {
     "type": "function",
     "function": {
@@ -412,6 +503,18 @@ _FORWARD_TOOL_OUTPUT_SCHEMA = {
             "forward."
         ),
         "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+_FORWARD_ITEM_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "forward_tool_output",
+        "description": _FORWARD_TOOL_OUTPUT_SCHEMA["function"]["description"],
+        "parameters": {
+            "type": "object",
+            "properties": {"item": {"type": "integer", "description": "The number of the item this output answers."}},
+        },
     },
 }
 
@@ -694,6 +797,25 @@ def _render_call_list(calls: "list[dict]") -> str:
     return "\n".join(lines)
 
 
+def _render_forwarded(text: str, forwarded: "dict[int, str]", typed: "list[dict]") -> str:
+    """Each forwarded item's tool output in place of its `N. (forwarded)` line, or appended."""
+    lines = text.split("\n")
+    for k in sorted(forwarded):
+        kind = typed[k - 1]["type"]
+        _status, out = _decode_result(forwarded[k])
+        if kind == "test_result":
+            out = summarize_tests(out)[0]
+        elif kind == "output":
+            out = canonicalize_run(out)[0]
+        block = f"{k}. [{kind}]\n{out}"
+        at = next((i for i, line in enumerate(lines) if re.match(rf"\s*{k}\.\s*\(?forwarded\)?\s*$", line)), None)
+        if at is None:
+            lines += ["", block]
+        else:
+            lines[at] = block
+    return "\n".join(lines).strip("\n")
+
+
 def _trim_worker_history(
     conversation: "list[dict]", n: int, orders: "frozenset[str] | set[str]" = frozenset()
 ) -> "list[dict]":
@@ -746,6 +868,8 @@ def run_tandem_loop(
     dual_mode: bool = False,
     # Replace runs of report lines the supervisor has already seen with a marker.
     delta_reports: bool = False,
+    # Typed smart_tool items answered in per-type formats: "dense", or "render" (outputs forwarded, not copied).
+    typed_reports: str = "",
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -777,6 +901,14 @@ def run_tandem_loop(
 
     def smart_tool_handler(args_json: str) -> str:
         args = _parse_args(args_json)
+        typed = args.get("items")
+        if typed_reports and isinstance(typed, list) and typed:
+            typed = [
+                {"type": str(i.get("type") or "explanation"), "what": str(i.get("what") or "").strip()}
+                if isinstance(i, dict) else {"type": "explanation", "what": str(i)}
+                for i in typed
+            ]
+            return run_order((args.get("task") or "").strip(), "", typed)
         items = args.get("tasks")
         if not isinstance(items, list):
             return run_order((args.get("task") or "").strip(), (args.get("report") or "").strip())
@@ -791,7 +923,7 @@ def run_tandem_loop(
         last_calls["calls"] = calls
         return "\n\n".join(parts) if parts else run_order("", "")
 
-    def run_order(task: str, report_request: str) -> str:
+    def run_order(task: str, report_request: str, typed: "list[dict] | None" = None) -> str:
         last_calls["calls"] = []
         if not task:
             return _render_report(
@@ -822,9 +954,14 @@ def run_tandem_loop(
             worker_conversation["messages"], worker_history_turns, sent_orders
         )
         # Plain user text: the worker sees an ordinary request, no marker; sent_orders finds it again.
-        segment_marker = (
-            f"{task}\n\nIn your reply, include: {report_request}" if report_request else task
-        )
+        render = typed_reports == "render"
+        if typed:
+            report_request = _typed_request(typed, render)
+            segment_marker = f"{task}\n\n{report_request}"
+        else:
+            segment_marker = (
+                f"{task}\n\nIn your reply, include: {report_request}" if report_request else task
+            )
         sent_orders.add(segment_marker)
         worker_conversation["messages"].append({"role": "user", "content": segment_marker})
         worker_messages = worker_conversation["messages"]
@@ -836,10 +973,15 @@ def run_tandem_loop(
         # docstring).
         call_id_results: "dict[str, str]" = {}
         forwarded = {"content": None}
+        forwarded_items: "dict[int, str]" = {}
 
         def forward_tool_output_handler(_args_json: str) -> str:
             if not call_id_results:
                 return json.dumps({"error": "no previous tool call in this task to forward"})
+            item = _parse_args(_args_json).get("item")
+            if render and typed and isinstance(item, int) and 1 <= item <= len(typed):
+                forwarded_items[item] = next(reversed(call_id_results.values()))
+                return json.dumps({"result": f"staged your most recent tool call's output as item {item}"})
             forwarded["content"] = next(reversed(call_id_results.values()))
             return json.dumps(
                 {"result": "staged your most recent tool call's output as your final tool_output"}
@@ -870,7 +1012,7 @@ def run_tandem_loop(
                 # (bridge is None), there's nothing to strip it, and passing it
                 # straight through to litellm/Bedrock is a bad request.
                 internal_kind=("tandem_worker" if bridge is not None else None),
-                extra_tool_schemas=[_FORWARD_TOOL_OUTPUT_SCHEMA],
+                extra_tool_schemas=[_FORWARD_ITEM_SCHEMA if render and typed else _FORWARD_TOOL_OUTPUT_SCHEMA],
                 extra_dispatch_table={"forward_tool_output": forward_tool_output_handler},
                 call_id_results=call_id_results,
                 # Keep submit_output supervisor-only, not MCP-discoverable by the worker.
@@ -946,6 +1088,9 @@ def run_tandem_loop(
                 )
             if note:
                 report["tool_output"] += f"\n\n{REVIEW_HEADER}\n{note}"
+        if forwarded_items:
+            report["tool_output"] = _render_forwarded(report["tool_output"] or "", forwarded_items, typed)
+            print(f"[tandem_harness] typed report: {len(forwarded_items)} of {len(typed)} items forwarded", file=sys.stderr)
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry
         last_calls["calls"] = report["tool_calls"]
@@ -983,7 +1128,7 @@ def run_tandem_loop(
         return _render_call_list(last_calls["calls"])
 
     supervisor_tool_schemas = [
-        _SMART_TOOL_LIST_SCHEMA if smart_tool_lists else _SMART_TOOL_SCHEMA,
+        _SMART_TOOL_TYPED_SCHEMA if typed_reports else _SMART_TOOL_LIST_SCHEMA if smart_tool_lists else _SMART_TOOL_SCHEMA,
         _GET_TOOL_CALL_LIST_SCHEMA,
         _GET_TOOL_CALL_DETAIL_SCHEMA,
     ]

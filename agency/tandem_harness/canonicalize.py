@@ -3,6 +3,8 @@
     is_run_command(command) -> bool
     canonicalize_run(output) -> (text, stats)
     compact_tables(output) -> (text, stats)
+    is_test_command(command) -> bool
+    summarize_tests(output) -> (text, stats)
 
 Applied by the bash tool, when enabled, to commands that run a program or a
 test suite (not to file reads, searches or queries, whose content the caller
@@ -135,6 +137,42 @@ def canonicalize_run(output: str) -> tuple[str, dict]:
         out.append(f"[... {len(lines) - 1 - prev} lines omitted ...]")
     stats.update(lines_out=len(selected), omitted=len(lines) - len(selected))
     return "\n".join(out), stats
+
+
+_TEST_CMD_RE = re.compile(
+    r"^\s*(?:\w+=\S*\s+)*(?:timeout\s+\S+\s+)?(?:"
+    r"(?:python[0-9.]*|\S*/python[0-9.]*)\s+(?:-\S+\s+)*(?:-m\s+(?:pytest|unittest)\b|\S*runtests\S*\.py\b)"
+    r"|pytest\b|py\.test\b|\S*/?runtests\S*)"
+)
+
+
+def is_test_command(command: str) -> bool:
+    """A command one of whose pipeline steps invokes a test runner (not one that only mentions it)."""
+    return any(_TEST_CMD_RE.match(part) for part in re.split(r"&&|\|\||;|\||\n", command))
+
+
+def summarize_tests(output: str) -> tuple[str, dict]:
+    """Test-runner output at any size: failures with context, runner summaries and the last lines."""
+    text = clean(output)
+    lines = text.split("\n")
+    stats = {"lines_in": len(lines), "chars_in": len(output), "omitted": 0}
+    if not any(_SUMMARY_RE.search(line) for line in lines):
+        return text, stats
+    n = len(lines)
+    keep = set(range(max(0, n - 3), n))
+    for i, line in enumerate(lines):
+        if _ERROR_RE.search(line):
+            keep.update(range(max(0, i - 2), min(n, i + 3)))
+        if _SUMMARY_RE.search(line):
+            keep.add(i)
+    out, prev = [], -1
+    for i in sorted(keep):
+        if i > prev + 1:
+            out.append(f"[... {i - prev - 1} lines omitted ...]")
+        out.append(lines[i])
+        prev = i
+    stats["omitted"] = n - len(keep)
+    return ("\n".join(out), stats) if stats["omitted"] else (text, stats)
 
 
 _CODE_READ_RE = re.compile(r"\bsed -n|\bcat |\bhead |\btail |\bnl ")

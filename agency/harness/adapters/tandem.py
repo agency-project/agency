@@ -169,6 +169,10 @@ class TandemAdapter(NativeAdapter):
                 argv.append("--dual-mode")
             if ha.delta_reports:
                 argv.append("--delta-reports")
+            if ha.typed_reports:
+                argv += ["--typed-reports", ha.typed_reports]
+            if ha.compact_tests:
+                argv.append("--compact-tests")
 
             envp = {
                 "PATH": HARNESS_PATH,
