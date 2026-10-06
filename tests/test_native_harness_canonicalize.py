@@ -160,3 +160,21 @@ def test_bash_tool_compacts_tables_only_when_enabled(monkeypatch):
         monkeypatch.setattr(module, "COMPACT_TABLES", True)
         out = json.loads(module._run_bash_tool(json.dumps({"command": command})))["output"]
         assert out == "a (int)\n1\n"
+
+
+def test_bash_tool_keeps_output_with_invalid_utf8():
+    for module in (tools, tandem_tools):
+        out = json.loads(module._run_bash_tool(json.dumps({"command": "printf 'ok\\xff bytes\\n'"})))
+        assert out["output"] == "ok� bytes\n" and out["returncode"] == 0
+
+
+def test_canonicalizers_handle_empty_and_huge_output():
+    assert canonicalize_run("")[0] == "" and compact_tables("")[0] == ""
+    huge = "\n".join(f"step {i} energy {i * 0.001:.6f}" for i in range(50000))
+    out, stats = canonicalize_run(huge)
+    assert stats["omitted"] > 49000 and out.split("\n")[0] == "step 0 energy 0.000000"
+
+
+def test_multi_file_diff_is_left_alone():
+    diff = "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/y b/y\n@@ -2 +2 @@\n-c\n+d\n"
+    assert canonicalize_run(diff)[0] == diff and compact_tables(diff)[0] == diff

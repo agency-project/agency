@@ -557,6 +557,7 @@ def _run_bash_tool(arguments_json: str) -> str:
             capture_output=True,
             timeout=timeout,
             text=True,
+            errors="replace",
             cwd=workdir,
         )
         output = proc.stdout + proc.stderr
@@ -727,6 +728,7 @@ def _run_glob_tool(arguments_json: str) -> str:
             capture_output=True,
             timeout=30,
             text=True,
+            errors="replace",
         )
         return json.dumps(parse_glob_output(proc.stdout))
     except Exception as e:
@@ -744,6 +746,7 @@ def _run_grep_tool(arguments_json: str) -> str:
             capture_output=True,
             timeout=30,
             text=True,
+            errors="replace",
         )
         return json.dumps(parse_grep_json_output(proc.stdout))
     except Exception as e:
