@@ -142,6 +142,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "list-valued smart_tool (list), optionally with conditional items (list_cond).",
     )
     p.add_argument(
+        "--review-reports",
+        action="store_true",
+        help="Append the supervisor model's separate review (suspicious lines) to code-heavy reports.",
+    )
+    p.add_argument(
         "--outline-reports",
         action="store_true",
         help="In code-heavy reports, list functions the request didn't name as one-line outlines.",
@@ -252,6 +257,7 @@ def main(argv: "list[str] | None" = None) -> int:
         worker_history_turns=args.worker_history_turns,
         outline_reports=args.outline_reports,
         smart_tool_lists=args.batch_mode in LIST_SCHEMA_MODES,
+        review_reports=args.review_reports,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

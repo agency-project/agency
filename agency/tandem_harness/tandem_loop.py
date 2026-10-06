@@ -91,6 +91,8 @@ def _debug(msg: str) -> None:
 
 
 from .outline import outline_report, paths_from_calls
+from .review import HEADER as REVIEW_HEADER
+from .review import review_report
 from .react_loop import run_react_loop
 
 if TYPE_CHECKING:
@@ -692,6 +694,8 @@ def run_tandem_loop(
     outline_reports: bool = False,
     # smart_tool takes a list of {task, report} items, run in order.
     smart_tool_lists: bool = False,
+    # Append the supervisor model's separate review of code-heavy reports (review.py).
+    review_reports: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -864,6 +868,16 @@ def run_tandem_loop(
             used_short_ids=used_short_ids,
             outline_request=segment_marker if outline_reports else None,
         )
+        if review_reports and report["tool_output"]:
+            note, stats = review_report(report["tool_output"], paths_from_calls(full_trace), supervisor_llm, supervisor_model)
+            if stats["input_tokens"]:
+                print(
+                    f"[tandem_harness] reviewed report: {stats['code_lines']} code lines, tokens in "
+                    f"{stats['input_tokens']} out {stats['output_tokens']}, flagged: {'yes' if note else 'no'}",
+                    file=sys.stderr,
+                )
+            if note:
+                report["tool_output"] += f"\n\n{REVIEW_HEADER}\n{note}"
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry
         last_calls["calls"] = report["tool_calls"]

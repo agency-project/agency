@@ -1187,3 +1187,41 @@ def test_list_ablations_split_guidance_from_schema():
     assert _LIST_BULLET in BATCH_MODES["list_guide"] and "smart_tool(tasks)" not in BATCH_MODES["list_guide"]
     assert _LIST_BULLET not in BATCH_MODES["list_schema"] and "smart_tool(tasks)" in BATCH_MODES["list_schema"]
     assert "list_schema" in LIST_SCHEMA_MODES and "list_guide" not in LIST_SCHEMA_MODES
+
+
+def test_review_reports_appends_the_supervisor_models_note(monkeypatch, tmp_path):
+    from agency.tandem_harness import review
+
+    source = tmp_path / "mod.py"
+    source.write_text("\n".join(f"value_{i} = compute_something({i}) + offset_{i}" for i in range(30)))
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    monkeypatch.setattr(review, "MIN_CODE_LINES", 5)
+    supervisor_llm = _Llm(
+        [
+            _smart_tool_response("show mod.py", "its code"),
+            {"message": {"role": "assistant", "content": "mod.py: `value_2 = ...` — wrong sign"}, "usage": {"prompt_tokens": 9, "completion_tokens": 4}},
+            _supervisor_final_response("done"),
+        ]
+    )
+    worker_llm = _Llm(
+        [
+            _worker_tool_call_response(f"cat {source}", "w-1"),
+            _supervisor_final_response("Here it is:\n" + source.read_text()),
+        ]
+    )
+
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}],
+        "supervisor-model",
+        "worker-model",
+        supervisor_llm,
+        worker_llm,
+        segment_step_cap=2,
+        offload_dir=str(tmp_path),
+        review_reports=True,
+    )
+
+    review_request = supervisor_llm.requests[1]
+    assert review_request[0] == "supervisor-model" and "value_29" in review_request[1][0]["content"]
+    report = supervisor_llm.requests[2][1][-1]["content"]
+    assert review.HEADER in report and "wrong sign" in report

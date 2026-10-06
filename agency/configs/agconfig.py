@@ -326,6 +326,8 @@ class harnessadapterconfig(confignamespace):
     outline_reports: bool = False
     # Tandem: batching of independent checks ("prompt", "list" or "list_cond"; "" = off).
     batch_mode: str = ""
+    # Tandem: append the supervisor model's separate review of code-heavy reports.
+    review_reports: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

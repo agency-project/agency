@@ -159,3 +159,15 @@ def outline_report(text: str, paths: "list[str]", request: str) -> tuple[str, di
         out.append(line)
     out += ["", NOTE]
     return "\n".join(out), stats
+
+
+def code_line_count(text: str, paths: "list[str]") -> int:
+    """Lines of `text` that match a line of one of the files at `paths`."""
+    known = set()
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                known.update(k for k in map(_norm, f.read().split("\n")) if k)
+        except OSError:
+            continue
+    return sum(1 for line in text.split("\n") if _norm(line) in known)
