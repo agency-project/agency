@@ -1301,7 +1301,7 @@ def test_typed_reports_dense_sends_numbered_formats_to_the_worker(monkeypatch, t
     smart = next(t for t in supervisor_llm.requests[0][2] if t["function"]["name"] == "smart_tool")
     assert "items" in smart["function"]["parameters"]["required"]
     order = worker_llm.requests[0][1][-1]["content"]
-    assert "1. [location] def f — format: path:line" in order and "2. [value] TIMEOUT" in order
+    assert "1. [location] def f\n2. [value] TIMEOUT\nFormats: location: path:line" in order
     assert "forward_tool_output(item=N)" not in order
     assert "TIMEOUT = 5" in supervisor_llm.requests[1][1][-1]["content"]
 
@@ -1315,7 +1315,7 @@ def test_typed_reports_render_puts_forwarded_output_in_place(monkeypatch, tmp_pa
         _worker_tool_call_response("pytest tests/test_x.py", "w-1"),
         {"message": {"role": "assistant", "content": None, "tool_calls": [_tool_call("forward_tool_output", {"item": 1}, "w-2")]},
          "usage": {"prompt_tokens": 6, "completion_tokens": 2}},
-        _supervisor_final_response("1. (forwarded)\n2. test_b expects 2."),
+        _supervisor_final_response("1. [test_result] tests/test_x.py (forwarded)\n2. test_b expects 2."),
     ])
     run_tandem_loop([{"role": "user", "content": "task"}], "supervisor-model", "worker-model", supervisor_llm, worker_llm,
                     segment_step_cap=4, offload_dir=str(tmp_path), typed_reports="render")

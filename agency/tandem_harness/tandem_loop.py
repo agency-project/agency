@@ -337,11 +337,13 @@ TYPED_MODES = ("dense", "render")
 
 def _typed_request(items: list, render: bool) -> str:
     """The worker's reply instructions for typed items: numbered, each in its type's format."""
-    lines = []
-    for k, item in enumerate(items, 1):
-        kind = item["type"] if item["type"] in TYPE_FORMATS else "explanation"
-        lines.append(f"{k}. [{kind}] {item['what']} — format: {TYPE_FORMATS[kind]}")
-    text = "In your reply, give exactly these items, numbered, each in its format:\n" + "\n".join(lines)
+    kinds = [item["type"] if item["type"] in TYPE_FORMATS else "explanation" for item in items]
+    lines = [f"{k}. [{kind}] {item['what']}" for k, (kind, item) in enumerate(zip(kinds, items), 1)]
+    legend = "; ".join(f"{kind}: {TYPE_FORMATS[kind]}" for kind in dict.fromkeys(kinds))
+    text = (
+        "In your reply, give exactly these items, numbered, each as `N. answer`:\n" + "\n".join(lines)
+        + f"\nFormats: {legend}"
+    )
     if render and any(i["type"] in RENDER_TYPES for i in items):
         text += (
             "\nFor an item of type " + ", ".join(t for t in RENDER_TYPES) + ": if one tool call printed it, call "
@@ -808,7 +810,7 @@ def _render_forwarded(text: str, forwarded: "dict[int, str]", typed: "list[dict]
         elif kind == "output":
             out = canonicalize_run(out)[0]
         block = f"{k}. [{kind}]\n{out}"
-        at = next((i for i, line in enumerate(lines) if re.match(rf"\s*{k}\.\s*\(?forwarded\)?\s*$", line)), None)
+        at = next((i for i, line in enumerate(lines) if re.match(rf"\s*{k}\.\s", line) and "forwarded" in line), None)
         if at is None:
             lines += ["", block]
         else:
