@@ -117,6 +117,34 @@ _STEP_LIMIT_REPORT_PROMPT = (
     "You've used all the tool calls available for this task. Don't call any more tools. "
     "Reply now with your report: what the task asked for that you found or did, and what is left unfinished."
 )
+_DELTA_PREFIX = re.compile(r"^\s*\d+[:\-\t ]\s?")
+
+
+def _delta_key(line: str) -> "str | None":
+    s = _DELTA_PREFIX.sub("", line).strip()
+    return s if len(s) >= 12 else None
+
+
+def _delta_encode(text: str, seen: "set[str]", min_run: int = 3) -> str:
+    """Runs of min_run+ lines the supervisor already has, verbatim, become one marker line."""
+    lines = text.split("\n")
+    hit = [(_delta_key(line) in seen) if _delta_key(line) else None for line in lines]
+    out, i = [], 0
+    while i < len(lines):
+        if hit[i]:
+            j, n = i, 0
+            while j < len(lines) and hit[j] is not False:
+                n += bool(hit[j])
+                j += 1
+            if n >= min_run:
+                out.append(f"[{j - i} lines already shown above]")
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 _COVERAGE_PROMPT = (
     "Check your reply against what was asked for: {request}\n"
     "If your reply gives every item asked for, or says why an item could not be obtained, reply exactly COMPLETE. "
@@ -716,6 +744,8 @@ def run_tandem_loop(
     coverage_check: bool = False,
     # The supervisor also gets the basic tools, dispatched directly (no worker).
     dual_mode: bool = False,
+    # Replace runs of report lines the supervisor has already seen with a marker.
+    delta_reports: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -741,6 +771,9 @@ def run_tandem_loop(
     # never grows past that bound going into a dispatch.
     worker_conversation: "dict[str, list[dict] | None]" = {"messages": None}
     sent_orders: "set[str]" = set()
+    seen_lines: "set[str]" = {
+        k for m in messages for k in map(_delta_key, str(m.get("content") or "").split("\n")) if k
+    }
 
     def smart_tool_handler(args_json: str) -> str:
         args = _parse_args(args_json)
@@ -916,6 +949,12 @@ def run_tandem_loop(
         for entry in full_trace:
             all_calls[entry["call_id"]] = entry
         last_calls["calls"] = report["tool_calls"]
+        if delta_reports and report["tool_output"]:
+            before = len(report["tool_output"])
+            report["tool_output"] = _delta_encode(report["tool_output"], seen_lines)
+            if len(report["tool_output"]) < before:
+                print(f"[tandem_harness] delta-encoded report: chars {before} -> {len(report['tool_output'])}", file=sys.stderr)
+        seen_lines.update(k for k in map(_delta_key, f"{segment_marker}\n{report['tool_output'] or ''}".split("\n")) if k)
         rendered = _render_report(report)
         _debug(f"report[{segment_index}]: {rendered[:500]}")
         return rendered

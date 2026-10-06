@@ -332,6 +332,8 @@ class harnessadapterconfig(confignamespace):
     coverage_check: bool = False
     # Tandem: supervisor gets the basic tools as well as smart_tool.
     dual_mode: bool = False
+    # Tandem: replace report lines the supervisor already has with a marker.
+    delta_reports: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

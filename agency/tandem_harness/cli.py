@@ -143,6 +143,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "list-valued smart_tool (list), optionally with conditional items (list_cond).",
     )
     p.add_argument(
+        "--delta-reports",
+        action="store_true",
+        help="Replace runs of report lines the supervisor has already seen with a marker.",
+    )
+    p.add_argument(
         "--dual-mode",
         action="store_true",
         help="Also give the supervisor the basic tools (bash, read, edit, ...), dispatched directly.",
@@ -273,6 +278,7 @@ def main(argv: "list[str] | None" = None) -> int:
         review_reports=args.review_reports,
         coverage_check=args.coverage_check,
         dual_mode=args.dual_mode,
+        delta_reports=args.delta_reports,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own

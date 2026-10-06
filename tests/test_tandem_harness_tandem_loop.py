@@ -1268,3 +1268,19 @@ def test_dual_mode_lets_the_supervisor_call_basic_tools_directly(monkeypatch, tm
     assert {"smart_tool", "bash", "read", "edit"} <= names
     assert calls and supervisor_llm.requests[1][1][-1]["content"] == '{"output": "hi"}'
     assert not worker_llm.requests
+
+
+def test_delta_reports_marks_lines_the_supervisor_already_has(monkeypatch, tmp_path):
+    code = "\n".join(f"    value_{i} = compute_something({i})" for i in range(5))
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    supervisor_llm = _Llm([_smart_tool_response("show f", "its code"), _smart_tool_response("show f again", "its code"), _supervisor_final_response("done")])
+    worker_llm = _Llm([
+        _worker_tool_call_response("cat f", "w-1"), _supervisor_final_response("Code:\n" + code),
+        _worker_tool_call_response("cat f", "w-2"), _supervisor_final_response("Same code:\n" + code + "\nnew line here, unchanged"),
+    ])
+    run_tandem_loop([{"role": "user", "content": "task"}], "supervisor-model", "worker-model", supervisor_llm, worker_llm,
+                    segment_step_cap=2, offload_dir=str(tmp_path), delta_reports=True)
+    first = supervisor_llm.requests[1][1][-1]["content"]
+    second = supervisor_llm.requests[2][1][-1]["content"]
+    assert "value_4" in first
+    assert "value_4" not in second and "[5 lines already shown above]" in second and "new line here" in second
