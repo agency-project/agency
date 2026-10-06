@@ -60,3 +60,10 @@ def test_paths_come_from_read_and_bash_calls(tmp_path):
         {"arguments": json.dumps({"command": f"cd {tmp_path} && sed -n 1,20p pkg/mod.py"})},
     ]
     assert paths_from_calls(calls) == [str(tmp_path / "pkg" / "mod.py")]
+
+
+def test_paths_relative_to_the_bash_workdir_resolve(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "mod.py").write_text(SOURCE)
+    calls = [{"arguments": json.dumps({"workdir": str(tmp_path), "command": "nl -ba pkg/mod.py | sed -n '1,20p'"})}]
+    assert paths_from_calls(calls) == [str(tmp_path / "pkg" / "mod.py")]

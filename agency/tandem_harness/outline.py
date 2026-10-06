@@ -61,7 +61,8 @@ def paths_from_calls(calls: "list[dict]") -> "list[str]":
         except ValueError:
             continue
         text = " ".join(str(v) for v in args.values())
-        dirs = _CD_RE.findall(text) + [os.getcwd()]
+        workdir = [str(args["workdir"])] if args.get("workdir") else []
+        dirs = [os.path.join(w, d) for w in workdir or [""] for d in _CD_RE.findall(text)] + workdir + [os.getcwd()]
         for token in _PATH_RE.findall(text):
             for cand in [token] + [os.path.join(d, token) for d in dirs]:
                 if os.path.isfile(cand) and cand not in found:
