@@ -163,6 +163,8 @@ class TandemAdapter(NativeAdapter):
                 argv += ["--batch-mode", ha.batch_mode]
             if ha.review_reports:
                 argv.append("--review-reports")
+            if ha.coverage_check:
+                argv.append("--coverage-check")
 
             envp = {
                 "PATH": HARNESS_PATH,

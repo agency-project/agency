@@ -116,6 +116,11 @@ _STEP_LIMIT_REPORT_PROMPT = (
     "You've used all the tool calls available for this task. Don't call any more tools. "
     "Reply now with your report: what the task asked for that you found or did, and what is left unfinished."
 )
+_COVERAGE_PROMPT = (
+    "Check your reply against what was asked for: {request}\n"
+    "If your reply gives every item asked for, or says why an item could not be obtained, reply exactly COMPLETE. "
+    "Otherwise get what is missing and reply with only the missing items."
+)
 
 # Argument preview length for the tool_calls index in a smart_tool report; a
 # result is listed only by status and size. get_tool_call_detail serves either in full.
@@ -696,6 +701,8 @@ def run_tandem_loop(
     smart_tool_lists: bool = False,
     # Append the supervisor model's separate review of code-heavy reports (review.py).
     review_reports: bool = False,
+    # After each report, one worker turn to fetch any requested item the report lacks.
+    coverage_check: bool = False,
     # Supervisor-only, deliberately not threaded into the worker's own
     # run_react_loop call below -- a worker segment is stateless/ephemeral
     # by design (see this module's docstring), so there is no session for
@@ -854,6 +861,21 @@ def run_tandem_loop(
             worker_totals["output"] += wrap_up.total_output_tokens
             if wrap_up.status == "done" and (wrap_up.final_text or "").strip():
                 result = replace(wrap_up, status="error", message=result.message)
+        if coverage_check and report_request and result.status == "done" and (result.final_text or "").strip():
+            # One self-check turn: the worker fetches anything the request asked for that its report lacks.
+            check = run_worker(
+                result.messages + [{"role": "user", "content": _COVERAGE_PROMPT.format(request=report_request)}],
+                max_steps=max(4, segment_step_cap // 4),
+            )
+            worker_totals["input"] += check.total_input_tokens
+            worker_totals["output"] += check.total_output_tokens
+            added = (check.final_text or "").strip()
+            complete = added.strip("*. `").upper().startswith("COMPLETE")
+            print(f"[tandem_harness] coverage check: {'complete' if complete or not added else 'added ' + str(len(added)) + ' chars'}", file=sys.stderr)
+            if check.status == "done" and added and not complete:
+                result = replace(check, final_text=f"{result.final_text}\n\n{added}")
+            elif check.messages is not None:
+                result = replace(result, messages=check.messages)
         if result.messages is not None:
             # Becomes the base for the next segment's dispatch (trimmed to
             # worker_history_turns at that point, not here) -- whatever

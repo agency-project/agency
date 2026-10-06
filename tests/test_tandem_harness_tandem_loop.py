@@ -1225,3 +1225,25 @@ def test_review_reports_appends_the_supervisor_models_note(monkeypatch, tmp_path
     assert review_request[0] == "supervisor-model" and "value_29" in review_request[1][0]["content"]
     report = supervisor_llm.requests[2][1][-1]["content"]
     assert review.HEADER in report and "wrong sign" in report
+
+
+def _run_with_coverage(tmp_path, monkeypatch, check_reply):
+    monkeypatch.setitem(tools.TOOL_DISPATCH, "bash", lambda args: "{}")
+    supervisor_llm = _Llm([_smart_tool_response("list files", "the file names and their sizes"), _supervisor_final_response("done")])
+    worker_llm = _Llm([_worker_tool_call_response("ls", "w-1"), _supervisor_final_response("a.py b.py"), _supervisor_final_response(check_reply)])
+    run_tandem_loop(
+        [{"role": "user", "content": "task"}], "supervisor-model", "worker-model", supervisor_llm, worker_llm,
+        segment_step_cap=4, offload_dir=str(tmp_path), coverage_check=True,
+    )
+    assert "the file names and their sizes" in worker_llm.requests[2][1][-1]["content"]
+    return supervisor_llm.requests[1][1][-1]["content"]
+
+
+def test_coverage_check_appends_what_the_worker_adds(monkeypatch, tmp_path):
+    report = _run_with_coverage(tmp_path, monkeypatch, "sizes: a.py 10 bytes, b.py 20 bytes")
+    assert "a.py b.py" in report and "sizes: a.py 10 bytes" in report
+
+
+def test_coverage_check_complete_leaves_the_report(monkeypatch, tmp_path):
+    report = _run_with_coverage(tmp_path, monkeypatch, "COMPLETE")
+    assert "a.py b.py" in report and "COMPLETE" not in report

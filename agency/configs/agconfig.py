@@ -328,6 +328,8 @@ class harnessadapterconfig(confignamespace):
     batch_mode: str = ""
     # Tandem: append the supervisor model's separate review of code-heavy reports.
     review_reports: bool = False
+    # Tandem: one worker self-check turn per report for requested items it lacks.
+    coverage_check: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

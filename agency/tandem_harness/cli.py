@@ -142,6 +142,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "list-valued smart_tool (list), optionally with conditional items (list_cond).",
     )
     p.add_argument(
+        "--coverage-check",
+        action="store_true",
+        help="After each report, one worker turn to fetch any requested item the report lacks.",
+    )
+    p.add_argument(
         "--review-reports",
         action="store_true",
         help="Append the supervisor model's separate review (suspicious lines) to code-heavy reports.",
@@ -258,6 +263,7 @@ def main(argv: "list[str] | None" = None) -> int:
         outline_reports=args.outline_reports,
         smart_tool_lists=args.batch_mode in LIST_SCHEMA_MODES,
         review_reports=args.review_reports,
+        coverage_check=args.coverage_check,
         offload_dir=args.offload_dir,
         progress_path=args.progress_file,
         # Checkpoints the supervisor's session after every one of its own
