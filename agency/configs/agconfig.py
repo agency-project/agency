@@ -338,6 +338,12 @@ class harnessadapterconfig(confignamespace):
     typed_reports: str = ""
     # Native/tandem harness: test-runner output cut to failures and summaries.
     compact_tests: bool = False
+    # Native/tandem: end the run once every output field is submitted (no closing turn).
+    end_on_submit: bool = False
+    # Native/tandem: comma-separated tool names left out of the tool list.
+    drop_tools: str = ""
+    # Native/tandem: tell the agent it may submit together with its final check.
+    submit_with_check: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

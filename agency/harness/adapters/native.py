@@ -180,9 +180,13 @@ class NativeAdapter(HarnessAdapter):
                 ("--compact-code-reads", ha.compact_code_reads),
                 ("--compact-tables", ha.compact_tables),
                 ("--compact-tests", ha.compact_tests),
+                ("--end-on-submit", ha.end_on_submit),
+                ("--submit-with-check", ha.submit_with_check),
             ):
                 if on:
                     argv.append(flag)
+            if ha.drop_tools:
+                argv += ["--drop-tools", ha.drop_tools]
 
             envp = {
                 "PATH": HARNESS_PATH,

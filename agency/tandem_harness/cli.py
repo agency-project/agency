@@ -59,6 +59,7 @@ from .tandem_loop import (
     run_tandem_loop,
 )
 from . import session as session_store
+from . import react_loop
 from . import tools
 
 _DEFAULT_SESSION_DIR = os.path.join(os.path.expanduser("~"), ".tandem_harness", "sessions")
@@ -175,6 +176,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Print box-drawn result tables from bash as plain `a | b` rows and drop progress bars.",
     )
     p.add_argument(
+        "--end-on-submit",
+        action="store_true",
+        help="End the run once submit_output reports every output field in, without a closing turn.",
+    )
+    p.add_argument(
+        "--drop-tools",
+        default="",
+        help="Comma-separated tool names to leave out of the tool list.",
+    )
+    p.add_argument(
+        "--submit-with-check",
+        action="store_true",
+        help="Tell the agent it may submit its outputs in the same turn as its final check.",
+    )
+    p.add_argument(
         "--compact-tests",
         action="store_true",
         help="Cut test-runner output from bash to failures, summaries and the last lines.",
@@ -246,6 +262,8 @@ def _resolve_session(args: argparse.Namespace) -> "tuple[str, list]":
         else SUPERVISOR_SYSTEM
     )
     system = args.system or default
+    if args.submit_with_check:
+        system += "\n" + react_loop.SUBMIT_WITH_CHECK + "\n"
     return session_id, [{"role": "system", "content": system}]
 
 
@@ -255,6 +273,8 @@ def main(argv: "list[str] | None" = None) -> int:
     tools.CANONICALIZE_RUN_OUTPUT = args.canonicalize_run_output
     tools.COMPACT_TABLES = args.compact_tables
     tools.COMPACT_TESTS = args.compact_tests
+    react_loop.END_ON_SUBMIT = args.end_on_submit
+    react_loop.DROP_TOOLS = frozenset(t for t in args.drop_tools.split(",") if t)
     if not args.supervisor_model:
         parser.error("--supervisor-model must not be empty")
     if not args.worker_model:

@@ -26,6 +26,15 @@ from . import tools
 from .profiling import profile_run, span as profile_span
 from .compaction import maybe_compact
 
+# Set by cli.py: tool names left out of the tool list (T41), and whether a run ends as soon as
+# submit_output reports every output field in, without a closing turn (T39).
+DROP_TOOLS: "frozenset[str]" = frozenset()
+END_ON_SUBMIT = False
+SUBMIT_WITH_CHECK = (
+    "When you run your final check, call submit_output for every field in the same turn if you are confident the "
+    "check will pass. The task ends as soon as every output field is submitted."
+)
+
 if TYPE_CHECKING:
     from .bridge_client import BridgeClient
     from .llm_client import LLMClient
@@ -109,6 +118,9 @@ def run_react_loop(
         tool_schemas.append(schema)
         have_tool.add(name)
         dispatch_table[name] = lambda args_json, _name=name: mcp.call(_name, args_json)
+
+    if DROP_TOOLS:
+        tool_schemas = [t for t in tool_schemas if t["function"]["name"] not in DROP_TOOLS]
 
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
@@ -200,11 +212,31 @@ def run_react_loop(
                         f"[native_harness] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} WARNING: checkpoint write failed: {exc!r}",
                         file=sys.stderr,
                     )
+            if END_ON_SUBMIT and _all_outputs_submitted(tool_calls, messages):
+                return ReactLoopResult(
+                    status="done",
+                    messages=messages,
+                    final_text=message.get("content") or "",
+                    total_input_tokens=total_input_tokens,
+                    total_output_tokens=total_output_tokens,
+                    turn_count=step + 1,
+                )
     return ReactLoopResult(
         status="error",
         message=f"exceeded max_steps={max_steps} without a final answer",
         turn_count=max_steps,
     )
+
+
+def _all_outputs_submitted(tool_calls: list, messages: list) -> bool:
+    """True when a submit_output call this turn reported no output fields missing."""
+    ids = {tc["id"] for tc in tool_calls if tc["function"]["name"] == "submit_output"}
+    for m in messages[-len(tool_calls):]:
+        if m.get("role") == "tool" and m.get("tool_call_id") in ids:
+            result = _parse_tool_input(m.get("content") or "")
+            if "missing_output_fields" in result and not result["missing_output_fields"]:
+                return True
+    return False
 
 
 def _parse_tool_input(fn_args: str) -> dict:

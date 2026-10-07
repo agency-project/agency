@@ -173,6 +173,12 @@ class TandemAdapter(NativeAdapter):
                 argv += ["--typed-reports", ha.typed_reports]
             if ha.compact_tests:
                 argv.append("--compact-tests")
+            if ha.end_on_submit:
+                argv.append("--end-on-submit")
+            if ha.submit_with_check:
+                argv.append("--submit-with-check")
+            if ha.drop_tools:
+                argv += ["--drop-tools", ha.drop_tools]
 
             envp = {
                 "PATH": HARNESS_PATH,
