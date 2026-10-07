@@ -1,0 +1,21 @@
+{
+  "condition": "LSB",
+  "manifest": "../manifest.json",
+  "dataset_snapshot": "/srv/agency-data/verified/rows.json",
+  "condition_timeout_seconds": 1800,
+  "termination_grace_seconds": 5,
+  "model": "gpt-6-luna",
+  "api_key_env": "LITELLM_API_KEY",
+  "base_url_env": "LITELLM_BASE_URL",
+  "model_settings": {
+    "reasoning_effort": "none",
+    "max_completion_tokens": 4096,
+    "seed": 42
+  },
+  "context_limit": 196000,
+  "max_steps": 50,
+  "gateway_host": "host.docker.internal",
+  "codex_binary": "/opt/agency/bin/codex",
+  "codex_version": "0.147.0",
+  "codex_sha256": "REPLACE_WITH_SHA256_OF_REVIEWED_LINUX_BINARY"
+}
