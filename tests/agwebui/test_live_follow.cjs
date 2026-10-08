@@ -148,6 +148,19 @@ test('replay selections still hold history',()=>{
   assert.equal(p.ui.windowEnd(),1);
 });
 
+test('live overlay updates preserve both chart scroll positions',()=>{
+  const p=page();p.ui.state.trajectoryLayout='overlay';
+  p.ui.state.run.agents=[{id:'a',label:'Agent A'}];
+  p.ui.state.run.actions[0].name='Tool';
+  const region=p.node('content').querySelector('.trajectory-scroll');
+  region.scrollLeft=140;region.scrollTop=220;
+  // Replacing the chart resets its scrolling element before it is restored.
+  Object.defineProperty(p.node('content'),'innerHTML',{set(){region.scrollLeft=0;region.scrollTop=0;}});
+  p.append();
+  assert.equal(region.scrollLeft,140);
+  assert.equal(region.scrollTop,220);
+});
+
 test('new activities and calls prepend without replacing expanded cards',()=>{
   const p=page();p.ui.reconcile();
   const list=p.node('activity-list'),old=list.firstElementChild;

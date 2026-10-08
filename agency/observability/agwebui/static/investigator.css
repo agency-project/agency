@@ -551,7 +551,8 @@ small,.muted {
 }
 
 .trajectory-scroll {
-  overflow-x:auto;
+  max-height:70vh;
+  overflow:auto;
   padding:8px 3px;
   scrollbar-color:#394858 transparent
 }
@@ -2056,7 +2057,7 @@ small,.muted {
 #execution-message {font-size:11px;color:var(--amber);max-width:260px}
 
 /* Shared trajectory observability controls. Wide boards scroll inside the view. */
-.agent-columns {grid-template-columns:repeat(var(--agent-column-count,1),minmax(310px,1fr));overflow-x:auto;padding-bottom:12px}
+.agent-columns {grid-template-columns:repeat(var(--agent-column-count,1),minmax(310px,1fr));max-height:70vh;overflow:auto;padding-bottom:12px;scrollbar-color:#394858 transparent}
 .agent-column-controls {flex-wrap:wrap}
 #agent-tabs {max-width:100%;overflow-x:auto}
 #hidden-agents {max-height:95px;overflow:auto}

@@ -382,9 +382,10 @@ function updateTrajectory(changed,resynced=false) {
     if(state.trajectoryLayout==='episodes')reconcileActivities();
     else {
       const focused=document.activeElement?.getAttribute('data-action');
-      const scroll=$('content').querySelector('.trajectory-scroll')?.scrollLeft||0;
+      const previous=$('content').querySelector('.trajectory-scroll');
+      const left=previous?.scrollLeft||0,top=previous?.scrollTop||0;
       $('content').innerHTML=trajectoryView();
-      const region=$('content').querySelector('.trajectory-scroll');if(region)region.scrollLeft=scroll;
+      const region=$('content').querySelector('.trajectory-scroll');if(region){region.scrollLeft=left;region.scrollTop=top;}
       if(focused)$('content').querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
     }
   }
