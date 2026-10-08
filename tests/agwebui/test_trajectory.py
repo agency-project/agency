@@ -669,3 +669,176 @@ def test_late_end_recovers_missing_evidence_without_rewriting_final_execution_st
     assert trajectory.run["status"] == "cancelled"
     assert trajectory.actions["worker:a"]["result"] == "late retained output"
     assert not trajectory.signals["unfinished"]["active"]
+
+
+def test_pause_resume_projects_authoritative_state_and_freezes_running_calls():
+    trajectory = model()
+    trajectory.apply(event(1, "agent_state", state="waiting_llm", call_label="unused"))
+    trajectory.apply(event(2, "tool_call", call_id="open", tool="Bash"))
+    trajectory.apply(event(3, "tool_call", actor="other", call_id="other", tool="Bash"))
+    action = trajectory.actions["worker:open"]
+    episode = trajectory.episodes[action["episode"]]
+    trajectory.patch()
+    trajectory.apply(event(10, "agent_paused"))
+    patch = trajectory.patch()
+    assert patch["agents"][0]["status"] == "paused"
+    assert trajectory.snapshot()["agents"][0]["status"] == "paused"
+    assert action["duration"] == action["execution_duration"] == 8
+    frozen_end = episode["end"]
+    trajectory.apply(event(11, "agent_paused"))  # Repeated controls do not double-count.
+    trajectory.apply(event(12, "agent_state", state="executing_tool"))
+    trajectory.tick(20)
+    assert trajectory.agents["worker"]["status"] == "paused"
+    assert action["duration"] == action["execution_duration"] == 8
+    assert episode["end"] == frozen_end
+    assert action["outcome"] == episode["status"] == "running"
+    assert trajectory.actions["other:other"]["duration"] == 17
+    trajectory.apply(event(21, "agent_resumed"))
+    assert trajectory.agents["worker"]["status"] == "executing_tool"
+    assert trajectory.patch()["agents"][0]["status"] == "executing_tool"
+    trajectory.tick(25)
+    assert action["duration"] == 23  # Trace axis retains wall-clock boundaries.
+    assert action["execution_duration"] == 12
+    trajectory.apply(event(26, "agent_paused"))
+    trajectory.tick(30)
+    assert action["execution_duration"] == 13
+    trajectory.apply(event(31, "agent_resumed"))
+    trajectory.apply(event(35, "tool_result", call_id="open", result="done"))
+    assert action["execution_duration"] == 17
+    assert action["started_ts"] == 2
+    assert action["end_ts"] == 35
+    assert action["duration"] == 33
+
+
+def test_pause_state_ignores_stale_controls_and_finishes_cleanly():
+    trajectory = model()
+    trajectory.apply(event(1, "agent_state", state="waiting_llm"))
+    trajectory.apply(event(10, "agent_paused"))
+    trajectory.apply(event(5, "agent_resumed"))
+    assert trajectory.agents["worker"]["status"] == "paused"
+    trajectory.apply(event(11, "agent_resumed"))
+    assert trajectory.agents["worker"]["status"] == "waiting_llm"
+    trajectory.apply(event(12, "agent_paused"))
+    trajectory.apply(event(13, "done", status="completed"))
+    assert trajectory.agents["worker"]["status"] == "completed"
+    trajectory.apply(event(14, "agent_paused"))
+    assert trajectory.agents["worker"]["status"] == "completed"
+
+
+def test_live_source_reads_pause_resume_into_snapshots_and_patches(tmp_path):
+    source, actor = registered_source(tmp_path)
+    write_rows(actor, [event(3, "agent_paused")])
+    source.refresh(force=True)
+    snapshot = source.message()
+    agent = snapshot["run"]["agents"][0]
+    assert agent["status"] == "paused"
+    assert snapshot["run"]["actions"][0]["execution_duration"] == 1
+    write_rows(actor, [event(4, "agent_resumed")])
+    source.refresh(force=True)
+    update = source.message(snapshot["cursor"], snapshot["epoch"])
+    assert update["patches"][-1]["agents"][0]["status"] != "paused"
+    assert update["patches"][-1]["agents"][0]["control_ts"] == 4
+
+
+def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agency.agent import agent
+    from agency.observability.agwebui import _dispatch_command, server
+
+    source, _actor = registered_source(tmp_path)
+    source.refresh(force=True)
+    source.model.apply(event(3, "agent_registered", actor="other"))
+    command_dir = tmp_path / "ui_commands"
+    command_dir.mkdir()
+    (command_dir / ".heartbeat").touch()
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    monkeypatch.setattr(server, "_command_dir", command_dir)
+    monkeypatch.setattr(server, "_trajectory_source", lambda: source)
+    called = []
+    agents = [
+        SimpleNamespace(
+            agname=name,
+            pause=lambda n=name: called.append((n, "pause")),
+            resume=lambda n=name: called.append((n, "resume")),
+        )
+        for name in ("worker", "other")
+    ]
+    monkeypatch.setattr(agent, "all", classmethod(lambda cls: agents))
+    with TestClient(server.app) as client:
+        with client.websocket_connect("/ws/trajectory") as websocket:
+            assert websocket.receive_json()["execution_controls"]["available"]
+            for command in ("pause", "resume", "pause_all", "resume_all"):
+                websocket.send_json(
+                    {
+                        "type": "execution_command",
+                        "command": command,
+                        "agname": "worker",
+                        "id": command,
+                    }
+                )
+                while (result := websocket.receive_json())["type"] != "execution_command_result":
+                    pass
+                assert result == {"type": "execution_command_result", "id": command, "queued": True}
+                files = list(command_dir.glob("*.json"))
+                assert len(files) == 1
+                _dispatch_command(json.loads(files[0].read_text()))
+                files[0].unlink()
+            # The trajectory socket is still streaming after execution controls.
+            assert websocket.receive_json()["type"] == "updates"
+    assert called == [
+        ("worker", "pause"),
+        ("worker", "resume"),
+        ("worker", "pause"),
+        ("other", "pause"),
+        ("worker", "resume"),
+        ("other", "resume"),
+    ]
+
+
+def test_live_execution_command_failures_do_not_queue_commands(tmp_path, monkeypatch):
+    from agency.observability.agwebui import server
+
+    source, _ = registered_source(tmp_path)
+    source.refresh(force=True)
+    commands = tmp_path / "ui_commands"
+    commands.mkdir()
+    monkeypatch.setattr(server, "_command_dir", commands)
+    message = {"id": "one", "type": "execution_command", "command": "pause", "agname": "worker"}
+    assert "error" in server._trajectory_execution_command(source, message)
+    heartbeat = commands / ".heartbeat"
+    heartbeat.touch()
+    assert "error" in server._trajectory_execution_command(source, {**message, "agname": "missing"})
+    assert "error" in server._trajectory_execution_command(source, {**message, "command": "play"})
+
+    def fail_write(_command):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(server, "_queue_command", fail_write)
+    assert "Could not deliver" in server._trajectory_execution_command(source, message)["error"]
+    source.model.apply(event(4, "done", status="completed"))
+    assert "error" in server._trajectory_execution_command(source, message)
+    assert not list(commands.glob("*.json"))
+
+
+def test_replay_pause_and_execution_commands_never_reach_live_bridge(tmp_path, monkeypatch):
+    from agency.observability.agwebui import server
+
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    queued = []
+    monkeypatch.setattr(server, "_queue_command", queued.append)
+    with TestClient(server.app) as client:
+        with client.websocket_connect(
+            "/ws/trajectory?mode=replay&run=trajectory-scenarios"
+        ) as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "play", "speed": 0.1})
+            assert websocket.receive_json()["replay"]["playing"]
+            websocket.send_json({"type": "pause"})
+            while (update := websocket.receive_json())["replay"]["playing"]:
+                pass
+            assert not update["replay"]["playing"]
+            websocket.send_json({"type": "execution_command", "command": "pause_all", "id": "bad"})
+            while (response := websocket.receive_json())["type"] != "execution_command_result":
+                pass
+            assert "during replay" in response["error"]
+            assert queued == []

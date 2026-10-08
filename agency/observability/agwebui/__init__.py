@@ -164,23 +164,30 @@ def _flush_loop(stop_event: threading.Event, interval: float = 0.5) -> None:
 
 def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
     command_dir.mkdir(parents=True, exist_ok=True)
-    while not stop_event.is_set():
-        for f in sorted(command_dir.glob("*.json")):
-            try:
-                cmd = json.loads(f.read_text(encoding="utf-8"))
-                _dispatch_command(cmd)
-            except Exception as _e:
-                print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
-            finally:
+    # Lets the profiler distinguish a working relay from a standalone log viewer.
+    heartbeat = command_dir / ".heartbeat"
+    try:
+        while not stop_event.is_set():
+            heartbeat.touch()
+            for f in sorted(command_dir.glob("*.json")):
                 try:
-                    f.unlink()
-                except FileNotFoundError:
-                    # Command file may already be removed by another actor;
-                    # this cleanup is best-effort.
-                    pass
+                    cmd = json.loads(f.read_text(encoding="utf-8"))
+                    _dispatch_command(cmd)
                 except Exception as _e:
-                    print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
-        stop_event.wait(0.2)
+                    print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
+                finally:
+                    try:
+                        f.unlink()
+                    except FileNotFoundError:
+                        # Command file may already be removed by another actor;
+                        # this cleanup is best-effort.
+                        pass
+                    except Exception as _e:
+                        print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
+            stop_event.wait(0.2)
+
+    finally:
+        heartbeat.unlink(missing_ok=True)
 
 
 class agwebui:

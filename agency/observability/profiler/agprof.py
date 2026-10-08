@@ -1904,6 +1904,8 @@ class _Sampler(threading.Thread):
 
     def _tick(self) -> None:
         t = time.perf_counter_ns()
+        sample_start = len(_samples)
+        sampled_at = time.time()
         self._tick_workload_cgroup(t)
         self._tick_processes(t)
         if self._nvml is not None:
@@ -1917,6 +1919,26 @@ class _Sampler(threading.Thread):
                     _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
                     self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
         self._tick_cgroups(t)
+        # Reuse the sampled values and buffered logger; no second sampler or poller.
+        logger = _profile_data_logger
+        if logger is not None:
+            values = {name: value for _, name, value in _samples[sample_start:]}
+            previous = getattr(self, "_live_previous", {})
+            for name, value in list(values.items()):
+                if name.endswith((":cpu_us", ":cpu_s")) and name in previous:
+                    before_t, before_value = previous[name]
+                    elapsed = (t - before_t) / 1e9
+                    if elapsed > 0 and value >= before_value:
+                        unit = 1e6 if name.endswith(":cpu_us") else 1
+                        values[name.rsplit(":", 1)[0] + ":cpu_pct"] = (
+                            (value - before_value) / unit / elapsed * 100
+                        )
+            self._live_previous = {name: (t, value) for name, value in values.items()}
+            try:
+                logger.record_event("resource_sample", {"values": values, "sampled_at": sampled_at})
+            except Exception:
+                # Observability must not stop the sampler or workload.
+                _health["sample_export_failures"] += 1
 
     def run(self) -> None:
         _remember_thread_label("agprof sampler", priority=90)

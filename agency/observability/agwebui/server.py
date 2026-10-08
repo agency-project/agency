@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import copy
 import json
+import math
 import os
 import random
 import sqlite3
@@ -87,6 +88,46 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def _queue_command(command):
+    """The dashboard and live profiler share the execution-process relay."""
+    _atomic_write_text(_command_dir / f"{_uuid.uuid4().hex}.json", json.dumps(command))
+
+
+def _execution_controls(source):
+    try:
+        available = _time.time() - (_command_dir / ".heartbeat").stat().st_mtime < 30
+    except OSError:
+        available = False
+    with source.lock:
+        return {
+            "available": available and source.model.finished_at is None,
+            "agents": [
+                agent["id"]
+                for agent in source.model.agents.values()
+                if agent.get("identity") == "execution_actor"
+                and agent.get("execution_state", agent["status"])
+                not in {"completed", "failed", "cancelled"}
+            ],
+        }
+
+
+def _trajectory_execution_command(source, message):
+    result = {"type": "execution_command_result", "id": message.get("id")}
+    controls = _execution_controls(source)
+    command = message.get("command")
+    if not controls["available"] or not controls["agents"]:
+        return {**result, "error": "No active execution command bridge is available."}
+    if command not in {"pause", "resume", "pause_all", "resume_all"}:
+        return {**result, "error": "Unsupported execution command."}
+    if command in {"pause", "resume"} and message.get("agname") not in controls["agents"]:
+        return {**result, "error": "The selected agent is no longer active."}
+    try:
+        _queue_command({"type": command, "agname": message.get("agname")})
+    except OSError:
+        return {**result, "error": "Could not deliver the execution command."}
+    return {**result, "queued": True}
 
 
 def _db_path() -> Path:
@@ -957,8 +998,32 @@ async def _trajectory_replay_data(run_id):
     from .trajectory import replay_events
     from .trajectory_scenarios import events, scale_events
 
+    if run_id == "live":
+        source = _trajectory_source()
+        await asyncio.to_thread(source.refresh)
+        with source.lock:
+            run = {
+                key: value
+                for key, value in source.model.run.items()
+                if key
+                in {
+                    "id",
+                    "title",
+                    "source",
+                    "duration",
+                    "model",
+                    "harness",
+                    "condition",
+                    "task",
+                    "format",
+                    "time_origin",
+                }
+            }
+            origin = source.model.origin or 0
+            rows = [{**event, "ts": max(0, event["ts"] - origin)} for event in source.events]
+        return run, sorted(rows, key=lambda event: (event["ts"], event["id"]))
     run = await investigator_run(run_id)
-    if isinstance(run, JSONResponse) or run_id == "live":
+    if isinstance(run, JSONResponse):
         raise ValueError("Select a saved execution for replay.")
     cached = _replay_cache.get(run_id)
     if cached is not None and cached[0] is run:
@@ -969,7 +1034,26 @@ async def _trajectory_replay_data(run_id):
     elif run_id == "trajectory-scale":
         rows = scale_events()
     else:
-        rows = replay_events(run)
+        # Keep full recorded payloads in the evidence endpoint. The projected
+        # UI actions intentionally carry only bounded previews.
+        from .investigator import catalog, load_run
+        from .investigator_demo import DEMO_ENTRIES, demo_run
+
+        if run_id in {entry["id"] for entry in DEMO_ENTRIES}:
+            original = demo_run(run_id)
+            original["status"] = "completed"
+        else:
+            entries = await asyncio.to_thread(
+                catalog, str(_profiler_dir()), int(_time.time() // 30)
+            )
+            entry = next((item for item in entries if item["id"] == run_id), None)
+            original = run
+            if entry:
+                path = Path(entry["path"])
+                original = await asyncio.to_thread(
+                    load_run, str(path), path.stat().st_mtime, json.dumps(entry, sort_keys=True)
+                )
+        rows = replay_events(original)
     data = (run, rows)
     _replay_cache[run_id] = data
     if len(_replay_cache) > 4:
@@ -1000,10 +1084,14 @@ async def trajectory_stream(ws: WebSocket):
         while True:
             await asyncio.to_thread(source.refresh)
             message = source.message(cursor, epoch)
+            message["execution_controls"] = _execution_controls(source)
             await ws.send_json(message)
             cursor, epoch = message["cursor"], message["epoch"]
             try:
-                await asyncio.wait_for(ws.receive_json(), timeout=TAIL_POLL_INTERVAL)
+                command = await asyncio.wait_for(ws.receive_json(), timeout=TAIL_POLL_INTERVAL)
+                # Replay's plain 'pause' is never routed to the execution relay.
+                if command.get("type") == "execution_command":
+                    await ws.send_json(_trajectory_execution_command(source, command))
             except asyncio.TimeoutError:
                 pass
     except (WebSocketDisconnect, RuntimeError):
@@ -1015,74 +1103,119 @@ async def trajectory_stream(ws: WebSocket):
 async def _replay_stream(ws):
     from .trajectory import Trajectory
 
-    run, events = await _trajectory_replay_data(ws.query_params.get("run", "demo-baseline"))
-    model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
-    for key in ("model", "harness", "condition", "task", "format"):
-        if key in run:
-            model.run[key] = run[key]
-    model.run["coverage"]["replay"] = (
-        "Start/end boundaries reconstructed from saved spans; results appear only at their recorded end."
-    )
+    run_id = ws.query_params.get("run", "demo-baseline")
+    run, events = await _trajectory_replay_data(run_id)
     cursor = min(max(0, int(ws.query_params.get("cursor", "0"))), len(events))
-    for event in events[:cursor]:
-        model.apply(event)
     clock = events[cursor - 1]["ts"] if cursor else 0
+    if ws.query_params.get("clock") is not None:
+        selected_clock = float(ws.query_params["clock"])
+        clock = max(0, min(selected_clock, run["duration"])) if math.isfinite(selected_clock) else 0
+        cursor = sum(event["ts"] <= clock for event in events)
     playing, speed = False, 4.0
 
-    def replay_meta():
-        return {
+    def rebuild():
+        model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
+        for key in ("model", "harness", "condition", "task", "format", "time_origin"):
+            if key in run:
+                model.run[key] = run[key]
+        model.run["coverage"]["replay"] = (
+            "Canonical event prefix; saved spans use reconstructed boundaries."
+        )
+        for event in events[:cursor]:
+            model.apply(event)
+        return model
+
+    model = rebuild()
+    previous = _time.monotonic()
+    snapshot = True
+    while True:
+        model.tick(clock)
+        # Saved trace counters already share its relative clock. Canonical live
+        # counters enter through resource_sample events and incremental patches.
+        if run_id != "live":
+            model.run["counters"] = {
+                name: [point for point in points if point[0] <= clock]
+                for name, points in run.get("counters", {}).items()
+            }
+        meta = {
             "position": cursor,
             "total": len(events),
             "clock": clock,
+            "duration": max(run["duration"], events[-1]["ts"] if events else 0),
             "playing": playing,
             "finished": cursor == len(events),
             "speed": speed,
         }
-
-    await ws.send_json(
-        {"type": "snapshot", "run": model.snapshot(), "cursor": cursor, "replay": replay_meta()}
-    )
-    model.patch()
-    previous = _time.monotonic()
-    while True:
+        patch = model.patch()
+        if run_id != "live":
+            patch["meta"]["counters"] = model.run["counters"]
+        await ws.send_json(
+            {
+                "type": "snapshot" if snapshot else "updates",
+                **({"run": model.snapshot()} if snapshot else {"patches": [patch]}),
+                "cursor": cursor,
+                "replay": meta,
+            }
+        )
+        snapshot = False
         command = {}
         try:
             command = await asyncio.wait_for(ws.receive_json(), timeout=0.2)
         except asyncio.TimeoutError:
             pass
         now = _time.monotonic()
-        if command.get("type") == "play":
-            playing = True
-            speed = min(1000, max(0.1, float(command.get("speed", speed))))
-        elif command.get("type") == "pause":
+        kind = command.get("type")
+        if kind == "execution_command":
+            await ws.send_json(
+                {
+                    "type": "execution_command_result",
+                    "id": command.get("id"),
+                    "error": "Execution controls are unavailable during replay.",
+                }
+            )
+        if run_id == "live":
+            latest_run, latest_events = await _trajectory_replay_data(run_id)
+            # A late event must also be reflected in a historical prefix. Rebuild
+            # only on changed evidence; the selected clock never follows ingestion.
+            if len(latest_events) != len(events):
+                run, events = latest_run, latest_events
+                cursor = sum(event["ts"] <= clock for event in events)
+                model = rebuild()
+                snapshot = True
+            else:
+                run = latest_run
+        if kind == "seek":
+            target = float(command.get("clock", 0))
+            if not math.isfinite(target):
+                target = 0
+            clock = max(0, min(target, run["duration"]))
+            cursor = sum(event["ts"] <= clock for event in events)
             playing = False
-        elif command.get("type") == "step" and cursor < len(events):
+            model = rebuild()
+            snapshot = True
+        elif kind == "play":
+            playing = True
+            requested_speed = float(command.get("speed", speed))
+            speed = min(1000, max(0.1, requested_speed)) if math.isfinite(requested_speed) else 4
+        elif kind == "pause":
+            playing = False
+        elif kind == "step" and cursor < len(events):
+            playing = False
             clock = max(clock, events[cursor]["ts"])
             model.apply(events[cursor])
             cursor += 1
-        if playing:
-            clock = min(events[-1]["ts"], clock + (now - previous) * speed)
+        if playing and events:
+            clock = min(run["duration"], clock + (now - previous) * speed)
             for _ in range(100):
                 if cursor == len(events) or events[cursor]["ts"] > clock:
                     break
                 model.apply(events[cursor])
                 cursor += 1
-            # A bounded batch must not advance displayed time past evidence
-            # waiting in the next batch, or inflate unfinished call durations.
             if cursor < len(events):
                 clock = min(clock, events[cursor]["ts"])
         previous = now
-        model.tick(clock)
         if cursor == len(events):
             playing = False
-        await ws.send_json(
-            {
-                "type": "updates",
-                "patches": [model.patch()],
-                "cursor": cursor,
-                "replay": replay_meta(),
-            }
-        )
 
 
 @app.get("/api/investigator/runs/{run_id}/trace")
@@ -1222,16 +1355,14 @@ async def websocket_endpoint(ws: WebSocket):
                 mtype = msg.get("type")
                 if mtype in ("pause", "resume", "pause_all", "resume_all"):
                     cmd = {"type": mtype, "agname": msg.get("agname")}
-                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    _atomic_write_text(cmd_file, json.dumps(cmd))
+                    _queue_command(cmd)
                 elif mtype in ("update_config", "update_config_all"):
                     cmd = {
                         "type": mtype,
                         "agname": msg.get("agname"),
                         "config": msg.get("config") or {},
                     }
-                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    _atomic_write_text(cmd_file, json.dumps(cmd))
+                    _queue_command(cmd)
             except Exception as _e:
                 # Reference the raw `data`, not `msg` -- json.loads(data) itself
                 # may be what raised, in which case `msg` was never assigned.

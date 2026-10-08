@@ -51,14 +51,63 @@ after the last recorded request; a quiet connection does not establish a stop.
 
 Server startup requires no viewer download or frontend build.
 
+## Pause and inspect live execution
+
+With an active `agwebui.run(...)` workload, the live session bar offers
+**Pause all** / **Resume all**. Selecting an agent, episode, or action also
+exposes **Pause agent** / **Resume agent** for its owning agent. The agent
+inspector has the same control. If any active agent is paused, the global
+button offers **Resume all**.
+
+These commands use the existing webui relay and `agent.pause()` / `resume()`
+to stop and continue the harness process. The trajectory connection stays
+open, so actions, context, resources, and source evidence remain inspectable.
+Recorded pause/resume events supply the authoritative agent status and paused
+badges. A queued command stays pending until those events arrive; delivery
+errors or missing confirmation appear in the session bar.
+
+Running spans freeze while their agent is paused. Duration labels exclude
+recorded execution pauses; the inspector also shows the wall interval, and
+trace start/end timestamps and the shared wall-clock axis stay intact. The
+run's wall time continues advancing. Controls disable after completion,
+during disconnection, or when the execution command relay is unavailable.
+The standalone log-viewing server and the cost-free smoke example above have
+no live agent relay, so their execution controls stay disabled.
+
 ## Replay and investigation
 
-Select a saved execution, then **Replay recorded events**. Replay starts
+Select a live or saved execution, then **Replay recorded events**. Replay starts
 paused; use **Next event**, **Play replay**, speed, or **Restart replay**.
 `mode=replay` is preserved in the URL. Actual saved spans supply start/end
 boundaries, and results, usage, context, and final metadata arrive only at the
 recorded end. Reconstructed boundaries are identified as such in raw detail.
 Replay exhaustion is separate from a recorded final execution status.
+Replay pause controls playback only; saved/replay runs never expose live
+execution controls. Scrubbing the time cursor rebuilds the canonical event prefix,
+including paused/resumed agent state and resource samples. Live replay continues
+reading new evidence while its selected clock stays fixed. Reconnect preserves
+the selected time, including positions between sparse events.
+
+The **Timeline** tab follows Trajectory. Agent rows and sampled resource tracks
+share one wall-clock origin; overlapping calls occupy separate subrows. Zoom,
+fit, horizontal pan, tooltips, and click-to-inspect work on the same action IDs.
+**Lock to Present** defaults off. Enabling it follows the newest activity;
+manually scrolling backward releases it. Tab switches preserve zoom and pan.
+Metric dots represent observations without interpolation across missing samples.
+
+**Show details** on a call reveals formatted input/output, execution metadata,
+and system samples nearest the call start, with sample time and distance shown.
+Long content stays bounded until **Show full output** loads immutable source
+evidence. Copy controls retain the original data. Columns have no fixed limit;
+each has a minimum width and the board scrolls horizontally.
+
+The existing summary includes cumulative input/output/total tokens, model-call
+counts, run-average output rate, active agents, and available CPU/RAM/GPU/VRAM
+samples. Missing telemetry is shown as unavailable; cost is not estimated.
+The profiler persists its existing samples through the buffered data logger in
+`profile_data.sqlite3`; the shared live reader ingests them without an extra
+sampler or browser polling endpoint. CPU percentages are derived from measured
+CPU-time deltas and can exceed 100% across cores.
 
 The catalog includes separate synthetic fixtures:
 
@@ -98,7 +147,7 @@ accumulated model available without filling the DOM with every call.
 | Edit/artifact | Reported result references, with a digest when the producer records one. An edit-shaped command alone is not proof of a changed file. |
 | Activity grouping | Derived deterministically from actor, request, workstream, category, and call ordering. One primary assignment per call; groups hold at most eight calls. Late calls get stable separate groups. |
 | Attention | Exact failures; repeated matching assertion/check fingerprints without an intervening recorded edit; explicit input requests; scheduler/dependency waits; missing coverage. Successful equivalent checks close prior matching-check signals, without a task-success claim. Parallel overlapping checks are not called consecutive failures. |
-| Resources, transfers, evaluator outcome | Existing saved views retain their recorded data. Live resource attribution and absent transfer manifests remain unavailable. Recorded evaluator evidence stays separate from execution completion. |
+| Resources, transfers, evaluator outcome | Existing saved views retain their recorded data. Live resource samples retain their recorded workload/process/device scope; proximity to a call is not attribution. Absent transfer manifests remain unavailable. Recorded evaluator evidence stays separate from execution completion. |
 | Semantic suggestions | Optional interpretation beside the stable original label, with exact supporting IDs and quoted result evidence. It cannot move calls, merge actors, or change outcomes. |
 
 The declared-purpose label conveys what the agent says it is attempting.
@@ -312,9 +361,9 @@ alignment; late events do not reorganize published episode membership.
 Native annotations and explicit model IDs are connected; external harnesses
 may lack tool/context correlation and therefore display unlinked evidence.
 Input/delegation/handoff event types are supported, but all harnesses do not
-currently emit them. The dashboard link is preserved; no new pause/redirect/
-cancel buttons imply backend capabilities. Pause/resume remain existing stubs
-and cancellation requires an invocation handle.
+currently emit them. Live pause/resume reuse the existing process controls;
+redirect/cancel controls are outside this profiler change, and cancellation
+requires an invocation handle.
 
 The highest-value next step is consistent invocation-scoped input, delegation,
 transfer, and artifact/validation events across harnesses. That would turn

@@ -56,3 +56,36 @@ test('reconnect includes recovery cursor and ignores stale frames from the previ
     assert.equal(received,2);
   } finally {stream.close();globalThis.WebSocket=previousSocket;globalThis.location=previousLocation;}
 });
+
+
+test('execution acknowledgements retain the recovery cursor and command paths stay separate',()=>{
+  const previousSocket=globalThis.WebSocket,previousLocation=globalThis.location;
+  const sockets=[];
+  class Socket {static OPEN=1;readyState=1;constructor(){this.sent=[];sockets.push(this);}close(){}send(value){this.sent.push(JSON.parse(value));}}
+  globalThis.WebSocket=Socket;globalThis.location={protocol:'http:',host:'localhost'};
+  const received=[];
+  const live=new TrajectoryStream({runId:'live',replay:false,onMessage:m=>received.push(m),onTransport:()=>{}});
+  const replay=new TrajectoryStream({runId:'saved',replay:true,onMessage:()=>{},onTransport:()=>{}});
+  try {
+    sockets[0].onmessage({data:JSON.stringify({type:'snapshot',cursor:12,epoch:'one',run:{}})});
+    assert.equal(live.sendExecution('pause',{agname:'worker',id:'request'}),true);
+    assert.deepEqual(sockets[0].sent[0],{type:'execution_command',command:'pause',agname:'worker',id:'request'});
+    sockets[0].onmessage({data:JSON.stringify({type:'execution_command_result',id:'request',queued:true})});
+    assert.equal(live.cursor,12);assert.equal(live.epoch,'one');assert.equal(received.length,2);
+    assert.equal(live.sendReplay('pause'),false);
+    assert.equal(replay.sendExecution('pause_all'),false);
+    assert.equal(replay.sendReplay('pause'),true);
+    assert.deepEqual(sockets[1].sent,[{type:'pause'}]);
+    sockets[0].readyState=3;
+    assert.equal(live.sendExecution('resume_all'),false);
+    sockets[0].readyState=1;sockets[0].send=()=>{throw Error('send failed');};
+    assert.equal(live.sendExecution('resume_all'),false);
+  } finally {live.close();replay.close();globalThis.WebSocket=previousSocket;globalThis.location=previousLocation;}
+});
+
+test('late counter samples preserve series identity and temporal ordering',()=>{
+  const points=[[2,20]],run={counters:{cpu:points}};
+  mergeTrajectory(run,{counter_samples:{cpu:[[1,10],[3,30]]}});
+  assert.equal(run.counters.cpu,points);
+  assert.deepEqual(points,[[1,10],[2,20],[3,30]]);
+});

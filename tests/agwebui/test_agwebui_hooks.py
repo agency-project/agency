@@ -369,3 +369,27 @@ def test_poll_commands_applies_and_deletes_command_files(tmp_path):
     finally:
         stop.set()
         t.join(timeout=1.0)
+
+
+def test_command_relay_advertises_availability_only_while_polling(tmp_path, monkeypatch):
+    import importlib
+
+    ui = importlib.import_module("agency.observability.agwebui")
+    command_dir = tmp_path / "ui_commands"
+    applied = threading.Event()
+    monkeypatch.setattr(ui, "_dispatch_command", lambda command: applied.set())
+    stop = threading.Event()
+    thread = threading.Thread(target=ui._poll_commands, args=(command_dir, stop), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not (command_dir / ".heartbeat").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (command_dir / ".heartbeat").exists()
+        (command_dir / "test.json").write_text(json.dumps({"type": "pause_all"}))
+        assert applied.wait(2)
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    assert not (command_dir / ".heartbeat").exists()

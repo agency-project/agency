@@ -7,6 +7,8 @@ and replay prefixes; raw rows stay in their original databases or trace files.
 from __future__ import annotations
 
 import copy
+import bisect
+import math
 import hashlib
 import json
 import os
@@ -21,12 +23,15 @@ from pathlib import Path
 from .investigator import classify, object_value
 
 EVENT_TYPES = (
+    "resource_sample",
     "workload_started",
     "done",
     "agent_registered",
     "agent_created",
     "agent_forked",
     "agent_state",
+    "agent_paused",
+    "agent_resumed",
     "tool_call",
     "tool_result",
     "skill_start",
@@ -156,6 +161,8 @@ class Trajectory:
         self.running = set()
         self.intervals = {}
         self.dirty["intervals"] = set()
+        self.pauses = {}
+        self.counter_updates = {}
 
     def _agent(self, actor):
         if actor not in self.agents:
@@ -183,6 +190,19 @@ class Trajectory:
             "active": active,
         }
         self.dirty["signals"].add(key)
+
+    def _agent_status(self, agent, status):
+        agent["execution_state"] = status
+        agent["status"] = "paused" if agent.get("paused") else status
+
+    def _execution_duration(self, action, end):
+        """Exclude recorded control intervals without changing the trace's time axis."""
+        start = action["started_ts"]
+        paused = sum(
+            max(0, min(end, right if right is not None else end) - max(start, left))
+            for left, right in self.pauses.get(action["agent"], [])
+        )
+        return max(0, end - start - paused)
 
     def _close_signal(self, key):
         if key in self.signals and self.signals[key]["active"]:
@@ -288,6 +308,8 @@ class Trajectory:
                 "intent": intent,
                 "command": command[:8000],
                 "arguments": text(arguments)[:8000],
+                "input_truncated": payload.get("input_truncated", False)
+                or len(text(arguments)) > 8000,
                 "result": "",
                 "error": "",
                 "start": max(0, timestamp - self.origin),
@@ -346,9 +368,18 @@ class Trajectory:
         else:
             result = payload.get("result", payload.get("output", ""))
             action["result"] = text(result)[:8000]
+            action["output_truncated"] = (
+                payload.get("output_truncated", False)
+                or len(text(result)) > 8000
+                or len(text(payload.get("error", ""))) > 8000
+            )
             action["error"] = text(payload["error"])[:8000] if payload.get("error") else ""
             action["result_hash"] = fingerprint(action["error"] or result)
-            action["result_preview"] = action["error"][:240] or returned_preview(result)
+            action["result_preview"] = (
+                action["error"][:240]
+                or payload.get("recorded_result_preview")
+                or returned_preview(result)
+            )
             first_result = action["end_ts"] if "end_ts" in action else None
             action["end_ts"] = timestamp
             action["duration"] = max(0, timestamp - self.origin - action["start"])
@@ -371,6 +402,9 @@ class Trajectory:
                 self._attention(action)
         if action["outcome"] == "running" and self.finished_at is not None:
             action["outcome"] = "incomplete"
+        action["execution_duration"] = self._execution_duration(
+            action, action.get("end_ts", timestamp)
+        )
         if action["outcome"] == "running":
             self.running.add(action_id)
         else:
@@ -470,13 +504,28 @@ class Trajectory:
             return False
         self.seen.add(event["id"])
         self.run["coverage"]["events"] += 1
+        if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+            event = {
+                **event,
+                "ts": (self.origin or 0) + self.run["duration"],
+                "source": "timestamp_missing_ordered_at_last_observation",
+            }
         if self.origin is None:
             self.origin = event["ts"]
+            self.run["time_origin"] = self.origin
         self.run["duration"] = max(self.run["duration"], event["ts"] - self.origin)
         actor = event.get("actor") or "unattributed"
         event = {**event, "actor": actor}
         payload, kind = event["payload"], event["type"]
-        if kind == "workload_started":
+        if kind == "resource_sample":
+            at = max(0, event["ts"] - self.origin)
+            for name, value in payload.get("values", {}).items():
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    point = [at, value]
+                    series = self.run["counters"].setdefault(name, [])
+                    bisect.insort(series, point)
+                    self.counter_updates.setdefault(name, []).append(point)
+        elif kind == "workload_started":
             self.run["status"] = "running"
             self.run["task"] = payload.get("task")
             for field in ("model", "harness", "dataset"):
@@ -509,14 +558,31 @@ class Trajectory:
             for episode in self.episodes.values():
                 episode["closed"] = True
                 self.dirty["episodes"].add(episode["id"])
+            for agent in self.agents.values():
+                if agent.get("paused"):
+                    agent["paused"] = False
+                    self._agent_status(agent, self.run["status"])
+                    self.dirty["agents"].add(agent["id"])
         else:
             agent = self._agent(actor)
             if kind in {"agent_created", "agent_forked", "agent_registered"}:
                 # Process ancestry is deliberately not turned into delegation.
                 agent["identity"] = "execution_actor"
+            elif kind in {"agent_paused", "agent_resumed"}:
+                if event["ts"] >= agent.get("control_ts", 0) and self.finished_at is None:
+                    agent["control_ts"] = event["ts"]
+                    intervals = self.pauses.setdefault(actor, [])
+                    if kind == "agent_paused" and not agent.get("paused"):
+                        intervals.append([event["ts"], None])
+                        agent["paused"] = True
+                    elif kind == "agent_resumed" and agent.get("paused"):
+                        intervals[-1][1] = event["ts"]
+                        agent["paused"] = False
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
+                    self.tick(event["ts"], force=True)
             elif kind == "agent_state":
                 if event["ts"] >= agent.get("state_ts", 0):
-                    agent["status"] = payload.get("state", "unknown")
+                    self._agent_status(agent, payload.get("state", "unknown"))
                     agent["state_ts"] = event["ts"]
                 if payload.get("state") == "waiting_llm" and event.get("call_label"):
                     self._call(event, "model", f"model:{event['call_label']}")
@@ -593,7 +659,7 @@ class Trajectory:
                         text(payload.get("error") or payload),
                         [event["id"]],
                     )
-                agent["status"] = kind.removeprefix("request_")
+                self._agent_status(agent, kind.removeprefix("request_"))
             elif kind == "skill_start":
                 self._call(
                     {**event, "payload": {**payload, "name": payload.get("skill")}},
@@ -631,7 +697,7 @@ class Trajectory:
                     [event["id"]],
                     "required",
                 )
-                agent["status"] = "waiting_input"
+                self._agent_status(agent, "waiting_input")
             elif kind == "input_resolved" and f"input:{actor}" in self.signals:
                 self._close_signal(f"input:{actor}")
             elif kind in {"delegation", "handoff"}:
@@ -666,15 +732,25 @@ class Trajectory:
                 self._close_signal("unfinished")
         return True
 
-    def tick(self, now):
+    def tick(self, now, *, force=False):
         if self.finished_at is None and self.origin is not None:
             self.run["duration"] = max(self.run["duration"], now - self.origin)
         for action_id in self.running:
             action = self.actions[action_id]
             if action["outcome"] == "running":
-                duration = max(0, self.run["duration"] - action["start"])
-                if int(duration) != int(action["duration"]):
+                end = self.origin + self.run["duration"]
+                pauses = self.pauses.get(action["agent"], [])
+                if pauses and pauses[-1][1] is None:
+                    end = min(end, pauses[-1][0])
+                duration = max(0, end - action["started_ts"])
+                execution_duration = self._execution_duration(action, end)
+                if (
+                    force
+                    or int(duration) != int(action["duration"])
+                    or int(execution_duration) != int(action.get("execution_duration", 0))
+                ):
                     action["duration"] = duration
+                    action["execution_duration"] = execution_duration
                     self.dirty["actions"].add(action["id"])
                     self._interval(action)
                     self._refresh_episode(action)
@@ -697,9 +773,20 @@ class Trajectory:
         }
         patch["meta"] = {
             key: copy.deepcopy(self.run[key])
-            for key in ("status", "duration", "coverage", "task", "model", "harness", "dataset")
+            for key in (
+                "status",
+                "duration",
+                "coverage",
+                "task",
+                "model",
+                "harness",
+                "dataset",
+                "time_origin",
+            )
             if key in self.run
         }
+        patch["counter_samples"] = self.counter_updates
+        self.counter_updates = {}
         for ids in self.dirty.values():
             ids.clear()
         return patch
@@ -716,6 +803,11 @@ class LiveSource:
         self.directory = Path(directory).resolve()
         self.model = Trajectory("live", f"Current execution · {self.directory.parent.name}")
         self.paths = {"global": self.directory / "global_data.sqlite3"}
+        self.events = []
+        self.profile_path = (
+            Path(os.environ.get("AGENCY_PROFILE_DIR", self.directory.parent / "profiler"))
+            / "profile_data.sqlite3"
+        )
         self.cursors = {}
         self.epoch = uuid.uuid4().hex
         self.revision = 0
@@ -768,7 +860,7 @@ class LiveSource:
                     event = {
                         "id": f"{source}/{table}/{row_id}",
                         "type": kind,
-                        "ts": ts,
+                        "ts": body.get("sampled_at", ts) if kind == "resource_sample" else ts,
                         "actor": actor,
                         "call_label": label,
                         "payload": body,
@@ -844,6 +936,8 @@ class LiveSource:
             self.last_poll = time.monotonic()
             self.model.run["coverage"]["catching_up"] = False
             events, gaps = [], []
+            if self.profile_path.is_file():
+                self.paths["profiler"] = self.profile_path
             # Read global registration first, including agents created after connection.
             rows, gap = self._rows("global", self.paths["global"])
             events.extend(rows)
@@ -856,7 +950,27 @@ class LiveSource:
                 events.extend(rows)
                 if gap:
                     gaps.append(gap)
+            for event in events:
+                if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+                    event["ts"] = (self.model.origin or 0) + self.model.run["duration"]
+                    event["source"] = "timestamp_missing_ordered_at_last_observation"
             events.sort(key=lambda e: (e["ts"], e["id"]))
+            # Retain bounded replay evidence, not a second copy of huge tool
+            # outputs. Immutable originals remain available in their SQLite rows.
+            for event in events:
+                payload = dict(event["payload"])
+                for key, flag in (
+                    ("arguments", "input_truncated"),
+                    ("result", "output_truncated"),
+                    ("output", "output_truncated"),
+                    ("error", "output_truncated"),
+                ):
+                    if key in payload and len(text(payload[key])) > 8000:
+                        if key in {"result", "output"}:
+                            payload["recorded_result_preview"] = returned_preview(payload[key])
+                        payload[key] = text(payload[key])[:8000]
+                        payload[flag] = True
+                self.events.append({**event, "payload": payload})
             for event in events:
                 self.model.apply(event)
             self.model.run["coverage"]["gaps"] = gaps
@@ -922,7 +1036,9 @@ def replay_events(run):
             "call_id": action["id"],
             "kind": action["kind"],
             "tool": action["name"],
-            "arguments": {"command": action["command"]},
+            "arguments": object_value(action["arguments"])
+            if action.get("arguments")
+            else {"command": action["command"]},
             "intent": action.get("intent", ""),
             "request_id": action.get("request_id"),
             "metadata": {
