@@ -57,7 +57,7 @@ function page(replay=false) {
       (listeners[name]??=[]).push(fn);
     }};
   let subscription;const sent=[];
-  const context=vm.createContext({document, URLSearchParams, URL, Date,
+  const context=vm.createContext({document, URLSearchParams, URL, Date, structuredClone,
     setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
     clearTimeout:id=>timers.delete(id),
     location:{search:replay?'?mode=replay':''},
@@ -69,11 +69,6 @@ function page(replay=false) {
       sendReplay(type,extra){sent.push({type,...extra});return true;}
     },
     matchesAction:()=>true,
-    changedTrajectoryActions:()=>['new-call'],
-    mergeTrajectory:(run,patch)=>{
-      run.actions.push(patch.action);run.episodes.push(patch.episode);
-      run.duration=patch.duration;return [patch.action.id];
-    },
   });
   const source=fs.readFileSync(path.join(__dirname,
     '../../agency/observability/agwebui/static/investigator.js'),'utf8')
@@ -83,7 +78,7 @@ function page(replay=false) {
     .replace(/export function/g,'function'),context);
   vm.runInContext(fs.readFileSync(path.join(__dirname,
     '../../agency/observability/agwebui/static/trajectory-stream.js'),'utf8')
-    .split('export function changedTrajectoryActions')[0].replace(/export function/g,'function'),context);
+    .split('export class TrajectoryStream')[0].replace(/export function/g,'function'),context);
   vm.runInContext(source+`
     // Isolate follow behavior from chart/inspector markup, retaining the
     // real stream callback, selection handlers and updateTrajectory path.
@@ -95,9 +90,9 @@ function page(replay=false) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,loadRun,selectAction,holdHistory,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
+    globalThis.ui={state,loadRun,selectAction,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
-      paints:()=>paints,visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
+      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
   const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
@@ -107,8 +102,8 @@ function page(replay=false) {
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');return (agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');},
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
-      action:{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'},
-      episode:{id:'two',actions:['new-call'],status:'running'},duration:2,
+      actions:[{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'}],
+      episodes:[{id:'two',actions:['new-call'],status:'running'}],meta:{duration:2},
     }]});if(paint)flush();},
   };
 }
@@ -352,6 +347,116 @@ function debuggerPage() {
   p.ui.state.executionControls={available:true,agents:['a','b']};
   return p;
 }
+
+test('display pause freezes mutable evidence while live updates continue without commands',()=>{
+  const p=debuggerPage();
+  const run=p.ui.state.run;
+  Object.assign(run.actions[0],{outcome:'running',result:'Waiting',event_ids:['start'],files:[],name:'Read'});
+  run.counters={cpu:[[0,10]]};
+  p.ui.renderCallStack();
+  const column=p.node('call-stack').firstElementChild;
+  p.node('display-toggle').onclick();
+  const frozen=p.ui.state.run;
+  assert.notEqual(frozen,run);
+  assert.equal(p.ui.state.liveRun,run);
+  p.receive({type:'updates',patches:[{
+    actions:[{id:'old',outcome:'success',result:'Finished',event_ids:['start','end']}],
+    counter_samples:{cpu:[[2,50]]},meta:{duration:3},
+  }],execution_controls:{available:true,agents:['a','b']}});
+  p.append();p.visibility(true);p.visibility(false);
+  assert.equal(p.sent.length,0);
+  assert.equal(p.ui.state.displayPaused,true);
+  assert.equal(frozen.actions.length,1);
+  assert.equal(frozen.actions[0].result,'Waiting');
+  assert.equal(frozen.counters.cpu.length,1);
+  assert.equal(frozen.duration,1);
+  assert.equal(p.ui.state.liveRun.actions.length,2);
+  assert.equal(p.ui.state.liveRun.actions[0].result,'Finished');
+  assert.equal(p.ui.state.liveRun.counters.cpu.length,2);
+  assert.equal(p.node('call-stack').firstElementChild,column);
+  assert.equal(p.ui.paints(),0);
+  p.ui.selectAction('old');p.ui.renderInspector();p.ui.renderSession();
+  assert.match(p.node('inspector').innerHTML,/Waiting/);
+  assert.doesNotMatch(p.node('inspector').innerHTML,/Finished/);
+  assert.equal(p.node('display-toggle').textContent,'▶ Resume Display');
+  assert.match(p.node('display-state').textContent,/2 calls updated/);
+  p.node('display-toggle').onclick();
+  assert.equal(p.ui.state.run,run);
+  assert.equal(p.ui.state.liveRun,null);
+  assert.equal(p.ui.state.selected.id,'old');
+  assert.equal(p.ui.state.displayPaused,false);
+  assert.equal(p.ui.state.cursor,2);
+  assert.equal(p.ui.paints(),1);
+  assert.equal(p.sent.length,0);
+});
+
+test('execution controls use live agent state while the display is frozen',()=>{
+  const p=debuggerPage();p.ui.pauseDisplay();
+  p.node('execution-all').onclick();
+  assert.equal(p.sent[0].command,'pause_all');
+  const run=structuredClone(p.ui.state.liveRun);
+  for(const agent of run.agents){agent.status='paused';agent.control_ts=10;}
+  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  assert.equal(p.ui.state.executionPending,null);
+  assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
+  assert.equal(p.ui.state.displayPaused,true);
+  p.ui.renderSession();
+  assert.equal(p.node('execution-all').textContent,'▶ Resume Agents');
+  p.node('execution-all').onclick();
+  assert.equal(p.sent[1].command,'resume_all');
+  assert.equal(p.ui.state.displayPaused,true);
+  p.ui.state.selected={type:'agent',id:'a'};p.ui.renderSession();
+  assert.equal(p.node('execution-agent').textContent,'▶ Resume agent');
+});
+
+test('reconnect snapshots are retained behind the paused display and run switching resets it',()=>{
+  const p=page();p.ui.pauseDisplay();
+  const frozen=p.ui.state.run;
+  const recovered=structuredClone(p.ui.state.liveRun);
+  recovered.duration=9;recovered.actions.push({id:'recovered',outcome:'success'});
+  p.transport('disconnected');p.transport('connected');
+  p.receive({type:'snapshot',run:recovered,resynced:true});
+  assert.equal(p.ui.state.run,frozen);
+  assert.equal(p.ui.state.liveRun,recovered);
+  p.ui.resumeDisplay();
+  assert.equal(p.ui.state.run,recovered);
+  assert.equal(p.ui.state.cursor,9);
+  p.ui.pauseDisplay();p.ui.loadRun('live');
+  assert.equal(p.ui.state.displayPaused,false);
+  assert.equal(p.ui.state.liveRun,null);
+  assert.equal(p.ui.state.displayChanges.size,0);
+});
+
+test('pausing drains the pending UI batch and duration ticks do not inflate update counts',()=>{
+  const p=page();p.append(false);p.ui.pauseDisplay();
+  assert.equal(p.ui.paints(),1);
+  p.receive({type:'updates',patches:[{meta:{duration:20}}]});p.flush();
+  assert.equal(p.ui.state.run.duration,2);
+  assert.equal(p.ui.state.liveRun.duration,20);
+  assert.equal(p.ui.state.displayChanges.size,0);
+  assert.equal(p.ui.paints(),1);
+});
+
+test('display pause during replay sends no playback or execution commands',()=>{
+  const p=page(true);p.ui.pauseDisplay();p.append();
+  assert.equal(p.ui.state.run.actions.length,1);
+  assert.equal(p.sent.length,0);
+  p.ui.resumeDisplay();
+  assert.equal(p.ui.state.run.actions.length,2);
+  assert.equal(p.sent.length,0);
+});
+
+test('timeline scroll and resize paints keep reading the frozen snapshot',()=>{
+  const p=page();p.ui.state.view='timeline';
+  const viewer={update(run,actions){this.run=run;this.actions=actions;}};
+  p.ui.setTimeline(viewer);p.ui.pauseDisplay();p.append();
+  assert.equal(viewer.run,p.ui.state.run);
+  assert.equal(viewer.run.duration,1);
+  assert.equal(viewer.actions.length,1);
+  p.ui.resumeDisplay();
+  assert.equal(viewer.run.duration,2);
+  assert.equal(viewer.actions.length,2);
+});
 
 test('debugger controls follow action selection and send named-agent commands',()=>{
   const p=debuggerPage();p.ui.selectAction('old');p.ui.renderSession();

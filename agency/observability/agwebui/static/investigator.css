@@ -652,6 +652,40 @@ small,.muted {
   padding:8px 10px
 }
 
+.pause-controls {
+  display:flex;
+  align-items:center;
+  gap:7px
+}
+
+.display-control {
+  color:#d7edff;
+  background:#1d4b72;
+  border-color:var(--blue)
+}
+
+.display-control:hover {
+  background:#28638f;
+  border-color:#a6d6ff
+}
+
+.execution-control {
+  color:#ffe3b0;
+  background:#664519;
+  border-color:var(--amber)
+}
+
+.execution-control:hover {
+  background:#805923;
+  border-color:#ffdb9d
+}
+
+#display-state {
+  display:block;
+  color:var(--blue);
+  font-size:10px
+}
+
 .trajectory-glance {
   padding:18px 20px;
   border:1px solid #334553;

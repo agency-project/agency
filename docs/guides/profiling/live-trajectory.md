@@ -53,11 +53,21 @@ Server startup requires no viewer download or frontend build.
 
 ## Pause and inspect live execution
 
-With an active `agwebui.run(...)` workload, the live session bar offers
-**Pause all** / **Resume all**. Selecting an agent, episode, or action also
+The session bar places blue **Pause Display** / **Resume Display** beside amber
+**Pause Agents** / **Resume Agents**. Pause Display holds the visible cards,
+details, timelines, and metrics at a snapshot while agents keep executing and
+incoming updates are retained. You can scroll, select boxes, and expand their
+details while the display is held. A status label counts calls updated in the
+background. Resume Display catches up to the latest evidence and keeps the
+selected box and scroll position. Display pause sends no execution or replay
+playback command.
+
+With an active `agwebui.run(...)` workload, **Pause Agents** / **Resume Agents**
+controls execution of all active agents. Selecting an agent, episode, or action also
 exposes **Pause agent** / **Resume agent** for its owning agent. The agent
 inspector has the same control. If any active agent is paused, the global
-button offers **Resume all**.
+button offers **Resume Agents**. Execution controls continue to reflect the latest
+agent state while the display is held.
 
 These commands use the existing webui relay and `agent.pause()` / `resume()`
 to stop and continue the harness process. The trajectory connection stays

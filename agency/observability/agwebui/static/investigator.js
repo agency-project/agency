@@ -37,7 +37,9 @@ function scheduleTrajectoryUpdate(changed,resynced=false) {
     updateTrajectory(changes,resync);
   },120);
 }
-Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null});
+Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set()});
+const currentExecution = () => state.liveRun || state.run;
+const executionState = () => executionControlState({...state, run:currentExecution()});
 const displayDuration = action => action.execution_duration ?? action.duration;
 const pausedBadge = id => state.run?.agents.find(a=>a.id===id)?.status==='paused' ? pill('paused') : '';
 const actionMap = run => new Map((run?.actions || []).map(a=>[a.id,a]));
@@ -169,6 +171,7 @@ async function loadRun(id, selected=null, replay=false) {
   timelineNavigation={scale:null,left:0,lock:false};openToolDetails.clear();
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
+  state.displayPaused=false;state.liveRun=null;state.displayChanges.clear();
   state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;
   state.run=null;state.agent='';state.cursor=0;state.selected=selected;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
   state.comparison=null;state.compareId=null;state.compareError=null;compareGeneration++;
@@ -185,20 +188,23 @@ async function loadRun(id, selected=null, replay=false) {
         return;
       }
       state.executionControls=message.execution_controls||null;
-      const first=!state.run;
+      const first=!currentExecution();
       let changed=[];
       if(message.type==='snapshot') {
-        if(state.run)changed=changedTrajectoryActions(state.run.actions,message.run.actions);
-        state.run=message.run;state.loading=false;
+        if(currentExecution())changed=changedTrajectoryActions(currentExecution().actions,message.run.actions);
+        if(state.displayPaused)state.liveRun=message.run;else state.run=message.run;
+        state.loading=false;
       }
-      else for(const patch of message.patches||[]) changed.push(...mergeTrajectory(state.run,patch));
+      else for(const patch of message.patches||[]) changed.push(...mergeTrajectory(currentExecution(),patch));
       reconcileExecutionCommand();
       state.replayState=message.replay||null;
       if(state.replay&&pendingSeek!=null){const clock=pendingSeek;pendingSeek=null;state.stream.sendReplay('seek',{clock});}
-      if(state.replay&&message.type==='snapshot'&&message.replay)state.cursor=message.replay.clock;
+      if(state.replay&&!state.displayPaused&&message.type==='snapshot'&&message.replay)state.cursor=message.replay.clock;
       if(!state.follow) for(const actionId of changed) state.unread.add(actionId);
-      if(state.follow) state.cursor=message.replay?.clock??state.run.duration;
+      if(state.displayPaused)for(const actionId of changed)state.displayChanges.add(actionId);
+      if(state.follow&&!state.displayPaused) state.cursor=message.replay?.clock??state.run.duration;
       if(first){catalogOptions();updateUrl();render();}
+      else if(state.displayPaused)renderSession();
       else scheduleTrajectoryUpdate(changed,message.resynced);
     }});
     return;
@@ -239,6 +245,11 @@ function updateUrl() {
 function render() {
   const run=state.run;
   if (!run || state.loading) return;
+  const content=$('content');
+  const heldScroll=content.dataset.run===run.id&&content.dataset.view===state.view
+    ? ['#call-stack','.trajectory-scroll','#tandem-columns'].map(selector=>{
+      const region=content.querySelector(selector);return [selector,region?.scrollLeft||0,region?.scrollTop||0];
+    }):[];
   $('views').innerHTML=views.map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">0${index+1}</span>${label}</button>`).join('');
   $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
   renderRunChrome();
@@ -258,6 +269,8 @@ function render() {
       for(const [id,top] of held.scroll)$('tandem-columns').querySelector(`[data-tandem-agent="${CSS.escape(id)}"] .col-body`)?.scrollTo({top});
     }
   }
+  for(const [selector,left,top] of heldScroll){const region=content.querySelector(selector);if(region){region.scrollLeft=left;region.scrollTop=top;}}
+  content.dataset.run=run.id;content.dataset.view=state.view;
   renderInspector();
 }
 
@@ -312,16 +325,40 @@ function clearExecutionPending() {
   clearTimeout(state.executionPending?.timer);
   state.executionPending=null;
 }
+function pauseDisplay() {
+  if(state.displayPaused||!state.stream||!state.run||state.loading)return;
+  // Finish the pending paint before holding a separate, immutable display model.
+  if(trajectoryUpdateTimer!==null){
+    clearTimeout(trajectoryUpdateTimer);trajectoryUpdateTimer=null;
+    updateTrajectory([...pendingTrajectoryChanges],pendingResync);
+    pendingTrajectoryChanges.clear();pendingResync=false;
+  }
+  state.liveRun=state.run;
+  state.run=structuredClone(state.liveRun);
+  state.displayPaused=true;state.displayChanges.clear();
+  // Timeline scrolling and resize paints must also read the held snapshot.
+  timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
+  renderSession();
+}
+function resumeDisplay() {
+  if(!state.displayPaused)return;
+  state.run=state.liveRun;state.liveRun=null;state.displayPaused=false;
+  state.displayChanges.clear();state.follow=true;state.unread.clear();state.windowEnd=null;
+  state.cursor=state.replayState?.clock??state.run.duration;
+  if(['trajectory','timeline','agents'].includes(state.view))updateTrajectory(state.run.actions.map(a=>a.id));
+  else render();
+}
 function finishExecutionCommand(message) {
   clearExecutionPending();state.executionMessage=message;renderSession();
 }
 function reconcileExecutionCommand() {
   const pending=state.executionPending;
   if(!pending)return;
-  if(['completed','failed','cancelled'].includes(state.run.status)) {
+  const run=currentExecution();
+  if(['completed','failed','cancelled'].includes(run.status)) {
     finishExecutionCommand('Execution finished before command confirmation.');return;
   }
-  const targets=pending.agents.map(id=>state.run.agents.find(a=>a.id===id));
+  const targets=pending.agents.map(id=>run.agents.find(a=>a.id===id));
   if(targets.some(a=>!a||!state.executionControls?.agents.includes(a.id))) {
     finishExecutionCommand('An agent is no longer active; check the recorded state.');return;
   }
@@ -330,7 +367,7 @@ function reconcileExecutionCommand() {
   }
 }
 function pauseResumeExecution(all) {
-  const controls=executionControlState(state);
+  const controls=executionState();
   if(state.executionPending||!(all?controls.allEnabled:controls.agentEnabled))return;
   const command=all?controls.allCommand:controls.agentCommand;
   const targets=all?controls.active:[controls.target];
@@ -346,18 +383,25 @@ function pauseResumeExecution(all) {
 }
 
 function renderSession() {
-  const run=state.run, replay=state.replay;
+  const run=currentExecution(), replay=state.replay;
   const mode=replay?'Replay':run?.id==='live'?'Live':'Review';
   const status=run?.status||'unknown';
-  const debuggerState=executionControlState(state);
+  const debuggerState=executionState();
   const paused=run?.agents.filter(a=>a.status==='paused').length||0;
   $('execution-agent').hidden=!debuggerState.live||!debuggerState.target;
   $('execution-all').hidden=!debuggerState.live;
   $('execution-agent').textContent=debuggerState.agentCommand==='resume'?'▶ Resume agent':'⏸ Pause agent';
   $('execution-agent').title=debuggerState.target?`Control execution of ${debuggerState.target.label}`:'';
   $('execution-agent').disabled=!debuggerState.agentEnabled||Boolean(state.executionPending);
-  $('execution-all').textContent=debuggerState.allCommand==='resume_all'?'▶ Resume all':'⏸ Pause all';
+  $('execution-all').textContent=debuggerState.allCommand==='resume_all'?'▶ Resume Agents':'⏸ Pause Agents';
+  $('execution-all').title='Pause or resume execution of all active agents';
   $('execution-all').disabled=!debuggerState.allEnabled||Boolean(state.executionPending);
+  $('display-toggle').hidden=!state.stream;
+  $('display-toggle').disabled=!state.run||state.loading;
+  $('display-toggle').textContent=state.displayPaused?'▶ Resume Display':'⏸ Pause Display';
+  $('display-toggle').title=state.displayPaused?'Catch up the display to incoming updates':'Freeze the display while agents continue executing';
+  $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
+  $('display-state').textContent=state.displayPaused?`Display paused · ${state.displayChanges.size} calls updated · incoming updates retained`:'';
   const inspectorControl=$('inspector').querySelector('[data-execution-agent]');
   if(inspectorControl){inspectorControl.disabled=$('execution-agent').disabled;inspectorControl.textContent=$('execution-agent').textContent;}
   $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
@@ -370,13 +414,14 @@ function renderSession() {
   $('replay-play').textContent=state.replayState?.playing?'Pause replay':'Play replay';
   $('replay-play').disabled=Boolean(state.replayState?.finished)||state.transport!=='connected';
   $('replay-step').disabled=Boolean(state.replayState?.finished)||state.transport!=='connected';
-  $('follow-live').hidden=!state.stream;
+  $('follow-live').hidden=!state.stream||state.displayPaused;
   $('follow-live').textContent=state.follow?'Following latest':state.unread.size?`${state.unread.size} calls changed · Follow latest`:'History held · Follow latest';
   $('follow-live').setAttribute('aria-pressed',String(state.follow));
   $('reconnect-updates').hidden=!state.stream;
 }
 
 function updateTrajectory(changed,resynced=false) {
+  if(state.displayPaused){renderSession();return;}
   renderRunChrome();
   if(state.view==='trajectory') {
     if(state.trajectoryLayout==='episodes')reconcileActivities();
@@ -391,7 +436,7 @@ function updateTrajectory(changed,resynced=false) {
   }
   if(state.view==='agents')renderTandemBoard();
   if(state.view==='timeline')timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
-  const target=executionControlState(state).target;
+  const target=executionState().target;
   const controlSignature=`${target?.id}:${target?.status}:${target?.control_ts}`;
   const controlChanged=controlSignature!==state.inspectorControlSignature;
   if(controlChanged||((!state.selected||changed.includes(state.selected?.id))&&!$('inspector').contains(document.activeElement)))renderInspector(true);
@@ -903,7 +948,7 @@ function renderInspector(preserveEvidence=false) {
     content=`${pill(o.status)}<h2>${esc(o.title)}</h2><p>${esc(o.note)}</p>${field('Obligation source',o.inferred?'Inferred from actions':'Explicit / evaluator')}<div class="detail-label">Supporting evidence</div>${o.evidence.map(id=>map.get(id)).filter(Boolean).map(a=>`<button class="jump" data-action="${esc(a.id)}">${esc(a.kind)} · ${formatTime(a.start)} · ${esc(a.outcome)} →</button>`).join('')||'<p>No supporting action has been recorded.</p>'}<button class="jump" data-view="trajectory">Follow the trajectory →</button>`;
   } else if(selection.type==='agent') {
     const agent=run.agents.find(a=>a.id===selection.id);
-    content=agent?`${pill('Agent')} ${pill(agent.status||'unknown')}<h2>${esc(agent.label)}</h2><p>${esc(agent.role)}</p>${field('Model',agent.model||'unavailable')}${field('Harness',agent.harness||'unavailable')}${field('Parent',agent.parent?agentName(agent.parent):'No recorded parent')}${field('State',agent.status||'unknown')}${field('Actions',run.actions.filter(a=>a.agent===agent.id).length)}${executionControlState(state).live?`<button class="jump" data-execution-agent ${!executionControlState(state).agentEnabled||state.executionPending?'disabled':''}>${agent.status==='paused'?'▶ Resume agent':'⏸ Pause agent'}</button>`:''}<button class="jump" data-view="trajectory">Inspect agent trajectory →</button><button class="jump" data-view="context">Inspect agent context →</button>`:'<p>The selected agent is no longer available.</p>';
+    content=agent?`${pill('Agent')} ${pill(agent.status||'unknown')}<h2>${esc(agent.label)}</h2><p>${esc(agent.role)}</p>${field('Model',agent.model||'unavailable')}${field('Harness',agent.harness||'unavailable')}${field('Parent',agent.parent?agentName(agent.parent):'No recorded parent')}${field('State',agent.status||'unknown')}${field('Actions',run.actions.filter(a=>a.agent===agent.id).length)}${executionState().live?`<button class="jump execution-control" data-execution-agent ${!executionState().agentEnabled||state.executionPending?'disabled':''}>${executionState().agentCommand==='resume'?'▶ Resume agent':'⏸ Pause agent'}</button>`:''}<button class="jump" data-view="trajectory">Inspect agent trajectory →</button><button class="jump" data-view="context">Inspect agent context →</button>`:'<p>The selected agent is no longer available.</p>';
   } else if(selection.type==='interval') {
     const i=run.intervals.find(i=>i.id===selection.id);
     content=`${pill(i.kind)}<h2>${esc(i.label)}</h2>${field('Start',formatTime(i.start))}${field('Duration',formatTime(i.duration))}${field('Source',i.source)}<p>This interval has no observed action attribution. It may contain uninstrumented work, transport, waiting or idle time.</p>`;
@@ -994,6 +1039,7 @@ function holdSelection() {
 }
 
 function followLatest() {
+  if(state.displayPaused){resumeDisplay();return;}
   state.follow=true;state.windowEnd=null;state.unread.clear();
   if(state.run)state.cursor=state.replayState?.clock??state.run.duration;
   renderRunChrome();
@@ -1034,7 +1080,9 @@ for(const id of ['model-filter','harness-filter']) $(id).onchange=()=>{const run
 $('agent-select').onchange=event=>{holdSelection();state.agent=event.target.value;state.selected=state.agent?{type:'agent',id:state.agent}:null;render();};
 $('search').oninput=event=>{holdSelection();state.query=event.target.value;render();};
 $('cursor').oninput=event=>{
-  const clock=Number(event.target.value);holdHistory();state.cursor=clock;state.model=null;
+  const clock=Number(event.target.value);
+  if(state.displayPaused){state.cursor=clock;state.model=null;render();return;}
+  holdHistory();state.cursor=clock;state.model=null;
   $('cursor-value').textContent=formatTime(clock);
   if(state.replay)state.stream?.sendReplay('seek',{clock});
   else {pendingSeek=clock;loadRun(state.run.id,null,true);}
@@ -1052,10 +1100,11 @@ document.addEventListener('change',event=>{
   else if(event.target.id==='comparison-select'){state.compareError=null;loadComparison(event.target.value);}
   else if(event.target.id==='trajectory-layout'){state.trajectoryLayout=event.target.value;updateUrl();render();}
 });
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream)followLatest();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream&&!state.displayPaused)followLatest();});
 window.addEventListener('pagehide',()=>state.stream?.close());
 $('execution-agent').onclick=()=>pauseResumeExecution(false);
 $('execution-all').onclick=()=>pauseResumeExecution(true);
+$('display-toggle').onclick=()=>{if(state.displayPaused)resumeDisplay();else pauseDisplay();};
 $('open-live').onclick=()=>{state.trajectoryLayout='episodes';state.view='trajectory';loadRun('live');};
 $('start-replay').onclick=()=>loadRun(state.run.id,null,true);
 $('replay-restart').onclick=()=>loadRun(state.run.id,null,true);
