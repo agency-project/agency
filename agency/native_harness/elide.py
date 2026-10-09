@@ -313,7 +313,7 @@ def _render_selected(block_lines: "list[str]", first: int, picked: "list[tuple[i
 
 def _render_outline(ref: str, path: str, first_line: int, n_lines: int, entries: "list[dict]", tok: int) -> str:
     head = (f"[{ref}: {path}, lines {first_line}-{first_line + n_lines - 1} (~{tok} tokens), shown as an outline. "
-            f"Get the parts you need in one call: show_elided(parts=[\"{ref}:<name>\", \"{ref}:<start>-<end>\", ...]).]")
+            f"Get the parts you need in one call, alongside your next command: show_elided(parts=[\"{ref}:<name>\", \"{ref}:<start>-<end>\", ...]).]")
     rows = []
     for e in entries[:_OUTLINE_MAX_ENTRIES]:
         text = e["text"] if len(e["text"]) <= _SIG_MAX_CHARS else e["text"][:_SIG_MAX_CHARS] + " ..."
@@ -402,7 +402,7 @@ def _elide_file_blocks(output: str, command: str, workdir: "str | None") -> "tup
         entries_all = None
         for k, j, length in reversed(_file_runs(out_lines, file_lines)):
             block = "\n".join(out_lines[k:k + length])
-            if tokens(block) < _BLOCK_MIN_TOKENS:
+            if tokens(block) < min(_BLOCK_MIN_TOKENS, ELIDE_MIN_TOKENS // 2):
                 continue
             if entries_all is None:
                 entries_all = outline(src, path)
@@ -497,7 +497,10 @@ SHOW_ELIDED_PARAMS = {
     },
     "required": ["parts"],
 }
-SHOW_ELIDED_DESCRIPTION = "Return pieces of tool outputs that were shown as outlines or cut short (references like E3)."
+SHOW_ELIDED_DESCRIPTION = (
+    "Return pieces of tool outputs that were shown as outlines or cut short (references like E3). Ask for every "
+    "piece you need in one call, made in the same turn as your next command when you can."
+)
 
 
 def _numbered(lines: "list[str]", first: int) -> str:
