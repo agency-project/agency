@@ -22,6 +22,7 @@ import sys
 import uuid
 from typing import Generator
 
+from . import elide
 from .canonicalize import canonicalize_run, is_test_command, summarize_tests, compact_code_read, compact_tables, is_code_read_command, is_run_command
 
 _BASH_TIMEOUT_S = 120
@@ -593,6 +594,18 @@ def _run_bash_tool(arguments_json: str) -> str:
                     f"{stats['progress_lines']} progress lines, chars {stats['chars_in']} -> {stats['chars_out']}",
                     file=sys.stderr,
                 )
+        if elide.COMPACT_SEARCH:
+            output, stats = elide.compact_search(output)
+            if stats["chars_out"] < stats["chars_in"]:
+                print(f"[native_harness] compacted search output: chars {stats['chars_in']} -> {stats['chars_out']}", file=sys.stderr)
+        if elide.ELIDE_MIN_TOKENS:
+            output, stats = elide.elide_output(command, workdir, output)
+            if stats["files"] or stats["hit_files"]:
+                print(
+                    f"[native_harness] elided output: {stats['files']} files, {stats['hit_files']} hit runs, "
+                    f"tokens {stats['tokens_in']} -> {stats['tokens_out']}",
+                    file=sys.stderr,
+                )
         return json.dumps({"output": output, "returncode": proc.returncode})
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"command timed out after {timeout}s"})
@@ -681,6 +694,10 @@ def _run_read_tool(arguments_json: str) -> str:
         return json.dumps({"error": str(e)})
     if args.get("symbol"):
         return _read_symbol(file_path, content, str(args["symbol"]))
+    if not args.get("offset") and not args.get("limit"):
+        shown = elide.elide_read(file_path, content)
+        if shown is not None:
+            return json.dumps({"path": file_path, "type": "outline", "content": shown})
     result = paginate_text(content, offset, limit)
     result["path"] = file_path
     return json.dumps(result)
@@ -932,6 +949,13 @@ CODE_READ_HINT = (
     "rather than printing line ranges. On bash, read and grep calls, set `want` to what you need "
     "from the output."
 )
+
+
+def enable_show_elided() -> None:
+    TOOL_DISPATCH["show_elided"] = elide.show_elided
+    BUILTIN_TOOL_SCHEMAS["show_elided"] = _tool_schema(
+        "show_elided", elide.SHOW_ELIDED_DESCRIPTION, elide.SHOW_ELIDED_PARAMS
+    )
 
 
 def enable_code_read_tools(want_required: bool = False) -> None:

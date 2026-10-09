@@ -187,6 +187,15 @@ class NativeAdapter(HarnessAdapter):
                     argv.append(flag)
             if ha.drop_tools:
                 argv += ["--drop-tools", ha.drop_tools]
+            if ha.compact_search:
+                argv.append("--compact-search")
+            if ha.elide_large:
+                argv += ["--elide-large", str(ha.elide_large)]
+            if ha.cache_keepalive_s:
+                argv += ["--cache-keepalive-s", str(ha.cache_keepalive_s)]
+            if ha.elide_selector and ha.supervisor_model:
+                argv += ["--selector-model", ha.supervisor_model,
+                         "--selector-llm-base-url", f"{runtime.harness_base_url}/supervisor"]
 
             envp = {
                 "PATH": HARNESS_PATH,
@@ -340,6 +349,36 @@ class NativeAdapter(HarnessAdapter):
             agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
+        if type(self) is NativeAdapter and self.agconfig.harness_adapter.elide_selector:
+
+            @app.post("/supervisor/v1/chat/completions")
+            async def selector_chat_completions(request: Request):
+                token = extract_bearer_token(request)
+                if not token or not router.validate_token(token):
+                    return JSONResponse(
+                        {"error": {"message": "unknown or missing bearer token"}}, status_code=401
+                    )
+                body = await request.json()
+                model = router.resolve_model(token, mount="llm_supervisor")
+                agency_context = self._format_context_harness_to_agency(body)
+                if body.get("stream"):
+                    frames = stream_response(
+                        router,
+                        token,
+                        agency_context,
+                        model,
+                        self._format_agency_stream_to_harness,
+                        keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                        keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                        error_frame=chat_error_frame,
+                        mount="llm_supervisor",
+                    )
+                    return await start_streaming_response(request, frames)
+                agency_response = await anyio.to_thread.run_sync(
+                    lambda: router.dispatch(token, agency_context, mount="llm_supervisor")
+                )
+                return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
+
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
         messages: "list[dict]" = []
         for m in raw_request.get("messages", []):
@@ -423,12 +462,15 @@ class NativeAdapter(HarnessAdapter):
                 )
             messages.append({"role": role, "blocks": blocks})
 
-        return {
+        context = {
             "messages": messages,
             "tools": raw_request.get("tools"),
             "tool_choice": raw_request.get("tool_choice"),
             "agency_internal_kind": raw_request.get("agency_internal_kind"),
         }
+        if raw_request.get("max_completion_tokens"):
+            context["max_completion_tokens"] = raw_request["max_completion_tokens"]
+        return context
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:
         message = agency_response["message"]

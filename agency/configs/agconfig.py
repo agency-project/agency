@@ -344,6 +344,14 @@ class harnessadapterconfig(confignamespace):
     drop_tools: str = ""
     # Native/tandem: tell the agent it may submit together with its final check.
     submit_with_check: bool = False
+    # Native: grep hits grouped by file and licence headers dropped (T43).
+    compact_search: bool = False
+    # Native: outputs above this many tokens shown as outlines, expandable via show_elided (T44; 0 = off).
+    elide_large: int = 0
+    # Native: keep the prompt cache warm during tool calls this long after its last use (T42; 0 = off).
+    cache_keepalive_s: int = 0
+    # Native: supervisor_model picks the lines of an elided output shown in full (T45).
+    elide_selector: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 

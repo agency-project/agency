@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -30,6 +31,7 @@ from .compaction import maybe_compact
 # submit_output reports every output field in, without a closing turn (T39).
 DROP_TOOLS: "frozenset[str]" = frozenset()
 END_ON_SUBMIT = False
+CACHE_KEEPALIVE_S = 0  # T42: seconds after the cache's last use at which a 1-token request refreshes it
 SUBMIT_WITH_CHECK = (
     "When you run your final check, call submit_output for every field in the same turn if you are confident the "
     "check will pass. The task ends as soon as every output field is submitted."
@@ -128,6 +130,8 @@ def run_react_loop(
                 messages, context_limit, llm, model, previous_summary
             )
 
+            sent = list(messages)
+            cache_used_at = time.monotonic()
             resp = llm.dispatch(model, messages, tool_schemas or None)
             if "error" in resp:
                 return ReactLoopResult(
@@ -154,54 +158,13 @@ def run_react_loop(
                 progress_path, messages, total_input_tokens, total_output_tokens, step + 1
             )
 
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
-                fn_args = tc["function"]["arguments"]
-                handler = dispatch_table.get(fn_name)
-                call_id = None
-                tool_duration_ns = None
-                if handler is None:
-                    result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
-                elif bridge is not None:
-                    decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
-                    call_id = decision.get("call_id")
-                    if decision.get("decision") == "deny":
-                        result_content = json.dumps(
-                            {
-                                "error": f"denied by policy: {decision.get('reason', 'no reason given')}"
-                            }
-                        )
-                    else:
-                        tool_started_ns = time.perf_counter_ns()
-                        tool_started_wall_ns = time.time_ns()
-                        try:
-                            result_content = handler(fn_args)
-                        except Exception as exc:
-                            result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-                        tool_duration_ns = time.perf_counter_ns() - tool_started_ns
-                else:
-                    try:
-                        result_content = handler(fn_args)
-                    except Exception as exc:
-                        result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-                result_error = _parse_tool_input(result_content).get("error")
-                result_content = tools.offload_if_oversized(
-                    fn_name, tc["id"], result_content, offload_dir
-                )
-                if bridge is not None:
-                    if tool_duration_ns is not None:
-                        bridge.complete_tool_policy(
-                            call_id,
-                            result_content,
-                            duration_ns=tool_duration_ns,
-                            started_wall_ns=tool_started_wall_ns,
-                            error=str(result_error) if result_error is not None else None,
-                        )
-                    else:
-                        bridge.complete_tool_policy(call_id, result_content)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
-                )
+            tools.elide.note_context(sent, message)
+            keepalive = _start_keepalive(llm, model, sent, tool_schemas, cache_used_at)
+            try:
+                _run_tool_calls(tool_calls, dispatch_table, bridge, offload_dir, messages)
+            finally:
+                if keepalive is not None:
+                    keepalive.set()
             # Only after every tool result is in: a resume must never start from a
             # dangling tool_use, so a crash mid-turn reverts to the previous turn.
             if on_checkpoint is not None:
@@ -226,6 +189,77 @@ def run_react_loop(
         message=f"exceeded max_steps={max_steps} without a final answer",
         turn_count=max_steps,
     )
+
+
+def _run_tool_calls(tool_calls: list, dispatch_table: dict, bridge, offload_dir: str, messages: list) -> None:
+    for tc in tool_calls:
+        fn_name = tc["function"]["name"]
+        fn_args = tc["function"]["arguments"]
+        handler = dispatch_table.get(fn_name)
+        call_id = None
+        tool_duration_ns = None
+        if handler is None:
+            result_content = json.dumps({"error": f"unknown tool: {fn_name}"})
+        elif bridge is not None:
+            decision = bridge.check_tool_policy(fn_name, _parse_tool_input(fn_args))
+            call_id = decision.get("call_id")
+            if decision.get("decision") == "deny":
+                result_content = json.dumps(
+                    {
+                        "error": f"denied by policy: {decision.get('reason', 'no reason given')}"
+                    }
+                )
+            else:
+                tool_started_ns = time.perf_counter_ns()
+                tool_started_wall_ns = time.time_ns()
+                try:
+                    result_content = handler(fn_args)
+                except Exception as exc:
+                    result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+                tool_duration_ns = time.perf_counter_ns() - tool_started_ns
+        else:
+            try:
+                result_content = handler(fn_args)
+            except Exception as exc:
+                result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+        result_error = _parse_tool_input(result_content).get("error")
+        result_content = tools.offload_if_oversized(
+            fn_name, tc["id"], result_content, offload_dir
+        )
+        if bridge is not None:
+            if tool_duration_ns is not None:
+                bridge.complete_tool_policy(
+                    call_id,
+                    result_content,
+                    duration_ns=tool_duration_ns,
+                    started_wall_ns=tool_started_wall_ns,
+                    error=str(result_error) if result_error is not None else None,
+                )
+            else:
+                bridge.complete_tool_policy(call_id, result_content)
+        messages.append(
+            {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
+        )
+
+
+def _start_keepalive(llm, model: str, sent: list, tool_schemas: list, cache_used_at: float) -> "threading.Event | None":
+    """While tools run, re-send the last request (max 1 output token) before the prompt cache expires."""
+    if not CACHE_KEEPALIVE_S:
+        return None
+    stop = threading.Event()
+
+    def run() -> None:
+        last = cache_used_at
+        while not stop.wait(max(0.0, last + CACHE_KEEPALIVE_S - time.monotonic())):
+            last = time.monotonic()
+            resp = llm.dispatch(model, sent, tool_schemas or None, internal_kind="keepalive", max_tokens=1)
+            if "error" in resp:
+                print(f"[native_harness] cache keep-alive failed: {resp['error']}", file=sys.stderr)
+                return
+            print("[native_harness] cache keep-alive sent", file=sys.stderr)
+
+    threading.Thread(target=run, daemon=True, name="cache-keepalive").start()
+    return stop
 
 
 def _all_outputs_submitted(tool_calls: list, messages: list) -> bool:

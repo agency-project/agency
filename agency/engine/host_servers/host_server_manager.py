@@ -93,9 +93,9 @@ class HostServerManager:
             skill_name=skill.name,
         )
         self._llm_handler_server_supervisor: "LlmHandlerServer | None" = None
-        if (
+        if agent.agconfig.harness_adapter.supervisor_model and (
             getattr(agent, "harness", None) == "tandem"
-            and agent.agconfig.harness_adapter.supervisor_model
+            or (getattr(agent, "harness", None) == "native" and agent.agconfig.harness_adapter.elide_selector)
         ):
             self._llm_handler_server_supervisor = LlmHandlerServer(
                 type(self)._supervisor_agconfig(agent.agconfig),

@@ -62,6 +62,7 @@ class LLMClient:
         tools: "list[dict] | None" = None,
         *,
         internal_kind: "str | None" = None,
+        max_tokens: "int | None" = None,
     ) -> dict:
         """Returns `{"message": {...}, "usage": {...} | None}` on success,
         `{"error": "..."}` on failure (exhausted retries or a non-retryable
@@ -71,6 +72,8 @@ class LLMClient:
             kwargs["tools"] = tools
         if internal_kind is not None:
             kwargs["agency_internal_kind"] = internal_kind
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
 
         last_error = "dispatch failed with no attempts made"
         for attempt in range(_DISPATCH_MAX_RETRIES):

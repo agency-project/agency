@@ -121,6 +121,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Cut test-runner output from bash to failures, summaries and the last lines.",
     )
     p.add_argument(
+        "--compact-search",
+        action="store_true",
+        help="Group grep hits by file and drop licence headers from bash output.",
+    )
+    p.add_argument(
+        "--elide-large",
+        type=int,
+        default=0,
+        help="Show bash/read outputs above this many tokens as outlines, expandable with show_elided (0 = off).",
+    )
+    p.add_argument(
+        "--cache-keepalive-s",
+        type=int,
+        default=0,
+        help="While tools run, re-send the last request with max 1 output token once this many seconds "
+        "have passed since the cache was last used (0 = off).",
+    )
+    p.add_argument("--selector-model", default=None, help="Model that picks lines of elided outputs to show in full.")
+    p.add_argument("--selector-llm-base-url", default=None)
+    p.add_argument(
         "--progress-file",
         default=None,
         help="Path to checkpoint per-step progress to, for a bridged caller to poll for "
@@ -159,9 +179,19 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.code_read_tools or args.want_required or args.code_read_hint:
         tools.enable_code_read_tools(want_required=args.want_required)
     tools.COMPACT_CODE_READS = args.compact_code_reads
+    tools.elide.COMPACT_SEARCH = args.compact_search
+    tools.elide.ELIDE_MIN_TOKENS = args.elide_large
+    if args.elide_large:
+        tools.enable_show_elided()
+    react_loop.CACHE_KEEPALIVE_S = args.cache_keepalive_s
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     llm = LLMClient(llm_base_url, llm_api_key)
+    if args.selector_model and args.selector_llm_base_url:
+        selector = LLMClient(args.selector_llm_base_url, llm_api_key)
+        tools.elide.SELECTOR = lambda prompt: selector.dispatch(
+            args.selector_model, [{"role": "user", "content": prompt}], internal_kind="selector"
+        )
 
     bridge = (
         BridgeClient(args.bridge_base_url, args.bridge_token)

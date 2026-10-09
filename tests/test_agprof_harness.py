@@ -55,6 +55,7 @@ _BARE_THREAD_ALLOWLIST = {
     ): (1, "subprocess terminal reader"),
     # General background I/O and UI maintenance.
     ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
+    ("agency/native_harness/react_loop.py", "_start_keepalive"): (1, "prompt-cache keep-alive during tool calls"),
     (
         "agency/observability/agwebui/__init__.py",
         "agwebui.run",

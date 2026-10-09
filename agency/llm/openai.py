@@ -105,6 +105,8 @@ class _OpenAICompatibleBackend(agllm):
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         kwargs = self.build_kwargs(request["messages"], request.get("tools"))
+        if request.get("max_completion_tokens"):
+            kwargs["max_completion_tokens"] = request["max_completion_tokens"]
         tool_choice = request.get("tool_choice")
         # Responses-style clients such as Codex may send tool_choice="auto"
         # even after their hosted tools were filtered from a Chat Completions
