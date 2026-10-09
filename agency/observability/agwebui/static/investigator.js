@@ -39,7 +39,8 @@ function scheduleTrajectoryUpdate(changed,resynced=false) {
 }
 Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set()});
 const currentExecution = () => state.liveRun || state.run;
-const executionState = () => executionControlState({...state, run:currentExecution()});
+const executionState = (agentId=null) => executionControlState({...state, run:currentExecution(),
+  ...(agentId?{agent:agentId,selected:{type:'agent',id:agentId}}:{})});
 const displayDuration = action => action.execution_duration ?? action.duration;
 const pausedBadge = id => state.run?.agents.find(a=>a.id===id)?.status==='paused' ? pill('paused') : '';
 const actionMap = run => new Map((run?.actions || []).map(a=>[a.id,a]));
@@ -355,6 +356,17 @@ function reconcileExecutionCommand() {
   const pending=state.executionPending;
   if(!pending)return;
   const run=currentExecution();
+  if(pending.stopping) {
+    const targets=pending.agents.map(id=>run.agents.find(a=>a.id===id));
+    const ended=a=>a&&['completed','failed','cancelled'].includes(a.execution_state||a.status);
+    if(['completed','failed','cancelled'].includes(run.status)||targets.every(ended)) {
+      finishExecutionCommand('Execution stopped.');return;
+    }
+    if(targets.every(a=>ended(a)||(a?.stop_ts>pending.observed[a.id]&&a.stop_force===pending.force))) {
+      finishExecutionCommand(pending.force?'SIGKILL delivered; waiting for execution to finish.':'SIGTERM delivered; waiting for execution to finish. SIGKILL is available.');
+    }
+    return;
+  }
   if(['completed','failed','cancelled'].includes(run.status)) {
     finishExecutionCommand('Execution finished before command confirmation.');return;
   }
@@ -366,20 +378,41 @@ function reconcileExecutionCommand() {
     finishExecutionCommand('');
   }
 }
-function pauseResumeExecution(all) {
-  const controls=executionState();
+function pauseResumeExecution(all,agentId=null) {
+  const controls=executionState(agentId);
   if(state.executionPending||!(all?controls.allEnabled:controls.agentEnabled))return;
-  const command=all?controls.allCommand:controls.agentCommand;
+  sendExecutionCommand(all?controls.allCommand:controls.agentCommand,all,agentId);
+}
+function stopExecution(all,force=false,agentId=null) {
+  const controls=executionState(agentId);
+  if(!(all?controls.allEnabled:controls.agentEnabled)||(!force&&state.executionPending))return;
+  // Escalation remains usable while graceful shutdown awaits confirmation.
+  clearExecutionPending();
+  sendExecutionCommand(`${force?'kill':'stop'}${all?'_all':''}`,all,agentId);
+}
+function sendExecutionCommand(command,all,agentId=null) {
+  const controls=executionState(agentId);
   const targets=all?controls.active:[controls.target];
   const id=String(Date.now());
   if(!state.stream?.sendExecution(command,{id,...(all?{}:{agname:controls.target.id})})) {
     finishExecutionCommand('Could not deliver command; reconnect to updates and try again.');return;
   }
   // Queuing is not confirmation: only recorded agent control events change status.
-  const pending={id,agents:targets.map(a=>a.id),paused:command.startsWith('pause'),
-    observed:Object.fromEntries(targets.map(a=>[a.id,a.control_ts||0]))};
+  const stopping=command.startsWith('stop')||command.startsWith('kill');
+  const pending={id,agents:targets.map(a=>a.id),paused:command.startsWith('pause'),stopping,force:command.startsWith('kill'),
+    observed:Object.fromEntries(targets.map(a=>[a.id,(stopping?a.stop_ts:a.control_ts)||0]))};
   pending.timer=setTimeout(()=>{if(state.executionPending===pending)finishExecutionCommand('No execution confirmation received; check the agent state and command bridge.');},30000);
   state.executionPending=pending;state.executionMessage='Waiting for execution confirmation…';renderSession();
+}
+
+function agentControlButtons(id) {
+  const controls=executionState(id),pending=Boolean(state.executionPending);
+  const disabled=!controls.agentEnabled;
+  const target=esc(id),name=esc(agentName(id,currentExecution()));
+  return `<span class="control-section-label">Agent controls</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Gracefully stop ${name} with SIGTERM" ${disabled||pending?'disabled':''}>■ Stop</button><button class="execution-control danger-control" data-execution-kill="${target}" title="Force ${name} to exit with SIGKILL" ${disabled?'disabled':''}>SIGKILL</button>`;
+}
+function agentExecutionControls(id) {
+  return executionState(id).live&&executionState(id).target?`<div class="agent-execution-controls" data-agent-controls="${esc(id)}" role="group" aria-label="Controls for ${esc(agentName(id))}">${agentControlButtons(id)}</div>`:'';
 }
 
 function renderSession() {
@@ -388,22 +421,27 @@ function renderSession() {
   const status=run?.status||'unknown';
   const debuggerState=executionState();
   const paused=run?.agents.filter(a=>a.status==='paused').length||0;
-  $('execution-agent').hidden=!debuggerState.live||!debuggerState.target;
   $('execution-all').hidden=!debuggerState.live;
-  $('execution-agent').textContent=debuggerState.agentCommand==='resume'?'▶ Resume agent':'⏸ Pause agent';
-  $('execution-agent').title=debuggerState.target?`Control execution of ${debuggerState.target.label}`:'';
-  $('execution-agent').disabled=!debuggerState.agentEnabled||Boolean(state.executionPending);
   $('execution-all').textContent=debuggerState.allCommand==='resume_all'?'▶ Resume Agents':'⏸ Pause Agents';
   $('execution-all').title='Pause or resume execution of all active agents';
   $('execution-all').disabled=!debuggerState.allEnabled||Boolean(state.executionPending);
+  $('all-agent-controls').hidden=!debuggerState.live;
+  for(const force of [false,true]) {
+    const button=$(`execution-${force?'kill':'stop'}-all`);
+    button.disabled=!debuggerState.allEnabled||(!force&&Boolean(state.executionPending));
+    button.title=`${force?'Force termination with SIGKILL':'Gracefully stop with SIGTERM'} for all active agents`;
+  }
+  for(const group of document.querySelectorAll('[data-agent-controls]')) {
+    group.hidden=!debuggerState.live;
+    const html=agentControlButtons(group.dataset.agentControls);
+    if(group.innerHTML!==html)group.innerHTML=html;
+  }
   $('display-toggle').hidden=!state.stream;
   $('display-toggle').disabled=!state.run||state.loading;
   $('display-toggle').textContent=state.displayPaused?'▶ Resume Display':'⏸ Pause Display';
   $('display-toggle').title=state.displayPaused?'Catch up the display to incoming updates':'Freeze the display while agents continue executing';
   $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
   $('display-state').textContent=state.displayPaused?`Display paused · ${state.displayChanges.size} calls updated · incoming updates retained`:'';
-  const inspectorControl=$('inspector').querySelector('[data-execution-agent]');
-  if(inspectorControl){inspectorControl.disabled=$('execution-agent').disabled;inspectorControl.textContent=$('execution-agent').textContent;}
   $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
   $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} paused`:''}`;
   $('transport-state').textContent=state.stream?`${state.transport==='connected'?'Connected to updates':state.transport==='disconnected'?'Disconnected from updates · execution state retained':state.transport==='reconnecting'?'Reconnecting to updates':'Connecting to updates'}${replay&&state.replayState?` · ${state.replayState.finished?'replay exhausted':state.replayState.playing?'playing':'paused'} at ${formatTime(state.replayState.clock)}`:''}`:'Saved evidence · no live subscription';
@@ -522,7 +560,7 @@ function renderCallStack() {
     column.className=`agent-column ${agent===state.activeColumn?'active-agent-column':''}`;
     const heading=column.querySelector('.agent-column-heading');
     const running=state.run.actions.filter(action=>action.agent===agent&&action.outcome==='running').length;
-    const html=`<strong>${esc(agentName(agent))}</strong><span>${running} running</span>${pausedBadge(agent)}<button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}" ${state.agent||columns.length<=1?'disabled':''}>Hide</button>`;
+    const html=`<strong>${esc(agentName(agent))}</strong><span>${running} running</span>${pausedBadge(agent)}<button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}" ${state.agent||columns.length<=1?'disabled':''}>Hide</button>${agentExecutionControls(agent)}`;
     if(heading.innerHTML!==html)heading.innerHTML=html;
     if(stack.children[columnIndex]!==column)stack.insertBefore(column,stack.children[columnIndex]||null);
     const feed=column.querySelector('.agent-call-stack');
@@ -825,7 +863,7 @@ function renderTandemBoard() {
     if(host.children[index]!==col)host.insertBefore(col,host.children[index]||null);
     const parent=run.agents.some(a=>a.parent===agent.id),role=parent?'Supervisor':agent.parent?'Worker':'Agent';
     col.classList.toggle('supervisor-column',parent);
-    const header=`<div class="agent"><button data-agent="${esc(agent.id)}">${esc(agent.label)}</button><button data-remove-column="${esc(agent.id)}" ${state.agent||columns.length===1?'disabled':''}>Hide</button></div><div class="meta"><span class="badge ${parent?'sup':'wrk'}">${role}</span><span class="badge">${esc(agent.model||run.model)}</span>${pausedBadge(agent.id)}</div><p class="muted">${agentActivityCounts(agent.id)}${agent.parent?` · parent ${esc(agentName(agent.parent))}`:''}</p>`;
+    const header=`<div class="agent"><button data-agent="${esc(agent.id)}">${esc(agent.label)}</button><button data-remove-column="${esc(agent.id)}" ${state.agent||columns.length===1?'disabled':''}>Hide</button></div><div class="meta"><span class="badge ${parent?'sup':'wrk'}">${role}</span><span class="badge">${esc(agent.model||run.model)}</span>${pausedBadge(agent.id)}</div><p class="muted">${agentActivityCounts(agent.id)}${agent.parent?` · parent ${esc(agentName(agent.parent))}`:''}</p>${agentExecutionControls(agent.id)}`;
     const head=col.querySelector('.col-head');if(head.innerHTML!==header)head.innerHTML=header;
     const body=col.querySelector('.col-body'),actions=visibleActions(run).filter(a=>a.agent===agent.id),map=new Map(actions.map(a=>[a.id,a])),ids=new Set(map.keys());
     const episodes=run.episodes.filter(e=>e.agent===agent.id&&e.actions.some(id=>ids.has(id))).slice().reverse();
@@ -948,7 +986,7 @@ function renderInspector(preserveEvidence=false) {
     content=`${pill(o.status)}<h2>${esc(o.title)}</h2><p>${esc(o.note)}</p>${field('Obligation source',o.inferred?'Inferred from actions':'Explicit / evaluator')}<div class="detail-label">Supporting evidence</div>${o.evidence.map(id=>map.get(id)).filter(Boolean).map(a=>`<button class="jump" data-action="${esc(a.id)}">${esc(a.kind)} · ${formatTime(a.start)} · ${esc(a.outcome)} →</button>`).join('')||'<p>No supporting action has been recorded.</p>'}<button class="jump" data-view="trajectory">Follow the trajectory →</button>`;
   } else if(selection.type==='agent') {
     const agent=run.agents.find(a=>a.id===selection.id);
-    content=agent?`${pill('Agent')} ${pill(agent.status||'unknown')}<h2>${esc(agent.label)}</h2><p>${esc(agent.role)}</p>${field('Model',agent.model||'unavailable')}${field('Harness',agent.harness||'unavailable')}${field('Parent',agent.parent?agentName(agent.parent):'No recorded parent')}${field('State',agent.status||'unknown')}${field('Actions',run.actions.filter(a=>a.agent===agent.id).length)}${executionState().live?`<button class="jump execution-control" data-execution-agent ${!executionState().agentEnabled||state.executionPending?'disabled':''}>${executionState().agentCommand==='resume'?'▶ Resume agent':'⏸ Pause agent'}</button>`:''}<button class="jump" data-view="trajectory">Inspect agent trajectory →</button><button class="jump" data-view="context">Inspect agent context →</button>`:'<p>The selected agent is no longer available.</p>';
+    content=agent?`${pill('Agent')} ${pill(agent.status||'unknown')}<h2>${esc(agent.label)}</h2><p>${esc(agent.role)}</p>${field('Model',agent.model||'unavailable')}${field('Harness',agent.harness||'unavailable')}${field('Parent',agent.parent?agentName(agent.parent):'No recorded parent')}${field('State',agent.status||'unknown')}${field('Actions',run.actions.filter(a=>a.agent===agent.id).length)}<button class="jump" data-view="trajectory">Inspect agent trajectory →</button><button class="jump" data-view="context">Inspect agent context →</button>`:'<p>The selected agent is no longer available.</p>';
   } else if(selection.type==='interval') {
     const i=run.intervals.find(i=>i.id===selection.id);
     content=`${pill(i.kind)}<h2>${esc(i.label)}</h2>${field('Start',formatTime(i.start))}${field('Duration',formatTime(i.duration))}${field('Source',i.source)}<p>This interval has no observed action attribution. It may contain uninstrumented work, transport, waiting or idle time.</p>`;
@@ -984,9 +1022,11 @@ function setView(view) {
 }
 
 function handleClick(event) {
-  const el=event.target.closest('[data-execution-agent],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
+  const el=event.target.closest('[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
   if(!el||!state.run&&!(el.hasAttribute('data-retry')||el.hasAttribute('data-demo'))) return;
-  if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false);
+  if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
+  else if(el.hasAttribute('data-execution-stop'))stopExecution(false,false,el.dataset.executionStop);
+  else if(el.hasAttribute('data-execution-kill'))stopExecution(false,true,el.dataset.executionKill);
   else if(el.dataset.addColumn)addAgentColumn(el.dataset.addColumn);
   else if(el.dataset.removeColumn)removeAgentColumn(el.dataset.removeColumn);
   else if(el.dataset.agentTab)selectAgentColumn(el.dataset.agentTab);
@@ -1102,8 +1142,9 @@ document.addEventListener('change',event=>{
 });
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream&&!state.displayPaused)followLatest();});
 window.addEventListener('pagehide',()=>state.stream?.close());
-$('execution-agent').onclick=()=>pauseResumeExecution(false);
 $('execution-all').onclick=()=>pauseResumeExecution(true);
+for(const force of [false,true])
+  $(`execution-${force?'kill':'stop'}-all`).onclick=()=>stopExecution(true,force);
 $('display-toggle').onclick=()=>{if(state.displayPaused)resumeDisplay();else pauseDisplay();};
 $('open-live').onclick=()=>{state.trajectoryLayout='episodes';state.view='trajectory';loadRun('live');};
 $('start-replay').onclick=()=>loadRun(state.run.id,null,true);

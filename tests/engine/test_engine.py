@@ -1414,3 +1414,32 @@ def test_build_execution_result_converts_failed_or_missing_attempt_to_error():
     assert failed.error == "daemon failed"
     assert isinstance(missing, agerror)
     assert missing.error == "no attempt was made"
+
+
+def test_stop_during_daemon_startup_does_not_launch_an_attempt(monkeypatch):
+    holder = _install_fake_host_server_manager(monkeypatch, results=[])
+    cancelled = False
+    original_start = mod.HostServerManager.start
+
+    def start(manager):
+        nonlocal cancelled
+        cancelled = True
+        return original_start(manager)
+
+    monkeypatch.setattr(mod.HostServerManager, "start", start)
+    engine = AgentEngine(_FakeAgent())
+    monkeypatch.setattr(engine, "_build_prompt_payload", lambda *_args: "prompt")
+    skill = SimpleNamespace(
+        sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=0
+    )
+    result = engine.execute(
+        agcontext(),
+        skill,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        engine._agent.sandbox,
+        is_cancelled=lambda: cancelled,
+    )
+    assert result.error == "agent invocation cancelled"
+    assert holder["requests"] == []
+    assert holder["manager"].stopped

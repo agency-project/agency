@@ -119,9 +119,21 @@ def _trajectory_execution_command(source, message):
     command = message.get("command")
     if not controls["available"] or not controls["agents"]:
         return {**result, "error": "No active execution command bridge is available."}
-    if command not in {"pause", "resume", "pause_all", "resume_all"}:
+    if command not in {
+        "pause",
+        "resume",
+        "pause_all",
+        "resume_all",
+        "stop",
+        "kill",
+        "stop_all",
+        "kill_all",
+    }:
         return {**result, "error": "Unsupported execution command."}
-    if command in {"pause", "resume"} and message.get("agname") not in controls["agents"]:
+    if (
+        command in {"pause", "resume", "stop", "kill"}
+        and message.get("agname") not in controls["agents"]
+    ):
         return {**result, "error": "The selected agent is no longer active."}
     try:
         _queue_command({"type": command, "agname": message.get("agname")})
@@ -1353,7 +1365,16 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 msg = json.loads(data)
                 mtype = msg.get("type")
-                if mtype in ("pause", "resume", "pause_all", "resume_all"):
+                if mtype in (
+                    "pause",
+                    "resume",
+                    "pause_all",
+                    "resume_all",
+                    "stop",
+                    "kill",
+                    "stop_all",
+                    "kill_all",
+                ):
                     cmd = {"type": mtype, "agname": msg.get("agname")}
                     _queue_command(cmd)
                 elif mtype in ("update_config", "update_config_all"):

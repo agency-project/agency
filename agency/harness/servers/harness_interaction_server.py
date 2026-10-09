@@ -109,7 +109,10 @@ class HarnessInteractionServer:
                 request_id = (payload or {}).get("request_id")
                 if not isinstance(request_id, str) or not request_id:
                     return JSONResponse({"error": "missing request_id"}, status_code=400)
-                self._control_handler(action, request_id=request_id)
+                force = (payload or {}).get("force", True)
+                if not isinstance(force, bool):
+                    return JSONResponse({"error": "force must be a boolean"}, status_code=400)
+                self._control_handler(action, request_id=request_id, force=force)
             else:
                 self._control_handler(action)
             return JSONResponse({"ok": True})

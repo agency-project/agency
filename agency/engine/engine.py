@@ -94,11 +94,11 @@ class AgentEngine:
             # a late redirect never contacts a hibernated persistent daemon.
             return client.redirect_harness(self._request_id, message)
 
-    def cancel(self) -> None:
+    def cancel(self, *, force: bool = True) -> None:
         with self._services_lock:
             client = self._sandbox_interaction_client
             if not self._services_closed and client is not None:
-                client.cancel_harness(self._request_id)
+                client.cancel_harness(self._request_id, force=force)
 
     @property
     def host_server_manager(self) -> "HostServerManager":
@@ -327,6 +327,10 @@ class AgentEngine:
             resume_session_id = prior_session.get("session_id") if prior_session else None
             prior_session_blob_b64 = prior_session.get("blob_b64") if prior_session else None
             while True:
+                # A stop during daemon startup or schema recovery must not
+                # launch another process after its cancellation RPC was a no-op.
+                if is_cancelled():
+                    return self._controlled_error()
                 # Send the request through sandbox interaction server
                 attempt = self._run_attempt(
                     prompt,

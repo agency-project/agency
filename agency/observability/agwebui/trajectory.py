@@ -32,6 +32,7 @@ EVENT_TYPES = (
     "agent_state",
     "agent_paused",
     "agent_resumed",
+    "agent_stop_requested",
     "tool_call",
     "tool_result",
     "skill_start",
@@ -580,6 +581,17 @@ class Trajectory:
                         agent["paused"] = False
                     self._agent_status(agent, agent.get("execution_state", "unknown"))
                     self.tick(event["ts"], force=True)
+            elif kind == "agent_stop_requested":
+                if event["ts"] >= agent.get("stop_ts", 0):
+                    agent["stop_ts"] = event["ts"]
+                    agent["stop_force"] = bool(payload.get("force"))
+                    # This confirms delivery, not process exit. Terminal state
+                    # still comes from the scheduler's existing request events.
+                    agent["paused"] = False
+                    intervals = self.pauses.get(actor, [])
+                    if intervals and intervals[-1][1] is None:
+                        intervals[-1][1] = event["ts"]
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
             elif kind == "agent_state":
                 if event["ts"] >= agent.get("state_ts", 0):
                     self._agent_status(agent, payload.get("state", "unknown"))

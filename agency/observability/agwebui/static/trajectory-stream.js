@@ -83,7 +83,7 @@ export class TrajectoryStream {
     catch {return false;}
   }
   sendExecution(command, extra = {}) {
-    return !this.replay && this.runId === 'live' && ['pause','resume','pause_all','resume_all'].includes(command)
+    return !this.replay && this.runId === 'live' && ['pause','resume','pause_all','resume_all','stop','kill','stop_all','kill_all'].includes(command)
       && this.send('execution_command', {...extra, command});
   }
   sendReplay(type, extra = {}) {

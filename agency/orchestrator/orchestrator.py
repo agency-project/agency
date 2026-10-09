@@ -309,6 +309,18 @@ class GlobalAgentOrchestrator:
             request.cancelled = True
             return request.engine if request.state == "running" else None
 
+    def cancel_agent(self, ag: "agent") -> "list[AgentEngine]":
+        """Cancel all currently outstanding work using request-owned engines."""
+        with self._event_cond:
+            engines = []
+            for request_id in list(self._outstanding_by_agent.get(ag, ())):
+                request = self._requests.get(request_id)
+                if request is not None:
+                    engine = self.cancel_request(ag, request.result_future)
+                    if engine is not None:
+                        engines.append(engine)
+            return engines
+
     def _claim_completion(self, request: _ExecutionRequest) -> bool:
         with self._event_cond:
             if request.cancelled:

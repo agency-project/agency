@@ -294,6 +294,7 @@ const $resourceStats    = document.getElementById('resource-stats');
 const $btnPauseToggle   = document.getElementById('btn-pause-toggle');
 const $btnPauseAll      = document.getElementById('btn-pause-all');
 const $btnResumeAll     = document.getElementById('btn-resume-all');
+const stopButtons = ['btn-stop','btn-kill','btn-stop-all','btn-kill-all'].map(id=>document.getElementById(id));
 const $btnUpdateConfig  = document.getElementById('btn-update-config');
 const $configOverlay    = document.getElementById('config-modal-overlay');
 const $configTitle      = document.getElementById('config-modal-title');
@@ -606,6 +607,13 @@ function renderAgentList() {
 
 function updateAgentActionsBar() {
   const agname = currentAgent();
+  const connected=state.timeline.liveMode&&ws.readyState===WebSocket.OPEN;
+  const active=ag=>ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
+  stopButtons.forEach((button,i)=>{button.disabled=!connected||!(i<2?active(state.agents.get(agname)):[...state.agents.values()].some(active));});
+  document.querySelectorAll('.side-panel .agent-column-actions').forEach(group=>{
+    const html=dashboardAgentControls(group.dataset.agname);
+    if(group.innerHTML!==html)group.innerHTML=html;
+  });
   if (!agname) {
     $btnPauseToggle.disabled = true;
     $btnPauseToggle.textContent = 'Pause';
@@ -615,10 +623,10 @@ function updateAgentActionsBar() {
   }
   const ag = state.agents.get(agname);
   const paused = ag ? ag.state === 'paused' : false;
-  $btnPauseToggle.disabled = false;
+  $btnPauseToggle.disabled = !connected||!active(ag);
   $btnPauseToggle.textContent = paused ? 'Resume' : 'Pause';
   $btnPauseToggle.classList.toggle('active', paused);
-  $btnUpdateConfig.disabled = false;
+  $btnUpdateConfig.disabled = !connected;
 }
 
 function renderAgentEntry(agname, ag, indent, isFocused) {
@@ -928,7 +936,7 @@ function renderSidePanels() {
             `<button class="side-panel-close" title="Unpin">&times;</button>` +
           `</span>` +
         `</div>` +
-        `<div class="side-panel-history"></div>`;
+        `<div class="agent-column-actions" role="group" aria-label="Agent controls" data-agname="${esc(agname)}">${dashboardAgentControls(agname)}</div><div class="side-panel-history"></div>`;
       panel.querySelector('.side-panel-close').addEventListener('click', () => unpinAgent(agname));
       const historyEl = panel.querySelector('.side-panel-history');
       panelAutoScroll.set(agname, true);
@@ -960,6 +968,8 @@ function renderSidePanels() {
     const usage = state.tokenUsage.get(agname);
     els.tokenEl.textContent = usage ? fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite) : '';
 
+    const controls=els.panel.querySelector('.agent-column-actions'),html=dashboardAgentControls(agname);
+    if(controls.innerHTML!==html)controls.innerHTML=html;
     els.historyEl.innerHTML = buildHistoryHtml(agname);
     if (panelAutoScroll.get(agname) !== false) els.historyEl.scrollTop = els.historyEl.scrollHeight;
   }
@@ -1319,6 +1329,20 @@ $agentList.addEventListener('dragstart', e => {
 // Pause / resume actions
 // ---------------------------------------------------------------------------
 
+function dashboardAgentControls(agname) {
+  const ag=state.agents.get(agname),connected=state.timeline.liveMode&&ws.readyState===WebSocket.OPEN;
+  const enabled=connected&&ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
+  const name=esc(agname),paused=ag?.state==='paused';
+  return `<span class="control-section-label">Agent controls</span><button data-agent-control="${paused?'resume':'pause'}" data-agname="${name}" ${enabled?'':'disabled'}>${paused?'Resume':'Pause'}</button><button data-agent-control="stop" data-agname="${name}" title="Graceful stop (SIGTERM)" ${enabled?'':'disabled'}>Stop</button><button class="danger-control" data-agent-control="kill" data-agname="${name}" title="Force exit (SIGKILL)" ${enabled?'':'disabled'}>SIGKILL</button><button data-agent-control="config" data-agname="${name}" ${connected?'':'disabled'}>Update Config</button>`;
+}
+$interaction.addEventListener('click',event=>{
+  const button=event.target.closest('[data-agent-control]');
+  if(!button||button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
+  const agname=button.dataset.agname,type=button.dataset.agentControl;
+  if(type==='config')openConfigModal(agname);
+  else ws.send(JSON.stringify({type,agname}));
+});
+
 $btnPauseToggle.addEventListener('click', () => {
   const agname = currentAgent();
   if (!agname) return;
@@ -1334,6 +1358,11 @@ $btnPauseAll.addEventListener('click', () => {
 $btnResumeAll.addEventListener('click', () => {
   ws.send(JSON.stringify({ type: 'resume_all' }));
 });
+stopButtons.forEach((button,i)=>button.addEventListener('click',()=>{
+  if(button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
+  const all=i>=2,type=`${i%2?'kill':'stop'}${all?'_all':''}`;
+  ws.send(JSON.stringify({type,...(all?{}:{agname:currentAgent()})}));
+}));
 
 // ---------------------------------------------------------------------------
 // Config editor modal
@@ -1432,6 +1461,7 @@ $configUpdateAll.addEventListener('click', () => {
 
 const ws = new WebSocket(`ws://${location.host}/ws`);
 let wsClosed = false;
+ws.onopen = () => updateAgentActionsBar();
 
 ws.onmessage = e => {
   try {
@@ -1444,6 +1474,7 @@ ws.onmessage = e => {
 
 ws.onclose = () => {
   wsClosed = true;
+  updateAgentActionsBar();
   appendLog('\x1b[31m[web ui] connection closed — reload to reconnect\x1b[0m');
 };
 

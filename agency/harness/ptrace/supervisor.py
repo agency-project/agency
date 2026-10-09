@@ -443,6 +443,10 @@ class agProxyPtraceHandle:
         else:
             self._loop.on_exit(lambda pid, _code: callback(pid))
 
+    def terminate(self) -> None:
+        """Request graceful shutdown of this launch's tracked process tree."""
+        self._loop.terminate()
+
     def kill(self) -> None:
         self._loop.kill()
 

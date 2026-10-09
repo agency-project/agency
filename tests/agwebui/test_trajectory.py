@@ -760,6 +760,7 @@ def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypat
             agname=name,
             pause=lambda n=name: called.append((n, "pause")),
             resume=lambda n=name: called.append((n, "resume")),
+            stop=lambda force, n=name: called.append((n, "kill" if force else "stop")),
         )
         for name in ("worker", "other")
     ]
@@ -767,7 +768,16 @@ def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypat
     with TestClient(server.app) as client:
         with client.websocket_connect("/ws/trajectory") as websocket:
             assert websocket.receive_json()["execution_controls"]["available"]
-            for command in ("pause", "resume", "pause_all", "resume_all"):
+            for command in (
+                "pause",
+                "resume",
+                "pause_all",
+                "resume_all",
+                "stop",
+                "kill",
+                "stop_all",
+                "kill_all",
+            ):
                 websocket.send_json(
                     {
                         "type": "execution_command",
@@ -792,6 +802,12 @@ def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypat
         ("other", "pause"),
         ("worker", "resume"),
         ("other", "resume"),
+        ("worker", "stop"),
+        ("worker", "kill"),
+        ("worker", "stop"),
+        ("other", "stop"),
+        ("worker", "kill"),
+        ("other", "kill"),
     ]
 
 
@@ -842,3 +858,19 @@ def test_replay_pause_and_execution_commands_never_reach_live_bridge(tmp_path, m
                 pass
             assert "during replay" in response["error"]
             assert queued == []
+
+
+def test_stop_confirmation_preserves_execution_state_until_scheduler_reports_exit():
+    trajectory = model()
+    trajectory.apply(event(1, "agent_registered"))
+    trajectory.apply(event(2, "agent_state", state="running_harness"))
+    trajectory.apply(event(3, "agent_paused"))
+    trajectory.apply(event(4, "agent_stop_requested", force=False))
+    actor = trajectory.agents["worker"]
+    assert actor["stop_ts"] == 4 and not actor["stop_force"]
+    assert actor["status"] == "running_harness"
+    assert trajectory.pauses["worker"] == [[3, 4]]
+    trajectory.apply(event(5, "agent_stop_requested", force=True))
+    assert actor["stop_force"]
+    trajectory.apply(event(6, "request_cancelled", request_id="r"))
+    assert actor["status"] == "cancelled"

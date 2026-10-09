@@ -652,12 +652,6 @@ small,.muted {
   padding:8px 10px
 }
 
-.pause-controls {
-  display:flex;
-  align-items:center;
-  gap:7px
-}
-
 .display-control {
   color:#d7edff;
   background:#1d4b72;
@@ -2087,6 +2081,8 @@ small,.muted {
 @media(max-width:900px) { .tandem-board .board>.col:not(.active-agent-column) { display:none } }
 .tandem-board .supervisor-column .seg { border-left-color:var(--sup) }
 
+.danger-control {color:#ffd7dc;background:#50232c;border-color:var(--red)}
+.danger-control:hover {background:#70303d;border-color:#ffb6bf}
 .pill.paused {color:var(--amber);border-color:var(--amber);background:rgba(232,187,114,.08)}
 #execution-message {font-size:11px;color:var(--amber);max-width:260px}
 
@@ -2127,3 +2123,12 @@ small,.muted {
 /* Narrow screens use the same horizontally scrollable columns, not hidden grid cells. */
 .agent-columns>.agent-column {display:block}
 @media(max-width:900px) {#agent-tabs {flex-wrap:nowrap}}
+
+.all-agent-controls,.agent-execution-controls {display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.all-agent-controls {border-left:1px solid var(--line);padding-left:10px}
+.control-section-label {font:9px var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.agent-column-heading>.agent-execution-controls {flex-basis:100%;border-top:1px solid var(--line);padding-top:8px}
+.agent-execution-controls button {font-size:10px;padding:6px 8px}
+.col-head .agent-execution-controls {border-top:1px solid var(--line);padding-top:8px;margin-top:10px}
+
+.all-agent-controls[hidden],.agent-execution-controls[hidden] {display:none}

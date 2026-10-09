@@ -699,7 +699,7 @@ def test_websocket_resume_writes_command_file(server):
     assert cmds == [{"type": "resume", "agname": "alex_0000"}]
 
 
-@pytest.mark.parametrize("mtype", ["pause_all", "resume_all"])
+@pytest.mark.parametrize("mtype", ["pause_all", "resume_all", "stop_all", "kill_all"])
 def test_websocket_pause_all_resume_all_write_command_file(server, mtype):
     client, run_dir, srv = server
 
@@ -1397,3 +1397,12 @@ def test_profiler_viewer_and_downloads_share_default_sibling_directory(server, m
     assert client.get("/api/profiler").json()["trace_available"] is True
     assert client.get("/api/profiler/trace").json() == trace
     assert client.get("/api/profiler/download/agprof.trace.json").json() == trace
+
+
+@pytest.mark.parametrize("command", ["stop", "kill"])
+def test_dashboard_stop_commands_write_named_agent_command(server, command):
+    client, run_dir, _srv = server
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": command, "agname": "alex_0000"}))
+        assert _wait_for(lambda: _read_command_files(run_dir))
+    assert _read_command_files(run_dir) == [{"type": command, "agname": "alex_0000"}]

@@ -444,6 +444,20 @@ class agent:
             except Exception as exc:
                 print(f"[agent] WARNING: cancel_harness() failed for {self.agname}: {exc}")
 
+    def stop(self, *, force: bool = False) -> None:
+        """Cancel this agent's outstanding work; SIGTERM by default, SIGKILL on force."""
+        engines = self._orchestrator.cancel_agent(self)
+        with self._control_lock:
+            self._paused = False
+        for engine in engines:
+            engine.cancel(force=force)
+        self.data_logger.record_event(
+            type="agent_stop_requested",
+            payload={"agname": self.agname, "force": force},
+            term_message=f"[{self.agname}] STOP ■  {'SIGKILL' if force else 'SIGTERM'} requested",
+            flush=True,
+        )
+
     # ------------------------------------------------------------------
     # Execution — delegates to agskill
     # ------------------------------------------------------------------

@@ -1112,6 +1112,19 @@ class TracerLoop:
             self._stdin_writer.join()
         return self._returncode
 
+    def terminate(self) -> None:
+        """Deliver SIGTERM and release paused tasks so their handlers can run."""
+        if self._checkpoint_detached:
+            self.checkpoint_handoff("reattach")
+        with self._lock:
+            pids = list(self._known_pids)
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        self.resume()
+
     def kill(self) -> None:
         if self._checkpoint_detached:
             self.checkpoint_handoff("reattach")

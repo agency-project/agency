@@ -69,7 +69,7 @@ def _all_agteam_subclasses(cls):
 
 
 def _dispatch_command(cmd: dict) -> None:
-    """Apply one pause/resume command written by the webui server process.
+    """Apply one execution/config command written by the webui server process.
 
     The (isolated, no-agency-imports) server process can only write a plain
     file describing what it wants; this side -- running inside the
@@ -88,6 +88,14 @@ def _dispatch_command(cmd: dict) -> None:
     elif ctype in ("pause_all", "resume_all"):
         for a in _agent_cls.all():
             (a.pause if ctype == "pause_all" else a.resume)()
+    elif ctype in ("stop", "kill", "stop_all", "kill_all"):
+        targets = [a for a in _agent_cls.all() if ctype.endswith("_all") or a.agname == agname]
+        for a in targets:
+            try:
+                a.stop(force=ctype.startswith("kill"))
+            except Exception as exc:
+                # One failed RPC must not prevent stopping the remaining agents.
+                print(f"[agwebui] WARNING: {ctype} failed for {a.agname}: {exc}")
     elif ctype == "update_config":
         # Merge into the agent's existing agconfig. The webui editor only
         # ships a safe_snapshot() (LLM knobs etc.) -- replacing the whole

@@ -53,7 +53,7 @@ function page(replay=false) {
       }});
       return el;
     },
-    querySelector:()=>null, addEventListener:(name,fn)=>{
+    querySelector:()=>null, querySelectorAll:()=>[...nodes.values()].filter(el=>el.dataset.agentControls), addEventListener:(name,fn)=>{
       (listeners[name]??=[]).push(fn);
     }};
   let subscription;const sent=[];
@@ -90,15 +90,24 @@ function page(replay=false) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,loadRun,selectAction,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
+    globalThis.ui={state,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
+  const agentButton=(kind,id='a')=>{
+    const attribute=`data-execution-${kind}`,html=context.ui.agentExecutionControls(id);
+    const match=html.match(new RegExp(`<button[^>]*${attribute}="${id}"[^>]*>([^<]*)</button>`));
+    return {hidden:!match,disabled:!match||/disabled/.test(match[0]),textContent:match?.[1]||'',
+      onclick:()=>context.ui.handleClick({target:{closest:selector=>{
+        if(!selector.includes(`[${attribute}]`))return null;
+        return {dataset:{[`execution${kind[0].toUpperCase()+kind.slice(1)}`]:id},hasAttribute:name=>name===attribute};
+      }}})};
+  };
   const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, document, node,flush,delays,sent,receive:message=>subscription.onMessage(message),transport:value=>subscription.onTransport(value),window:context.window,
+  return {ui:context.ui, document, node,agentButton,flush,delays,sent,receive:message=>subscription.onMessage(message),transport:value=>subscription.onTransport(value),window:context.window,
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');return (agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');},
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
@@ -406,7 +415,7 @@ test('execution controls use live agent state while the display is frozen',()=>{
   assert.equal(p.sent[1].command,'resume_all');
   assert.equal(p.ui.state.displayPaused,true);
   p.ui.state.selected={type:'agent',id:'a'};p.ui.renderSession();
-  assert.equal(p.node('execution-agent').textContent,'▶ Resume agent');
+  assert.equal(p.agentButton('agent').textContent,'▶ Resume');
 });
 
 test('reconnect snapshots are retained behind the paused display and run switching resets it',()=>{
@@ -460,9 +469,9 @@ test('timeline scroll and resize paints keep reading the frozen snapshot',()=>{
 
 test('debugger controls follow action selection and send named-agent commands',()=>{
   const p=debuggerPage();p.ui.selectAction('old');p.ui.renderSession();
-  assert.equal(p.node('execution-agent').hidden,false);
-  assert.equal(p.node('execution-agent').disabled,false);
-  p.node('execution-agent').onclick();
+  assert.equal(p.agentButton('agent').hidden,false);
+  assert.equal(p.agentButton('agent').disabled,false);
+  p.agentButton('agent').onclick();
   assert.equal(p.sent[0].command,'pause');
   assert.equal(p.sent[0].agname,'a');
   assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
@@ -474,16 +483,16 @@ test('debugger controls follow action selection and send named-agent commands',(
   p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
   p.ui.renderSession();
   assert.equal(p.ui.state.executionPending,null);
-  assert.equal(p.node('execution-agent').textContent,'▶ Resume agent');
+  assert.equal(p.agentButton('agent').textContent,'▶ Resume');
   assert.match(p.node('execution-state').textContent,/1 agent paused/);
-  p.node('execution-agent').onclick();
+  p.agentButton('agent').onclick();
   assert.equal(p.sent[1].command,'resume');
   assert.equal(p.sent[1].agname,'a');
 });
 
 test('global debugger controls target all agents and expose resume for mixed paused states',()=>{
   const p=debuggerPage();p.ui.renderSession();
-  assert.equal(p.node('execution-agent').hidden,true);
+  assert.equal(p.agentButton('agent').hidden,false);
   p.node('execution-all').onclick();
   assert.equal(p.sent[0].command,'pause_all');
   assert.equal(p.sent[0].agname,undefined);
@@ -529,7 +538,7 @@ test('paused agent inspection and duration labels use the recorded execution dur
   p.ui.state.run.agents[0].status='paused';
   p.ui.state.selected={type:'agent',id:'a'};p.ui.renderInspector();
   assert.match(p.node('inspector').innerHTML,/pill paused/);
-  assert.match(p.node('inspector').innerHTML,/Resume agent/);
+  assert.match(p.ui.agentExecutionControls('a'),/Resume/);
   assert.match(p.ui.actionButton({...p.ui.state.run.actions[0],duration:25,execution_duration:5}),/>5.0s</);
 });
 
@@ -539,9 +548,101 @@ test('completed or missing selected agents disable controls and retain an inspec
   p.ui.state.selected={type:'agent',id:'a'};
   p.ui.state.executionControls.agents=['b'];
   p.ui.state.run.agents[0].status='completed';p.ui.renderSession();
-  assert.equal(p.node('execution-agent').disabled,true);
+  assert.equal(p.agentButton('agent').disabled,true);
   p.ui.state.run.agents=p.ui.state.run.agents.filter(a=>a.id!=='a');
   p.ui.renderInspector();p.ui.renderSession();
   assert.match(p.node('inspector').innerHTML,/no longer available/);
-  assert.equal(p.node('execution-agent').hidden,true);
+  assert.equal(p.agentButton('agent').hidden,true);
+});
+
+
+test('stop targets selected agent and SIGKILL can escalate while stop awaits confirmation',()=>{
+  const p=debuggerPage();p.ui.selectAction('old');p.ui.renderSession();
+  p.agentButton('stop').onclick();p.ui.renderSession();
+  assert.equal(p.sent[0].command,'stop');assert.equal(p.sent[0].agname,'a');
+  assert(p.ui.state.executionPending);
+  assert.equal(p.agentButton('stop').disabled,true);
+  assert.equal(p.agentButton('kill').disabled,false);
+  p.receive({type:'execution_command_result',id:p.sent[0].id,queued:true});
+  assert(p.ui.state.executionPending);
+  assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
+  p.agentButton('kill').onclick();
+  assert.equal(p.sent[1].command,'kill');assert.equal(p.sent[1].agname,'a');
+  const run=p.ui.state.run;run.agents[0].stop_ts=10;run.agents[0].stop_force=true;
+  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  assert.equal(p.ui.state.executionPending,null);
+  assert.match(p.ui.state.executionMessage,/SIGKILL delivered/);
+  assert.equal(run.agents[0].status,'waiting_llm');
+});
+
+test('stop all uses live execution while display is paused and SIGKILL all keeps all scope',()=>{
+  const p=debuggerPage();p.ui.pauseDisplay();p.ui.renderSession();
+  p.node('execution-stop-all').onclick();
+  assert.equal(p.sent[0].command,'stop_all');assert.equal(p.sent[0].agname,undefined);
+  p.node('execution-kill-all').onclick();
+  assert.equal(p.sent[1].command,'kill_all');assert.equal(p.sent[1].agname,undefined);
+  const run=p.ui.state.liveRun;
+  run.agents.forEach(agent=>{agent.status='cancelled';});run.status='cancelled';
+  p.receive({type:'snapshot',run,execution_controls:{available:false,agents:[]}});
+  assert.equal(p.ui.state.executionPending,null);
+  assert.equal(p.ui.state.executionMessage,'Execution stopped.');
+});
+
+test('stop controls hide in saved/replay views and disable on disconnect or completion',()=>{
+  const p=debuggerPage();p.ui.selectAction('old');
+  const ids=['execution-stop-all','execution-kill-all'];
+  p.transport('disconnected');p.ui.renderSession();
+  ids.forEach(id=>assert.equal(p.node(id).disabled,true));
+  p.transport('connected');p.ui.renderSession();
+  ids.forEach(id=>assert.equal(p.node(id).disabled,false));
+  p.ui.state.replay=true;p.ui.renderSession();
+  assert.equal(p.node('all-agent-controls').hidden,true);
+  assert.equal(p.ui.agentExecutionControls('a'),'');
+  p.ui.state.replay=false;p.ui.state.run.id='saved';p.ui.renderSession();
+  assert.equal(p.node('all-agent-controls').hidden,true);
+  assert.equal(p.ui.agentExecutionControls('a'),'');
+  p.ui.state.run.id='live';p.ui.state.run.status='completed';p.ui.renderSession();
+  ids.forEach(id=>assert.equal(p.node(id).disabled,true));
+});
+
+
+test('column controls target their own agent even when another agent is selected',()=>{
+  const p=debuggerPage();p.ui.state.selected={type:'agent',id:'a'};
+  for(const [attribute,command] of [['data-execution-stop','stop'],['data-execution-kill','kill']]) {
+    const kind=attribute.split('-').at(-1);
+    const element={dataset:{[`execution${kind[0].toUpperCase()+kind.slice(1)}`]:'b'},hasAttribute:name=>name===attribute};
+    p.ui.handleClick({target:{closest:selector=>selector.includes(`[${attribute}]`)?element:null}});
+    assert.equal(p.sent.at(-1).command,command);
+    assert.equal(p.sent.at(-1).agname,'b');
+  }
+});
+
+
+test('trajectory and tandem column headings contain agent controls while global controls stay separate',()=>{
+  const p=debuggerPage();p.ui.renderCallStack();
+  for(const column of p.node('call-stack').children) {
+    const html=column.querySelector('.agent-column-heading').innerHTML;
+    assert.match(html,new RegExp(`data-agent-controls="${column.dataset.agentColumn}"`));
+    assert.match(html,/Agent controls/);assert.match(html,/SIGKILL/);
+    assert.doesNotMatch(html,/Stop all agents/);
+  }
+  p.ui.renderTandemBoard();
+  for(const column of p.node('tandem-columns').children) {
+    assert.match(column.querySelector('.col-head').innerHTML,/data-agent-controls=/);
+  }
+  const pageHtml=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
+  assert.match(pageHtml,/id="all-agent-controls"/);
+  assert.doesNotMatch(pageHtml,/id="execution-agent"|id="execution-stop-agent"|id="execution-kill-agent"/);
+});
+
+test('column controls update from live state while the displayed evidence stays frozen',()=>{
+  const p=debuggerPage();p.ui.pauseDisplay();
+  const group=p.node('column-controls');group.dataset.agentControls='b';
+  p.ui.state.liveRun.agents[1].status='paused';p.ui.renderSession();
+  assert.match(group.innerHTML,/Resume/);
+  assert.equal(p.ui.state.run.agents[1].status,'running');
+  p.agentButton('agent','b').onclick();
+  assert.equal(p.sent[0].command,'resume');assert.equal(p.sent[0].agname,'b');
+  p.ui.renderSession();assert.match(group.innerHTML,/data-execution-stop="b"[^>]*disabled/);
+  assert.doesNotMatch(group.innerHTML,/data-execution-kill="b"[^>]*disabled/);
 });

@@ -27,6 +27,13 @@
       <div id="interaction">
         <div id="panel-main">
           <div class="panel-title" id="interaction-title">No agents</div>
+          <div id="agent-column-actions" class="agent-column-actions" role="group" aria-label="Selected agent controls">
+            <span class="control-section-label">Agent controls</span>
+            <button id="btn-pause-toggle" disabled>Pause</button>
+            <button id="btn-stop" disabled title="Gracefully stop selected agent with SIGTERM">Stop</button>
+            <button id="btn-kill" disabled title="Force selected agent to exit with SIGKILL">SIGKILL</button>
+            <button id="btn-update-config" disabled>Update Config</button>
+          </div>
           <div id="agent-history"></div>
           <div id="nav-bar">
             <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
@@ -52,11 +59,12 @@
         <input id="agent-search" type="text" placeholder="Search agents…" autocomplete="off" spellcheck="false">
       </div>
       <div id="agent-list"></div>
-      <div id="agent-actions">
-        <button id="btn-pause-toggle" disabled>Pause</button>
+      <div id="agent-actions" role="group" aria-label="All agents controls">
+        <span class="control-section-label">All agents</span>
         <button id="btn-pause-all">Pause All</button>
         <button id="btn-resume-all">Resume All</button>
-        <button id="btn-update-config" disabled>Update Config</button>
+        <button id="btn-stop-all" disabled title="Gracefully stop all agents with SIGTERM">Stop All</button>
+        <button id="btn-kill-all" disabled title="Force all agents to exit with SIGKILL">SIGKILL All</button>
       </div>
     </div>
   </div>
