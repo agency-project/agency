@@ -58,7 +58,7 @@ export function mergeTrajectorySnapshot(run, snapshot) {
 // Bounds apply only to the browser's live projection. Durable source records,
 // saved review and explicit historical pages retain their original evidence.
 export function boundTrajectory(run, pins=[]) {
-  const keep=new Set(pins.slice(0,500));
+  const keep=new Set(pins.slice(0,2000));
   const sorted=[...(run.actions||[])].sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
   let completed=0,active=0;
   for(const a of sorted)if(a.outcome==='running'?active++<200:completed++<2000)keep.add(a.id);
@@ -119,7 +119,7 @@ export class TrajectoryStream {
     catch {return false;}
   }
   sendExecution(command, extra = {}) {
-    return !this.replay && this.runId === 'live' && ['pause','resume','pause_all','resume_all','stop','kill','stop_all','kill_all'].includes(command)
+    return !this.replay && this.runId === 'live' && ['pause','resume','pause_all','resume_all','stop','kill','stop_all','kill_all','queue_message','redirect','run'].includes(command)
       && this.send('execution_command', {...extra, command});
   }
   sendReplay(type, extra = {}) {

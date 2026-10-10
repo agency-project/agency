@@ -2235,3 +2235,68 @@ small,.muted {
 }
 
 .execution-timeline-scroll { overflow-anchor: none; }
+
+/* Functional evidence and interaction layout: reuse profiler surfaces/colors. */
+.action-label {white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}
+.agent-column .call-card .action-kind {color:var(--muted);font-size:10px;overflow-wrap:anywhere}
+.agent-column .call-card .action-label {font:11px/1.55 var(--mono);margin-top:5px}
+.call-card-status .event-preview {white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.5}
+.agent-column-heading strong {overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-column-heading [data-column-order] {margin-left:0;padding:2px 5px}
+.agent-execution-controls {align-items:center;gap:5px}
+.agent-danger-menu {position:relative;font-size:10px}
+.agent-danger-menu summary {cursor:pointer;border:1px solid var(--line);border-radius:4px;padding:4px 7px}
+.agent-danger-menu[open] button {position:absolute;z-index:12;right:0;top:calc(100% + 4px);white-space:nowrap;background:var(--panel)}
+#control-scope {flex-basis:100%;font-size:10px;margin:0;max-width:100%}
+#control-outcomes {flex-basis:100%;font-size:11px;color:var(--amber);overflow-wrap:anywhere;max-height:100px;overflow:auto}
+.agent-roster {border:1px solid var(--line);border-radius:5px;font-size:11px;margin:0 0 8px;padding:5px 8px}
+.agent-roster>summary {cursor:pointer;color:var(--muted)}
+.roster-filters {display:flex;gap:10px;margin:8px 0;align-items:end}
+.roster-filters label {min-width:0;flex:1}
+.roster-filters input,.roster-filters select {width:100%;padding:5px}
+#roster-list {max-height:230px;overflow:auto}
+.roster-row {display:flex;align-items:center;gap:6px;flex-wrap:wrap;border-top:1px solid var(--line);padding:6px 0}
+.roster-row>button {max-width:45%;overflow:hidden;text-overflow:ellipsis;text-align:left;white-space:nowrap}
+.roster-row small {color:var(--muted)}
+.roster-row-actions {display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+.roster-row-actions button {font-size:10px;padding:4px 6px}
+.roster-children {margin-left:16px;border-left:1px solid var(--line);padding-left:8px}
+.roster-children summary {cursor:pointer;color:var(--muted);padding:4px}
+#hidden-agents {display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px}
+#hidden-agents button {font-size:10px;padding:3px 5px;max-width:100%;overflow-wrap:anywhere}
+.inspector textarea {width:100%;min-width:0;resize:vertical;font:11px/1.6 var(--mono);border:1px solid var(--line);border-radius:4px;padding:8px;background:var(--bg);color:var(--text);box-sizing:border-box}
+.inspector label {display:block;font-size:11px;color:var(--muted);margin:8px 0}
+.inspector label select {width:100%;margin-top:4px}
+.inspector [data-interaction-submit] {margin-top:8px;width:100%}
+.payload-section>button {font-size:10px;margin:5px 2px;padding:4px 6px}
+.payload-text {max-height:280px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.payload-paging {display:flex;gap:6px;margin:5px 0}
+.event-measurements {margin-top:12px;font-size:11px}
+.event-measurements summary {cursor:pointer;color:var(--muted)}
+.first-experience,.connection-guide {border:1px solid var(--line);border-radius:5px;background:var(--panel);padding:16px;margin-bottom:12px}
+.first-experience p,.connection-guide p {font-size:12px;line-height:1.65;color:var(--muted)}
+.first-experience button {margin:8px 8px 8px 0}
+.connection-guide {margin:8px 16px}
+.connection-guide pre {max-height:280px;overflow:auto;font:11px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.connection-guide>button {float:right}
+#agent-tabs {display:none}
+@media(max-width:1100px) {
+  .investigation.inspector-open {grid-template-columns:minmax(0,1fr) 290px}
+  .agent-columns {grid-auto-columns:minmax(310px,1fr)}
+}
+@media(max-width:700px) {
+  .investigation.inspector-open {grid-template-columns:minmax(0,1fr)}
+  .roster-filters {flex-wrap:wrap}
+}
+
+.timeline-block.selected {outline:2px solid var(--blue);outline-offset:2px;z-index:2}
+
+/* Keep investigation cards above the fold at desktop validation sizes. */
+.agent-column-controls>.agent-roster {margin:0;padding:4px 7px;margin-left:auto}
+.agent-column-controls>.agent-roster[open] {flex-basis:100%;margin-left:0}
+.agent-current h3,.agent-history h3 {margin:3px 0}
+.agent-current {margin-bottom:6px;padding-bottom:4px}
+.current-coverage {margin-bottom:3px}
+.agent-column-heading>.agent-execution-controls {padding-top:5px}
+.agent-column .call-card .action-row {padding:7px 6px;gap:5px}
+.agent-column .tool-details {margin:5px 0 0;padding-top:4px}

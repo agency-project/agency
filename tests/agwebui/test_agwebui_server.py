@@ -676,39 +676,82 @@ def _read_command_files(run_dir: Path) -> "list[dict]":
     return [json.loads(f.read_text()) for f in (run_dir / "ui_commands").glob("*.json")]
 
 
+def _dashboard_control_bridge(run_dir, srv, agents=("alex_0000",)):
+    """Advertise a deterministic owned relay; standalone log viewers cannot mutate."""
+    source = srv._trajectory_source()
+    for index, name in enumerate(agents):
+        source.model.apply(
+            {
+                "id": f"control-agent:{name}",
+                "actor": name,
+                "ts": 100 + index,
+                "type": "agent_registered",
+                "payload": {},
+            }
+        )
+    srv._command_ids = {}
+    (run_dir / "ui_commands" / ".heartbeat").touch()
+    (run_dir / "ui_commands" / ".session").write_text(
+        json.dumps({"relay_id": "test-relay", "capabilities": {name: {} for name in agents}})
+    )
+
+
+def _send_dashboard_control(ws, command, agname=None, identifier="test-command"):
+    ws.send_json({"type": "execution_controls_request"})
+    while (message := ws.receive_json())["type"] != "execution_controls":
+        pass
+    controls = message["execution_controls"]
+    assert controls["available"]
+    ws.send_json(
+        {
+            "type": command,
+            "agname": agname,
+            "id": identifier,
+            "relay_id": controls["relay_id"],
+            "execution": controls["execution"],
+            "targets": controls["agents"] if command.endswith("_all") else [agname],
+        }
+    )
+
+
 def test_websocket_pause_writes_command_file(server):
     client, run_dir, srv = server
+    _dashboard_control_bridge(run_dir, srv)
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "pause", "agname": "alex_0000"}))
+        _send_dashboard_control(ws, "pause", "alex_0000")
         assert _wait_for(lambda: _read_command_files(run_dir)), "pause command file was not written"
 
     cmds = _read_command_files(run_dir)
     assert len(cmds) == 1
-    assert cmds[0] == {"type": "pause", "agname": "alex_0000"}
+    assert cmds[0]["type"] == "pause" and cmds[0]["agname"] == "alex_0000"
+    assert cmds[0]["relay_id"] == "test-relay" and cmds[0]["targets"] == ["alex_0000"]
 
 
 def test_websocket_resume_writes_command_file(server):
     client, run_dir, srv = server
+    _dashboard_control_bridge(run_dir, srv)
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "resume", "agname": "alex_0000"}))
+        _send_dashboard_control(ws, "resume", "alex_0000")
         assert _wait_for(lambda: _read_command_files(run_dir))
 
     cmds = _read_command_files(run_dir)
-    assert cmds == [{"type": "resume", "agname": "alex_0000"}]
+    assert [(cmd["type"], cmd["agname"]) for cmd in cmds] == [("resume", "alex_0000")]
 
 
 @pytest.mark.parametrize("mtype", ["pause_all", "resume_all", "stop_all", "kill_all"])
 def test_websocket_pause_all_resume_all_write_command_file(server, mtype):
     client, run_dir, srv = server
+    _dashboard_control_bridge(run_dir, srv)
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": mtype}))
+        _send_dashboard_control(ws, mtype)
         assert _wait_for(lambda: _read_command_files(run_dir))
 
     cmds = _read_command_files(run_dir)
-    assert cmds == [{"type": mtype, "agname": None}]
+    assert [(cmd["type"], cmd["agname"]) for cmd in cmds] == [(mtype, None)]
+    assert cmds[0]["targets"] == ["alex_0000"]
 
 
 def test_websocket_update_config_writes_command_file(server):
@@ -775,10 +818,11 @@ def test_websocket_multiple_pause_commands_each_get_own_file(server):
     """Each command must land in its own file — a single overwritten file
     would silently drop all but the last command between poll cycles."""
     client, run_dir, srv = server
+    _dashboard_control_bridge(run_dir, srv, ("a", "b"))
 
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "pause", "agname": "a"}))
-        ws.send_text(json.dumps({"type": "pause", "agname": "b"}))
+        _send_dashboard_control(ws, "pause", "a", "first")
+        _send_dashboard_control(ws, "pause", "b", "second")
         assert _wait_for(lambda: len(_read_command_files(run_dir)) == 2)
 
     agnames = {c["agname"] for c in _read_command_files(run_dir)}
@@ -1401,8 +1445,26 @@ def test_profiler_viewer_and_downloads_share_default_sibling_directory(server, m
 
 @pytest.mark.parametrize("command", ["stop", "kill"])
 def test_dashboard_stop_commands_write_named_agent_command(server, command):
-    client, run_dir, _srv = server
+    client, run_dir, srv = server
+    _dashboard_control_bridge(run_dir, srv)
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": command, "agname": "alex_0000"}))
+        _send_dashboard_control(ws, command, "alex_0000")
         assert _wait_for(lambda: _read_command_files(run_dir))
-    assert _read_command_files(run_dir) == [{"type": command, "agname": "alex_0000"}]
+    cmds = _read_command_files(run_dir)
+    assert [(cmd["type"], cmd["agname"]) for cmd in cmds] == [(command, "alex_0000")]
+    assert cmds[0]["relay_id"] == "test-relay" and cmds[0]["targets"] == ["alex_0000"]
+
+
+def test_dashboard_standalone_or_unfenced_commands_cannot_target_ambient_execution(server):
+    client, run_dir, srv = server
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "pause_all", "id": "no-bridge"})
+        while (response := ws.receive_json())["type"] != "execution_command_result":
+            pass
+        assert "error" in response and not _read_command_files(run_dir)
+    _dashboard_control_bridge(run_dir, srv)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "pause", "agname": "alex_0000", "id": "missing-fence"})
+        while (response := ws.receive_json())["type"] != "execution_command_result":
+            pass
+        assert "Execution changed" in response["error"] and not _read_command_files(run_dir)

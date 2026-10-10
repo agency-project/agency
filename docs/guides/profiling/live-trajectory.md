@@ -75,19 +75,129 @@ button offers **Resume Agents**. Execution controls continue to reflect the late
 agent state while the display is held.
 
 These commands use the existing webui relay and `agent.pause()` / `resume()`
-to stop and continue the harness process. The trajectory connection stays
+to request local harness-process pause or continuation. Pause does not cancel
+an already-issued remote model or tool operation or pause scheduler admission.
+The trajectory connection stays
 open, so actions, context, resources, and source evidence remain inspectable.
-Recorded pause/resume events supply the authoritative agent status and paused
-badges. A queued command stays pending until those events arrive; delivery
-errors or missing confirmation appear in the session bar.
+Recorded pause/resume events supply the agent's recorded pause intent. They do
+not prove that every process has parked: the daemon can be absent, and a daemon
+RPC acknowledgement may be a no-op. A file-enqueue acknowledgement is only
+**Queued**. A correlated relay receipt reports per-agent API acceptance, RPC
+acknowledgement or error; recorded state changes arrive separately. Bulk actions
+retain each target's outcome, including partial failure. Stop preserves SIGTERM;
+Force stop preserves SIGKILL. Neither acknowledgement establishes process exit
+or cleanup. Disconnects and missing receipts leave the outcome unknown; the
+browser does not automatically retry mutations.
 
-Running spans freeze while their agent is paused. Duration labels exclude
-recorded execution pauses; the inspector also shows the wall interval, and
-trace start/end timestamps and the shared wall-clock axis stay intact. The
+Each command carries the live execution identity, an execution-process UUID,
+a unique request ID and a snapshot of target agents. Both server and relay fence
+replacement executions. The relay deduplicates the session's first 2,000 command
+IDs and retains its latest 200 receipts; further submissions require a new relay
+session. Requested actions and known outcomes are recorded as `ui_intervention`
+events when the existing global logger is available. Replay and recordings
+cannot send these commands. While Freeze view is active, controls still target
+the current live execution and explicitly say so.
+
+## Messages, redirects and task submission
+
+An active `agwebui.run(...)` relay exposes **Queue retained message** on each
+owned agent. This is the same `agent.queue_message(message)` publication boundary:
+**A submitted → B submitted → message → C submitted** delivers retained context
+to C and later invocations, not A or B, even if B is still queued. It neither
+injects into the current model turn nor starts an engine. **Queued** means the
+ordered context request was published; **Context committed** means its predecessor
+resolved and the retained context was appended. Neither means a model consumed
+or followed the message. Multiline content is preserved.
+
+**Redirect active invocation** is offered only for an active, unpaused invocation
+on the existing PTY adapters (`claude_code`, `codex`, `opencode`, `kimi`, `grok`).
+Its exact owned invocation ID is fenced. Successful native prompt acknowledgement
+is **Delivered**, continuing that same Agency invocation; it creates no successor
+invocation. If delivery loses the race after dispatch or fails, the unchanged SDK
+falls back to one future-context publication at the then-current chain tail.
+The receipt states **Queued** and names that context request. A target already
+gone before relay dispatch is rejected, so the composer cannot silently redirect
+a replacement. Native harnesses expose future-context queueing without a working
+looking interrupt control.
+
+**Run task** requires an explicit allowlist of existing skills in the execution
+script; a browser cannot import classes, choose arbitrary methods or change
+provider/sandbox configuration:
+
+```python
+from agency import agent, agdata, agskill
+from agency.observability.agwebui import agwebui
+
+answer = agskill("Answer", "Answer the supplied question.", input_schema=agdata(question=str))
+
+def workload():
+    # Construct/configure agents using the application's normal setup.
+    worker = agent()
+    worker.run(answer, agdata(question="Initial task")).wait()
+    # The relay remains available only while this workload is running.
+
+agwebui.run(workload, ui_tasks={"answer": answer})
+```
+
+This example illustrates the opt-in contract, not a cost-free smoke test: actual
+skill execution requires the normal configured Linux runtime, sandbox and model
+credentials. Selecting a task does not submit it. The explicit submit action
+validates a JSON input object with the skill's existing input schema, then calls
+`agent.run(skill, agdata(...))`. **Submitted** names the real invocation and means
+scheduler publication, not successful execution. No task allowlist means no Run
+task capability. A standalone log server, finished wrapper, or recorded example
+has no execution-owned relay and remains read-only.
+
+Cards show the calculated wall interval, including recorded pauses. Detailed
+execution duration and the legacy overlay labels exclude recorded pauses and
+are qualified separately; trace boundaries and the timeline use wall-clock time. The
 run's wall time continues advancing. Controls disable after completion,
 during disconnection, or when the execution command relay is unavailable.
 The standalone log-viewing server and the cost-free smoke example above have
 no live agent relay, so their execution controls stay disabled.
+
+## Readable cards and focused agents
+
+Trajectory is the default when no explicit view is selected. The short execution
+header retains the full copyable identifier in its disclosure; the metric strip
+shows available measurements only. Empty first visits offer a recorded synthetic
+example and the verified run/connect path without replacing a selected execution.
+
+Each agent column has a stable header, current in-flight calls, and newest-start-first
+history. Tool commands, specific returned failures, model identity/output/usage,
+and intervention acknowledgements are visible without expanding every metric.
+A failing tool call does not establish an unhealthy agent. Unknown timing and
+state remain unavailable. Card height is not elapsed time.
+
+Select a card to open captured input/output and scoped measurements beside the
+trajectory. Output and source evidence use plain text in 20,000-character windows;
+all remaining captured text stays accessible. Historical measurements show their
+recorded scope and sample time or interval. Current host telemetry is never
+substituted for missing event-time evidence. Explicit model/tool IDs establish
+links, including one response requesting several tools; adjacency establishes none.
+Older recordings remain readable with missing correlation and identity called out.
+
+The searchable roster retains every recorded agent. Pin up to six columns, hide
+without stopping, reorder explicitly, or return to a hidden agent. Hidden failure
+counts cover **retained calls**, not complete execution lifetime. Parent/child
+entries require explicit metadata. Long-call locators show calculated elapsed
+from available starts, not a proven bottleneck. Per-column reading pages, event
+selection, expanded details and focus are retained during live updates. Up to
+2,000 bounded inspection/reading IDs cover six columns alongside the live window.
+
+**Reveal on timeline** zooms to the selected event's actual available interval;
+**Reveal in trajectory** pins/reveals that same event. Clearing incompatible
+filters requires an explicit choice. Unknown timing is explained rather than
+invented. Each view retains its navigation while selection and execution identity
+stay shared. Recorded examples and replay have no mutation controls.
+
+Agency agent execution requires the repository's Linux x86-64 runtime, Python
+3.12 or newer, and its configured local Docker/Podman sandbox and model setup.
+The browser may open the server's reachable URL separately; the SDK workload and
+its owned command relay run on the execution host. This pass does not validate
+other operating systems, VMs, or container deployment arrangements. For loopback
+viewing, the standalone server accepts `--host 127.0.0.1`; its existing default
+binding is unchanged.
 
 ## Replay and investigation
 
@@ -113,8 +223,9 @@ Metric dots represent observations without interpolation across missing samples.
 **Show details** on a call reveals formatted input/output, execution metadata,
 and system samples nearest the call start, with sample time and distance shown.
 Long content stays bounded until **Show full output** loads immutable source
-evidence. Copy controls retain the original data. Columns have no fixed limit;
-each has a minimum width and the board scrolls horizontally.
+evidence. Copy controls retain the original data. Up to six focused columns
+retain a minimum readable width; the board scrolls horizontally, and the roster
+keeps all remaining agents reachable.
 
 The existing summary includes cumulative input/output/total tokens, model-call
 counts, run-average output rate, active agents, and available CPU/RAM/GPU/VRAM
@@ -391,9 +502,11 @@ alignment; late events do not reorganize published episode membership.
 Native annotations and explicit model IDs are connected; external harnesses
 may lack tool/context correlation and therefore display unlinked evidence.
 Input/delegation/handoff event types are supported, but all harnesses do not
-currently emit them. Live pause/resume reuse the existing process controls;
-redirect/cancel controls are outside this profiler change, and cancellation
-requires an invocation handle.
+currently emit them. Live pause/resume reuse the existing process controls.
+Redirect uses an owned active invocation on supported PTY adapters, while
+future-context messages and explicitly registered tasks use the SDK paths
+documented above. Invocation-specific cancellation remains programmatic and
+requires its invocation handle.
 
 The highest-value next step is consistent invocation-scoped input, delegation,
 transfer, and artifact/validation events across harnesses. That would turn

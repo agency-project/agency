@@ -51,6 +51,8 @@ INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 
 _run_dir: Path = Path(".")
 _command_dir: Path = Path(".")
+_command_lock = threading.RLock()
+_command_ids: dict[tuple[str, str], str] = {}
 
 # Highest event id seen so far -- ids are zero-padded-sequence + uuid4 hex
 # strings (agDataLogger._next_id_locked), sortable as TEXT; "" sorts before
@@ -92,7 +94,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 def _queue_command(command):
     """The dashboard and live profiler share the execution-process relay."""
-    _atomic_write_text(_command_dir / f"{_uuid.uuid4().hex}.json", json.dumps(command))
+    _atomic_write_text(
+        _command_dir / f"{_time.time_ns():020d}-{_uuid.uuid4().hex}.json", json.dumps(command)
+    )
 
 
 def _execution_controls(source):
@@ -100,9 +104,30 @@ def _execution_controls(source):
         available = _time.time() - (_command_dir / ".heartbeat").stat().st_mtime < 30
     except OSError:
         available = False
+    try:
+        session = json.loads((_command_dir / ".session").read_text())
+    except (OSError, ValueError):
+        session = {}
+    receipts = []
+    for path in sorted((_command_dir / "receipts").glob("*.json")):
+        try:
+            receipt = json.loads(path.read_text())
+            if receipt.get("relay_id") == session.get("relay_id"):
+                receipts.append(receipt)
+        except (OSError, ValueError):
+            pass
     with source.lock:
         return {
-            "available": available and source.model.finished_at is None,
+            "available": available
+            and bool(session.get("relay_id"))
+            and source.model.finished_at is None,
+            "relay_id": session.get("relay_id"),
+            "execution": {
+                "id": source.model.run["id"],
+                "time_origin": source.model.run.get("time_origin"),
+            },
+            "capabilities": session.get("capabilities", {}),
+            "receipts": sorted(receipts, key=lambda item: item.get("time", 0))[-200:],
             "agents": [
                 agent["id"]
                 for agent in source.model.agents.values()
@@ -117,8 +142,23 @@ def _trajectory_execution_command(source, message):
     result = {"type": "execution_command_result", "id": message.get("id")}
     controls = _execution_controls(source)
     command = message.get("command")
-    if not controls["available"] or not controls["agents"]:
+    if not isinstance(command, str) or (
+        message.get("agname") is not None and not isinstance(message["agname"], str)
+    ):
+        return {**result, "error": "Command and agent identifiers must be strings."}
+    if not controls["available"]:
         return {**result, "error": "No active execution command bridge is available."}
+    if (
+        message.get("relay_id") != controls["relay_id"]
+        or message.get("execution") != controls["execution"]
+    ):
+        return {
+            **result,
+            "error": "Execution changed; reopen the current live controls before submitting.",
+        }
+    identifier = message.get("id")
+    if not isinstance(identifier, str) or not identifier or len(identifier) > 128:
+        return {**result, "error": "A nonblank command ID of at most 128 characters is required."}
     if command not in {
         "pause",
         "resume",
@@ -128,18 +168,85 @@ def _trajectory_execution_command(source, message):
         "kill",
         "stop_all",
         "kill_all",
+        "queue_message",
+        "redirect",
+        "run",
     }:
         return {**result, "error": "Unsupported execution command."}
+    capabilities = controls["capabilities"].get(message.get("agname"), {})
     if (
         command in {"pause", "resume", "stop", "kill"}
         and message.get("agname") not in controls["agents"]
     ):
         return {**result, "error": "The selected agent is no longer active."}
+    if command in {"queue_message", "redirect", "run"} and not capabilities:
+        return {**result, "error": "The selected agent is unavailable to this execution process."}
+    if command in {"queue_message", "redirect"}:
+        content = message.get("message")
+        if not isinstance(content, str) or not content.strip() or len(content) > 32000:
+            return {**result, "error": "Message must contain 1–32000 characters."}
+        if command == "queue_message" and not capabilities.get("queue_message"):
+            return {**result, "error": "Retained-context messages are unsupported for this target."}
+        if command == "redirect" and message.get("invocation") not in capabilities.get(
+            "redirect", []
+        ):
+            return {**result, "error": "This target has no currently redirectable invocation."}
+    if command == "run":
+        if not isinstance(message.get("task"), str):
+            return {**result, "error": "Task identifier must be a string."}
+        if message.get("task") not in {task["id"] for task in capabilities.get("run", [])}:
+            return {**result, "error": "Task is not registered for this profiler session."}
+        if not isinstance(message.get("input"), dict) or len(json.dumps(message["input"])) > 32000:
+            return {
+                **result,
+                "error": "Task input must be a JSON object of at most 32000 characters.",
+            }
+    targets = list(controls["agents"]) if command.endswith("_all") else [message.get("agname")]
+    if "targets" in message and message["targets"] != targets:
+        return {
+            **result,
+            "error": "Agent scope changed; review the current targets before submitting.",
+        }
+    if not targets:
+        return {**result, "error": "No active agents are available."}
+    queued = {
+        "id": identifier,
+        "type": command,
+        "agname": message.get("agname"),
+        "targets": targets,
+        "relay_id": controls["relay_id"],
+        "execution": controls["execution"],
+    }
+    for field in ("message", "invocation", "task", "input"):
+        if field in message:
+            queued[field] = message[field]
+    signature = json.dumps(queued, sort_keys=True)
+    key = (controls["relay_id"], identifier)
     try:
-        _queue_command({"type": command, "agname": message.get("agname")})
+        with _command_lock:
+            if key in _command_ids:
+                if _command_ids[key] != signature:
+                    return {
+                        **result,
+                        "error": "Command ID was already used for a different request.",
+                    }
+                return {
+                    **result,
+                    "queued": True,
+                    "state": "queued",
+                    "duplicate": True,
+                    "targets": targets,
+                }
+            if len(_command_ids) >= 2000:
+                return {
+                    **result,
+                    "error": "This server reached its command limit; no request was submitted.",
+                }
+            _queue_command(queued)
+            _command_ids[key] = signature
     except OSError:
         return {**result, "error": "Could not deliver the execution command."}
-    return {**result, "queued": True}
+    return {**result, "queued": True, "state": "queued", "targets": targets}
 
 
 def _db_path() -> Path:
@@ -896,7 +1003,7 @@ async def investigator_page():
 async def investigator_runs():
     from .investigator import catalog
     from .investigator_demo import DEMO_ENTRIES
-    from .trajectory_scenarios import ENTRY, SCALE_ENTRY
+    from .trajectory_scenarios import ENTRY, SCALE_ENTRY, MULTI_AGENT_ENTRIES
 
     entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
     live = {
@@ -913,6 +1020,7 @@ async def investigator_runs():
         + [{k: v for k, v in e.items() if k != "path"} for e in entries]
         + DEMO_ENTRIES
         + [ENTRY, SCALE_ENTRY]
+        + MULTI_AGENT_ENTRIES
     }
 
 
@@ -925,7 +1033,12 @@ async def investigator_run(run_id: str):
         source = _trajectory_source()
         await asyncio.to_thread(source.refresh, force=True)
         return source.message()["run"]
-    if run_id in {"trajectory-scenarios", "trajectory-scale"}:
+    if run_id in {
+        "trajectory-scenarios",
+        "trajectory-scale",
+        "trajectory-agents-10",
+        "trajectory-agents-32",
+    }:
         return await asyncio.to_thread(_scenario_trajectory, run_id)
 
     if run_id in {entry["id"] for entry in DEMO_ENTRIES}:
@@ -964,15 +1077,31 @@ def _demo_trajectory(run_id):
 _replay_cache = OrderedDict()
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def _scenario_trajectory(run_id):
     from .trajectory import Trajectory
-    from .trajectory_scenarios import ENTRY, SCALE_ENTRY, events, scale_events
+    from .trajectory_scenarios import (
+        ENTRY,
+        SCALE_ENTRY,
+        MULTI_AGENT_ENTRIES,
+        events,
+        scale_events,
+        multi_agent_events,
+    )
 
-    entry = SCALE_ENTRY if run_id == SCALE_ENTRY["id"] else ENTRY
+    entry = next((entry for entry in MULTI_AGENT_ENTRIES if entry["id"] == run_id), None) or (
+        SCALE_ENTRY if run_id == SCALE_ENTRY["id"] else ENTRY
+    )
     model = Trajectory(run_id, entry["title"], mode="review", source="synthetic")
     model.run.update({key: entry[key] for key in ("model", "harness", "subtitle")})
-    for event in scale_events() if run_id == SCALE_ENTRY["id"] else events():
+    rows = (
+        multi_agent_events(entry["agent_count"], hierarchy=entry["agent_count"] == 10)
+        if "agent_count" in entry
+        else scale_events()
+        if run_id == SCALE_ENTRY["id"]
+        else events()
+    )
+    for event in rows:
         model.apply(event)
     return model.snapshot()
 
@@ -1070,6 +1199,11 @@ async def _trajectory_replay_data(run_id):
         rows = events()
     elif run_id == "trajectory-scale":
         rows = scale_events()
+    elif run_id in {"trajectory-agents-10", "trajectory-agents-32"}:
+        from .trajectory_scenarios import multi_agent_events
+
+        count = 10 if run_id == "trajectory-agents-10" else 32
+        rows = multi_agent_events(count, hierarchy=count == 10)
     else:
         # Keep full recorded payloads in the evidence endpoint. The projected
         # UI actions intentionally carry only bounded previews.
@@ -1390,7 +1524,16 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 msg = json.loads(data)
                 mtype = msg.get("type")
-                if mtype in (
+                if mtype == "execution_controls_request":
+                    source = _trajectory_source()
+                    await asyncio.to_thread(source.refresh)
+                    await ws.send_json(
+                        {
+                            "type": "execution_controls",
+                            "execution_controls": _execution_controls(source),
+                        }
+                    )
+                elif mtype in (
                     "pause",
                     "resume",
                     "pause_all",
@@ -1400,8 +1543,18 @@ async def websocket_endpoint(ws: WebSocket):
                     "stop_all",
                     "kill_all",
                 ):
-                    cmd = {"type": mtype, "agname": msg.get("agname")}
-                    _queue_command(cmd)
+                    source = _trajectory_source()
+                    await asyncio.to_thread(source.refresh)
+                    # Dashboard controls now obtain the same execution fence
+                    # through an explicit read-only handshake.
+                    response = _trajectory_execution_command(
+                        source,
+                        {
+                            **msg,
+                            "command": mtype,
+                        },
+                    )
+                    await ws.send_json(response)
                 elif mtype in ("update_config", "update_config_all"):
                     cmd = {
                         "type": mtype,
@@ -1487,10 +1640,13 @@ if __name__ == "__main__":
         "--run-dir", required=True, help="log_dir shared with the execution process's agents"
     )
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="Bind address; use 127.0.0.1 for a local viewer"
+    )
     parsed = parser.parse_args()
 
     _run_dir = Path(parsed.run_dir)
     _command_dir = _run_dir / "ui_commands"
     _command_dir.mkdir(parents=True, exist_ok=True)
 
-    uvicorn.run(app, host="0.0.0.0", port=parsed.port, log_level="error")
+    uvicorn.run(app, host=parsed.host, port=parsed.port, log_level="error")

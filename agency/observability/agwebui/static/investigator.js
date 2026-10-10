@@ -1,3 +1,5 @@
+import {agentRoster, reconcilePinnedAgents, pinAgent} from './agent-roster.js';
+import {eventCard, actionState, eventRelationships, eventMeasurements, payloadWindow, payloadValue} from './event-details.js';
 import {ExecutionTimeline} from './execution-timeline.js';
 import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
 import {executionControlState, mergeTrajectory, mergeTrajectorySnapshot, boundTrajectory, TrajectoryStream} from './trajectory-stream.js';
@@ -16,7 +18,9 @@ const views = [
 const params = new URLSearchParams(location.search);
 const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, inspectorOpen:false, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
 let timelineViewer=null;
-let timelineNavigation={scale:null,left:0,lock:false};
+let timelineNavigation={scale:null,left:0,top:0,lock:false};
+const fullPayloads=new WeakMap();
+let commandSequence=0;
 const openToolDetails=new Set();
 const trajectoryColumns=new Map();
 const columnReading=new Map();
@@ -43,9 +47,9 @@ function scheduleTrajectoryUpdate(changed,resynced=false) {
     updateTrajectory(changes,resync);
   },120);
 }
-Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set(),pendingNew:new Set()});
+Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', executionOutcomes:[], interaction:null, rosterQuery:'', rosterStatus:'', rosterOpen:false, rosterExpanded:[], stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set(),pendingNew:new Set()});
 const currentExecution = () => state.liveRun || state.run;
-const executionState = (agentId=null) => executionControlState({...state, run:currentExecution(),
+const executionState = (agentId=null) => executionControlState({...state, executionControls:state.executionControls?.relay_id&&state.executionControls?.execution?state.executionControls:{...state.executionControls,available:false}, run:currentExecution(),
   replay:state.replay||(state.displayPaused&&executionIdentity(state.run)!==executionIdentity(currentExecution())),
   ...(agentId?{agent:agentId,selected:{type:'agent',id:agentId}}:{})});
 const displayDuration = action => action.execution_duration ?? action.duration;
@@ -76,18 +80,15 @@ function readablePayload(value,limit=4000){
   return `<pre class="payload-text">${html}${truncated?'\n… Preview truncated':''}</pre>`;
 }
 function nearestMetrics(action,run){
-  const at=action.start;const samples=[];
-  for(const [name,points] of Object.entries(run.counters||{})){
-    let nearest=null;
-    for(const p of points)if(Number.isFinite(p[0])&&Number.isFinite(p[1])&&(!nearest||Math.abs(p[0]-at)<Math.abs(nearest[0]-at)))nearest=p;
-    if(nearest)samples.push(field(name,`${count(nearest[1])} · ${nearest[0]===at?'at event time':`nearest sample at ${formatTime(nearest[0])}, Δ ${formatTime(Math.abs(nearest[0]-at))}`}`));
-  }
-  return samples.join('')||'<p class="muted">No system metrics recorded for this execution.</p>';
+  const measured=eventMeasurements(action,run);
+  return measured.samples.map(sample=>field(sample.label,`${count(sample.value)} ${sample.unit} · ${sample.scope} · ${sample.provenance} sample at ${formatTime(sample.at)}, Δ ${formatTime(sample.delta)} from call start`)).join('')||'<p class="muted">No recorded resource samples available for this call interval. Current host measurements are not substituted.</p>';
 }
 function detailBody(a,run){
-  const agent=run.agents.find(agent=>agent.id===a.agent);
-  return `<div class="detail-label">System metrics at call start</div>${nearestMetrics(a,run)}<div class="detail-label">Full input / output</div>${['input','output'].map(kind=>`<section class="payload-section"><b>${kind==='input'?'Input':'Output'}</b>${readablePayload(kind==='input'?(a.arguments||a.command):(a.error||a.result))}<button data-full-payload="${esc(a.id)}" data-payload-kind="${kind}" data-payload-run="${esc(run.id)}">Show full ${kind}${a[kind+'_truncated']?' from source':''}</button><button data-copy-payload="${esc(a.id)}" data-payload-kind="${kind}" data-payload-run="${esc(run.id)}">Copy original ${kind}</button><div class="full-payload"></div></section>`).join('')}${field('Agent ID',a.agent)}${field('Start',formatTime(a.start))}${field('End',a.outcome==='running'?'Not recorded':formatTime(a.start+a.duration))}${field('Wall interval',formatTime(a.duration))}${field('Model',agent?.model||run.model||'Unavailable')}${field('Harness',agent?.harness||run.harness||'Unavailable')}${a.error?readablePayload(a.error):''}${a.tokens!=null?field('Reported call tokens',`${count(a.tokens)} input / ${count(a.output_tokens)} output`):''}`;
+  const agent=run.agents.find(agent=>agent.id===a.agent),measurements=eventMeasurements(a,run);
+  const rows=measurements.rows.map(row=>field(`${row.label} · ${row.provenance}`,`${row.unit==='s'?formatTime(row.value):count(row.value)+' '+row.unit} · ${row.scope}${row.interval?' · '+formatTime(row.interval[0])+' → '+formatTime(row.interval[1]):''}`)).join('');
+  return `<div class="detail-label">Captured input / output · ${run.source==='synthetic'?'synthetic example':'recorded evidence'}</div>${['input','output'].map(kind=>`<section class="payload-section"><b>${kind==='input'?'Input':'Output'}</b>${readablePayload(payloadValue(a,kind))}<button data-full-payload="${esc(a.id)}" data-payload-kind="${kind}" data-payload-run="${esc(run.id)}">Open captured ${kind}${a[kind+'_truncated']?' from source':''}</button><button data-copy-payload="${esc(a.id)}" data-payload-kind="${kind}" data-payload-run="${esc(run.id)}">Copy original ${kind}</button><div class="full-payload"></div></section>`).join('')}<details class="event-measurements"><summary>Timing &amp; recorded measurements</summary>${rows}<p class="muted">${esc(measurements.coverage)} Nearest resource samples are contextual observations, not operation attribution.</p>${nearestMetrics(a,run)}</details>${field('Agent ID',a.agent)}${field('Start · projected boundary',a.missing_start||String(a.source||'').includes('timestamp_missing')?'Unavailable':formatTime(a.start))}${field('End · projected boundary',a.outcome==='running'||a.outcome==='incomplete'||String(a.source||'').includes('timestamp_missing')?'Not recorded':formatTime(a.start+a.duration))}${a.kind==='model'?field('Model identity',eventCard(a,run).primary):''}${field('Harness',agent?.harness||run.harness||'Unavailable')}`;
 }
+
 function toolDetails(a,run,open=false){return `<details class="tool-details" data-tool-details="${esc(a.id)}" ${open?'open':''}><summary><span class="when-closed">Show details</span><span class="when-open">Hide details</span></summary><div class="tool-detail-body">${open?detailBody(a,run):''}</div></details>`;}
 document.addEventListener('toggle',event=>{
   const details=event.target;if(!details.matches?.('[data-tool-details]'))return;
@@ -105,12 +106,14 @@ function refreshCallDetails(button){
   button.remove();details.querySelector('summary').focus({preventScroll:true});
 }
 async function originalPayload(a,kind,run){
-  if(!a[kind+'_truncated'])return kind==='input'?(a.arguments||a.command):(a.error||a.result);
+  if(!a[kind+'_truncated']&&!(kind==='input'&&a.kind==='model'&&a.context?.truncated)){const value=payloadValue(a,kind);return typeof value==='string'?value:JSON.stringify(value,null,2)||'';}
   const ids=kind==='output'?[...(a.event_ids||[])].reverse():(a.event_ids||[]);
   for(const id of ids){
     const url=run.id==='live'?`/api/trajectory/live/events/${encodeURIComponent(id)}`:`/api/trajectory/replay/${encodeURIComponent(run.id)}/events/${encodeURIComponent(id)}`;
     const raw=await fetchJson(url),p=raw.payload||{};
-    const value=kind==='input'?p.arguments:p.error||p.result||p.output;
+    const captured=kind==='input'?(a.kind==='model'?Array.isArray(p.context?.blocks):p.arguments!=null||p.input!=null||p.command!=null):p.error!=null||p.result!=null||p.output!=null||p.model_response!=null;
+    if(!captured)continue;
+    const value=payloadValue({kind:a.kind,arguments:p.arguments,command:p.command,input:p.input,context:p.context,result:p.result,output:p.output,model_response:p.model_response,error:p.error},kind);
     if(value!=null)return typeof value==='string'?value:JSON.stringify(value,null,2);
   }
   throw new Error('Full payload unavailable in retained source evidence.');
@@ -126,8 +129,7 @@ document.addEventListener('click',async event=>{
     else {
       // Explicitly requested, bounded scrolling output; preserve original bytes
       // in a text node for huge strings instead of generating syntax spans.
-      output.innerHTML=raw.length>200000?'<pre class="payload-text"></pre>':readablePayload(raw,Infinity);
-      if(raw.length>200000)output.firstElementChild.textContent=raw;
+      renderFullPayload(output,raw);
       button.hidden=true;
     }
   }catch(error){output.textContent=error.message;}finally{button.disabled=false;}
@@ -174,12 +176,12 @@ async function loadRun(id, selected=null, replay=false) {
   clearTimeout(trajectoryUpdateTimer);trajectoryUpdateTimer=null;
   pendingTrajectoryChanges.clear();pendingResync=false;
   const generation = ++loadGeneration;
-  clearExecutionPending();state.executionControls=null;state.executionMessage='';
-  timelineNavigation={scale:null,left:0,lock:false};openToolDetails.clear();trajectoryColumns.clear();columnReading.clear();clearNotice(state.pendingNew);
+  clearExecutionPending();state.executionControls=null;state.executionMessage='';state.executionOutcomes=[];if(state.interaction){state.interaction.invalid='Execution changed. Reopen interaction for the intended agent.';renderInteractionStatus();}
+  timelineNavigation={scale:null,left:0,top:0,lock:false};openToolDetails.clear();trajectoryColumns.clear();columnReading.clear();clearNotice(state.pendingNew);
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
   state.displayPaused=false;state.liveRun=null;clearNotice(state.displayChanges);clearNotice(state.unread);
-  state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;
+  state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;state.rosterQuery='';state.rosterStatus='';
   state.run=null;state.agent='';state.cursor=0;state.selected=selected?{...selected,execution:id}:null;state.inspectorOpen=Boolean(selected);state.inspectorSelection=null;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
   $('inspector').innerHTML='';state.inspectorMarkup=null;state.inspectorMarkupSelection=null;syncInspector();
   state.comparison=null;state.compareId=null;state.compareError=null;compareGeneration++;
@@ -189,13 +191,15 @@ async function loadRun(id, selected=null, replay=false) {
   $('status').textContent='Loading execution…';
   if(id==='live'||replay) {
     state.transport='connecting';renderSession();
-    state.stream=new TrajectoryStream({runId:id,replay,onTransport:transport=>{if(generation===loadGeneration){state.transport=transport;if(transport!=='connected'&&state.executionPending)finishExecutionCommand('Command confirmation interrupted; check agent state after reconnect.');renderSession();}},onMessage:message=>{
+    state.stream=new TrajectoryStream({runId:id,replay,onTransport:transport=>{if(generation===loadGeneration){state.transport=transport;if(transport!=='connected'&&state.interaction?.pending){state.interaction.status='Connection lost after submission · outcome unknown; no automatic retry.';renderInteractionStatus();}if(transport!=='connected'&&state.executionPending)finishExecutionCommand('Connection lost after submission; outcome unknown. Check recorded state after reconnect; no automatic retry was sent.');renderSession();}},onMessage:message=>{
       if(generation!==loadGeneration)return;
       if(message.type==='execution_command_result'){
-        if(message.id===state.executionPending?.id&&message.error)finishExecutionCommand(message.error);
+        receiveCommandResult(message);
         return;
       }
       state.executionControls=message.execution_controls||null;
+      for(const receipt of state.executionControls?.receipts||[])receiveCommandResult(receipt);
+      renderInteractionStatus();
       const first=!currentExecution();
       let changed=[];
       const before=new Set((currentExecution()?.actions||[]).map(a=>a.id));
@@ -270,6 +274,8 @@ function render() {
   const content=$('content');
   const focusedContent=content.contains(document.activeElement)?document.activeElement:null;
   for(const column of trajectoryColumns.values())if(column.parentElement===document.getElementById('call-stack'))captureColumnReading(column);
+  const existingRoster=content.querySelector('#agent-roster');
+  if(existingRoster){state.rosterOpen=existingRoster.open;state.rosterExpanded=[...existingRoster.querySelectorAll('[data-roster-parent]')].filter(el=>el.open).map(el=>el.dataset.rosterParent);}
   const heldScroll=content.dataset.run===run.id&&content.dataset.view===state.view
     ? ['#call-stack','.trajectory-scroll','#tandem-columns'].map(selector=>{
       const region=content.querySelector(selector);return [selector,region?.scrollLeft||0,region?.scrollTop||0];
@@ -285,8 +291,8 @@ function render() {
   }:null;
   timelineViewer?.destroy();timelineViewer=null;
   $('content').innerHTML=({timeline:timelineView,trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView})[state.view]();
-  if(state.view==='timeline'){if(state.displayPaused)timelineNavigation.lock=false;timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id),()=>holdHistory());timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.scroll.scrollLeft=timelineNavigation.left;timelineViewer.setFrozen(state.displayPaused);}
-  if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') reconcileActivities(true);
+  if(state.view==='timeline'){if(state.displayPaused)timelineNavigation.lock=false;timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id),()=>holdHistory());timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.setSelection?.(state.selected?.run!=='b'&&state.selected?.execution===executionIdentity(run)?state.selected.id:null);timelineViewer.scroll.scrollLeft=timelineNavigation.left;timelineViewer.scroll.scrollTop=timelineNavigation.top||0;timelineViewer.setFrozen(state.displayPaused);}
+  if(state.view==='trajectory'&&state.trajectoryLayout==='episodes'){reconcileActivities(true);$('agent-roster').open=state.rosterOpen;for(const el of content.querySelectorAll('[data-roster-parent]'))el.open=state.rosterExpanded.includes(el.dataset.rosterParent);}
   if(state.view==='agents'){
     renderTandemBoard();
     if(held){
@@ -315,7 +321,7 @@ function renderRunChrome() {
   $('run-subtitle').textContent=`${run.condition?.replace('_',' ') || (run.id==='live'?'current execution':state.replay?'recorded replay':'saved execution')} / ${run.harness} / ${run.model}`;
   const agentCount=run.agents.filter(a=>a.id!=='workflow').length;
   $('run-description').textContent=`${agentCount} recorded actor${agentCount===1?'':'s'} · ${run.actions.length} observed calls · ${run.episodes.length} activities`;
-  $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source);
+  $('provenance').innerHTML=pill(run.source==='synthetic'?'Recorded example · synthetic':state.replay?'Replay · recorded':run.id==='live'?'Live evidence':'Recorded evidence',run.source);
   $('provenance').title=run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.';
   const measurements=executionMeasurements(run);
   $('metrics').innerHTML=measurements.primary.map(item=>measurementHTML(run.coverage.client_window&&item[0]==='Calls'?['Retained calls',...item.slice(1)]:item)).join('');
@@ -333,16 +339,17 @@ function renderRunChrome() {
 }
 
 function actionButton(action) {
-  return `<button class="action-row ${state.selected?.run!=='b'&&state.selected?.id===action.id?'selected':''}" data-action="${esc(action.id)}"><span class="action-time">${formatTime(action.start)}</span><span class="action-kind" style="color:${colors[action.kind]}">${esc(action.kind)}</span><span class="action-label">${esc(action.intent||action.name)}<small>${esc((action.command || (action.tokens==null?'Token usage not recorded':`${count(action.tokens)} input → ${count(action.output_tokens)} output tokens`)).slice(0,240))}</small></span><span class="action-duration">${formatTime(displayDuration(action))}</span><span class="status-icon ${action.outcome}">${action.outcome==='success'?'✓':action.outcome==='failed'?'×':'·'}</span></button>`;
+  const card=eventCard(action,state.run);
+  return `<button class="action-row ${state.selected?.run!=='b'&&state.selected?.id===action.id?'selected':''}" data-action="${esc(action.id)}"><span class="action-time">${action.missing_start||String(action.source||'').includes('timestamp_missing')?'Unknown':formatTime(action.start)}</span><span class="action-kind">${esc(card.secondary)}</span><span class="action-label">${esc(card.primary)}</span><span class="action-duration" aria-label="Calculated wall interval">${action.outcome==='incomplete'?'End missing':card.elapsed==null?'Unknown':formatTime(card.elapsed)}</span><span class="status-icon ${esc(action.outcome)}" aria-label="${esc(card.state.label)}">${esc(card.state.icon)}</span></button>`;
 }
 
 function trajectoryView() {
   const overlay=state.trajectoryLayout==='overlay';
   const controls=`<label class="trajectory-layout">Layout<select id="trajectory-layout" aria-label="Trajectory layout"><option value="episodes" ${overlay?'':'selected'}>Episode list</option><option value="overlay" ${overlay?'selected':''}>Agent overlay</option></select></label>`;
-  const header=heading('Execution trajectory',overlay?'Compare agent actions on a shared execution clock.':'A narrative of the run, grouped by action intent.',controls);
+  const header=heading('Execution trajectory',overlay?'Compare agent actions on a shared execution clock.':'Each column is an agent. Select a call to inspect captured evidence; card positions are not a time scale.',controls);
   const key=legend([['search','Search'],['read','Read'],['edit','Edit'],['test','Test'],['model','Model call']]);
   if(overlay) return header+trajectoryOverlay(visibleActions(state.run),key)+trajectoryWorkflow();
-  return header+`<details id="trajectory-attention" class="trajectory-attention"><summary>Execution signals <span id="signal-count"></span></summary><div id="trajectory-signals"></div></details><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span></div><div id="hidden-agents" aria-label="Hidden agent activity"></div><div id="call-stack" class="agent-columns"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
+  return header+`<details id="trajectory-attention" class="trajectory-attention"><summary>Execution signals <span id="signal-count"></span></summary><div id="trajectory-signals"></div></details><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span><details id="agent-roster" class="agent-roster"><summary>Agent roster <span id="roster-count"></span></summary><div class="roster-filters"><label>Find agent<input id="roster-search" placeholder="Name or identifier" aria-label="Search agent roster" value="${esc(state.rosterQuery)}"></label><label>Show<select id="roster-status" aria-label="Roster filter"><option value="">All agents</option><option value="hidden">Hidden agents</option><option value="failed-actions">Retained call failures</option><option value="running">Running agents</option><option value="paused">Paused agents</option><option value="completed">Completed agents</option><option value="unknown">Unknown state</option></select></label></div><div id="roster-list"></div></details></div><div id="hidden-agents" aria-label="Hidden agent failures"></div><div id="call-stack" class="agent-columns"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
 }
 
 function clearExecutionPending() {
@@ -377,31 +384,57 @@ function resumeDisplay() {
 function finishExecutionCommand(message) {
   clearExecutionPending();state.executionMessage=message;renderSession();
 }
-function reconcileExecutionCommand() {
+function commandTargetSnapshot() {
+  return {relay_id:state.executionControls?.relay_id,execution:state.executionControls?.execution};
+}
+function targetReceiptDescription(target){
+  if(target.scope==='future_retained_context'&&target.context_state==='committed')return 'Retained context committed; model consumption unconfirmed'+(target.detail?' · '+target.detail:'');
+  if(target.scope==='future_retained_context'&&target.context_state==='failed')return 'Retained context failed to commit'+(target.detail?' · '+target.detail:'');
+  if(target.detail)return target.detail;
+  if(target.scope==='future_retained_context')return target.context_state==='committed'?'Retained context committed; model consumption unconfirmed':'Message published at the retained-context tail; consumption unconfirmed';
+  if(target.scope==='native_prompt_acknowledgement')return 'Native prompt accepted for this invocation; model response/compliance unconfirmed';
+  if(target.scope==='scheduler_submission_not_completion')return `Invocation ${target.invocation||'ID unavailable'} submitted; completion unconfirmed`;
+  if(target.scope==='stop_requested_not_process_exit')return 'Stop requested through agent API; process exit unconfirmed';
+  if(target.requested==='pause'||target.requested==='resume')return `Agent intent recorded; ${target.rpc_acknowledged?'daemon RPC acknowledged':'daemon RPC not acknowledged'}; actual process state not independently measured`;
+  return 'API acknowledgement; application unconfirmed';
+}
+function receiveCommandResult(receipt) {
   const pending=state.executionPending;
-  if(!pending)return;
+  if(pending?.id===receipt.id){
+    if(receipt.error){finishExecutionCommand(receipt.error);return;}
+    pending.accepted=receipt.queued||receipt.state==='queued'||receipt.state==='accepted'||receipt.state==='partial';
+    if(receipt.targets?.some(t=>typeof t==='object')){pending.receipts=receipt.targets;state.executionOutcomes=receipt.targets.map(t=>`${agentName(t.agname,currentExecution())}: ${t.state} · ${targetReceiptDescription(t)}`);}
+    if(receipt.state==='failed'){finishExecutionCommand('Control failed. '+(state.executionOutcomes.join(' · ')||receipt.detail||'Dispatch was not acknowledged.'));return;}
+    state.executionMessage=receipt.state==='partial'?'Some targets failed; waiting for recorded state of accepted targets.':pending.accepted?'Backend accepted the request; waiting for newer recorded agent state.':'Request sent; backend acceptance is unknown.';
+    renderSession();
+  }
+  const draft=state.interaction;
+  if(draft?.requestId===receipt.id){
+    if(receipt.error){draft.status='Failed · '+receipt.error;draft.pending=false;}
+    else if(receipt.targets?.some(t=>typeof t==='object')){
+      const target=receipt.targets.find(t=>t.agname===draft.agent)||receipt.targets[0];
+      draft.status=`${target.context_state==='committed'?'Context committed':target.context_state==='failed'?'Context failed':target.state} · ${targetReceiptDescription(target)}`;
+      draft.pending=false;
+    }else if(receipt.queued){draft.status='Requested · relay file queued; agent dispatch not confirmed.';}
+    renderInteractionStatus();
+  }
+}
+function reconcileExecutionCommand() {
+  const pending=state.executionPending;if(!pending)return;
+  if(pending.relay&&pending.relay!==state.executionControls?.relay_id||pending.execution!==executionIdentity(currentExecution())){finishExecutionCommand('Target execution changed; request outcome unknown. No retry was sent.');return;}
   const run=currentExecution();
-  if(pending.stopping) {
-    const targets=pending.agents.map(id=>run.agents.find(a=>a.id===id));
-    const ended=a=>a&&['completed','failed','cancelled'].includes(a.execution_state||a.status);
-    if(['completed','failed','cancelled'].includes(run.status)||targets.every(ended)) {
-      finishExecutionCommand('Execution stopped.');return;
-    }
-    if(targets.every(a=>ended(a)||(a?.stop_ts>pending.observed[a.id]&&a.stop_force===pending.force))) {
-      finishExecutionCommand(pending.force?'SIGKILL delivered; waiting for execution to finish.':'SIGTERM delivered; waiting for execution to finish. SIGKILL is available.');
-    }
-    return;
-  }
-  if(['completed','failed','cancelled'].includes(run.status)) {
-    finishExecutionCommand('Execution finished before command confirmation.');return;
-  }
-  const targets=pending.agents.map(id=>run.agents.find(a=>a.id===id));
-  if(targets.some(a=>!a||!state.executionControls?.agents.includes(a.id))) {
-    finishExecutionCommand('An agent is no longer active; check the recorded state.');return;
-  }
-  if(targets.every(a=>(a.status==='paused')===pending.paused&&a.control_ts>pending.observed[a.id])) {
-    finishExecutionCommand('');
-  }
+  const results=pending.agents.map(id=>{
+    const a=run.agents.find(a=>a.id===id),receipt=pending.receipts?.find(t=>t.agname===id);
+    if(receipt?.state==='failed')return {id,done:true,text:`${agentName(id,run)}: failed · ${receipt.detail||'dispatch failed'}`};
+    const ended=a&&['completed','failed','cancelled'].includes(a.execution_state||a.status);
+    if(pending.stopping&&ended)return {id,done:true,text:`${agentName(id,run)}: terminal state recorded (${a.execution_state||a.status}); process exit not independently confirmed`};
+    if(pending.stopping&&a?.stop_ts>pending.observed[id]&&a.stop_force===pending.force)return {id,done:true,text:`${agentName(id,run)}: ${pending.force?'SIGKILL':'SIGTERM'} request recorded; process exit unconfirmed`};
+    if(!pending.stopping&&a&&(a.status==='paused')===pending.paused&&a.control_ts>pending.observed[id])return {id,done:true,text:`${agentName(id,run)}: ${pending.paused?'paused':'resumed'} state recorded; process application not independently measured`};
+    if(!a||!state.executionControls?.agents.includes(id))return {id,done:true,text:`${agentName(id,run)}: no longer active; application outcome unknown`};
+    return {id,done:false,text:`${agentName(id,run)}: ${receipt?.state==='accepted'?'API accepted; awaiting recorded state':'awaiting acknowledgement/state'}`};
+  });
+  state.executionOutcomes=results.map(r=>r.text);
+  if(results.every(r=>r.done))finishExecutionCommand('Control result · '+state.executionOutcomes.join(' · '));
 }
 function pauseResumeExecution(all,agentId=null) {
   const controls=executionState(agentId);
@@ -410,34 +443,47 @@ function pauseResumeExecution(all,agentId=null) {
 }
 function stopExecution(all,force=false,agentId=null) {
   const controls=executionState(agentId);
-  if(!(all?controls.allEnabled:controls.agentEnabled)||(!force&&state.executionPending))return;
-  // Escalation remains usable while graceful shutdown awaits confirmation.
-  clearExecutionPending();
-  sendExecutionCommand(`${force?'kill':'stop'}${all?'_all':''}`,all,agentId);
+  if(!(all?controls.allEnabled:controls.agentEnabled)||(!force&&state.executionPending)||force&&state.executionPending?.force)return;
+  const targets=all?controls.active:[controls.target];
+  const names=targets.map(a=>agentName(a.id,currentExecution())).join(', ');
+  const consequence=force?'Send SIGKILL without a cleanup guarantee':'Send SIGTERM; the process may ignore it and exit/cleanup is not guaranteed';
+  if(!window.confirm(`${force?'Force stop':'Stop'} ${targets.length} agent${targets.length===1?'':'s'} in ${readableExecutionTitle(currentExecution())}: ${names}?\n${consequence}. Outstanding requests are cancelled by the agent API.`))return;
+  clearExecutionPending();sendExecutionCommand(`${force?'kill':'stop'}${all?'_all':''}`,all,agentId);
 }
 function sendExecutionCommand(command,all,agentId=null) {
-  const controls=executionState(agentId);
-  const targets=all?controls.active:[controls.target];
-  const id=String(Date.now());
-  if(!state.stream?.sendExecution(command,{id,...(all?{}:{agname:controls.target.id})})) {
-    finishExecutionCommand('Could not deliver command; reconnect to updates and try again.');return;
+  const controls=executionState(agentId),targets=all?controls.active:[controls.target];
+  const id=`ui-${Date.now()}-${++commandSequence}`,fence=commandTargetSnapshot();
+  if(!state.stream?.sendExecution(command,{id,...fence,targets:targets.map(a=>a.id),...(all?{}:{agname:controls.target.id})})) {
+    finishExecutionCommand('Request not sent; no automatic retry. Reconnect before trying again.');return;
   }
-  // Queuing is not confirmation: only recorded agent control events change status.
   const stopping=command.startsWith('stop')||command.startsWith('kill');
-  const pending={id,agents:targets.map(a=>a.id),paused:command.startsWith('pause'),stopping,force:command.startsWith('kill'),
+  const pending={id,command,execution:executionIdentity(currentExecution()),relay:fence.relay_id,agents:targets.map(a=>a.id),paused:command.startsWith('pause'),stopping,force:command.startsWith('kill'),
     observed:Object.fromEntries(targets.map(a=>[a.id,(stopping?a.stop_ts:a.control_ts)||0]))};
-  pending.timer=setTimeout(()=>{if(state.executionPending===pending)finishExecutionCommand('No execution confirmation received; check the agent state and command bridge.');},30000);
-  state.executionPending=pending;state.executionMessage='Waiting for execution confirmation…';renderSession();
+  pending.timer=setTimeout(()=>{if(state.executionPending===pending)finishExecutionCommand('No execution confirmation received; outcome unknown. Inspect current state; no automatic retry was sent.');},30000);
+  state.executionPending=pending;state.executionOutcomes=[];state.executionMessage='Requested · waiting for backend acceptance and recorded agent state.';renderSession();
+}
+function agentControlButtons(id) {
+  const controls=executionState(id),pending=state.executionPending;
+  const disabled=!controls.agentEnabled,target=esc(id),name=esc(agentName(id,currentExecution()));
+  const own=pending?.agents.includes(id);
+  const label=own?(pending.stopping?(pending.force?'Force stop requested':'Stopping…'):(pending.paused?'Pausing…':'Resuming…')):(controls.target?.status||'unknown');
+  return `<span class="control-section-label">Agent controls · ${esc(label)}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" title="Pause/resume the harness process; already-issued remote work may continue" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Send SIGTERM to ${name}; process exit unconfirmed" ${disabled||pending?'disabled':''}>■ Stop</button><details class="agent-danger-menu"><summary>More</summary><button class="execution-control danger-control" data-execution-kill="${target}" ${disabled||pending?.force?'disabled':''}>Force stop · SIGKILL</button></details><button data-interact="${target}" title="Message this agent or run an explicitly registered task">Interact</button>`;
 }
 
-function agentControlButtons(id) {
-  const controls=executionState(id),pending=Boolean(state.executionPending);
-  const disabled=!controls.agentEnabled;
-  const target=esc(id),name=esc(agentName(id,currentExecution()));
-  return `<span class="control-section-label">Agent controls · ${esc(controls.target?.status||'unknown')}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Gracefully stop ${name} with SIGTERM" ${disabled||pending?'disabled':''}>■ Stop</button><button class="execution-control danger-control" data-execution-kill="${target}" title="Force ${name} to exit with SIGKILL" ${disabled?'disabled':''}>SIGKILL</button>`;
-}
 function agentExecutionControls(id) {
   return executionState(id).live&&executionState(id).target?`<div class="agent-execution-controls" data-agent-controls="${esc(id)}" role="group" aria-label="Controls for ${esc(agentName(id))}">${agentControlButtons(id)}</div>`:'';
+}
+
+function updateAgentControls(group,html) {
+  if(group.innerHTML===html)return;
+  const focused=group.contains(document.activeElement)?document.activeElement:null;
+  const attribute=['executionAgent','executionStop','executionKill','interact'].find(key=>focused?.dataset[key]);
+  const menu=group.querySelector('.agent-danger-menu'),open=menu?.open,summary=focused?.tagName==='SUMMARY';
+  group.innerHTML=html;
+  const replacementMenu=group.querySelector('.agent-danger-menu');if(replacementMenu)replacementMenu.open=Boolean(open);
+  const replacement=summary?replacementMenu?.querySelector('summary'):attribute?group.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`):null;
+  if(replacement&&!replacement.disabled)replacement.focus({preventScroll:true});
+  else if(focused){group.tabIndex=-1;group.focus({preventScroll:true});}
 }
 
 function renderSession() {
@@ -447,27 +493,30 @@ function renderSession() {
   const debuggerState=executionState();
   const paused=run?.agents.filter(a=>a.status==='paused').length||0;
   $('execution-all').hidden=!debuggerState.live;
-  $('execution-all').textContent=debuggerState.allCommand==='resume_all'?'▶ Resume Agents':'⏸ Pause Agents';
-  $('execution-all').title='Pause or resume execution of all active agents';
+  $('execution-all').textContent=state.executionPending&&!state.executionPending.stopping?(state.executionPending.paused?'Pausing agents…':'Resuming agents…'):debuggerState.allCommand==='resume_all'?'▶ Resume all active agents':'⏸ Pause all active agents';
+  $('execution-all').title='Targets every active agent in this execution, including hidden columns; harness pause does not cancel already-issued remote work';
   $('execution-all').disabled=!debuggerState.allEnabled||Boolean(state.executionPending);
   $('all-agent-controls').hidden=!debuggerState.live;
   for(const force of [false,true]) {
     const button=$(`execution-${force?'kill':'stop'}-all`);
-    button.disabled=!debuggerState.allEnabled||(!force&&Boolean(state.executionPending));
+    button.disabled=!debuggerState.allEnabled||(!force&&Boolean(state.executionPending))||force&&Boolean(state.executionPending?.force);
     button.title=`${force?'Force termination with SIGKILL':'Gracefully stop with SIGTERM'} for all active agents`;
   }
   for(const group of document.querySelectorAll('[data-agent-controls]')) {
     group.hidden=!debuggerState.live;
     const html=agentControlButtons(group.dataset.agentControls);
-    if(group.innerHTML!==html){const focused=group.contains(document.activeElement)?document.activeElement:null;const attribute=['executionAgent','executionStop','executionKill'].find(key=>focused?.dataset[key]);group.innerHTML=html;if(attribute)group.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`)?.focus({preventScroll:true});}
+    updateAgentControls(group,html);
   }
   if(state.run)for(const column of trajectoryColumns.values())renderColumnFollow(column);
+  renderInteractionStatus();
   $('display-toggle').hidden=!state.stream;
   $('display-toggle').disabled=!state.run||state.loading;
   $('display-toggle').textContent=state.displayPaused?'Unfreeze view':'Freeze view';
   $('display-toggle').title=state.displayPaused?'Apply buffered event updates and preserve reading positions':'Freeze event display; agent execution and ingestion continue';
   $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
   $('display-state').textContent=state.displayPaused?`View frozen · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.displayChanges)} calls changed · agents may still be running`:state.stream?(state.follow?'View following live':`History held · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.unread)} calls changed`):'';
+  $('control-outcomes').textContent=state.executionOutcomes.join(' · ');
+  $('control-scope').textContent=debuggerState.live?`${debuggerState.active.length} active agents · bulk actions include hidden agents. Pause holds harness processes; already-issued remote operations may continue.${state.displayPaused?' Controls target CURRENT LIVE execution while event display is frozen.':''}`:'';
   $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
   $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} paused`:''}`;
   $('transport-state').textContent=state.stream?`${state.transport==='connected'?'Connected to updates':state.transport==='disconnected'?'Disconnected from updates · execution state retained':state.transport==='reconnecting'?'Reconnecting to updates':'Connecting to updates'}${replay&&state.replayState?` · ${state.replayState.finished?'replay exhausted':state.replayState.playing?'playing':'paused'} at ${formatTime(state.replayState.clock)}`:''}`:'Saved evidence · no live subscription';
@@ -517,8 +566,7 @@ function trajectoryAgents() {
 
 function visibleAgentColumns() {
   const agents=trajectoryAgents();
-  state.agentColumns=state.agentColumns.filter(id=>agents.includes(id));
-  if(!state.columnsCustomized)for(const id of agents)if(state.agentColumns.length<3&&!state.agentColumns.includes(id))state.agentColumns.push(id);
+  state.agentColumns=reconcilePinnedAgents(state.run,state.agentColumns,{customized:state.columnsCustomized});
   const columns=state.agent?[state.agent]:state.agentColumns;
   if(!columns.includes(state.activeColumn))state.activeColumn=columns[0]||null;
   return columns;
@@ -526,21 +574,23 @@ function visibleAgentColumns() {
 
 function addAgentColumn(id) {
   if(!trajectoryAgents().includes(id)||state.agentColumns.includes(id))return;
-  state.columnsCustomized=true;state.agentColumns.push(id);state.activeColumn=id;
+  const pinned=pinAgent(state.run,state.agentColumns,id);
+  if(!pinned.changed){$('agent-column-limit').textContent=pinned.reason;return;}
+  state.columnsCustomized=true;state.agentColumns=pinned.ids;state.activeColumn=id;
   state.agent='';$('agent-select').value='';
   if(state.view==='agents')renderTandemBoard();else renderCallStack();
   scrollAgentColumn(id);
 }
 
 function removeAgentColumn(id) {
-  if(state.agentColumns.length<=1)return;
-  state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);
+  if(!state.agentColumns.includes(id))return;
+  state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);if(state.agent===id){state.agent='';$('agent-select').value='';}
   if(state.view==='agents')renderTandemBoard();else renderCallStack();
 }
 
 function selectAgentColumn(id) {
-  if(!visibleAgentColumns().includes(id))return;
-  state.activeColumn=id;if(state.view==='agents')renderTandemBoard();else renderCallStack();
+  if(!state.agentColumns.includes(id))return;
+  state.agent='';$('agent-select').value='';state.activeColumn=id;if(state.view==='agents')renderTandemBoard();else renderCallStack();
   scrollAgentColumn(id);
 }
 
@@ -556,19 +606,32 @@ function agentActivityCounts(id) {
 }
 
 function renderAgentColumnControls(columns) {
-  const agents=trajectoryAgents(),hidden=agents.filter(id=>!columns.includes(id));
-  const full=false;
+  const agents=trajectoryAgents(),hidden=agents.filter(id=>!state.agentColumns.includes(id));
+  const full=state.agentColumns.length>=6;
   const picker=$('add-agent-column');
   const options='<option value="">Add agent…</option>'+hidden.map(id=>`<option value="${esc(id)}">${esc(agentName(id))}</option>`).join('');
   if(picker.innerHTML!==options)picker.innerHTML=options;
   picker.disabled=full||!hidden.length;
-  $('agent-column-limit').textContent=`${columns.length} visible · scroll to inspect more`;
+  $('agent-column-limit').textContent=`${state.agentColumns.length} of ${agents.length} pinned · up to 6 readable columns`;
   const tabs=columns.map(id=>`<button role="tab" aria-selected="${id===state.activeColumn}" tabindex="${id===state.activeColumn?0:-1}" data-agent-tab="${esc(id)}">${esc(agentName(id))}<small>${agentActivityCounts(id)}</small></button>`).join('');
   if($('agent-tabs').innerHTML!==tabs)$('agent-tabs').innerHTML=tabs;
-  const badges=hidden.map(id=>{
-    return `<button data-add-column="${esc(id)}" ${full?'disabled':''}>${esc(agentName(id))} · ${agentActivityCounts(id)}</button>`;
-  }).join('');
+  renderRoster(state.agentColumns);
+  const failures=agentRoster(state.run,{pinnedIds:state.agentColumns}).filter(a=>!a.pinned&&a.failedActionCount>0);
+  const badges=failures.slice(0,5).map(a=>`<button data-add-column="${esc(a.id)}" ${full?'disabled':''}>${esc(a.label)} · ${a.failedActionCount} retained call failure${a.failedActionCount===1?'':'s'}</button>`).join('');
   if($('hidden-agents').innerHTML!==badges)$('hidden-agents').innerHTML=badges;
+}
+function renderRoster(columns=state.agentColumns) {
+  const roster=$('roster-list');if(!roster)return;
+  const rows=agentRoster(state.run,{pinnedIds:columns,query:state.rosterQuery,status:state.rosterStatus});
+  $('roster-count').textContent=`· ${trajectoryAgents().length} agents · ${columns.length} pinned`;
+  $('roster-status').value=state.rosterStatus;
+  const row=a=>`<div class="roster-row"><button data-agent="${esc(a.id)}" title="${esc(a.id)}">${esc(a.label)}</button>${pill(a.status||'unknown')}<small>${a.activeCount} in flight${a.failedActionCount?` · ${a.failedActionCount} retained call failures`:''}</small><div class="roster-row-actions">${a.pinned?`<button data-agent-tab="${esc(a.id)}">Return</button><button data-remove-column="${esc(a.id)}">Unpin</button>`:`<button data-add-column="${esc(a.id)}" ${columns.length>=6?'disabled':''}>Pin column</button>`}${a.latestFailedAction?`<button data-reveal-action="${esc(a.latestFailedAction.id)}">Inspect failed call</button>`:''}${a.longCalls?.length?`<button data-reveal-action="${esc(a.longCalls[0].action.id)}">Open for ${formatTime(a.longCalls[0].elapsed)} · calculated</button>`:''}</div></div>`;
+  const byId=new Map(rows.map(a=>[a.id,a]));
+  const rendered=new Set();
+  const branch=(a,ancestors=new Set())=>{if(rendered.has(a.id))return '';rendered.add(a.id);const children=(a.childIds||[]).map(id=>byId.get(id)).filter(c=>c&&!ancestors.has(c.id));return row(a)+(children.length?`<details class="roster-children" data-roster-parent="${esc(a.id)}"><summary>${children.length} explicitly recorded child agent${children.length===1?'':'s'}</summary>${children.map(c=>branch(c,new Set([...ancestors,a.id]))).join('')}</details>`:a.parentId?`<small class="muted">Recorded parent: ${esc(agentName(a.parentId))}</small>`:'');};
+  const html=rows.filter(a=>!a.parentId||!byId.has(a.parentId)).map(a=>branch(a)).join('')+rows.filter(a=>!rendered.has(a.id)).map(a=>branch(a)).join('');
+  if(!roster.contains(document.activeElement)&&roster.innerHTML!==html){const expanded=new Set([...roster.querySelectorAll('[data-roster-parent]')].filter(el=>el.open).map(el=>el.dataset.rosterParent));roster.innerHTML=html||'<p class="muted">No matching agents. Clear the roster filters.</p>';for(const el of roster.querySelectorAll('[data-roster-parent]'))el.open=expanded.has(el.dataset.rosterParent);}
+
 }
 
 function readingState(agent) {
@@ -593,14 +656,15 @@ function readingPins() {
     pins.push(...(live?.actions||[]).filter(a=>a.agent===agent&&a.outcome!=='running').sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0)).slice(0,50).map(a=>a.id));
   }
   pins.push(...openToolDetails);
-  return [...new Set(pins)].slice(0,500);
+  return [...new Set(pins)].slice(0,2000);
 }
 function renderColumnFollow(column) {
   const r=readingState(column.dataset.agentColumn),heading=column.querySelector('.agent-column-heading');
   const count=heading.querySelector('.column-call-count');
   if(count.dataset.running!=null)count.textContent=`${count.dataset.running} in flight${state.displayPaused?' · frozen':''}`;
-  const follow=heading.querySelector('.column-follow');
-  follow.querySelector('span').textContent=state.displayPaused?`View frozen${!r.follow?' · history held':''}`:r.error||(!r.follow?`${noticeCount(r.pending)} changed · history held`:'Following live');
+  const follow=heading.querySelector('.column-follow');follow.hidden=!state.stream&&r.follow;
+  follow.querySelector('span').textContent=state.displayPaused?`View frozen${!r.follow?' · history held':''}`:r.error||(!state.stream?'Recorded history':!r.follow?`${noticeCount(r.pending)} changed · history held`:state.replay?'Following replay':'Following live');
+  follow.querySelector('button').textContent=!state.stream?'Newest in column':state.replay?'Latest replay activity':'Live in this column';
   follow.querySelector('button').hidden=r.follow;follow.querySelector('button').disabled=state.displayPaused;
   if(state.displayPaused)for(const selector of ['[data-column-older]','[data-active-older]'])column.querySelector(selector).disabled=true;
 }
@@ -664,7 +728,7 @@ function renderCallStack() {
     if(column&&column.parentElement===stack&&!r.resetPosition)captureColumnReading(column);r.resetPosition=false;
     if(!column){
       column=document.createElement('section');column.dataset.agentColumn=agent;
-      column.innerHTML=`<header class="agent-column-heading"><strong></strong><span class="column-call-count"></span><button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}">Hide</button><div class="agent-execution-controls" data-agent-controls="${esc(agent)}" role="group" aria-label="Authoritative controls for ${esc(agentName(agent))}"></div><div class="column-follow"><span></span><button data-column-live="${esc(agent)}">Live in this column</button></div></header><div class="agent-call-stack" tabindex="0" aria-label="Activity for ${esc(agentName(agent))}"><section class="agent-current"><h3>Current activity</h3><p class="current-coverage"></p><div class="agent-current-calls"></div><button data-active-older="${esc(agent)}">More in-flight calls</button></section><section class="agent-history"><h3>History · newest starts first</h3><div class="agent-history-calls"></div><button data-column-older="${esc(agent)}">Older calls</button></section></div>`;
+      column.innerHTML=`<header class="agent-column-heading"><strong></strong><span class="column-call-count"></span><button data-column-order="${esc(agent)}" data-direction="-1" aria-label="Move ${esc(agentName(agent))} column left">←</button><button data-column-order="${esc(agent)}" data-direction="1" aria-label="Move ${esc(agentName(agent))} column right">→</button><button data-remove-column="${esc(agent)}" title="Hide column only; agent keeps executing" aria-label="Hide ${esc(agentName(agent))}">Hide</button><div class="agent-execution-controls" data-agent-controls="${esc(agent)}" role="group" aria-label="Authoritative controls for ${esc(agentName(agent))}"></div><div class="column-follow"><span></span><button data-column-live="${esc(agent)}">Live in this column</button></div></header><div class="agent-call-stack" tabindex="0" aria-label="Activity for ${esc(agentName(agent))}"><section class="agent-current"><h3>Current activity</h3><p class="current-coverage"></p><div class="agent-current-calls"></div><button data-active-older="${esc(agent)}">More in-flight calls</button></section><section class="agent-history"><h3>History · newest starts first</h3><div class="agent-history-calls"></div><button data-column-older="${esc(agent)}">Older calls</button></section></div>`;
       trajectoryColumns.set(agent,column);
       const feed=column.querySelector('.agent-call-stack');
       feed.addEventListener('scroll',()=>{captureColumnReading(column);if(feed.scrollTop>2&&r.follow)holdColumn(agent);});
@@ -674,10 +738,10 @@ function renderCallStack() {
     heading.querySelector('strong').textContent=agentName(agent);
     const running=actions.filter(a=>a.agent===agent&&a.outcome==='running').length;
     heading.querySelector('.column-call-count').dataset.running=running;
-    heading.querySelector('[data-remove-column]').disabled=Boolean(state.agent)||columns.length<=1;
-    const controls=heading.querySelector('[data-agent-controls]');controls.hidden=!executionState().live;
-    const controlHtml=agentControlButtons(agent);
-    if(controls.innerHTML!==controlHtml){const focused=controls.contains(document.activeElement)?document.activeElement:null;const attribute=['executionAgent','executionStop','executionKill'].find(key=>focused?.dataset[key]);controls.innerHTML=controlHtml;if(attribute)controls.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`)?.focus({preventScroll:true});}
+    heading.querySelector('[data-remove-column]').disabled=Boolean(state.agent);
+    const controls=heading.querySelector('[data-agent-controls]');controls.hidden=false;
+    const controlHtml=executionState().live?agentControlButtons(agent):`<span class="control-section-label">Recorded agent state · ${esc(state.run.agents.find(a=>a.id===agent)?.status||'unknown')}</span><button data-interact="${esc(agent)}">Interaction info</button>`;
+    updateAgentControls(controls,controlHtml);
     renderColumnFollow(column);
     if(stack.children[columnIndex]!==column)stack.insertBefore(column,stack.children[columnIndex]||null);
     const feed=column.querySelector('.agent-call-stack');
@@ -710,7 +774,8 @@ function renderCallStack() {
       visibleGroups.add(group.id);let section=existing.get(group.id);
       if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;section.innerHTML='<div class="call-group-heading"></div><div class="call-group-grid"></div>';}
       section.className=`call-stack-group ${group.running?'running-group':''}`;
-      section.querySelector('.call-group-heading').textContent=`${group.running?'In flight':'Finished'}${group.actions.length>1?' · Concurrent calls':''}`;
+      section.querySelector('.call-group-heading').hidden=group.actions.length===1&&group.actions[0].kind!=='control';
+      section.querySelector('.call-group-heading').textContent=`${group.running?'In flight':group.actions.every(a=>a.kind==='control')?'Recorded intervention':'Finished'}${group.actions.length>1?' · Concurrent calls':''}`;
       const grid=section.querySelector('.call-group-grid');
       for(const [index,action] of group.actions.entries()) {
         visibleCards.add(action.id);let card=cards.get(action.id);
@@ -722,7 +787,8 @@ function renderCallStack() {
         const details=card.querySelector('.tool-details'),version=callEvidenceVersion(action);
         if(!card.dataset.evidenceVersion||!details?.querySelector('.tool-detail-body')?.innerHTML)card.dataset.evidenceVersion=version;
         if(card.dataset.evidenceVersion!==version&&details)details.dataset.stale='true';
-        const html=pill(action.outcome)+(details?.dataset.stale?`<button data-refresh-details="${esc(action.id)}">New evidence · Refresh details</button>`:'')+(action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:'');
+        const cardSummary=eventCard(action,state.run);
+        const html=pill(cardSummary.state.label,action.outcome)+(details?.dataset.stale?`<button data-refresh-details="${esc(action.id)}">New evidence · Refresh details</button>`:'')+(cardSummary.preview?`<p class="event-preview">${esc(cardSummary.preview)}</p>`:'')+(cardSummary.usage.length?`<small class="muted">${esc(cardSummary.usage.join(' · '))}</small>`:'');
         if(status.innerHTML!==html)status.innerHTML=html;
         if(grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);
       }
@@ -748,8 +814,8 @@ function renderCallStack() {
   for(const [id,column] of trajectoryColumns)if(!columns.includes(id))column.remove();
   // Keep detached columns for view switches, with a bounded cache for hidden agents.
   for(const [id] of trajectoryColumns)if(trajectoryColumns.size>Math.max(10,columns.length)&&!columns.includes(id)){trajectoryColumns.delete(id);columnReading.delete(id);}
-  if(!columns.length)stack.innerHTML=empty('Waiting for recorded agents','Agent columns will appear when execution begins.');
-  else stack.querySelector('.empty-state')?.remove();
+  if(!columns.length)stack.innerHTML=firstExperience();
+  else {stack.querySelector('.empty-state')?.remove();stack.querySelector('.first-experience')?.remove();}
 }
 
 function relevantEpisodes() {
@@ -1091,6 +1157,129 @@ function compareView() {
     `<div class="notice">Alignment uses the longest common subsequence of tool action categories, following the saved experiment’s category comparison. Matching categories do not imply identical commands, behavior or correctness. Different tasks can be compared; interpretation requires care. Referenced file paths are extracted from command text, not a verified artifact inventory.</div>`;
 }
 
+function moveColumn(id,direction) {
+  const index=state.agentColumns.indexOf(id),next=index+direction;
+  if(index<0||next<0||next>=state.agentColumns.length)return;
+  const order=[...state.agentColumns];[order[index],order[next]]=[order[next],order[index]];
+  state.columnsCustomized=true;state.agentColumns=order;renderCallStack();
+  trajectoryColumns.get(id)?.querySelector(`[data-column-order][data-direction="${direction}"]`)?.focus({preventScroll:true});
+}
+function firstExperience() {
+  return `<section class="first-experience"><h3>${trajectoryAgents().length?'No pinned columns':'Ready to see agent activity'}</h3><p>${trajectoryAgents().length?'Choose agents in the roster to return them to your workspace.':'Each column is an agent. Select a call to inspect captured input and output. Execution controls affect agents; Freeze view holds only the display.'}</p><button data-demo>Open recorded example</button><button data-connect>Run or connect your agents</button><p class="muted">The example is synthetic, read-only evidence. It does not run agents or measure a benchmark.</p></section>`;
+}
+function showConnectionGuide() {
+  $('connection-guide').hidden=false;$('connection-guide').querySelector('button').focus();
+}
+function revealEvent(view) {
+  const a=actionMap(state.run).get(state.selected?.id);
+  if(!a||state.selected?.run==='b')return;
+  if(!matchesAction(a,state.agent,state.query)){
+    if(!window.confirm('This event is excluded by the agent/search filter. Clear those filters to reveal this recorded event?'))return;
+    state.agent='';state.query='';$('agent-select').value='';$('search').value='';
+  }
+  if(view==='timeline'){
+    setView('timeline');timelineViewer?.setSelection(a.id);
+    const result=timelineViewer?.revealEvent(a.id);
+    if(result&&!result.revealed)$('status').textContent=result.reason;
+  }else {
+    if(!state.agentColumns.includes(a.agent)){
+      const result=pinAgent(state.run,state.agentColumns,a.agent);
+      if(!result.changed){$('status').textContent=result.reason+' Selection remains inspectable.';return;}
+      state.columnsCustomized=true;state.agentColumns=result.ids;
+    }
+    state.trajectoryLayout='episodes';state.activeColumn=a.agent;
+    const r=readingState(a.agent);r.follow=false;
+    const calls=visibleActions(state.run).filter(c=>c.agent===a.agent&&(c.outcome==='running')===(a.outcome==='running')).sort((x,y)=>y.start-x.start||(x.id>y.id?1:-1));
+    const index=calls.findIndex(c=>c.id===a.id),start=Math.max(0,index-12);
+    r[a.outcome==='running'?'activeIds':'ids']=calls.slice(start,start+50).map(c=>c.id);
+    r.anchor=null;r.scrollTop=0;r.resetPosition=true;state.follow=false;
+    setView('trajectory');scrollAgentColumn(a.agent);
+    const column=trajectoryColumns.get(a.agent),feed=column?.querySelector('.agent-call-stack'),card=[...(feed?.querySelectorAll('[data-call-card]')||[])].find(c=>c.dataset.callCard===a.id);
+    if(card){feed.scrollTop+=card.getBoundingClientRect().top-feed.getBoundingClientRect().top;captureColumnReading(column);card.querySelector('[data-action]').focus({preventScroll:true});}
+  }
+}
+function interactionCapabilities(agent) {
+  if(!executionState(agent).live||state.transport!=='connected'||!state.executionControls?.available)return null;
+  return state.executionControls.capabilities?.[agent]||null;
+}
+function openInteraction(agent) {
+  if(!currentExecution()?.agents.some(a=>a.id===agent))return;
+  const caps=interactionCapabilities(agent);
+  const selected=state.selected?.execution===executionIdentity(currentExecution())?actionMap(currentExecution()).get(state.selected.id):null;
+  state.interaction={agent,execution:executionIdentity(currentExecution()),relay:state.executionControls?.relay_id,
+    invocation:caps?.redirect?.includes(selected?.request_id)?selected.request_id:caps?.redirect?.[0]||'',pending:false,submitted:false,status:''};
+  state.inspectorOpen=true;syncInspector();renderComposer();
+  $('interaction-message')?.focus({preventScroll:true});
+}
+function closeInteraction(){state.interaction=null;state.inspectorMarkup=null;state.inspectorMarkupSelection=null;state.inspectorOpen=Boolean(state.selected);renderInspector(true);$('inspector-toggle').focus({preventScroll:true});}
+function composerDescription(operation) {
+  return operation==='queue_message'?'Queue retained context after all work already submitted to this agent. Already-submitted invocations do not receive it; later retained contexts do. This does not interrupt current work.':operation==='redirect'?'Try to interrupt the selected active invocation and submit a native prompt. A target gone before dispatch is rejected. If native delivery fails after dispatch, the SDK queues retained context at the then-current tail. Prompt acknowledgement does not prove the model followed it.':'Submit one registered skill with validated input through this agent’s existing run API. Submission creates a pending invocation; it does not prove task completion.';
+}
+function renderComposer() {
+  const draft=state.interaction;if(!draft)return;
+  // The inspector survives view switches and live paints. Keep its form nodes,
+  // multiline draft, selection and focus until the user chooses a new target.
+  if(draft.rendered&&$('inspector').querySelector('[data-interaction-close]')){renderInteractionStatus();return;}
+  const caps=interactionCapabilities(draft.agent),operations=[];
+  if(caps?.queue_message)operations.push(['queue_message','Queue retained message']);
+  if(caps?.redirect?.length)operations.push(['redirect','Redirect active invocation']);
+  if(caps?.run?.length)operations.push(['run','Run task']);
+  $('inspector').innerHTML=`<div class="inspector-top"><span>AGENT INTERACTION</span><button data-interaction-close>Close</button></div><h2>${esc(agentName(draft.agent,currentExecution()))}</h2>${field('Agent identifier',draft.agent)}${field('Execution',readableExecutionTitle(currentExecution()))}<p id="interaction-target-status" role="status"></p>${operations.length?`<label>Operation<select id="interaction-operation">${operations.map(([id,label])=>`<option value="${id}">${label}</option>`).join('')}</select></label><p id="interaction-description"></p><label id="interaction-invocation-label">Invocation<select id="interaction-invocation">${(caps.redirect||[]).map(id=>`<option value="${esc(id)}" ${id===draft.invocation?'selected':''}>${esc(id)}</option>`).join('')}</select></label><label id="interaction-task-label">Registered task<select id="interaction-task">${(caps.run||[]).map(task=>`<option value="${esc(task.id)}">${esc(task.label||task.id)}</option>`).join('')}</select></label><pre id="interaction-schema" class="payload-text"></pre><label id="interaction-message-label">Message<textarea id="interaction-message" rows="7" maxlength="32000" placeholder="Multiline instructions…"></textarea></label><label id="interaction-input-label">Task input (JSON object)<textarea id="interaction-input" rows="7" maxlength="32000" spellcheck="false">{}</textarea></label><button data-interaction-submit>Submit explicitly</button>`:`<p>Interaction unavailable. ${!executionState(draft.agent).live?'Recorded examples, saved executions and replay are read-only.':state.transport!=='connected'?'Reconnect before interacting with this execution.':'This execution has no enabled interaction relay for this agent. Queue messages need a live SDK agent; redirect needs an owned active invocation and interactive harness; Run task requires an explicitly registered skill.'}</p>`}<p id="interaction-status" role="status" aria-live="polite"></p><p class="muted">No work starts by opening this panel or selecting a task.</p>`;
+  draft.rendered=true;renderInteractionOperation();renderInteractionStatus();
+}
+function renderInteractionOperation() {
+  const draft=state.interaction,operation=$('interaction-operation')?.value;if(!draft||!operation)return;
+  $('interaction-description').textContent=composerDescription(operation);
+  for(const [id,visible] of [['interaction-invocation-label',operation==='redirect'],['interaction-task-label',operation==='run'],['interaction-message-label',operation!=='run'],['interaction-input-label',operation==='run'],['interaction-schema',operation==='run']])$(id).hidden=!visible;
+  const task=interactionCapabilities(draft.agent)?.run?.find(task=>task.id===$('interaction-task').value);
+  $('interaction-schema').textContent=task?(typeof task.input_schema==='string'?task.input_schema:JSON.stringify(task.input_schema,null,2)):'';
+}
+function renderInteractionStatus() {
+  const draft=state.interaction;if(!draft)return;
+  const run=currentExecution(),caps=interactionCapabilities(draft.agent);
+  if(draft.execution!==executionIdentity(run)||draft.relay&&draft.relay!==state.executionControls?.relay_id)draft.invalid='Target execution changed. Close and reopen for the intended live agent.';
+  else if(['completed','failed','cancelled'].includes(run?.status))draft.invalid='Execution finished. This interaction target is read-only.';
+  const invocation=$('interaction-invocation');if(invocation&&!invocation.hidden&&$('interaction-operation')?.value==='redirect'&&!caps?.redirect?.includes(invocation.value)){draft.invalid='Selected invocation finished or is no longer redirectable. Close and reopen before redirecting.';}
+  const target=$('interaction-target-status');if(target)target.textContent=draft.invalid||`${state.displayPaused?'View frozen · ':''}Controls target CURRENT LIVE execution, agent ${agentName(draft.agent,run)}.${state.transport!=='connected'?' Disconnected; request outcome may be unknown.':''}`;
+  const status=$('interaction-status');if(status)status.textContent=draft.status||'';
+  const submit=$('inspector').querySelector('[data-interaction-submit]');
+  if(submit)submit.disabled=Boolean(draft.invalid)||draft.submitted||draft.pending||!caps;
+}
+function submitInteraction() {
+  const draft=state.interaction,caps=draft&&interactionCapabilities(draft.agent);if(!draft||!caps||draft.invalid||draft.submitted||draft.pending)return;
+  if(draft.execution!==executionIdentity(currentExecution())||draft.relay!==state.executionControls?.relay_id){draft.invalid='Execution target changed.';renderInteractionStatus();return;}
+  const command=$('interaction-operation').value,extra={};
+  if(command==='queue_message'&&!caps.queue_message)return;
+  if(command==='run'){
+    extra.task=$('interaction-task').value;if(!caps.run?.some(t=>t.id===extra.task))return;
+    try{extra.input=JSON.parse($('interaction-input').value);if(!extra.input||typeof extra.input!=='object'||Array.isArray(extra.input))throw Error('Task input must be a JSON object.');}
+    catch(error){draft.status='Invalid input · '+error.message;renderInteractionStatus();return;}
+  }else {
+    extra.message=$('interaction-message').value;
+    if(extra.message.length>32000){draft.status='Message exceeds 32,000 characters.';renderInteractionStatus();return;}
+    if(!extra.message.trim()){draft.status='Enter a nonblank message.';renderInteractionStatus();return;}
+    if(command==='redirect'){
+      extra.invocation=$('interaction-invocation').value;
+      if(!caps.redirect?.includes(extra.invocation)){draft.status='Invocation is no longer redirectable. Queue retained context explicitly or reopen the panel.';renderInteractionStatus();return;}
+    }
+  }
+  const id=`ui-${Date.now()}-${++commandSequence}`;
+  draft.pending=true;draft.submitted=true;draft.requestId=id;draft.status='Requested · waiting for relay acceptance.';
+  if(!state.stream?.sendExecution(command,{id,...commandTargetSnapshot(),agname:draft.agent,...extra})){draft.pending=false;draft.status='Not sent · connection unavailable. No retry was sent.';}
+  else setTimeout(()=>{if(state.interaction===draft&&draft.pending){draft.pending=false;draft.status='Outcome unknown · no acknowledgement received. Inspect execution history; no retry was sent.';renderInteractionStatus();}},30000);
+  renderInteractionStatus();
+}
+function renderFullPayload(viewer,text,offset=0) {
+  const page=payloadWindow(text,{offset,limit:20000});
+  fullPayloads.set(viewer,{text,offset:page.offset});
+  viewer.innerHTML=`<p class="muted">${page.total?`Captured text · characters ${page.offset+1}–${page.offset+page.text.length} of ${page.total}`:'No captured text available in this evidence.'}</p><pre class="payload-text" tabindex="0"></pre><div class="payload-paging"><button data-payload-page="previous" ${page.offset===0?'disabled':''}>Previous</button><button data-payload-page="next" ${page.offset+page.text.length>=page.total?'disabled':''}>Next</button></div>`;
+  viewer.querySelector('pre').textContent=page.text;
+}
+function pagePayload(button) {
+  const viewer=button.closest('.full-payload'),data=fullPayloads.get(viewer);if(!data)return;
+  renderFullPayload(viewer,data.text,data.offset+(button.dataset.payloadPage==='next'?20000:-20000));viewer.querySelector('pre').focus({preventScroll:true});
+}
+
 function selectedInterval() {
   if(state.selected?.run==='b')return null;
   if(state.selected?.interval) {const i=state.run.intervals.find(i=>i.id===state.selected.interval);if(i)return [i.start,i.start+i.duration];}
@@ -1105,24 +1294,24 @@ function selectedInterval() {
 }
 
 function setSelection(selection,run=state.run) {
-  state.selected=selection?{...selection,execution:executionIdentity(run)}:null;
-  state.inspectorOpen=Boolean(selection);
+  state.interaction=null;state.selected=selection?{...selection,execution:executionIdentity(run)}:null;
+  state.inspectorOpen=Boolean(selection)||Boolean(state.interaction);
 }
 
 function syncInspector() {
   const selection=state.selected;
   const signature=selection?`${selection.execution||state.run?.id}:${selection.run||'a'}:${selection.type}:${selection.id}`:null;
   if(signature&&signature!==state.inspectorSelection)state.inspectorOpen=true;
-  if(!selection)state.inspectorOpen=false;
+  if(!selection&&!state.interaction)state.inspectorOpen=false;
   state.inspectorSelection=signature;
   $('inspector').hidden=!state.inspectorOpen;
   $('investigation').classList.toggle('inspector-open',state.inspectorOpen);
-  $('inspector-toggle').disabled=!selection;
+  $('inspector-toggle').disabled=!selection&&!state.interaction;
   $('inspector-toggle').setAttribute('aria-expanded',String(state.inspectorOpen));
 }
 
 function toggleInspector(open=!state.inspectorOpen) {
-  if(!state.selected)return;
+  if(!state.selected&&!state.interaction)return;
   state.inspectorOpen=open;
   syncInspector();
   if(open){renderInspector(true);$('inspector').querySelector('[data-inspector-close]')?.focus({preventScroll:true});}
@@ -1131,6 +1320,7 @@ function toggleInspector(open=!state.inspectorOpen) {
 
 function renderInspector(preserveEvidence=false) {
   syncInspector();
+  if(state.interaction){renderComposer();return;}
   if(!state.selected){$('inspector').innerHTML='';state.inspectorMarkup=null;state.inspectorMarkupSelection=null;return;}
   state.inspectorDirty=false;
   const top=`<p class="inspector-update" role="status"></p><div class="inspector-top"><span>SELECTION INSPECTOR${state.selected.run==='b'?' · COMPARISON B':''}</span><button data-inspector-close aria-label="Close inspector">Close</button></div>`;
@@ -1142,18 +1332,20 @@ function renderInspector(preserveEvidence=false) {
     const a=map.get(selection.id);
     if(!a) content='<p>Selection is no longer available.</p>';
     else {
-      content=`${pill(a.kind,'neutral')} ${pill(a.outcome)}${run===state.run?pausedBadge(a.agent):''}<h2>${esc(a.intent||a.name)}</h2><p>${esc(agentName(a.agent,run))}</p>${field('Start',formatTime(a.start))}${field(a.execution_duration==null?'Duration':'Execution duration',formatTime(displayDuration(a)))}${a.execution_duration!=null?field('Wall interval',formatTime(a.duration)):''}${field('Timing',a.timing)}${field('Data source',a.source)}${a.tokens!=null?field('Input / output tokens',`${count(a.tokens)} / ${count(a.output_tokens)}`):''}${toolDetails(a,run,true)}`;
+      const card=eventCard(a,run);
+      content=`${pill(a.kind,'neutral')} ${pill(card.state.label,a.outcome)}${run===state.run?pausedBadge(a.agent):''}<h2>${esc(card.primary)}</h2><p>${esc(card.secondary)}</p><p>${esc(agentName(a.agent,run))}</p>${field('Evidence',run.source==='synthetic'?'Synthetic example':a.source||'Recorded source unspecified')}${field('Timing provenance',a.timing||'Not recorded')}${a.tokens!=null?field('Input / output tokens',`${count(a.tokens)} / ${count(a.output_tokens)}`):''}${toolDetails(a,run,true)}`;
       content+=field('Lifecycle',a.missing_start?'End recorded; start missing':a.outcome==='running'?'Started; end not recorded yet':a.outcome==='incomplete'?'End missing at final execution boundary':a.outcome);
       if(a.intent)content+=`<div class="detail-label">Declared purpose</div><p>${esc(a.intent)}</p>`;
-      if(a.kind!=='model')content+=a.model_id?`<button class="jump" data-action="${esc(a.model_id)}">Related model invocation (explicit call ID) →</button>`:field('Model linkage','Unlinked; timing alone is not attribution');
+      const relationships=eventRelationships(a,run);
+      content+=`<div class="detail-label">Explicit event relationships</div>`+(relationships.links.length?relationships.links.map(link=>`<button class="jump" data-reveal-action="${esc(link.id)}">${esc(link.label)} →</button>`).join(''):field('Correlation',relationships.unavailable));
       if(a.artifacts?.length)content+=`<div class="detail-label">Recorded artifacts</div><pre>${esc(JSON.stringify(a.artifacts,null,2))}</pre>`;
       if(a.event_ids?.length)content+=`<div class="detail-label">Immutable source evidence</div>${a.event_ids.slice(-10).map((id,i)=>`<button class="jump" data-raw-event="${esc(id)}">Source event ${i+1} · ${esc(id.slice(-16))} ↗</button>`).join('')}`;
       if(selection.interval&&selection.interval!==selection.id){const interval=run.intervals.find(i=>i.id===selection.interval);if(interval)content+=`<div class="detail-label">Linked wait</div><p>${esc(interval.label)}</p>${field('Wait interval',`${formatTime(interval.start)} → ${formatTime(interval.start+interval.duration)}`)}`;}
       if(state.contextBlock) content+=`<div class="detail-label">${esc(state.contextBlock.source)} · ${esc(state.contextBlock.change)}</div><pre>${esc(state.contextBlock.preview)}</pre>`;
-      if(a.files.length) content+=`<div class="detail-label">Referenced files</div>${a.files.map(f=>`<span class="file-chip">${esc(f)}</span>`).join('')}`;
+      if(a.files?.length) content+=`<div class="detail-label">Referenced files</div>${a.files.map(f=>`<span class="file-chip">${esc(f)}</span>`).join('')}`;
       if(selection.run==='b') content+='<button class="jump" data-open-comparison>Open B in trajectory →</button>';
-      else content+=`<button class="jump" data-view="trajectory">Locate in trajectory →</button><button class="jump" data-view="resources">Correlate resource interval →</button>${a.kind==='model'?'<button class="jump" data-view="context">Inspect this model’s context →</button>':''}`;
-      content+=`<details><summary class="detail-label">Event metadata</summary><pre>${esc(JSON.stringify(a.metadata,null,2))}</pre></details>`;
+      else content+=`<button class="jump" data-reveal-event="trajectory">Reveal in trajectory →</button><button class="jump" data-reveal-event="timeline">Reveal on timeline →</button><button class="jump" data-view="resources">Correlate resource interval →</button>${a.kind==='model'?'<button class="jump" data-view="context">Inspect this model’s context →</button>':''}`;
+      content+=`<details><summary class="detail-label">Event metadata</summary><div id="event-metadata-payload" class="full-payload"></div></details>`;
     }
   } else if(selection.type==='episode') {
     const episode=run.episodes.find(e=>e.id===selection.id);
@@ -1173,9 +1365,19 @@ function renderInspector(preserveEvidence=false) {
   const markup=top+content;
   if(state.inspectorMarkup===markup&&state.inspectorMarkupSelection===state.inspectorSelection)return;
   state.inspectorMarkup=markup;state.inspectorMarkupSelection=state.inspectorSelection;
-  const raw=preserveEvidence?$('raw-evidence'):null;
-  $('inspector').innerHTML=markup;
+  const raw=preserveEvidence?$('raw-evidence'):null,inspectorTop=$('inspector').scrollTop;
+  $('inspector').innerHTML=markup;$('inspector').scrollTop=inspectorTop;
   if(raw)$('inspector').append(raw);
+  if(selection.type==='action'){const action=map.get(selection.id);if(action){loadInspectorPayloads(action,run);const metadata=$('event-metadata-payload');if(metadata)renderFullPayload(metadata,JSON.stringify(action.metadata,null,2));}}
+}
+
+async function loadInspectorPayloads(action,run){
+  const selectionKey=state.inspectorSelection;
+  for(const button of $('inspector').querySelectorAll('[data-full-payload]')){
+    const viewer=button.parentElement.querySelector('.full-payload');
+    try{const text=await originalPayload(action,button.dataset.payloadKind,run);if(selectionKey!==state.inspectorSelection||!$('inspector').contains(button))return;renderFullPayload(viewer,text);button.parentElement.querySelector('.payload-text').hidden=true;button.hidden=true;}
+    catch(error){if(selectionKey===state.inspectorSelection)viewer.textContent=error.message;}
+  }
 }
 
 function selectAction(id, comparison=false, intervalId=null) {
@@ -1204,16 +1406,24 @@ function setView(view) {
 }
 
 function handleClick(event) {
-  const el=event.target.closest('[data-refresh-details],[data-column-live],[data-column-older],[data-active-older],[data-inspector-close],[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
-  if(!el||!state.run&&!(el.hasAttribute('data-retry')||el.hasAttribute('data-demo'))) return;
-  if(el.dataset.refreshDetails)refreshCallDetails(el);
+  const el=event.target.closest('[data-interact],[data-interaction-close],[data-interaction-submit],[data-payload-page],[data-reveal-event],[data-reveal-action],[data-column-order],[data-connect],[data-refresh-details],[data-column-live],[data-column-older],[data-active-older],[data-inspector-close],[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],button[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
+  if(!el||!state.run&&!(el.hasAttribute?.('data-retry')||el.hasAttribute?.('data-demo'))) return;
+  if(el.dataset.interact)openInteraction(el.dataset.interact);
+  else if(el.hasAttribute?.('data-interaction-close'))closeInteraction();
+  else if(el.hasAttribute?.('data-interaction-submit'))submitInteraction();
+  else if(el.hasAttribute?.('data-connect'))showConnectionGuide();
+  else if(el.dataset.payloadPage)pagePayload(el);
+  else if(el.dataset.revealEvent)revealEvent(el.dataset.revealEvent);
+  else if(el.dataset.revealAction){const comparison=$('inspector').contains(el)&&state.selected?.run==='b';selectAction(el.dataset.revealAction,comparison);if(!comparison)revealEvent('trajectory');}
+  else if(el.dataset.columnOrder)moveColumn(el.dataset.columnOrder,Number(el.dataset.direction));
+  else if(el.dataset.refreshDetails)refreshCallDetails(el);
   else if(el.dataset.columnLive)liveColumn(el.dataset.columnLive);
   else if(el.dataset.columnOlder)olderCalls(el.dataset.columnOlder);
   else if(el.dataset.activeOlder)olderCalls(el.dataset.activeOlder,true);
-  else if(el.hasAttribute('data-inspector-close'))toggleInspector(false);
-  else if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
-  else if(el.hasAttribute('data-execution-stop'))stopExecution(false,false,el.dataset.executionStop);
-  else if(el.hasAttribute('data-execution-kill'))stopExecution(false,true,el.dataset.executionKill);
+  else if(el.hasAttribute?.('data-inspector-close')){if(state.interaction)closeInteraction();else toggleInspector(false);}
+  else if(el.hasAttribute?.('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
+  else if(el.hasAttribute?.('data-execution-stop'))stopExecution(false,false,el.dataset.executionStop);
+  else if(el.hasAttribute?.('data-execution-kill'))stopExecution(false,true,el.dataset.executionKill);
   else if(el.dataset.addColumn)addAgentColumn(el.dataset.addColumn);
   else if(el.dataset.removeColumn)removeAgentColumn(el.dataset.removeColumn);
   else if(el.dataset.agentTab)selectAgentColumn(el.dataset.agentTab);
@@ -1232,7 +1442,7 @@ function handleClick(event) {
   } else if(el.dataset.agent) {
     state.agent=el.dataset.agent;setSelection({type:'agent',id:state.agent});$('agent-select').value=state.agent;render();
   } else if(el.dataset.model) selectAction(el.dataset.model);
-  else if(el.hasAttribute('data-block')) {
+  else if(el.hasAttribute?.('data-block')) {
     const a=actionMap(state.run).get(el.dataset.modelId);
     const block=a.context.blocks.concat(a.context.dropped)[Number(el.dataset.block)];
     state.model=a.id;setSelection({type:'action',id:a.id});state.contextBlock=block;state.cursor=a.start;render();
@@ -1241,13 +1451,13 @@ function handleClick(event) {
   } else if(el.dataset.obligation) {setSelection({type:'obligation',id:el.dataset.obligation});render();}
   else if(el.dataset.artifact) {setSelection({type:'artifact',id:el.dataset.artifact});render();}
   else if(el.dataset.compareAction) selectAction(el.dataset.compareAction,el.dataset.side==='b');
-  else if(el.hasAttribute('data-open-comparison')) {const id=state.selected.id;state.view='trajectory';loadRun(state.comparison.id,{type:'action',id});}
-  else if(el.hasAttribute('data-zoom')) {const interval=selectedInterval();if(interval){state.zoom=[Math.max(0,interval[0]-1),Math.min(state.run.duration,interval[1]+1)];render();}else{$('status').textContent='Select an episode or span to focus its interval.';}}
-  else if(el.hasAttribute('data-reset-zoom')) {state.zoom=null;render();}
-  else if(el.hasAttribute('data-retry')) refresh();
-  else if(el.hasAttribute('data-demo')) loadRun('demo-baseline');
-  else if(el.hasAttribute('data-older-activities')) {holdHistory();state.windowEnd=Math.max(50,(state.windowEnd??relevantEpisodes().length)-50);render();}
-  else if(el.hasAttribute('data-latest-activities')) {state.windowEnd=null;render();}
+  else if(el.hasAttribute?.('data-open-comparison')) {const id=state.selected.id;state.view='trajectory';loadRun(state.comparison.id,{type:'action',id});}
+  else if(el.hasAttribute?.('data-zoom')) {const interval=selectedInterval();if(interval){state.zoom=[Math.max(0,interval[0]-1),Math.min(state.run.duration,interval[1]+1)];render();}else{$('status').textContent='Select an episode or span to focus its interval.';}}
+  else if(el.hasAttribute?.('data-reset-zoom')) {state.zoom=null;render();}
+  else if(el.hasAttribute?.('data-retry')) refresh();
+  else if(el.hasAttribute?.('data-demo')){state.view='trajectory';loadRun('demo-baseline');}
+  else if(el.hasAttribute?.('data-older-activities')) {holdHistory();state.windowEnd=Math.max(50,(state.windowEnd??relevantEpisodes().length)-50);render();}
+  else if(el.hasAttribute?.('data-latest-activities')) {state.windowEnd=null;render();}
   else if(el.dataset.rawEvent) showRawEvidence(el.dataset.rawEvent,$('inspector').contains(el)&&state.selected?.run==='b'?state.comparison:state.run);
 }
 
@@ -1288,7 +1498,7 @@ async function showRawEvidence(id,run=state.run) {
   let panel=$('raw-evidence');
   if(!panel){panel=document.createElement('section');panel.id='raw-evidence';$('inspector').append(panel);}
   panel.innerHTML='<div class="detail-label">Source event</div><p>Reading immutable evidence…</p>';
-  try{const raw=await fetchJson(url);if((state.run?.id===runId||state.comparison?.id===runId)&&panel.isConnected)panel.innerHTML=`<div class="detail-label">Immutable source event</div><pre>${esc(JSON.stringify(raw,null,2))}</pre>`;}
+  try{const raw=await fetchJson(url);if((state.run?.id===runId||state.comparison?.id===runId)&&panel.isConnected){panel.innerHTML='<div class="detail-label">Immutable source event · recorded evidence</div><div class="full-payload"></div>';renderFullPayload(panel.querySelector('.full-payload'),JSON.stringify(raw,null,2));}}
   catch(error){if(panel.isConnected)panel.innerHTML=`<p>${esc(error.message)}</p>`;}
 }
 
@@ -1337,10 +1547,14 @@ $('export').onclick=()=>{
   const anchor=document.createElement('a');anchor.href=url;anchor.download=`agency-${state.run.id}.json`;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
 document.addEventListener('change',event=>{
-  if(event.target.id==='add-agent-column'){addAgentColumn(event.target.value);event.target.value='';}
+  if(event.target.id==='interaction-operation'||event.target.id==='interaction-task')renderInteractionOperation();
+  else if(event.target.id==='roster-status'){state.rosterStatus=event.target.value;renderRoster();}
+  else if(event.target.id==='add-agent-column'){addAgentColumn(event.target.value);event.target.value='';}
   else if(event.target.id==='comparison-select'){state.compareError=null;loadComparison(event.target.value);}
   else if(event.target.id==='trajectory-layout'){state.trajectoryLayout=event.target.value;updateUrl();render();}
 });
+document.addEventListener('input',event=>{if(event.target.id==='roster-search'){state.rosterQuery=event.target.value;renderRoster();}});
+$('connection-close').onclick=()=>{$('connection-guide').hidden=true;};
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.follow&&state.stream&&!state.displayPaused)followLatest();});
 window.addEventListener('pagehide',()=>state.stream?.close());
 $('execution-all').onclick=()=>pauseResumeExecution(true);

@@ -170,17 +170,25 @@ def _flush_loop(stop_event: threading.Event, interval: float = 0.5) -> None:
                 print(f"[agwebui] WARNING: failed to flush data logger for {a.agname}: {_e}")
 
 
-def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
+def _poll_commands(command_dir: Path, stop_event: threading.Event, relay=None) -> None:
+    from .relay import ProfilerRelay
+
+    relay = relay or ProfilerRelay(command_dir)
     command_dir.mkdir(parents=True, exist_ok=True)
     # Lets the profiler distinguish a working relay from a standalone log viewer.
     heartbeat = command_dir / ".heartbeat"
     try:
         while not stop_event.is_set():
             heartbeat.touch()
+            relay.publish()
             for f in sorted(command_dir.glob("*.json")):
                 try:
                     cmd = json.loads(f.read_text(encoding="utf-8"))
-                    _dispatch_command(cmd)
+                    if cmd.get("id"):
+                        relay.dispatch(cmd)
+                    else:
+                        # Backwards-compatible programmatic config/legacy files.
+                        _dispatch_command(cmd)
                 except Exception as _e:
                     print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
                 finally:
@@ -195,7 +203,7 @@ def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
             stop_event.wait(0.2)
 
     finally:
-        heartbeat.unlink(missing_ok=True)
+        relay.close()
 
 
 class agwebui:
@@ -220,6 +228,7 @@ class agwebui:
         run_dir: Path | None = None,
         port: int = 7860,
         linger: bool = True,
+        ui_tasks: dict | None = None,
         **kwargs,
     ) -> None:
         """Run *fn(\\*args, \\*\\*kwargs)* with the web UI active.
@@ -260,6 +269,9 @@ class agwebui:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         ui = cls(run_dir=run_dir, port=port)
+        from .relay import ProfilerRelay
+
+        relay = ProfilerRelay(run_dir / "ui_commands", ui_tasks)
 
         server_log = open(run_dir / "server.log", "w")
         ui._server_log = server_log
@@ -331,7 +343,7 @@ class agwebui:
         command_stop = threading.Event()
         threading.Thread(
             target=_poll_commands,
-            args=(run_dir / "ui_commands", command_stop),
+            args=(run_dir / "ui_commands", command_stop, relay),
             daemon=True,
             name="agwebui-commands",
         ).start()

@@ -380,9 +380,51 @@ def obligations(actions, resolved=None):
     return rows
 
 
-def model_output(raw):
+def visible_model_response(raw):
+    """Keep visible captured response fields, excluding private reasoning blocks."""
     response = object_value(raw)
     if not isinstance(response, dict):
+        return None
+    visible = {key: response[key] for key in ("role", "content", "tool_calls") if key in response}
+    if not isinstance(visible.get("tool_calls"), list):
+        visible.pop("tool_calls", None)
+    else:
+        visible["tool_calls"] = [call for call in visible["tool_calls"] if isinstance(call, dict)]
+    private = {"thinking", "reasoning", "redacted_thinking", "metadata"}
+    if isinstance(visible.get("content"), list):
+        visible["content"] = [
+            block
+            for block in visible["content"]
+            if isinstance(block, dict) and block.get("type") not in private
+        ]
+    if isinstance(response.get("blocks"), list):
+        visible["blocks"] = [
+            block
+            for block in response["blocks"]
+            if isinstance(block, dict) and block.get("type") not in private
+        ]
+    return visible
+
+
+def response_tool_ids(response):
+    if not isinstance(response, dict):
+        return []
+    calls = [
+        block
+        for block in response.get("blocks", [])
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
+    calls.extend(call for call in response.get("tool_calls", []) if isinstance(call, dict))
+    return list(
+        dict.fromkeys(
+            call["id"] for call in calls if isinstance(call.get("id"), str) and call["id"]
+        )
+    )
+
+
+def model_output(raw):
+    response = visible_model_response(raw)
+    if response is None:
         return str(raw or "")
     content = response.get("content")
     parts = [content] if isinstance(content, str) else []
@@ -392,7 +434,8 @@ def model_output(raw):
         if block.get("type") == "tool_use":
             parts.append(f"{block.get('name', 'tool')}({block.get('arguments', '')})")
     for call in response.get("tool_calls", []):
-        function = call.get("function", {})
+        function = call.get("function") or {}
+        function = function if isinstance(function, dict) else {}
         parts.append(f"{function.get('name', 'tool')}({function.get('arguments', '')})")
     return "\n\n".join(parts)
 
@@ -484,6 +527,9 @@ def normalize_trace(trace, entry, summary=None):
                 context["truncated"] = context["truncated"] or bool(
                     attrs.get("llm.messages_truncated")
                 )
+        captured_response = (
+            visible_model_response(attrs.get("llm.response")) if kind == "model" else None
+        )
         action = {
             "id": attrs.get("span_id") or attrs.get("agency.span_id") or f"action-{len(actions)}",
             "agent": agent,
@@ -494,10 +540,16 @@ def normalize_trace(trace, entry, summary=None):
             "duration": elapsed,
             "outcome": outcome,
             "command": command if name.startswith("tool:") else "",
+            "arguments": attrs.get("tool.arguments") if name.startswith("tool:") else None,
             "result": model_output(attrs.get("llm.response"))
             if kind == "model"
             else str(attrs.get("tool.result") or ""),
             "context": context,
+            "model": attrs.get("model"),
+            "model_response": captured_response,
+            "tool_call_ids": response_tool_ids(captured_response),
+            "model_tool_call_id": attrs.get("model_tool_call_id"),
+            "model_id": attrs.get("model_id"),
             "files": sorted(
                 set(re.findall(r"[\w./-]+\.(?:py|ts|tsx|js|json|md|rs|go|css)", command))
             )[:30],
@@ -675,6 +727,8 @@ def normalize_native_events(path, entry):
                     "tool.arguments": json.dumps(annotation.get("arguments", {})),
                     "tool.result": event.get("result", ""),
                     "call_id": event.get("call_id"),
+                    "model_tool_call_id": event.get("model_tool_call_id")
+                    or annotation.get("model_tool_call_id"),
                     "annotation_status": record.get("status"),
                     "tool.intent": raw.get("purpose", "")
                     if record.get("status") == "valid"

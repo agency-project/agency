@@ -26,6 +26,7 @@ function page(replay=false,view=null) {
       if(this.dataset.agentColumn&&['.agent-current-calls','.agent-history-calls'].includes(selector))return this.querySelector('.agent-call-stack').querySelector(selector);
       if(this.dataset.agentColumn&&selector==='[data-agent-controls]')return this.querySelector('.agent-column-heading').querySelector(selector);
       if(selector==='.empty-state')return null;
+      if(selector==='.first-experience')return this.children.find(child=>child.className==='first-experience')||null;
       if(!this.parts.has(selector)){const part=new Element();part.host=this;if(selector==='[data-action]')part.dataset.action=this.dataset.callCard;this.parts.set(selector,part);}
       return this.parts.get(selector);
     }
@@ -70,7 +71,7 @@ function page(replay=false,view=null) {
     setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
     clearTimeout:id=>timers.delete(id),
     location:{search:view?`?view=${view}`:replay?'?mode=replay':''},
-    window:{scrollY:0, addEventListener:()=>{}},
+    window:{scrollY:0, confirm:()=>true, addEventListener:()=>{}},
     TrajectoryStream:class {
       constructor(options){subscription=options;}
       close(){}
@@ -88,6 +89,7 @@ function page(replay=false,view=null) {
   vm.runInContext(fs.readFileSync(path.join(__dirname,
     '../../agency/observability/agwebui/static/trajectory-stream.js'),'utf8')
     .split('export class TrajectoryStream')[0].replace(/export function/g,'function'),context);
+  for(const file of ['agent-roster.js','event-details.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/'+file),'utf8').replace(/^export /gm,''),context);
   vm.runInContext(source+`
     // Isolate follow behavior from chart/inspector markup, retaining the
     // real stream callback, selection handlers and updateTrajectory path.
@@ -99,7 +101,7 @@ function page(replay=false,view=null) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
+    globalThis.ui={state,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,moveColumn,revealEvent,renderRoster,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
@@ -116,7 +118,7 @@ function page(replay=false,view=null) {
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message),transport:value=>subscription.onTransport(value),window:context.window,
+  return {ui:context.ui, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');const body=(agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');const column=body.host;return {get children(){return [...column.querySelector('.agent-current-calls').children,...column.querySelector('.agent-history-calls').children];},get firstElementChild(){return this.children[0];}};},
     columnFeed:agent=>node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-call-stack'),
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
@@ -132,6 +134,16 @@ test('trajectory is the default execution view and the inspector starts collapse
   assert.equal(p.ui.state.view,'trajectory');
   assert.equal(p.node('inspector').hidden,true);
   assert.equal(p.node('inspector-toggle').disabled,true);
+});
+test('first-use prompt is removed when agent columns become available',()=>{
+  const p=page(),stack=p.node('call-stack'),run=structuredClone(p.ui.state.run);
+  p.ui.state.run.actions=[];p.ui.renderCallStack();
+  assert.match(stack.innerHTML,/class="first-experience"/);
+  // Represent the section created by this markup in the small DOM fixture.
+  const prompt=p.document.createElement('section');prompt.className='first-experience';stack.append(prompt);
+  p.ui.state.run=run;p.ui.renderCallStack();
+  assert.equal(stack.children.includes(prompt),false);
+  assert.equal(stack.querySelectorAll('[data-agent-column]').length,1);
 });
 test('explicit alternative execution views remain selected on entry',()=>{
   assert.equal(page(false,'timeline').ui.state.view,'timeline');
@@ -290,7 +302,7 @@ test('reconnect snapshots merge duplicate delivery without replacing selected ac
 test('live control updates never repaint frozen event columns',()=>{
   const p=debuggerPage();p.ui.renderCallStack();p.ui.pauseDisplay();
   const card=p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild;
-  p.receive({type:'updates',patches:[{agents:[{id:'a',status:'paused',control_ts:20}],actions:[{id:'old',result:'New evidence'}]}],execution_controls:{available:true,agents:['a','b']}});
+  p.receive({type:'updates',patches:[{agents:[{id:'a',status:'paused',control_ts:20}],actions:[{id:'old',result:'New evidence'}]}],execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   p.ui.renderSession();
   assert.equal(p.ui.state.run.actions[0].result,undefined);assert.equal(p.ui.state.liveRun.actions[0].result,'New evidence');
   assert.equal(p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild,card);
@@ -465,7 +477,7 @@ test('hidden agents show activity counts and each column contains its own calls'
   p.ui.renderCallStack();p.ui.removeAgentColumn('c');p.ui.renderCallStack();
   assert.equal(p.feed('a').firstElementChild.dataset.callGroup,'running:a:tool');
   assert.equal(p.feed('b').firstElementChild.dataset.callGroup,'two');
-  assert.match(p.node('hidden-agents').innerHTML,/c · 1 running · 1 failed/);
+  assert.match(p.node('hidden-agents').innerHTML,/c · 1 retained call failure/);
   p.ui.selectAgentColumn('b');
   assert.equal(p.ui.state.activeColumn,'b');
   const columns=p.node('call-stack').querySelectorAll('[data-agent-column]');
@@ -528,7 +540,7 @@ function debuggerPage() {
   p.ui.state.run.agents=[{id:'a',label:'A',status:'waiting_llm'},{id:'b',label:'B',status:'running'}];
   p.ui.state.run.status='running';
   p.ui.state.transport='connected';
-  p.ui.state.executionControls={available:true,agents:['a','b']};
+  p.ui.state.executionControls={relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']};
   return p;
 }
 
@@ -546,7 +558,7 @@ test('display pause freezes mutable evidence while live updates continue without
   p.receive({type:'updates',patches:[{
     actions:[{id:'old',outcome:'success',result:'Finished',event_ids:['start','end']}],
     counter_samples:{cpu:[[2,50]]},meta:{duration:3},
-  }],execution_controls:{available:true,agents:['a','b']}});
+  }],execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   p.append();p.visibility(true);p.visibility(false);
   assert.equal(p.sent.length,0);
   assert.equal(p.ui.state.displayPaused,true);
@@ -580,12 +592,12 @@ test('execution controls use live agent state while the display is frozen',()=>{
   assert.equal(p.sent[0].command,'pause_all');
   const run=structuredClone(p.ui.state.liveRun);
   for(const agent of run.agents){agent.status='paused';agent.control_ts=10;}
-  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  p.receive({type:'snapshot',run,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   assert.equal(p.ui.state.executionPending,null);
   assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
   assert.equal(p.ui.state.displayPaused,true);
   p.ui.renderSession();
-  assert.equal(p.node('execution-all').textContent,'▶ Resume Agents');
+  assert.equal(p.node('execution-all').textContent,'▶ Resume all active agents');
   p.node('execution-all').onclick();
   assert.equal(p.sent[1].command,'resume_all');
   assert.equal(p.ui.state.displayPaused,true);
@@ -656,7 +668,7 @@ test('debugger controls follow action selection and send named-agent commands',(
   assert(p.ui.state.executionPending); // Queuing is not authoritative state.
   const run=p.ui.state.run;
   run.agents[0].status='paused';run.agents[0].control_ts=10;
-  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  p.receive({type:'snapshot',run,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   p.ui.renderSession();
   assert.equal(p.ui.state.executionPending,null);
   assert.equal(p.agentButton('agent').textContent,'▶ Resume');
@@ -674,7 +686,7 @@ test('global debugger controls target all agents and expose resume for mixed pau
   assert.equal(p.sent[0].agname,undefined);
   const run=p.ui.state.run;
   for(const agent of run.agents){agent.status='paused';agent.control_ts=10;}
-  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  p.receive({type:'snapshot',run,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   p.ui.renderSession();
   p.node('execution-all').onclick();
   assert.equal(p.sent[1].command,'resume_all');
@@ -709,13 +721,13 @@ test('failed, unconfirmed and disconnected commands retain recorded status and r
   p.ui.renderSession();assert.equal(p.node('execution-all').disabled,true);
 });
 
-test('paused agent inspection and duration labels use the recorded execution duration',()=>{
+test('paused agent inspection keeps wall interval distinct from pause-excluded execution time',()=>{
   const p=debuggerPage();
   p.ui.state.run.agents[0].status='paused';
   p.ui.state.selected={type:'agent',id:'a'};p.ui.renderInspector();
   assert.match(p.node('inspector').innerHTML,/pill paused/);
   assert.match(p.ui.agentExecutionControls('a'),/Resume/);
-  assert.match(p.ui.actionButton({...p.ui.state.run.actions[0],duration:25,execution_duration:5}),/>5.0s</);
+  assert.match(p.ui.actionButton({...p.ui.state.run.actions[0],duration:25,execution_duration:5}),/>25.0s</);
 });
 
 
@@ -745,9 +757,9 @@ test('stop targets selected agent and SIGKILL can escalate while stop awaits con
   p.agentButton('kill').onclick();
   assert.equal(p.sent[1].command,'kill');assert.equal(p.sent[1].agname,'a');
   const run=p.ui.state.run;run.agents[0].stop_ts=10;run.agents[0].stop_force=true;
-  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  p.receive({type:'snapshot',run,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   assert.equal(p.ui.state.executionPending,null);
-  assert.match(p.ui.state.executionMessage,/SIGKILL delivered/);
+  assert.match(p.ui.state.executionMessage,/SIGKILL request recorded; process exit unconfirmed/);
   assert.equal(run.agents[0].status,'waiting_llm');
 });
 
@@ -761,7 +773,7 @@ test('stop all uses live execution while display is paused and SIGKILL all keeps
   run.agents.forEach(agent=>{agent.status='cancelled';});run.status='cancelled';
   p.receive({type:'snapshot',run,execution_controls:{available:false,agents:[]}});
   assert.equal(p.ui.state.executionPending,null);
-  assert.equal(p.ui.state.executionMessage,'Execution stopped.');
+  assert.match(p.ui.state.executionMessage,/terminal state recorded/);
 });
 
 test('stop controls hide in saved/replay views and disable on disconnect or completion',()=>{
@@ -821,4 +833,139 @@ test('column controls update from live state while the displayed evidence stays 
   assert.equal(p.sent[0].command,'resume');assert.equal(p.sent[0].agname,'b');
   p.ui.renderSession();assert.match(group.innerHTML,/data-execution-stop="b"[^>]*disabled/);
   assert.doesNotMatch(group.innerHTML,/data-execution-kill="b"[^>]*disabled/);
+});
+
+test('pending pause blocks duplicate submissions and remains requested until recorded state',()=>{
+  const p=debuggerPage();p.ui.pauseResumeExecution(false,'a');p.ui.pauseResumeExecution(false,'a');
+  assert.equal(p.sent.length,1);assert.equal(p.sent[0].relay_id,'fixture-relay');assert.equal(p.sent[0].execution.id,'live');
+  assert.match(p.ui.agentExecutionControls('a'),/Pausing/);
+  p.receive({type:'execution_command_result',id:p.sent[0].id,queued:true,targets:['a']});
+  assert(p.ui.state.executionPending);assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
+});
+
+test('partial bulk receipts retain specific failed targets and recorded accepted targets',()=>{
+  const p=debuggerPage();p.ui.pauseResumeExecution(true);
+  p.receive({type:'execution_command_result',id:p.sent[0].id,state:'partial',targets:[{agname:'a',state:'accepted'},{agname:'b',state:'failed',detail:'daemon unavailable'}]});
+  assert(p.ui.state.executionPending);assert.match(p.ui.state.executionMessage,/Some targets failed/);
+  const run=p.ui.state.run;run.agents[0].status='paused';run.agents[0].control_ts=10;
+  p.receive({type:'snapshot',run,execution_controls:{available:true,agents:['a','b']}});
+  assert.equal(p.ui.state.executionPending,null);assert.match(p.ui.state.executionMessage,/daemon unavailable/);assert.match(p.ui.state.executionMessage,/paused state recorded/);
+});
+
+test('destructive confirmations name the execution, targets and agent count; cancel sends nothing',()=>{
+  const p=debuggerPage();const messages=[];p.window.confirm=message=>{messages.push(message);return false;};
+  p.ui.stopExecution(true,true);assert.equal(p.sent.length,0);assert.match(messages[0],/Force stop 2 agents/);assert.match(messages[0],/A, B/);assert.match(messages[0],/SIGKILL without a cleanup guarantee/);
+  p.ui.pauseResumeExecution(false,'a');assert.equal(messages.length,1);assert.equal(p.sent.length,1);
+});
+
+test('a replacement relay cannot confirm an older control request',()=>{
+  const p=debuggerPage();p.ui.pauseResumeExecution(false,'a');
+  p.receive({type:'snapshot',run:p.ui.state.run,execution_controls:{available:true,agents:['a','b'],relay_id:'replacement'}});
+  assert.equal(p.ui.state.executionPending,null);assert.match(p.ui.state.executionMessage,/execution changed/);assert.equal(p.sent.length,1);
+});
+
+function interactionPage(){
+  const p=debuggerPage();p.ui.state.executionControls.capabilities={a:{queue_message:true,redirect:['run-active'],run:[{id:'echo',label:'Echo',input_schema:'{"label":"string"}'}]}};
+  p.ui.openInteraction('a');p.node('interaction-operation').value='queue_message';p.node('interaction-message').value='first line\nsecond line';return p;
+}
+
+test('interaction queues exact multiline input once with an execution fence',()=>{
+  const p=interactionPage();p.ui.submitInteraction();p.ui.submitInteraction();
+  assert.equal(p.sent.length,1);assert.equal(p.sent[0].command,'queue_message');assert.equal(p.sent[0].message,'first line\nsecond line');assert.equal(p.sent[0].relay_id,'fixture-relay');
+  p.receive({type:'execution_command_result',id:p.sent[0].id,queued:true,targets:['a']});
+  assert.equal(p.ui.state.interaction.pending,true);assert.match(p.ui.state.interaction.status,/dispatch not confirmed/);
+  p.receive({type:'snapshot',run:p.ui.state.run,execution_controls:{...p.ui.state.executionControls,receipts:[{id:p.sent[0].id,state:'accepted',targets:[{agname:'a',state:'queued',scope:'future_retained_context'}]}]}});
+  assert.equal(p.ui.state.interaction.pending,false);assert.match(p.ui.state.interaction.status,/queued/);assert.doesNotMatch(p.ui.state.interaction.status,/followed|success/);
+});
+
+test('recorded and replay interaction panels remain read-only',()=>{
+  const p=interactionPage();p.ui.state.replay=true;p.ui.openInteraction('a');p.ui.submitInteraction();
+  assert.equal(p.sent.length,0);assert.match(p.node('inspector').innerHTML,/read-only/);
+  p.ui.state.replay=false;p.ui.state.run.id='saved';p.ui.openInteraction('a');p.ui.submitInteraction();assert.equal(p.sent.length,0);
+});
+
+test('interaction target changes and disconnect after submission never cause a retry',()=>{
+  const p=interactionPage();p.ui.submitInteraction();p.transport('disconnected');
+  assert.match(p.ui.state.interaction.status,/outcome unknown/);p.transport('connected');p.ui.submitInteraction();assert.equal(p.sent.length,1);
+  p.ui.state.executionControls.relay_id='new-runtime';p.ui.renderInteractionStatus();p.ui.submitInteraction();
+  assert.match(p.ui.state.interaction.invalid,/execution changed/);assert.equal(p.sent.length,1);
+});
+
+test('task selection does not submit; invalid JSON and unregistered tasks cannot run',()=>{
+  const p=interactionPage();p.node('interaction-operation').value='run';p.node('interaction-task').value='echo';p.ui.renderInteractionOperation();assert.equal(p.sent.length,0);
+  p.node('interaction-input').value='[1,2]';p.ui.submitInteraction();assert.equal(p.sent.length,0);assert.match(p.ui.state.interaction.status,/JSON object/);
+  p.node('interaction-input').value='{"label":"hello"}';p.node('interaction-task').value='not-registered';p.ui.submitInteraction();assert.equal(p.sent.length,0);
+  p.node('interaction-task').value='echo';p.ui.submitInteraction();assert.equal(p.sent[0].command,'run');assert.deepEqual(JSON.parse(JSON.stringify(p.sent[0].input)),{label:'hello'});
+});
+
+test('redirect uses only an active explicit invocation and becomes unavailable when it ends',()=>{
+  const p=interactionPage();p.node('interaction-operation').value='redirect';p.node('interaction-invocation').value='run-active';p.ui.submitInteraction();
+  assert.equal(p.sent[0].command,'redirect');assert.equal(p.sent[0].invocation,'run-active');
+  p.ui.closeInteraction();p.ui.openInteraction('a');p.node('interaction-operation').value='redirect';p.node('interaction-invocation').value='run-ended';p.ui.submitInteraction();assert.equal(p.sent.length,1);
+  assert.match(p.ui.state.interaction.status,/no longer redirectable/);
+});
+
+test('frozen composer targets the current live execution and retains frozen inspection',()=>{
+  const p=interactionPage();p.ui.pauseDisplay();const frozen=p.ui.state.run;p.ui.renderInteractionStatus();
+  assert.match(p.node('interaction-target-status').textContent,/View frozen.*CURRENT LIVE/);p.ui.submitInteraction();assert.equal(p.sent.length,1);assert.equal(p.ui.state.run,frozen);assert.equal(p.ui.state.displayPaused,true);
+});
+
+test('filtered roster return and unpin preserve actual pinned order',()=>{
+  const p=page();p.ui.state.run.agents=[{id:'a'},{id:'b'},{id:'c'}];p.ui.visibleAgentColumns();p.ui.state.agent='a';
+  p.ui.selectAgentColumn('b');assert.equal(p.ui.state.agent,'');assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c']);
+  p.ui.state.agent='b';p.ui.removeAgentColumn('b');assert.equal(p.ui.state.agent,'');assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','c']);
+  p.ui.moveColumn('c',-1);assert.deepEqual(Array.from(p.ui.state.agentColumns),['c','a']);
+});
+
+
+test('native disclosures do not bubble into the content view bookkeeping attribute',()=>{
+  const p=page();p.ui.state.view='trajectory';
+  // A native summary's nearest data-view is the workspace bookkeeping node,
+  // not a view switch. Clicking it must leave the view and selected event alone.
+  p.ui.state.selected={execution:'a',id:'selected',type:'action',run:'a'};
+  p.ui.handleClick({target:{closest:selector=>selector.split(',').includes('[data-view]')?{dataset:{view:'timeline'}}:null}});
+  assert.equal(p.ui.state.view,'trajectory');assert.equal(p.ui.state.selected.id,'selected');
+});
+
+test('full captured model input skips start events that have no prompt payload',async()=>{
+  const p=page(),urls=[];
+  p.setFetch(async url=>{urls.push(url);return {ok:true,json:async()=>({payload:url.endsWith('start')?{}:{context:{blocks:[{source:'Original task',text:'complete captured prompt'}]}}})};});
+  const text=await p.ui.originalPayload({kind:'model',input_truncated:true,event_ids:['start','complete']},'input',{id:'live'});
+  assert.match(text,/complete captured prompt/);assert.equal(urls.length,2);
+});
+
+test('full captured model output keeps explicit tool requests alongside emitted text',async()=>{
+  const p=page();p.setFetch(async()=>({ok:true,json:async()=>({payload:{result:'emitted preview',model_response:[{type:'text',text:'emitted preview'},{type:'tool_use',id:'real-tool-id',name:'Bash',input:{command:'meaningful command'}}]}})}));
+  const text=await p.ui.originalPayload({kind:'model',output_truncated:true,event_ids:['complete']},'output',{id:'live'});
+  assert.match(text,/emitted preview/);assert.match(text,/meaningful command/);assert.match(text,/real-tool-id/);
+});
+
+test('later context commitment and failure update composer after publication acknowledgement',()=>{
+  const p=interactionPage();p.node('interaction-message').value='retained';p.ui.submitInteraction();const id=p.sent[0].id;
+  const target={agname:'a',state:'queued',scope:'future_retained_context',detail:'Publication recorded'};
+  p.ui.receiveCommandResult({id,targets:[target]});assert.match(p.ui.state.interaction.status,/queued/);
+  p.ui.receiveCommandResult({id,targets:[{...target,context_state:'committed'}]});assert.match(p.ui.state.interaction.status,/Context committed/);assert.match(p.ui.state.interaction.status,/consumption unconfirmed/);
+  p.ui.receiveCommandResult({id,targets:[{...target,context_state:'failed',detail:'predecessor cancelled'}]});assert.match(p.ui.state.interaction.status,/Context failed/);assert.match(p.ui.state.interaction.status,/predecessor cancelled/);
+  assert.equal(p.sent.length,1);
+});
+
+test('composer keeps multiline draft, operation, form node and keyboard focus through rerenders',()=>{
+  const p=interactionPage(),input=p.node('interaction-message');input.value='first line\nsecond line';input.focus();p.node('interaction-operation').value='run';p.node('inspector').innerHTML='preserved composer';
+  p.ui.renderComposer();p.ui.setView('timeline');p.ui.renderInspector();
+  assert.equal(p.node('inspector').innerHTML,'preserved composer');assert.equal(input.value,'first line\nsecond line');assert.equal(p.node('interaction-operation').value,'run');assert.equal(p.document.activeElement,input);
+});
+
+test('six held columns retain their reading pages through high-volume updates',()=>{
+  const p=page();p.ui.state.run={id:'live',actions:[],agents:[],episodes:[],intervals:[]};p.ui.state.agentColumns=[];
+  for(let n=0;n<6;n++){
+    const agent=`agent-${n}`;p.ui.state.agentColumns.push(agent);p.ui.state.run.agents.push({id:agent});
+    const r=p.ui.readingState(agent);r.follow=false;
+    r.ids=Array.from({length:102},(_,i)=>`${agent}-held-${i}`);r.activeIds=Array.from({length:102},(_,i)=>`${agent}-active-${i}`);
+    for(const id of [...r.ids,...r.activeIds])p.ui.state.run.actions.push({id,agent,start:0,outcome:id.includes('active')?'running':'success'});
+    for(let i=0;i<500;i++)p.ui.state.run.actions.push({id:`${agent}-new-${i}`,agent,start:1+i,outcome:'success'});
+  }
+  p.receive({type:'snapshot',run:p.ui.state.run});
+  const held=p.ui.readingPins();assert(held.length>=1500);
+  const ids=new Set(p.ui.state.run.actions.map(a=>a.id));for(const id of held)assert(ids.has(id),id);
+  assert(p.ui.state.run.actions.length<=4200);
 });

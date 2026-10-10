@@ -5,6 +5,7 @@ import os
 import sys
 import tarfile
 import threading
+import contextvars
 import uuid as _uuid_mod
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -51,6 +52,8 @@ from .configs.agconfig import agconfig as agconfig_cls
 
 from .agname import agname as _agname
 from .observability.profiler import agprof
+
+_queue_receipt_capture = contextvars.ContextVar("agency_queue_receipt_capture", default=None)
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
@@ -379,15 +382,23 @@ class agent:
         with self._control_lock:
             self._paused = True
             handle = self._daemon_handle()
+            receipt = {
+                "requested": "pause",
+                "rpc_acknowledged": False,
+                "scope": "agent_pause_intent",
+            }
             if handle is not None:
                 try:
                     with handle.client(timeout_s=10) as client:
                         client.pause_harness()
+                    receipt["rpc_acknowledged"] = True
                 except Exception as exc:
+                    receipt["error"] = str(exc)
                     print(f"[agent] WARNING: pause_harness() failed for {self.agname}: {exc}")
+            self._last_control_receipt = receipt
         self.data_logger.record_event(
             type="agent_paused",
-            payload={"agname": self.agname},
+            payload={"agname": self.agname, **receipt},
             term_message=f"[{self.agname}] PAUSE ▶  requested",
         )
 
@@ -395,15 +406,23 @@ class agent:
         with self._control_lock:
             self._paused = False
             handle = self._daemon_handle()
+            receipt = {
+                "requested": "resume",
+                "rpc_acknowledged": False,
+                "scope": "agent_pause_intent",
+            }
             if handle is not None:
                 try:
                     with handle.client(timeout_s=10) as client:
                         client.resume_harness()
+                    receipt["rpc_acknowledged"] = True
                 except Exception as exc:
+                    receipt["error"] = str(exc)
                     print(f"[agent] WARNING: resume_harness() failed for {self.agname}: {exc}")
+            self._last_control_receipt = receipt
         self.data_logger.record_event(
             type="agent_resumed",
-            payload={"agname": self.agname},
+            payload={"agname": self.agname, **receipt},
             term_message=f"[{self.agname}] PAUSE ✓  resumed",
         )
 
@@ -416,6 +435,10 @@ class agent:
         This never waits for a pending result and never targets another run.
         Unsupported harnesses also use queue_message().
         """
+        self._redirect_receipt(handle, message)
+
+    def _redirect_receipt(self, handle: agdata, message: str) -> dict:
+        """Private acknowledgement; public redirect still returns None."""
         if not isinstance(message, str):
             raise TypeError("message must be a string")
         if not message.strip():
@@ -429,10 +452,14 @@ class agent:
             raise ValueError("handle must be a skill result from this agent")
         try:
             if self._orchestrator.redirect_request(self, request_id, message):
-                return
+                return {
+                    "state": "delivered",
+                    "invocation": request_id,
+                    "scope": "native_prompt_acknowledgement",
+                }
         except Exception as exc:
             print(f"[agent] WARNING: redirect delivery failed for {self.agname}: {exc}")
-        self.queue_message(message)
+        return {"invocation": request_id, **self._invoke_queue_message_receipt(message)}
 
     def cancel(self, handle: agdata) -> None:
         """Cancel whichever run() produced *handle*."""
@@ -478,11 +505,34 @@ class agent:
 
     def queue_message(self, message: str) -> None:
         """Append one ordered retained message without starting infrastructure"""
+        receipt = self._queue_message_receipt(message)
+        capture = _queue_receipt_capture.get()
+        if capture is not None and capture[0] is self:
+            capture[1].append(receipt)
+
+    def _invoke_queue_message_receipt(self, message: str) -> dict:
+        """Observe this public call only; preserve overrides without borrowing old receipts."""
+        receipts = []
+        token = _queue_receipt_capture.set((self, receipts))
+        try:
+            self.queue_message(message)
+        finally:
+            _queue_receipt_capture.reset(token)
+        if len(receipts) == 1:
+            return {**receipts[0], "state": "queued", "scope": "future_retained_context"}
+        return {
+            "state": "accepted",
+            "scope": "sdk_dispatch_without_queue_receipt",
+            "detail": "Custom queue_message returned without a unique retained-context receipt; delivery is unverified.",
+        }
+
+    def _queue_message_receipt(self, message: str) -> dict:
+        """Private ordered-publication receipt; no engine or model work."""
         if not isinstance(message, str):
             raise TypeError("message must be a string")
         if not message.strip():
             raise ValueError("message must be a non-empty string")
-        self._orchestrator.submit_context_message(self, message)
+        return self._orchestrator._submit_context_message_receipt(self, message)
 
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
         """Submit ready work and immediately return its bare result agdata."""

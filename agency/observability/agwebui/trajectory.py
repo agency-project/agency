@@ -33,6 +33,7 @@ EVENT_TYPES = (
     "agent_paused",
     "agent_resumed",
     "agent_stop_requested",
+    "ui_intervention",
     "tool_call",
     "tool_result",
     "skill_start",
@@ -327,10 +328,25 @@ class Trajectory:
                 "context": None,
                 "event_ids": [],
                 "call_id": payload.get("call_id") or event.get("call_label"),
-                "model_tool_call_id": annotation.get("model_tool_call_id"),
-                "model_id": self.model_links.get((actor, annotation.get("model_tool_call_id"))),
+                "model_tool_call_id": payload.get("model_tool_call_id")
+                or annotation.get("model_tool_call_id"),
+                "model_id": payload.get("model_id")
+                or self.model_links.get(
+                    (
+                        actor,
+                        payload.get("model_tool_call_id") or annotation.get("model_tool_call_id"),
+                    )
+                ),
                 "parent_id": payload.get("parent_id"),
                 "request_id": payload.get("request_id") or self.actor_request.get(actor),
+                "request_correlation": payload.get("request_correlation")
+                or (
+                    "explicit"
+                    if payload.get("request_id")
+                    else "actor_context_fallback"
+                    if self.actor_request.get(actor)
+                    else "unavailable"
+                ),
                 "workstream_ids": declared.get("workstream_ids", []),
                 "missing_start": ending,
                 "result_hash": None,
@@ -345,6 +361,29 @@ class Trajectory:
                 ).append(action_id)
             self._episode(action, late)
         action["event_ids"].append(event["id"])
+        if payload.get("request_id"):
+            action["request_id"] = payload["request_id"]
+            action["request_correlation"] = payload.get("request_correlation") or "explicit"
+        if payload.get("model"):
+            action["model"] = payload["model"]
+        tool_identity = payload.get("model_tool_call_id") or (payload.get("annotation") or {}).get(
+            "model_tool_call_id"
+        )
+        if tool_identity and not action.get("model_tool_call_id"):
+            action["model_tool_call_id"] = tool_identity
+            action["model_id"] = payload.get("model_id") or self.model_links.get(
+                (actor, tool_identity)
+            )
+            if not action["model_id"]:
+                self.pending_model_links.setdefault((actor, tool_identity), []).append(action_id)
+        if isinstance(payload.get("tool_call_ids"), list):
+            action["tool_call_ids"] = list(
+                dict.fromkeys(
+                    item
+                    for item in [*action.get("tool_call_ids", []), *payload["tool_call_ids"]]
+                    if isinstance(item, str) and item
+                )
+            )
         if not ending:
             missing_start = action["missing_start"]
             action["missing_start"] = False
@@ -388,6 +427,10 @@ class Trajectory:
             action["tokens"] = payload.get("tokens") if kind == "model" else None
             action["output_tokens"] = payload.get("output_tokens") if kind == "model" else None
             action["context"] = payload.get("context")
+            if kind == "model" and payload.get("model_response") is not None:
+                action["model_response"] = payload["model_response"]
+            if kind == "model" and isinstance(action["context"], dict):
+                action["input_truncated"] = bool(action["context"].get("truncated"))
             action["files"] = payload.get("files") or []
             action["timing"] = payload.get("timing", action["timing"])
             parsed_result = object_value(result)
@@ -411,10 +454,12 @@ class Trajectory:
         else:
             self.running.discard(action_id)
         action["metadata"] = {
+            **action["metadata"],
             **payload.get("metadata", {}),
             "event_ids": action["event_ids"],
             "call_id": action["call_id"],
             "request_id": action["request_id"],
+            "request_correlation": action["request_correlation"],
             "missing_start": action["missing_start"],
             "parent_id": action["parent_id"],
             "source": action["source"],
@@ -569,6 +614,49 @@ class Trajectory:
             if kind in {"agent_created", "agent_forked", "agent_registered"}:
                 # Process ancestry is deliberately not turned into delegation.
                 agent["identity"] = "execution_actor"
+                if payload.get("parent_agname"):
+                    agent["parent"] = payload["parent_agname"]
+                    agent["parent_source"] = "recorded_parent_agname"
+                config = payload.get("llm_config") or {}
+                if isinstance(config, dict) and config.get("model"):
+                    agent["model"] = config["model"]
+                if payload.get("harness"):
+                    agent["harness"] = payload["harness"]
+            elif kind == "ui_intervention":
+                state = payload.get("state", "unknown")
+                command = payload.get("requested_action", "unknown")
+                arguments = {
+                    "command": payload.get("message") or command,
+                    "input": payload.get("input"),
+                    "task": payload.get("task"),
+                }
+                action = self._call(
+                    {
+                        **event,
+                        "payload": {
+                            "action_id": f"{actor}:control:{payload.get('relay_id', '')}:{payload.get('command_id', event['id'])}",
+                            "name": command,
+                            "kind": "control",
+                            "arguments": arguments,
+                            "request_id": payload.get("invocation"),
+                            "outcome": state,
+                            "result": payload.get("result", {}),
+                            "metadata": {"scope": "human_intervention", "recorded_state": state},
+                        },
+                    },
+                    "control",
+                    payload.get("command_id", event["id"]),
+                    ending=state != "requested",
+                )
+                action.update(
+                    target_agent=payload.get("target_agent", actor),
+                    requested_action=command,
+                    outcome=state,
+                    command=payload.get("message") or command,
+                    control_scope="human_intervention",
+                )
+                self.running.discard(action["id"])
+                self._refresh_episode(action)
             elif kind in {"agent_paused", "agent_resumed"}:
                 if event["ts"] >= agent.get("control_ts", 0) and self.finished_at is None:
                     agent["control_ts"] = event["ts"]
@@ -603,10 +691,10 @@ class Trajectory:
                 key = payload.get("call_id") or event.get("call_label") or event["id"]
                 if call_kind == "model":
                     key = f"model:{key}"
-                self._call(event, call_kind, key, ending=kind.endswith("result"))
+                action = self._call(event, call_kind, key, ending=kind.endswith("result"))
                 if call_kind == "model":
                     model_id = payload.get("action_id") or f"{actor}:{key}"
-                    for tool_id in payload.get("tool_call_ids", []):
+                    for tool_id in action.get("tool_call_ids", []):
                         self.model_links[(actor, tool_id)] = model_id
                         for action_id in self.pending_model_links.pop((actor, tool_id), []):
                             self.actions[action_id]["model_id"] = model_id
@@ -937,11 +1025,44 @@ class LiveSource:
             if block.get("type") not in {"thinking", "reasoning", "redacted_thinking"}:
                 chains[chain_kind].append(block)
         metadata = next((b for b in chains["response"] if b.get("type") == "metadata"), {})
+        native = metadata.get("data")
+        if isinstance(native, list):
+            native = next(
+                (item for item in reversed(native) if isinstance(item, dict) and item.get("model")),
+                {},
+            )
+        recorded_model = metadata.get("model") or (
+            native.get("model") if isinstance(native, dict) else None
+        )
         visible = [b.get("text", "") for b in chains["response"] if b.get("type") == "text"]
+        response_blocks = [b for b in chains["response"] if b.get("type") != "metadata"]
+        # Keep source-backed previews bounded without dropping tool-use evidence.
+        # The raw-event endpoint calls full=True and returns these captured
+        # visible blocks unchanged; provider metadata/private reasoning stays out.
+        response_preview = response_blocks if full else response_blocks[:80]
+        response_truncated = not full and (
+            len(response_blocks) > 80 or any(len(text(block)) > 1200 for block in response_preview)
+        )
+        model_response = {
+            "blocks": [
+                block
+                if full or len(text(block)) <= 1200
+                else {
+                    **{key: block[key] for key in ("type", "id", "name") if key in block},
+                    "preview": text(block)[:1200],
+                    "chars": len(text(block)),
+                    "truncated": True,
+                }
+                for block in response_preview
+            ]
+        }
         markers = next((b for b in chains["response"] if b.get("error") or b.get("cancelled")), {})
         prompt = chains["prompt"] if full else chains["prompt"][:80]
         preview_limit = None if full else 1200
         return {
+            "model": recorded_model if isinstance(recorded_model, str) else None,
+            "model_response": model_response,
+            "output_truncated": response_truncated,
             "result": "\n".join(visible),
             "error": markers.get("error"),
             "outcome": "failed"
@@ -954,6 +1075,14 @@ class LiveSource:
             "tool_call_ids": [
                 b["id"] for b in chains["response"] if b.get("type") == "tool_use" and b.get("id")
             ],
+            "request_id": metadata.get("request_id"),
+            # Provider-native data may include hidden reasoning. Expose only
+            # captured identity / usage timing, never the opaque native body.
+            "metadata": {
+                key: metadata[key]
+                for key in ("request_id", "skill", "stop_reason", "ttft_ms", "new_prompt_tokens")
+                if metadata.get(key) is not None
+            },
             "context": {
                 "source": "recorded",
                 "available": bool(chains["prompt"]),
@@ -1088,6 +1217,10 @@ def replay_events(run):
             else {"command": action["command"]},
             "intent": action.get("intent", ""),
             "request_id": action.get("request_id"),
+            "request_correlation": action.get("request_correlation"),
+            "model": action.get("model"),
+            "model_id": action.get("model_id"),
+            "model_tool_call_id": action.get("model_tool_call_id"),
             "metadata": {
                 key: value
                 for key, value in action.get("metadata", {}).items()
@@ -1129,6 +1262,8 @@ def replay_events(run):
                         "outcome": action["outcome"],
                         "tokens": action.get("tokens"),
                         "output_tokens": action.get("output_tokens"),
+                        "tool_call_ids": action.get("tool_call_ids", []),
+                        "model_response": action.get("model_response"),
                         "context": action.get("context"),
                         "files": action.get("files"),
                         "timing": action.get("timing"),

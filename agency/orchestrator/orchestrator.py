@@ -251,6 +251,10 @@ class GlobalAgentOrchestrator:
         chain is already guaranteed synchronously here, before this method
         returns, so there is nothing for a caller to hold a handle to.
         """
+        self._submit_context_message_receipt(ag, message)
+
+    def _submit_context_message_receipt(self, ag: "agent", message: str) -> dict:
+        """Same ordered publication, with private evidence for the profiler relay."""
         result_future: "Future[agdata]" = Future()
         context_future: "Future[agcontext]" = Future()
         cycle_ack: Future[None] | None = None
@@ -282,6 +286,8 @@ class GlobalAgentOrchestrator:
             self._post_locked("schedule", (request.request_id, cycle_ack))
         if cycle_ack is not None:
             cycle_ack.result()
+
+        return {"request_id": request.request_id, "future": result_future}
 
     def redirect_request(self, ag: "agent", request_id: str, message: str) -> bool:
         with self._event_cond:

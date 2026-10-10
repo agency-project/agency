@@ -21,6 +21,8 @@ const state = {
   focusedIdx: 0,
   autoSelected: false,     // true once the first agent has been auto-selected
   activeTab:  'all',       // 'all' | 'live' | 'idle' | 'finished'
+  executionControls: null,
+  controlRequests: new Map(),
   timeline: {
     liveMode:  true,
     indexLen:  0,
@@ -607,8 +609,10 @@ function renderAgentList() {
 
 function updateAgentActionsBar() {
   const agname = currentAgent();
-  const connected=state.timeline.liveMode&&ws.readyState===WebSocket.OPEN;
+  const connected=dashboardExecutionAvailable()&&state.controlRequests.size===0;
   const active=ag=>ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
+  $btnPauseAll.disabled=!connected||state.controlRequests.size>0;
+  $btnResumeAll.disabled=!connected||state.controlRequests.size>0;
   stopButtons.forEach((button,i)=>{button.disabled=!connected||!(i<2?active(state.agents.get(agname)):[...state.agents.values()].some(active));});
   document.querySelectorAll('.side-panel .agent-column-actions').forEach(group=>{
     const html=dashboardAgentControls(group.dataset.agname);
@@ -624,7 +628,8 @@ function updateAgentActionsBar() {
   const ag = state.agents.get(agname);
   const paused = ag ? ag.state === 'paused' : false;
   $btnPauseToggle.disabled = !connected||!active(ag);
-  $btnPauseToggle.textContent = paused ? 'Resume' : 'Pause';
+  const pendingControl=[...state.controlRequests.values()].find(request=>request.targets.includes(agname));
+  $btnPauseToggle.textContent = pendingControl?(pendingControl.type.startsWith('pause')?'Pausing…':pendingControl.type.startsWith('resume')?'Resuming…':'Control pending…'):paused?'Resume':'Pause';
   $btnPauseToggle.classList.toggle('active', paused);
   $btnUpdateConfig.disabled = !connected;
 }
@@ -1330,7 +1335,7 @@ $agentList.addEventListener('dragstart', e => {
 // ---------------------------------------------------------------------------
 
 function dashboardAgentControls(agname) {
-  const ag=state.agents.get(agname),connected=state.timeline.liveMode&&ws.readyState===WebSocket.OPEN;
+  const ag=state.agents.get(agname),connected=dashboardExecutionAvailable()&&state.controlRequests.size===0;
   const enabled=connected&&ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
   const name=esc(agname),paused=ag?.state==='paused';
   return `<span class="control-section-label">Agent controls</span><button data-agent-control="${paused?'resume':'pause'}" data-agname="${name}" ${enabled?'':'disabled'}>${paused?'Resume':'Pause'}</button><button data-agent-control="stop" data-agname="${name}" title="Graceful stop (SIGTERM)" ${enabled?'':'disabled'}>Stop</button><button class="danger-control" data-agent-control="kill" data-agname="${name}" title="Force exit (SIGKILL)" ${enabled?'':'disabled'}>SIGKILL</button><button data-agent-control="config" data-agname="${name}" ${connected?'':'disabled'}>Update Config</button>`;
@@ -1340,7 +1345,7 @@ $interaction.addEventListener('click',event=>{
   if(!button||button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
   const agname=button.dataset.agname,type=button.dataset.agentControl;
   if(type==='config')openConfigModal(agname);
-  else ws.send(JSON.stringify({type,agname}));
+  else sendDashboardControl(type,agname);
 });
 
 $btnPauseToggle.addEventListener('click', () => {
@@ -1348,21 +1353,48 @@ $btnPauseToggle.addEventListener('click', () => {
   if (!agname) return;
   const ag = state.agents.get(agname);
   const type = (ag && ag.state === 'paused') ? 'resume' : 'pause';
-  ws.send(JSON.stringify({ type, agname }));
+  sendDashboardControl(type, agname);
 });
 
 $btnPauseAll.addEventListener('click', () => {
-  ws.send(JSON.stringify({ type: 'pause_all' }));
+  sendDashboardControl('pause_all');
 });
 
 $btnResumeAll.addEventListener('click', () => {
-  ws.send(JSON.stringify({ type: 'resume_all' }));
+  sendDashboardControl('resume_all');
 });
 stopButtons.forEach((button,i)=>button.addEventListener('click',()=>{
   if(button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
   const all=i>=2,type=`${i%2?'kill':'stop'}${all?'_all':''}`;
-  ws.send(JSON.stringify({type,...(all?{}:{agname:currentAgent()})}));
+  sendDashboardControl(type,all?undefined:currentAgent());
 }));
+
+function dashboardExecutionAvailable() {
+  return state.timeline.liveMode&&ws.readyState===WebSocket.OPEN&&state.executionControls?.available&&state.executionControls?.relay_id;
+}
+function sendDashboardControl(type,agname) {
+  if(!dashboardExecutionAvailable()||state.controlRequests.size)return;
+  const controls=state.executionControls,targets=type.endsWith('_all')?[...controls.agents]:[agname];
+  if(!targets.length||targets.some(target=>!controls.agents.includes(target)))return;
+  if(type.startsWith('stop')||type.startsWith('kill')) {
+    const force=type.startsWith('kill'),scope=targets.length===1?targets[0]:`${targets.length} active agents`;
+    if(!window.confirm(`${force?'Force stop':'Stop'} ${scope}? Cancel outstanding work and request ${force?'SIGKILL':'SIGTERM'}. This does not confirm process exit or cleanup.`))return;
+  }
+  const id=globalThis.crypto?.randomUUID?.()||`dashboard-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  state.controlRequests.set(id,{type,targets});
+  ws.send(JSON.stringify({type,agname,id,targets,relay_id:controls.relay_id,execution:controls.execution}));
+  appendLog(`[agent controls] ${type} requested for ${targets.join(', ')}; application unconfirmed.`);
+  updateAgentActionsBar();
+  setTimeout(()=>{if(state.controlRequests.has(id))appendLog(`[agent controls] Timed out waiting for ${type} confirmation for ${targets.join(', ')}. Outcome unknown; request will not be retried.`);},30000);
+}
+function receiveDashboardControlResult(result) {
+  if(!state.controlRequests.has(result.id))return;
+  if(result.error||result.targets?.some(target=>typeof target==='object')) {
+    state.controlRequests.delete(result.id);
+    appendLog(`[agent controls] ${result.error||result.targets.map(target=>`${target.agname}: ${target.state}${target.detail?' · '+target.detail:''}`).join('; ')}. API receipt does not confirm every process is parked or exited.`);
+    updateAgentActionsBar();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Config editor modal
@@ -1461,11 +1493,25 @@ $configUpdateAll.addEventListener('click', () => {
 
 const ws = new WebSocket(`ws://${location.host}/ws`);
 let wsClosed = false;
-ws.onopen = () => updateAgentActionsBar();
+let lastDashboardControlsRequest=0;
+function requestDashboardControls() {
+  if(ws.readyState!==WebSocket.OPEN||Date.now()-lastDashboardControlsRequest<1000)return;
+  lastDashboardControlsRequest=Date.now();ws.send(JSON.stringify({type:'execution_controls_request'}));
+}
+ws.onopen = () => {requestDashboardControls();updateAgentActionsBar();};
 
 ws.onmessage = e => {
   try {
     const ev = JSON.parse(e.data);
+    if(ev.type==='execution_controls') {
+      if(state.executionControls?.relay_id&&state.executionControls.relay_id!==ev.execution_controls?.relay_id) {
+        state.controlRequests.clear();appendLog('[agent controls] Execution process changed; previous outcomes remain unconfirmed.');
+      }
+      state.executionControls=ev.execution_controls;
+      for(const result of state.executionControls?.receipts||[])receiveDashboardControlResult(result);
+      updateAgentActionsBar();return;
+    }
+    if(ev.type==='execution_command_result'){receiveDashboardControlResult(ev);return;}
     // In historical mode, only accept timeline_sync and ignore live events.
     if (!state.timeline.liveMode && ev.type !== 'timeline_sync') return;
     handleEvent(ev);
@@ -1474,8 +1520,10 @@ ws.onmessage = e => {
 
 ws.onclose = () => {
   wsClosed = true;
+  state.executionControls=null;
   updateAgentActionsBar();
   appendLog('\x1b[31m[web ui] connection closed — reload to reconnect\x1b[0m');
+  if(state.controlRequests.size)appendLog('[agent controls] Connection lost after submission; outcomes are unknown. Requests will not be retried.');
 };
 
 ws.onerror = () => {
@@ -1506,6 +1554,7 @@ ws.onerror = () => {
 async function _pollAgentDetailLoop() {
   if (wsClosed) return;
   if (state.timeline.liveMode) {
+    requestDashboardControls();
     const agname = currentAgent();
     const toPoll = new Set(state.pinnedAgents);
     if (agname) toPoll.add(agname);

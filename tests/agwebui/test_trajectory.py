@@ -811,6 +811,9 @@ def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypat
     command_dir = tmp_path / "ui_commands"
     command_dir.mkdir()
     (command_dir / ".heartbeat").touch()
+    (command_dir / ".session").write_text(
+        json.dumps({"relay_id": "test-relay", "capabilities": {}})
+    )
     monkeypatch.setattr(server, "_run_dir", tmp_path)
     monkeypatch.setattr(server, "_command_dir", command_dir)
     monkeypatch.setattr(server, "_trajectory_source", lambda: source)
@@ -844,11 +847,13 @@ def test_live_profiler_commands_use_existing_dispatch_bridge(tmp_path, monkeypat
                         "command": command,
                         "agname": "worker",
                         "id": command,
+                        "relay_id": "test-relay",
+                        "execution": server._execution_controls(source)["execution"],
                     }
                 )
                 while (result := websocket.receive_json())["type"] != "execution_command_result":
                     pass
-                assert result == {"type": "execution_command_result", "id": command, "queued": True}
+                assert result["id"] == command and result["queued"] and result["state"] == "queued"
                 files = list(command_dir.glob("*.json"))
                 assert len(files) == 1
                 _dispatch_command(json.loads(files[0].read_text()))
@@ -883,6 +888,8 @@ def test_live_execution_command_failures_do_not_queue_commands(tmp_path, monkeyp
     assert "error" in server._trajectory_execution_command(source, message)
     heartbeat = commands / ".heartbeat"
     heartbeat.touch()
+    (commands / ".session").write_text(json.dumps({"relay_id": "test-relay", "capabilities": {}}))
+    message.update(relay_id="test-relay", execution=server._execution_controls(source)["execution"])
     assert "error" in server._trajectory_execution_command(source, {**message, "agname": "missing"})
     assert "error" in server._trajectory_execution_command(source, {**message, "command": "play"})
 

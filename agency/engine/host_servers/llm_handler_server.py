@@ -402,7 +402,11 @@ class LlmHandlerServer:
         call_label = uuid.uuid4().hex[:12]
         self._data_logger.record_event(
             type="agent_state",
-            payload={"state": "waiting_llm"},
+            payload={
+                "state": "waiting_llm",
+                "request_id": self._request_id,
+                "model": self.resolve_model(),
+            },
             update_latest_snapshot=True,
             flush=True,
             call_label=call_label,
@@ -516,7 +520,11 @@ class LlmHandlerServer:
         call_label = handle.call_label
         self._data_logger.record_event(
             type="agent_state",
-            payload={"state": "waiting_llm"},
+            payload={
+                "state": "waiting_llm",
+                "request_id": self._request_id,
+                "model": self.resolve_model(),
+            },
             update_latest_snapshot=True,
             flush=True,
             call_label=call_label,
