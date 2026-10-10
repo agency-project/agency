@@ -25,6 +25,7 @@ from agency.observability.agwebui import agwebui
 | `submit_context_message(ag, message)` | Advanced Agent.queue_message operation; returns None. |
 | `redirect_request(ag, request_id, message)` | Returns bool for request delivery, unlike Agent.redirect this low-level call has no queued-message fallback. |
 | `cancel_request(ag, future)` | Marks an owned request and returns its active engine or None; Agent.cancel performs the follow-up best-effort engine cancellation. Use original Agent handle API in applications. |
+| `cancel_agent(ag)` | Cancels all currently outstanding requests owned by this agent and returns a list of their active request-owned engines. Does not itself send harness signals or wait for process exit; `Agent.stop()` performs the follow-up engine cancellation. Prefer that agent API in applications. |
 
 `ExecutionScheduler(orchestrator)` owns one scheduling-cycle protocol. `execute()` discovers/promotes dependencies then calls its assignable `.schedule` callback, default `default_schedule()`; both return None. Admission is FIFO among ready work within capacity and same-agent predecessor constraints. `materialize_dependencies(value)` blocks resolving nested handles and returns the reconstructed value; don't call it on unfinished dependencies from a scheduler callback. Private request-record methods are excluded from application reference.
 
@@ -134,7 +135,7 @@ def workload():
 
 ::: agency.orchestrator.orchestrator.GlobalAgentOrchestrator
     options:
-      members: ["__init__", "change_config", "submit", "submit_context_message", "redirect_request", "cancel_request", "snapshot", "flush", "shutdown"]
+      members: ["__init__", "change_config", "submit", "submit_context_message", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown"]
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
