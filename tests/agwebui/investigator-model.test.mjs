@@ -2,7 +2,23 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/investigator-model.js', import.meta.url),'utf8');
-const {alignSequences, overlapDuration, matchesAction, packActionTracks, readableExecutionTitle, executionMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {alignSequences, overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('history order depends on starts and stable IDs, never completion duration',()=>{
+  const calls=[{id:'slow',agent:'a',start:0,duration:50,outcome:'running'},
+    {id:'b',agent:'a',start:1,duration:1,outcome:'running'},
+    {id:'a',agent:'a',start:1,duration:3,outcome:'success'}];
+  assert.equal(groupCallStack(calls)[0].running,true);
+  calls[1].outcome='success';calls[0].outcome='success';
+  assert.deepEqual(groupCallStack(calls).map(g=>g.id),['a','b','slow']);
+  calls[0].duration=10000;calls[1].duration=500;
+  assert.deepEqual(groupCallStack(calls).map(g=>g.id),['a','b','slow']);
+});
+test('selection execution keys survive reconnect epochs and distinguish recorded origins',()=>{
+  assert.equal(executionIdentity({id:'legacy'}),'legacy');
+  assert.equal(executionIdentity({id:'live',time_origin:1,epoch:'a'}),executionIdentity({id:'live',time_origin:1,epoch:'b'}));
+  assert.notEqual(executionIdentity({id:'live',time_origin:1}),executionIdentity({id:'live',time_origin:2}));
+});
 
 test('readable titles prefer a recorded task over a technical execution heading',()=>{
   assert.equal(readableExecutionTitle({id:'live',title:'Current execution · 1234',task:'Repair the scheduler\nFurther instructions'}),'Repair the scheduler');

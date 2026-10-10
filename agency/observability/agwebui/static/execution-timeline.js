@@ -3,7 +3,7 @@
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const seconds = value => `${Number(value).toFixed(1)}s`;
 export class ExecutionTimeline {
-  constructor(host, navigation, select) {
+  constructor(host, navigation, select, onHistory=()=>{}) {
     this.host=host; this.nav=navigation; this.select=select;
     host.innerHTML=`<div class="timeline-controls"><button data-zoom-out aria-label="Zoom out">−</button><button data-zoom-in aria-label="Zoom in">+</button><button data-fit>Fit trace</button><button data-latest>Jump to latest</button><label><input type="checkbox" data-lock> Lock to Present</label><span data-range></span></div><div class="execution-timeline-scroll" tabindex="0" aria-label="Execution timeline; scroll horizontally to pan"><div class="execution-timeline-canvas"></div></div><p class="notice">Shared wall-clock axis · drag the scrollbar to pan · overlapping calls occupy subrows · dots are measured samples; gaps are not interpolated. Scrolling backward releases Lock to Present.</p>`;
     this.scroll=host.querySelector('.execution-timeline-scroll');this.canvas=this.scroll.firstElementChild;
@@ -16,12 +16,14 @@ export class ExecutionTimeline {
     host.querySelector('[data-latest]').onclick=()=>this.latest();
     this.scroll.addEventListener('scroll',()=>{
       if(this.nav.lock&&this.scroll.scrollLeft<(this.lastLeft||0)-2){this.nav.lock=false;host.querySelector('[data-lock]').checked=false;}
-      this.nav.left=this.lastLeft=this.scroll.scrollLeft;
+      if(this.scroll.scrollLeft<(this.lastLeft||0)-2||this.scroll.scrollTop>(this.lastTop||0)+2)onHistory();
+      this.nav.left=this.lastLeft=this.scroll.scrollLeft;this.lastTop=this.scroll.scrollTop;
       this.schedule();
     });
     this.canvas.addEventListener('click',event=>{const block=event.target.closest('[data-timeline-action]');if(block)this.select(block.dataset.timelineAction);});
     this.resize=new ResizeObserver(()=>this.schedule());this.resize.observe(this.scroll);
   }
+  setFrozen(frozen){const lock=this.host.querySelector('[data-lock]');lock.disabled=frozen;if(frozen){this.nav.lock=false;lock.checked=false;}}
   destroy(){this.resize.disconnect();cancelAnimationFrame(this.frame);}
   schedule(){if(!this.frame)this.frame=requestAnimationFrame(()=>{this.frame=null;this.paint();});}
   zoom(factor){const center=(this.scroll.scrollLeft+this.scroll.clientWidth/2-180)/(this.nav.scale||1);this.nav.scale=Math.max(.01,Math.min(10000,this.nav.scale*factor));this.paint();this.scroll.scrollLeft=Math.max(0,center*this.nav.scale-this.scroll.clientWidth/2+180);}
@@ -29,6 +31,8 @@ export class ExecutionTimeline {
   update(run, actions=run.actions, agentFilter="",extent=run.duration){this.run=run;this.extent=extent;this.actions=actions;this.agentFilter=agentFilter;if(!this.nav.scale)this.nav.scale=Math.max(.01,(this.scroll.clientWidth-210)/Math.max(1,this.extent));this.paint();if(this.nav.lock)this.latest();}
   paint(){
     if(!this.run)return;
+    const focused=document.activeElement?.closest?.('[data-timeline-action]')?.dataset.timelineAction;
+    const scrollTop=this.scroll.scrollTop;
     const run=this.run,scale=this.nav.scale,left=180;
     const width=Math.max(this.scroll.clientWidth,left+Math.max(1,this.extent)*scale+30);
     this.canvas.style.width=`${width}px`;
@@ -67,5 +71,7 @@ export class ExecutionTimeline {
     const old=new Map([...this.canvas.querySelectorAll('[data-track]')].map(e=>[e.dataset.track,e]));
     for(const [index,[id,height,html]] of rows.entries()){let row=old.get(id);if(!row){row=document.createElement('div');row.className='execution-track';row.dataset.track=id;this.canvas.append(row);}old.delete(id);if(this.canvas.children[index+1]!==row)this.canvas.insertBefore(row,this.canvas.children[index+1]||null);row.style.height=`${height}px`;if(row.innerHTML!==html)row.innerHTML=html;}
     for(const row of old.values())row.remove();
+    this.scroll.scrollTop=scrollTop;
+    if(focused)this.canvas.querySelector(`[data-timeline-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
   }
 }

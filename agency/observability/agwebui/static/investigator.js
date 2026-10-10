@@ -1,6 +1,6 @@
 import {ExecutionTimeline} from './execution-timeline.js';
-import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
-import {changedTrajectoryActions, executionControlState, mergeTrajectory, TrajectoryStream} from './trajectory-stream.js';
+import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
+import {executionControlState, mergeTrajectory, mergeTrajectorySnapshot, boundTrajectory, TrajectoryStream} from './trajectory-stream.js';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
@@ -18,6 +18,12 @@ const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===
 let timelineViewer=null;
 let timelineNavigation={scale:null,left:0,lock:false};
 const openToolDetails=new Set();
+const trajectoryColumns=new Map();
+const columnReading=new Map();
+const pendingLimit=256;
+function retainNotice(set,id){if(set.has(id))return;if(set.size<pendingLimit)set.add(id);else set.overflow=true;}
+const noticeCount=set=>`${set.size}${set.overflow?'+':''}`;
+function clearNotice(set){set.clear();set.overflow=false;}
 let pendingSeek=null;
 let loadGeneration = 0;
 let compareGeneration = 0;
@@ -26,7 +32,7 @@ const pendingTrajectoryChanges=new Set();
 let pendingResync=false;
 
 function scheduleTrajectoryUpdate(changed,resynced=false) {
-  for(const id of changed)pendingTrajectoryChanges.add(id);
+  for(const id of changed){retainNotice(pendingTrajectoryChanges,id);if(id===state.selected?.id)pendingTrajectoryChanges.add(id);}
   pendingResync ||= resynced;
   // A bounded batch rather than a debounce: a busy stream still paints.
   if(trajectoryUpdateTimer!==null)return;
@@ -37,9 +43,10 @@ function scheduleTrajectoryUpdate(changed,resynced=false) {
     updateTrajectory(changes,resync);
   },120);
 }
-Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set()});
+Object.assign(state, {executionControls:null, executionPending:null, executionMessage:'', stream:null, replay:params.get('mode')==='replay', transport:'offline', follow:true, unread:new Set(), windowEnd:null, replayState:null, agentColumns:[], columnsCustomized:false, activeColumn:null, displayPaused:false, liveRun:null, displayChanges:new Set(),pendingNew:new Set()});
 const currentExecution = () => state.liveRun || state.run;
 const executionState = (agentId=null) => executionControlState({...state, run:currentExecution(),
+  replay:state.replay||(state.displayPaused&&executionIdentity(state.run)!==executionIdentity(currentExecution())),
   ...(agentId?{agent:agentId,selected:{type:'agent',id:agentId}}:{})});
 const displayDuration = action => action.execution_duration ?? action.duration;
 const pausedBadge = id => state.run?.agents.find(a=>a.id===id)?.status==='paused' ? pill('paused') : '';
@@ -85,9 +92,18 @@ function toolDetails(a,run,open=false){return `<details class="tool-details" dat
 document.addEventListener('toggle',event=>{
   const details=event.target;if(!details.matches?.('[data-tool-details]'))return;
   const id=details.dataset.toolDetails;
-  if(details.open){openToolDetails.add(id);const a=actionMap(state.run).get(id);const body=details.querySelector('.tool-detail-body');if(a&&!body.innerHTML)body.innerHTML=detailBody(a,state.run);}
+  if(details.open){openToolDetails.add(id);const a=actionMap(state.run).get(id);const body=details.querySelector('.tool-detail-body');if(a&&(!body.innerHTML||details.dataset.stale)){body.innerHTML=detailBody(a,state.run);delete details.dataset.stale;const card=details.closest('[data-call-card]');if(card){card.dataset.evidenceVersion=callEvidenceVersion(a);card.querySelector('[data-refresh-details]')?.remove();}}}
   else openToolDetails.delete(id);
 },true);
+function callEvidenceVersion(a){return JSON.stringify([a.outcome,a.event_ids,a.result,a.error]);}
+function refreshCallDetails(button){
+  const card=button.closest('[data-call-card]'),a=actionMap(state.run).get(card?.dataset.callCard);
+  if(!a)return;
+  const details=card.querySelector('.tool-details');
+  details.querySelector('.tool-detail-body').innerHTML=detailBody(a,state.run);
+  card.dataset.evidenceVersion=callEvidenceVersion(a);delete details.dataset.stale;
+  button.remove();details.querySelector('summary').focus({preventScroll:true});
+}
 async function originalPayload(a,kind,run){
   if(!a[kind+'_truncated'])return kind==='input'?(a.arguments||a.command):(a.error||a.result);
   const ids=kind==='output'?[...(a.event_ids||[])].reverse():(a.event_ids||[]);
@@ -159,13 +175,13 @@ async function loadRun(id, selected=null, replay=false) {
   pendingTrajectoryChanges.clear();pendingResync=false;
   const generation = ++loadGeneration;
   clearExecutionPending();state.executionControls=null;state.executionMessage='';
-  timelineNavigation={scale:null,left:0,lock:false};openToolDetails.clear();
+  timelineNavigation={scale:null,left:0,lock:false};openToolDetails.clear();trajectoryColumns.clear();columnReading.clear();clearNotice(state.pendingNew);
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
-  state.displayPaused=false;state.liveRun=null;state.displayChanges.clear();
+  state.displayPaused=false;state.liveRun=null;clearNotice(state.displayChanges);clearNotice(state.unread);
   state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;
   state.run=null;state.agent='';state.cursor=0;state.selected=selected?{...selected,execution:id}:null;state.inspectorOpen=Boolean(selected);state.inspectorSelection=null;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
-  $('inspector').innerHTML='';syncInspector();
+  $('inspector').innerHTML='';state.inspectorMarkup=null;state.inspectorMarkupSelection=null;syncInspector();
   state.comparison=null;state.compareId=null;state.compareError=null;compareGeneration++;
   $('agent-select').innerHTML='<option value="">All agents</option>';
   state.loading = true;
@@ -182,20 +198,34 @@ async function loadRun(id, selected=null, replay=false) {
       state.executionControls=message.execution_controls||null;
       const first=!currentExecution();
       let changed=[];
+      const before=new Set((currentExecution()?.actions||[]).map(a=>a.id));
       if(message.type==='snapshot') {
-        if(currentExecution())changed=changedTrajectoryActions(currentExecution().actions,message.run.actions);
-        if(state.displayPaused)state.liveRun=message.run;else state.run=message.run;
+        const previous=currentExecution();
+        const same=!state.replay&&previous&&executionIdentity(previous)===executionIdentity(message.run);
+        if(same)changed=mergeTrajectorySnapshot(previous,message.run);
+        else {
+          changed=message.run.actions.map(a=>a.id);
+          const incoming={...message.run,actions:[],agents:[],episodes:[],edges:[],intervals:[],signals:[],counters:{}};mergeTrajectorySnapshot(incoming,message.run);
+          if(state.displayPaused)state.liveRun=incoming;else state.run=incoming;
+          if(previous&&executionIdentity(previous)!==executionIdentity(message.run)&&!state.displayPaused){setSelection(null);trajectoryColumns.clear();columnReading.clear();}
+        }
         state.loading=false;
       }
       else for(const patch of message.patches||[]) changed.push(...mergeTrajectory(currentExecution(),patch));
+      for(const id of new Set(changed)) {
+        if(!state.follow)retainNotice(state.unread,id);
+        if(state.displayPaused)retainNotice(state.displayChanges,id);
+        if(!before.has(id)&&(state.displayPaused||!state.follow))retainNotice(state.pendingNew,id);
+        const actor=currentExecution().actions.find(a=>a.id===id)?.agent,reading=columnReading.get(actor);
+        if(reading&&!reading.follow)retainNotice(reading.pending,id);
+      }
+      if(!state.replay){boundTrajectory(currentExecution(),readingPins());const retained=new Set(currentExecution().actions.map(a=>a.id));for(const id of openToolDetails)if(!retained.has(id))openToolDetails.delete(id);}
       reconcileExecutionCommand();
       state.replayState=message.replay||null;
       if(state.replay&&pendingSeek!=null){const clock=pendingSeek;pendingSeek=null;state.stream.sendReplay('seek',{clock});}
       if(state.replay&&!state.displayPaused&&message.type==='snapshot'&&message.replay)state.cursor=message.replay.clock;
-      if(!state.follow) for(const actionId of changed) state.unread.add(actionId);
-      if(state.displayPaused)for(const actionId of changed)state.displayChanges.add(actionId);
       if(state.follow&&!state.displayPaused) state.cursor=message.replay?.clock??state.run.duration;
-      if(first){catalogOptions();updateUrl();render();}
+      if(first){if(state.selected)state.selected.execution=executionIdentity(state.run);catalogOptions();updateUrl();render();}
       else if(state.displayPaused)renderSession();
       else scheduleTrajectoryUpdate(changed,message.resynced);
     }});
@@ -205,7 +235,7 @@ async function loadRun(id, selected=null, replay=false) {
   try {
     const run = await fetchJson(`/api/investigator/runs/${encodeURIComponent(id)}`);
     if (generation!==loadGeneration) return;
-    state.run=run; state.agent=''; state.cursor=0; state.expanded=new Set(); state.contextBlock=null; state.model=null; state.zoom=null; state.comparison=null;
+    state.run=run;if(state.selected)state.selected.execution=executionIdentity(run); state.agent=''; state.cursor=0; state.expanded=new Set(); state.contextBlock=null; state.model=null; state.zoom=null; state.comparison=null;
     if (selected?.type==='action') {
       const action = actionMap(run).get(selected.id);
       if (action) {state.cursor=action.start;state.expanded.add(action.episode);}
@@ -238,6 +268,8 @@ function render() {
   const run=state.run;
   if (!run || state.loading) return;
   const content=$('content');
+  const focusedContent=content.contains(document.activeElement)?document.activeElement:null;
+  for(const column of trajectoryColumns.values())if(column.parentElement===document.getElementById('call-stack'))captureColumnReading(column);
   const heldScroll=content.dataset.run===run.id&&content.dataset.view===state.view
     ? ['#call-stack','.trajectory-scroll','#tandem-columns'].map(selector=>{
       const region=content.querySelector(selector);return [selector,region?.scrollLeft||0,region?.scrollTop||0];
@@ -253,7 +285,7 @@ function render() {
   }:null;
   timelineViewer?.destroy();timelineViewer=null;
   $('content').innerHTML=({timeline:timelineView,trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView})[state.view]();
-  if(state.view==='timeline'){timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id));timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.scroll.scrollLeft=timelineNavigation.left;}
+  if(state.view==='timeline'){if(state.displayPaused)timelineNavigation.lock=false;timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id),()=>holdHistory());timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.scroll.scrollLeft=timelineNavigation.left;timelineViewer.setFrozen(state.displayPaused);}
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') reconcileActivities(true);
   if(state.view==='agents'){
     renderTandemBoard();
@@ -264,6 +296,7 @@ function render() {
   }
   for(const [selector,left,top] of heldScroll){const region=content.querySelector(selector);if(region){region.scrollLeft=left;region.scrollTop=top;}}
   content.dataset.run=run.id;content.dataset.view=state.view;
+  if(focusedContent&&content.contains(focusedContent))focusedContent.focus({preventScroll:true});
   renderInspector();
 }
 
@@ -278,17 +311,17 @@ function renderRunChrome() {
   $('run-title').textContent=readableExecutionTitle(run);
   $('run-title').title=readableExecutionTitle(run);
   if($('execution-id').value!==run.id){$('execution-id').value=run.id;$('copy-id-status').textContent='';}
-  $('execution-metadata').innerHTML=field('Full execution title',run.title||'Unavailable')+(run.task?field('Task',typeof run.task==='string'?run.task:JSON.stringify(run.task)):'')+field('Source events',Number.isFinite(run.coverage.events)?count(run.coverage.events):'Unavailable')+field('Timed spans',['live','replay'].includes(run.mode)?'Not collected in this event projection':Number.isFinite(run.coverage.spans)?count(run.coverage.spans):'Unavailable')+[run.coverage.context,run.coverage.relationships].filter(Boolean).map(note=>`<p>${esc(note)}</p>`).join('');
+  $('execution-metadata').innerHTML=field('Full execution title',run.title||'Unavailable')+(run.task?field('Task',typeof run.task==='string'?run.task:JSON.stringify(run.task)):'')+field('Source events',Number.isFinite(run.coverage.events)?count(run.coverage.events):'Unavailable')+field('Timed spans',['live','replay'].includes(run.mode)?'Not collected in this event projection':Number.isFinite(run.coverage.spans)?count(run.coverage.spans):'Unavailable')+[run.coverage.context,run.coverage.relationships,run.coverage.client_window].filter(Boolean).map(note=>`<p>${esc(note)}</p>`).join('');
   $('run-subtitle').textContent=`${run.condition?.replace('_',' ') || (run.id==='live'?'current execution':state.replay?'recorded replay':'saved execution')} / ${run.harness} / ${run.model}`;
   const agentCount=run.agents.filter(a=>a.id!=='workflow').length;
   $('run-description').textContent=`${agentCount} recorded actor${agentCount===1?'':'s'} · ${run.actions.length} observed calls · ${run.episodes.length} activities`;
   $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source);
   $('provenance').title=run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.';
   const measurements=executionMeasurements(run);
-  $('metrics').innerHTML=measurements.primary.map(item=>measurementHTML(item)).join('');
+  $('metrics').innerHTML=measurements.primary.map(item=>measurementHTML(run.coverage.client_window&&item[0]==='Calls'?['Retained calls',...item.slice(1)]:item)).join('');
   $('metrics').hidden=!measurements.primary.length;
   $('secondary-metrics').innerHTML=measurements.primary.concat(measurements.secondary).map(item=>measurementHTML(item,true)).join('');
-  $('telemetry-coverage').textContent=measurements.coverage;
+  $('telemetry-coverage').textContent=measurements.coverage+(run.coverage.client_window?' Live view is windowed: page older calls in each column; full evidence remains in recorded review/export.':'');
   $('cursor').max=Math.ceil((state.replayState?.duration??run.duration)*10)/10;
   $('cursor').value=state.cursor;
   $('cursor-value').textContent=formatTime(state.cursor);
@@ -326,15 +359,17 @@ function pauseDisplay() {
   }
   state.liveRun=state.run;
   state.run=structuredClone(state.liveRun);
-  state.displayPaused=true;state.displayChanges.clear();
+  timelineNavigation.lock=false;timelineViewer?.setFrozen?.(true);
+  state.displayPaused=true;clearNotice(state.displayChanges);clearNotice(state.pendingNew);
   // Timeline scrolling and resize paints must also read the held snapshot.
   timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
   renderSession();
 }
 function resumeDisplay() {
   if(!state.displayPaused)return;
-  state.run=state.liveRun;state.liveRun=null;state.displayPaused=false;
-  state.displayChanges.clear();state.follow=true;state.unread.clear();state.windowEnd=null;
+  state.run=state.liveRun;state.liveRun=null;state.displayPaused=false;timelineViewer?.setFrozen?.(false);
+  if(state.selected&&state.selected.execution!==executionIdentity(state.run))setSelection(null);
+  clearNotice(state.displayChanges);clearNotice(state.pendingNew);
   state.cursor=state.replayState?.clock??state.run.duration;
   if(['trajectory','timeline','agents'].includes(state.view))updateTrajectory(state.run.actions.map(a=>a.id));
   else render();
@@ -399,7 +434,7 @@ function agentControlButtons(id) {
   const controls=executionState(id),pending=Boolean(state.executionPending);
   const disabled=!controls.agentEnabled;
   const target=esc(id),name=esc(agentName(id,currentExecution()));
-  return `<span class="control-section-label">Agent controls</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Gracefully stop ${name} with SIGTERM" ${disabled||pending?'disabled':''}>■ Stop</button><button class="execution-control danger-control" data-execution-kill="${target}" title="Force ${name} to exit with SIGKILL" ${disabled?'disabled':''}>SIGKILL</button>`;
+  return `<span class="control-section-label">Agent controls · ${esc(controls.target?.status||'unknown')}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Gracefully stop ${name} with SIGTERM" ${disabled||pending?'disabled':''}>■ Stop</button><button class="execution-control danger-control" data-execution-kill="${target}" title="Force ${name} to exit with SIGKILL" ${disabled?'disabled':''}>SIGKILL</button>`;
 }
 function agentExecutionControls(id) {
   return executionState(id).live&&executionState(id).target?`<div class="agent-execution-controls" data-agent-controls="${esc(id)}" role="group" aria-label="Controls for ${esc(agentName(id))}">${agentControlButtons(id)}</div>`:'';
@@ -424,14 +459,15 @@ function renderSession() {
   for(const group of document.querySelectorAll('[data-agent-controls]')) {
     group.hidden=!debuggerState.live;
     const html=agentControlButtons(group.dataset.agentControls);
-    if(group.innerHTML!==html)group.innerHTML=html;
+    if(group.innerHTML!==html){const focused=group.contains(document.activeElement)?document.activeElement:null;const attribute=['executionAgent','executionStop','executionKill'].find(key=>focused?.dataset[key]);group.innerHTML=html;if(attribute)group.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`)?.focus({preventScroll:true});}
   }
+  if(state.run)for(const column of trajectoryColumns.values())renderColumnFollow(column);
   $('display-toggle').hidden=!state.stream;
   $('display-toggle').disabled=!state.run||state.loading;
-  $('display-toggle').textContent=state.displayPaused?'▶ Resume Display':'⏸ Pause Display';
-  $('display-toggle').title=state.displayPaused?'Catch up the display to incoming updates':'Freeze the display while agents continue executing';
+  $('display-toggle').textContent=state.displayPaused?'Unfreeze view':'Freeze view';
+  $('display-toggle').title=state.displayPaused?'Apply buffered event updates and preserve reading positions':'Freeze event display; agent execution and ingestion continue';
   $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
-  $('display-state').textContent=state.displayPaused?`Display paused · ${state.displayChanges.size} calls updated · incoming updates retained`:state.stream?(state.follow?'Display following latest':'Display held at selection'):'';
+  $('display-state').textContent=state.displayPaused?`View frozen · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.displayChanges)} calls changed · agents may still be running`:state.stream?(state.follow?'View following live':`History held · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.unread)} calls changed`):'';
   $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
   $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} paused`:''}`;
   $('transport-state').textContent=state.stream?`${state.transport==='connected'?'Connected to updates':state.transport==='disconnected'?'Disconnected from updates · execution state retained':state.transport==='reconnecting'?'Reconnecting to updates':'Connecting to updates'}${replay&&state.replayState?` · ${state.replayState.finished?'replay exhausted':state.replayState.playing?'playing':'paused'} at ${formatTime(state.replayState.clock)}`:''}`:'Saved evidence · no live subscription';
@@ -442,9 +478,9 @@ function renderSession() {
   $('replay-play').textContent=state.replayState?.playing?'Pause replay':'Play replay';
   $('replay-play').disabled=Boolean(state.replayState?.finished)||state.transport!=='connected';
   $('replay-step').disabled=Boolean(state.replayState?.finished)||state.transport!=='connected';
-  $('follow-live').hidden=!state.stream||state.displayPaused;
-  $('follow-live').textContent=state.follow?'Following latest':state.unread.size?`${state.unread.size} calls changed · Follow latest`:'History held · Follow latest';
-  $('follow-live').setAttribute('aria-pressed',String(state.follow));
+  $('follow-live').hidden=!state.stream;
+  $('follow-live').textContent='Jump to live';
+  $('follow-live').title='Unfreeze and return every agent column and timeline to live';
   $('reconnect-updates').hidden=!state.stream;
 }
 
@@ -467,7 +503,10 @@ function updateTrajectory(changed,resynced=false) {
   const target=executionState().target;
   const controlSignature=`${target?.id}:${target?.status}:${target?.control_ts}`;
   const controlChanged=controlSignature!==state.inspectorControlSignature;
-  if(controlChanged||((!state.selected||changed.includes(state.selected?.id))&&!$('inspector').contains(document.activeElement)))renderInspector(true);
+  if(controlChanged||!state.selected||changed.includes(state.selected?.id)){
+    if($('inspector').contains(document.activeElement)){state.inspectorDirty=true;const note=$('inspector').querySelector('.inspector-update');if(note)note.textContent='Selected evidence updated. Details refresh when you leave the inspector.';}
+    else renderInspector(true);
+  }
   state.inspectorControlSignature=controlSignature;
   if(resynced)$('transport-state').textContent+=' · recovered from durable snapshot';
 }
@@ -532,71 +571,185 @@ function renderAgentColumnControls(columns) {
   if($('hidden-agents').innerHTML!==badges)$('hidden-agents').innerHTML=badges;
 }
 
+function readingState(agent) {
+  if(!columnReading.has(agent))columnReading.set(agent,{follow:state.follow,pending:new Set(),ids:null,activeIds:null,scrollTop:0});
+  return columnReading.get(agent);
+}
+function readingPins() {
+  const pins=[];
+  if(state.selected?.run!=='b'&&state.selected){
+    pins.push(state.selected.id);
+    if(state.selected.type==='episode')pins.push(...(state.run?.episodes.find(e=>e.id===state.selected.id)?.actions||[]));
+    if(state.selected.type==='interval'){const interval=state.run?.intervals.find(i=>i.id===state.selected.id);if(interval?.action)pins.push(interval.action);}
+  }
+  const focused=document.activeElement?.closest?.('[data-call-card]')?.dataset.callCard;
+  if(focused)pins.push(focused);
+  const live=currentExecution();
+  const agents=state.agentColumns.length?state.agentColumns:(live?.agents||[]).map(a=>a.id).filter(id=>id!=='workflow').slice(0,3);
+  for(const agent of agents){
+    const r=columnReading.get(agent);if(r)pins.push(...(r.ids||[]),...(r.activeIds||[]));
+    // Retain each visible column's live history page as well as its held page,
+    // so Jump to live cannot mistakenly relabel an old page as current.
+    pins.push(...(live?.actions||[]).filter(a=>a.agent===agent&&a.outcome!=='running').sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0)).slice(0,50).map(a=>a.id));
+  }
+  pins.push(...openToolDetails);
+  return [...new Set(pins)].slice(0,500);
+}
+function renderColumnFollow(column) {
+  const r=readingState(column.dataset.agentColumn),heading=column.querySelector('.agent-column-heading');
+  const count=heading.querySelector('.column-call-count');
+  if(count.dataset.running!=null)count.textContent=`${count.dataset.running} in flight${state.displayPaused?' · frozen':''}`;
+  const follow=heading.querySelector('.column-follow');
+  follow.querySelector('span').textContent=state.displayPaused?`View frozen${!r.follow?' · history held':''}`:r.error||(!r.follow?`${noticeCount(r.pending)} changed · history held`:'Following live');
+  follow.querySelector('button').hidden=r.follow;follow.querySelector('button').disabled=state.displayPaused;
+  if(state.displayPaused)for(const selector of ['[data-column-older]','[data-active-older]'])column.querySelector(selector).disabled=true;
+}
+function captureColumnReading(column) {
+  const feed=column.querySelector('.agent-call-stack'),r=readingState(column.dataset.agentColumn);
+  r.scrollTop=feed.scrollTop||0;
+  const top=feed.getBoundingClientRect().top;
+  const visible=[...feed.querySelectorAll('[data-call-card]')].find(card=>card.getBoundingClientRect().bottom>top);
+  if(visible)r.anchor={id:visible.dataset.callCard,offset:visible.getBoundingClientRect().top-top};
+}
+function holdColumn(agent) {
+  const r=readingState(agent);r.follow=false;state.follow=false;
+  const column=trajectoryColumns.get(agent);if(column)captureColumnReading(column);
+  renderSession();
+}
+function liveColumn(agent) {
+  const r=readingState(agent);Object.assign(r,{follow:true,ids:null,activeIds:null,anchor:null,scrollTop:0,more:null,activeMore:null});clearNotice(r.pending);
+  const column=trajectoryColumns.get(agent);if(column)column.querySelector('.agent-call-stack').scrollTop=0;
+  state.follow=[...columnReading.values()].every(r=>r.follow);
+  if(state.follow){clearNotice(state.unread);clearNotice(state.pendingNew);}
+  renderCallStack();renderSession();
+}
+async function olderCalls(agent,active=false) {
+  if(state.displayPaused)return;
+  const r=readingState(agent),key=active?'activeIds':'ids';
+  const map=actionMap(state.run),last=(r[key]||[]).map(id=>map.get(id)).filter(Boolean).at(-1);
+  if(!last&&!state.run.coverage.client_window)return;
+  holdColumn(agent);r.loading=true;renderCallStack();
+  const generation=loadGeneration,execution=executionIdentity(state.run),search=state.query;
+  let pageChanged=false;
+  try {
+    let page;
+    if(state.stream&&!state.replay){
+      const query=new URLSearchParams({agent,active,query:state.query});
+      if(last){query.set('before_start',last.start);query.set('before_id',last.id);}
+      page=await fetchJson(`/api/trajectory/live/history?${query}`);
+      if(!page.execution||executionIdentity(page.execution)!==execution)throw new Error("History page belongs to a different or unidentified execution. Reconnect updates before paging.");
+    } else {
+      const calls=visibleActions(state.run).filter(a=>a.agent===agent&&(a.outcome==='running')===active&&(a.start<last.start||a.start===last.start&&a.id>last.id)).sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
+      page={actions:calls.slice(0,50),has_more:calls.length>50};
+    }
+    if(generation!==loadGeneration||state.displayPaused||executionIdentity(state.run)!==execution||state.query!==search)return;
+    pageChanged=page.actions.length>0;
+    if(page.actions.length){r[key]=page.actions.map(a=>a.id);r.anchor=null;r.scrollTop=0;r.resetPosition=true;mergeTrajectory(state.run,page);}
+    r[active?'activeMore':'more']=page.has_more;
+    if(!state.replay&&state.stream)boundTrajectory(state.run,readingPins());
+  }catch(error){if(generation===loadGeneration)r.error=error.message;}
+  finally{r.loading=false;if(generation===loadGeneration&&executionIdentity(state.run)===execution){renderCallStack();const c=trajectoryColumns.get(agent);
+    if(pageChanged&&c){const feed=c.querySelector('.agent-call-stack'),section=c.querySelector(active?'.agent-current':'.agent-history');feed.scrollTop+=section.getBoundingClientRect().top-feed.getBoundingClientRect().top;captureColumnReading(c);section.querySelector('[data-action]')?.focus({preventScroll:true});}
+    else c?.querySelector('[data-column-live]')?.focus({preventScroll:true});
+  }}
+}
 function renderCallStack() {
   const stack=$('call-stack');if(!stack)return;
-  const columns=visibleAgentColumns();
-  renderAgentColumnControls(columns);
+  const columns=visibleAgentColumns();renderAgentColumnControls(columns);
   stack.style.setProperty('--agent-column-count',Math.max(1,columns.length));
-  const oldColumns=new Map([...stack.querySelectorAll('[data-agent-column]')].map(el=>[el.dataset.agentColumn,el]));
-  const existing=new Map([...stack.querySelectorAll('[data-call-group]')].map(el=>[el.dataset.callGroup,el]));
-  const cards=new Map([...stack.querySelectorAll('[data-call-card]')].map(el=>[el.dataset.callCard,el]));
-  const positions=new Map([...cards].map(([id,el])=>[id,el.getBoundingClientRect?.()]));
-  const focused=stack.contains(document.activeElement)?document.activeElement?.getAttribute('data-action'):null;
-  const visibleCards=new Set(),visibleGroups=new Set();
   const actions=visibleActions(state.run);
   for(const [columnIndex,agent] of columns.entries()) {
-    let column=oldColumns.get(agent);
-    if(!column){column=document.createElement('section');column.dataset.agentColumn=agent;column.innerHTML='<header class="agent-column-heading"></header><div class="agent-call-stack"></div>';}
+    let column=trajectoryColumns.get(agent);
+    const r=readingState(agent);
+    if(column&&column.parentElement===stack&&!r.resetPosition)captureColumnReading(column);r.resetPosition=false;
+    if(!column){
+      column=document.createElement('section');column.dataset.agentColumn=agent;
+      column.innerHTML=`<header class="agent-column-heading"><strong></strong><span class="column-call-count"></span><button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}">Hide</button><div class="agent-execution-controls" data-agent-controls="${esc(agent)}" role="group" aria-label="Authoritative controls for ${esc(agentName(agent))}"></div><div class="column-follow"><span></span><button data-column-live="${esc(agent)}">Live in this column</button></div></header><div class="agent-call-stack" tabindex="0" aria-label="Activity for ${esc(agentName(agent))}"><section class="agent-current"><h3>Current activity</h3><p class="current-coverage"></p><div class="agent-current-calls"></div><button data-active-older="${esc(agent)}">More in-flight calls</button></section><section class="agent-history"><h3>History · newest starts first</h3><div class="agent-history-calls"></div><button data-column-older="${esc(agent)}">Older calls</button></section></div>`;
+      trajectoryColumns.set(agent,column);
+      const feed=column.querySelector('.agent-call-stack');
+      feed.addEventListener('scroll',()=>{captureColumnReading(column);if(feed.scrollTop>2&&r.follow)holdColumn(agent);});
+    }
     column.className=`agent-column ${agent===state.activeColumn?'active-agent-column':''}`;
     const heading=column.querySelector('.agent-column-heading');
-    const running=state.run.actions.filter(action=>action.agent===agent&&action.outcome==='running').length;
-    const html=`<strong>${esc(agentName(agent))}</strong><span>${running} running</span>${pausedBadge(agent)}<button data-remove-column="${esc(agent)}" aria-label="Hide ${esc(agentName(agent))}" ${state.agent||columns.length<=1?'disabled':''}>Hide</button>${agentExecutionControls(agent)}`;
-    if(heading.innerHTML!==html)heading.innerHTML=html;
+    heading.querySelector('strong').textContent=agentName(agent);
+    const running=actions.filter(a=>a.agent===agent&&a.outcome==='running').length;
+    heading.querySelector('.column-call-count').dataset.running=running;
+    heading.querySelector('[data-remove-column]').disabled=Boolean(state.agent)||columns.length<=1;
+    const controls=heading.querySelector('[data-agent-controls]');controls.hidden=!executionState().live;
+    const controlHtml=agentControlButtons(agent);
+    if(controls.innerHTML!==controlHtml){const focused=controls.contains(document.activeElement)?document.activeElement:null;const attribute=['executionAgent','executionStop','executionKill'].find(key=>focused?.dataset[key]);controls.innerHTML=controlHtml;if(attribute)controls.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`)?.focus({preventScroll:true});}
+    renderColumnFollow(column);
     if(stack.children[columnIndex]!==column)stack.insertBefore(column,stack.children[columnIndex]||null);
     const feed=column.querySelector('.agent-call-stack');
-    const groups=groupCallStack(actions.filter(action=>action.agent===agent));
-    const visible=groups.filter(group=>group.running).concat(groups.filter(group=>!group.running).slice(0,50));
-    for(const [position,group] of visible.entries()) {
-      visibleGroups.add(group.id);
-      let section=existing.get(group.id);
+    const existing=new Map([...feed.querySelectorAll('[data-call-group]')].map(el=>[el.dataset.callGroup,el]));
+    const cards=new Map([...feed.querySelectorAll('[data-call-card]')].map(el=>[el.dataset.callCard,el]));
+    const focused=document.activeElement;
+    const groups=groupCallStack(actions.filter(a=>a.agent===agent));
+    const completed=groups.filter(g=>!g.running).map(g=>g.actions[0]);
+    const active=groups.filter(g=>g.running).flatMap(g=>g.actions).sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
+    if(r.follow||!r.ids)r.ids=completed.slice(0,50).map(a=>a.id);
+    if(!r.activeIds||r.follow)r.activeIds=active.slice(0,50).map(a=>a.id);
+    const selected=state.selected?.run!=='b'?state.selected?.id:null;
+    const historyIds=new Set(r.ids),activeIds=new Set(r.activeIds);
+    // Completion migrates an inspected or already-visible active card into
+    // its start-ordered history position, preserving its DOM and selection.
+    for(const a of completed)if(activeIds.has(a.id))historyIds.add(a.id);
+    const focusedId=focused?.closest?.('[data-call-card]')?.dataset.callCard;
+    if(selected)historyIds.add(selected);if(focusedId)historyIds.add(focusedId);for(const id of openToolDetails)historyIds.add(id);
+    const historyPool=completed.filter(a=>historyIds.has(a.id));
+    const visibleHistory=historyPool.slice(0,50);
+    for(const a of historyPool)if((a.id===selected||a.id===focusedId||openToolDetails.has(a.id))&&!visibleHistory.includes(a)&&visibleHistory.length<102)visibleHistory.push(a);
+    visibleHistory.sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
+    r.ids=visibleHistory.map(a=>a.id);
+    const visibleActive=active.filter(a=>activeIds.has(a.id)).slice(0,50);
+    for(const a of active)if((a.id===selected||a.id===focusedId||openToolDetails.has(a.id))&&!visibleActive.includes(a)&&visibleActive.length<102)visibleActive.push(a);
+    r.activeIds=visibleActive.map(a=>a.id);
+    const visible=groupCallStack(visibleActive).concat(groupCallStack(visibleHistory));
+    const visibleGroups=new Set(),visibleCards=new Set();let currentPosition=0,historyPosition=0;
+    for(const group of visible) {
+      visibleGroups.add(group.id);let section=existing.get(group.id);
       if(!section){section=document.createElement('section');section.dataset.callGroup=group.id;section.innerHTML='<div class="call-group-heading"></div><div class="call-group-grid"></div>';}
       section.className=`call-stack-group ${group.running?'running-group':''}`;
-      section.querySelector('.call-group-heading').textContent=`${group.running?'Running':'Finished'}${group.actions.length>1?' · Concurrent calls':''}`;
+      section.querySelector('.call-group-heading').textContent=`${group.running?'In flight':'Finished'}${group.actions.length>1?' · Concurrent calls':''}`;
       const grid=section.querySelector('.call-group-grid');
       for(const [index,action] of group.actions.entries()) {
-        visibleCards.add(action.id);
-        let card=cards.get(action.id);
-        if(!card){card=document.createElement('div');card.className='call-card';card.dataset.callCard=action.id;cards.set(action.id,card);}
-        const html=actionButton(action)+`<div class="call-card-status">${pill(action.outcome)}${pausedBadge(action.agent)}${action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:''}</div>`+toolDetails(action,state.run,openToolDetails.has(action.id));
-        if(card.renderedHtml!==html){
-          const details=card.querySelector('details[open]');
-          card.innerHTML=html;card.renderedHtml=html;
-          if(details?.open)card.querySelector('.tool-details')?.replaceWith(details);
-        }
+        visibleCards.add(action.id);let card=cards.get(action.id);
+        if(!card){card=document.createElement('div');card.className='call-card';card.dataset.callCard=action.id;card.innerHTML=actionButton(action)+'<div class="call-card-status"></div>'+toolDetails(action,state.run,openToolDetails.has(action.id));cards.set(action.id,card);}
+        const template=document.createElement('template');template.innerHTML=actionButton(action);const next=template.content.firstElementChild;
+        const button=card.querySelector('[data-action]');button.className=next.className;
+        if(button.innerHTML!==next.innerHTML)button.innerHTML=next.innerHTML;
+        const status=card.querySelector('.call-card-status');
+        const details=card.querySelector('.tool-details'),version=callEvidenceVersion(action);
+        if(!card.dataset.evidenceVersion||!details?.querySelector('.tool-detail-body')?.innerHTML)card.dataset.evidenceVersion=version;
+        if(card.dataset.evidenceVersion!==version&&details)details.dataset.stale='true';
+        const html=pill(action.outcome)+(details?.dataset.stale?`<button data-refresh-details="${esc(action.id)}">New evidence · Refresh details</button>`:'')+(action.result_preview||action.result?`<p>${esc((action.result_preview||action.result).slice(0,240))}</p>`:'');
+        if(status.innerHTML!==html)status.innerHTML=html;
         if(grid.children[index]!==card)grid.insertBefore(card,grid.children[index]||null);
       }
-      if(feed.children[position]!==section)feed.insertBefore(section,feed.children[position]||null);
+      const target=column.querySelector(group.running?'.agent-current-calls':'.agent-history-calls'),position=group.running?currentPosition++:historyPosition++;
+      if(target.children[position]!==section)target.insertBefore(section,target.children[position]||null);
     }
-    if(!visible.length)feed.innerHTML=empty('No matching calls','Waiting for recorded activity for this agent.');
-    else feed.querySelector('.empty-state')?.remove();
+    for(const [id,el] of existing)if(!visibleGroups.has(id))el.remove();
+    for(const [id,card] of cards)if(!visibleCards.has(id))card.remove();
+    column.querySelector('.current-coverage').textContent=active.length?`${visibleActive.length} retained in-flight calls shown${state.displayPaused?' · frozen observation':''}`:'No in-flight call is recorded in this view.';
+    const older=column.querySelector('[data-column-older]');older.disabled=state.displayPaused||r.loading||r.more===false||(!state.run.coverage.client_window&&completed.length<=visibleHistory.length&&!r.more);
+    older.hidden=!state.run.coverage.client_window&&completed.length<=visibleHistory.length&&!r.more;
+    const more=column.querySelector('[data-active-older]');more.hidden=r.activeMore===false||(!state.run.coverage.client_inflight_windowed&&active.length<=50&&!r.activeMore);more.disabled=state.displayPaused||r.loading;
+    if(r.follow&&!state.displayPaused)feed.scrollTop=0;
+    else {
+      // Browsers may reset a detached scroll container before it is reinserted.
+      // Restore its offset before measuring the retained reading anchor.
+      feed.scrollTop=r.scrollTop;
+      const anchor=[...cards.values()].find(card=>card.dataset.callCard===r.anchor?.id&&visibleCards.has(card.dataset.callCard));
+      feed.scrollTop=r.scrollTop+(anchor?anchor.getBoundingClientRect().top-feed.getBoundingClientRect().top-r.anchor.offset:0);
+    }
+    if(focused&&feed.contains(focused)&&document.activeElement!==focused)focused.focus({preventScroll:true});
   }
-  for(const [id,column] of oldColumns)if(!columns.includes(id))column.remove();
-  for(const [id,el] of existing)if(!visibleGroups.has(id))el.remove();
-  for(const [id,card] of cards)if(!visibleCards.has(id))card.remove();
+  for(const [id,column] of trajectoryColumns)if(!columns.includes(id))column.remove();
+  // Keep detached columns for view switches, with a bounded cache for hidden agents.
+  for(const [id] of trajectoryColumns)if(trajectoryColumns.size>Math.max(10,columns.length)&&!columns.includes(id)){trajectoryColumns.delete(id);columnReading.delete(id);}
   if(!columns.length)stack.innerHTML=empty('Waiting for recorded agents','Agent columns will appear when execution begins.');
   else stack.querySelector('.empty-state')?.remove();
-  if(focused)stack.querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
-  if(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)return;
-  for(const id of visibleCards) {
-    const card=cards.get(id),before=positions.get(id);
-    if(!card.animate||!card.getBoundingClientRect)continue;
-    card.getAnimations?.().forEach(animation=>animation.cancel());
-    const after=card.getBoundingClientRect();
-    if(before) {
-      const x=before.left-after.left,y=before.top-after.top;
-      if(Math.abs(x)+Math.abs(y)>1)card.animate([{transform:`translate(${x}px,${y}px)`},{transform:'translate(0,0)'}],{duration:220,easing:'ease-out'});
-    } else card.animate([{opacity:0,transform:'translateY(-6px)'},{opacity:1,transform:'translateY(0)'}],{duration:180,easing:'ease-out'});
-  }
 }
 
 function relevantEpisodes() {
@@ -952,7 +1105,7 @@ function selectedInterval() {
 }
 
 function setSelection(selection,run=state.run) {
-  state.selected=selection?{...selection,execution:run.id}:null;
+  state.selected=selection?{...selection,execution:executionIdentity(run)}:null;
   state.inspectorOpen=Boolean(selection);
 }
 
@@ -978,8 +1131,9 @@ function toggleInspector(open=!state.inspectorOpen) {
 
 function renderInspector(preserveEvidence=false) {
   syncInspector();
-  if(!state.selected){$('inspector').innerHTML='';return;}
-  const top=`<div class="inspector-top"><span>SELECTION INSPECTOR${state.selected.run==='b'?' · COMPARISON B':''}</span><button data-inspector-close aria-label="Close inspector">Close</button></div>`;
+  if(!state.selected){$('inspector').innerHTML='';state.inspectorMarkup=null;state.inspectorMarkupSelection=null;return;}
+  state.inspectorDirty=false;
+  const top=`<p class="inspector-update" role="status"></p><div class="inspector-top"><span>SELECTION INSPECTOR${state.selected.run==='b'?' · COMPARISON B':''}</span><button data-inspector-close aria-label="Close inspector">Close</button></div>`;
   const run=state.selected?.run==='b'?state.comparison:state.run;
   const map=actionMap(run);
   let content='';
@@ -1016,8 +1170,11 @@ function renderInspector(preserveEvidence=false) {
   } else if(selection.type==='artifact') {
     content=`${pill('Referenced artifact')}<h2 class="mono">${esc(selection.id)}</h2><p>Extracted from recorded command text.</p>${run.actions.filter(a=>a.files.includes(selection.id)).map(a=>`<button class="jump" data-action="${esc(a.id)}">${esc(a.kind)} · ${formatTime(a.start)} →</button>`).join('')}`;
   }
+  const markup=top+content;
+  if(state.inspectorMarkup===markup&&state.inspectorMarkupSelection===state.inspectorSelection)return;
+  state.inspectorMarkup=markup;state.inspectorMarkupSelection=state.inspectorSelection;
   const raw=preserveEvidence?$('raw-evidence'):null;
-  $('inspector').innerHTML=top+content;
+  $('inspector').innerHTML=markup;
   if(raw)$('inspector').append(raw);
 }
 
@@ -1047,9 +1204,13 @@ function setView(view) {
 }
 
 function handleClick(event) {
-  const el=event.target.closest('[data-inspector-close],[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
+  const el=event.target.closest('[data-refresh-details],[data-column-live],[data-column-older],[data-active-older],[data-inspector-close],[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
   if(!el||!state.run&&!(el.hasAttribute('data-retry')||el.hasAttribute('data-demo'))) return;
-  if(el.hasAttribute('data-inspector-close'))toggleInspector(false);
+  if(el.dataset.refreshDetails)refreshCallDetails(el);
+  else if(el.dataset.columnLive)liveColumn(el.dataset.columnLive);
+  else if(el.dataset.columnOlder)olderCalls(el.dataset.columnOlder);
+  else if(el.dataset.activeOlder)olderCalls(el.dataset.activeOlder,true);
+  else if(el.hasAttribute('data-inspector-close'))toggleInspector(false);
   else if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
   else if(el.hasAttribute('data-execution-stop'))stopExecution(false,false,el.dataset.executionStop);
   else if(el.hasAttribute('data-execution-kill'))stopExecution(false,true,el.dataset.executionKill);
@@ -1105,14 +1266,16 @@ function holdSelection() {
 }
 
 function followLatest() {
-  if(state.displayPaused){resumeDisplay();return;}
-  state.follow=true;state.windowEnd=null;state.unread.clear();
+  if(state.displayPaused)resumeDisplay();
+  state.follow=true;state.windowEnd=null;clearNotice(state.unread);clearNotice(state.pendingNew);
+  for(const reading of columnReading.values()){reading.follow=true;reading.more=null;reading.activeMore=null;reading.ids=null;reading.activeIds=null;reading.anchor=null;reading.scrollTop=0;clearNotice(reading.pending);reading.error=null;}
+  for(const column of trajectoryColumns.values())column.querySelector('.agent-call-stack').scrollTop=0;
+  timelineNavigation.lock=true;
   if(state.run)state.cursor=state.replayState?.clock??state.run.duration;
   renderRunChrome();
-  if(state.view==='trajectory'&&state.trajectoryLayout==='episodes') {
-    reconcileActivities();
-  }
+  if(state.view==='trajectory'&&state.trajectoryLayout==='episodes')reconcileActivities();
   if(state.view==='agents')renderTandemBoard();
+  if(state.view==='timeline'){timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);timelineViewer?.latest();}
 }
 
 async function showRawEvidence(id,run=state.run) {
@@ -1129,6 +1292,7 @@ async function showRawEvidence(id,run=state.run) {
   catch(error){if(panel.isConnected)panel.innerHTML=`<p>${esc(error.message)}</p>`;}
 }
 
+document.addEventListener('focusout',()=>{if(state.inspectorDirty)setTimeout(()=>{if(!$('inspector').contains(document.activeElement))renderInspector(true);},0);});
 document.addEventListener('click',handleClick);
 document.addEventListener('keydown',event=>{
   if(event.target.dataset.agentTab&&['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
@@ -1168,6 +1332,7 @@ $('demo').onclick=()=>{state.view='trajectory';$('model-filter').value='';$('har
 $('refresh').onclick=refresh;
 $('export').onclick=()=>{
   if(!state.run) return;
+  if(state.run.id==='live'&&!state.replay&&state.run.coverage.client_window){const anchor=document.createElement('a');anchor.href='/api/investigator/runs/live';anchor.download='agency-live-recording.json';anchor.click();return;}
   const blob=new Blob([JSON.stringify(state.run,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob);
   const anchor=document.createElement('a');anchor.href=url;anchor.download=`agency-${state.run.id}.json`;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };

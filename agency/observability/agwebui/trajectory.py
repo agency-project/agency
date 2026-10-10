@@ -808,6 +808,41 @@ class Trajectory:
         return copy.deepcopy(self.run)
 
 
+def trajectory_history(
+    run, agent, *, before_start=None, before_id="", active=False, query="", limit=50
+):
+    """Page observed calls by start time and identity, independent of completion time."""
+    calls = sorted(
+        (
+            a
+            for a in run["actions"]
+            if a["agent"] == agent
+            and (a["outcome"] == "running") == active
+            and query.lower()
+            in " ".join(
+                str(a.get(k, "")) for k in ("name", "intent", "command", "result", "files")
+            ).lower()
+        ),
+        key=lambda a: (-a["start"], a["id"]),
+    )
+    if before_start is not None:
+        calls = [
+            a
+            for a in calls
+            if a["start"] < before_start or (a["start"] == before_start and a["id"] > before_id)
+        ]
+    page = calls[:limit]
+    episode_ids = {a.get("episode") for a in page}
+    return copy.deepcopy(
+        {
+            "actions": page,
+            "execution": {"id": run["id"], "time_origin": run.get("time_origin")},
+            "episodes": [e for e in run["episodes"] if e["id"] in episode_ids],
+            "has_more": len(calls) > limit,
+        }
+    )
+
+
 class LiveSource:
     """One incremental reader per server run directory, shared by all clients."""
 

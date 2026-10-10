@@ -1006,6 +1006,31 @@ async def trajectory_event(event_id: str):
         )
 
 
+@app.get("/api/trajectory/live/history")
+async def trajectory_history_page(
+    agent: str,
+    before_start: float | None = None,
+    before_id: str = "",
+    active: bool = False,
+    query: str = "",
+):
+    from .trajectory import trajectory_history
+
+    if before_start is not None and not math.isfinite(before_start):
+        return JSONResponse({"error": "History cursor must be finite."}, status_code=422)
+    source = _trajectory_source()
+    await asyncio.to_thread(source.refresh)
+    with source.lock:
+        return trajectory_history(
+            source.model.run,
+            agent,
+            before_start=before_start,
+            before_id=before_id,
+            active=active,
+            query=query,
+        )
+
+
 async def _trajectory_replay_data(run_id):
     from .trajectory import replay_events
     from .trajectory_scenarios import events, scale_events

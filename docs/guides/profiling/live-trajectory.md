@@ -53,14 +53,19 @@ Server startup requires no viewer download or frontend build.
 
 ## Pause and inspect live execution
 
-The session bar places blue **Pause Display** / **Resume Display** beside amber
-**Pause Agents** / **Resume Agents**. Pause Display holds the visible cards,
-details, timelines, and metrics at a snapshot while agents keep executing and
-incoming updates are retained. You can scroll, select boxes, and expand their
-details while the display is held. A status label counts calls updated in the
-background. Resume Display catches up to the latest evidence and keeps the
-selected box and scroll position. Display pause sends no execution or replay
-playback command.
+The session bar separates **Freeze view** / **Unfreeze view** from
+**Pause Agents** / **Resume Agents**. Freeze view holds event cards, details,
+timeline spans, and metrics while backend ingestion continues. Connection and
+authoritative agent controls remain live, and the frozen-view label reminds you
+that agents may still be running. Counts distinguish newly buffered calls from
+changed calls; each count retains 256 distinct IDs and displays `256+` beyond
+that limit. These are changes to the buffered call projection, not raw event counts.
+
+Unfreeze view applies buffered evidence while preserving selection and held
+column reading positions. **Jump to live** unfreezes and returns all columns
+and the timeline to live. Neither action sends an agent or replay command.
+Trajectory and Timeline switches retain the execution, selection, and freeze
+state. **Lock to Present** is disabled while the view is frozen.
 
 With an active `agwebui.run(...)` workload, **Pause Agents** / **Resume Agents**
 controls execution of all active agents. Selecting an agent, episode, or action also
@@ -129,8 +134,11 @@ The catalog includes separate synthetic fixtures:
 - The earlier three-agent research demos retain context/resources/comparison
   examples. Their values and relationships are synthetic.
 
-Use **Add agent** to display agent columns side by side. Running calls stay
-pinned above completed history; newest activities and calls appear first.
+Use **Add agent** to display agent columns side by side. Each column has a stable
+header and a **Current activity** area that supports
+multiple in-flight calls. Completed calls move into history ordered by newest
+start time, with stable action IDs breaking ties. Completion time does not reorder
+history. An inspected call keeps its execution/action identity as it moves.
 The **Multi-agent** view preserves expanded transcripts while live updates
 arrive and aligns concurrent work with any recorded system metrics.
 Expand an activity for its calls. Select a call for arguments, lifecycle,
@@ -138,13 +146,23 @@ timing, output, artifacts, model links, and immutable source identifiers.
 Signals link to supporting calls or raw events. Agent focus retains explicit
 neighboring workflow notes. The overlay preserves actual parallel lanes.
 
-Inspecting live calls and switching browser tabs keep incoming updates
-following. Moving the time cursor or choosing earlier activity pages explicitly
-holds history; replay selections also hold history. Changed-call
-counts and highlighted cards show what arrived meanwhile. The overview stays
-at the held point; the session bar still reports current execution/transport
-state. **Follow latest** refreshes the overview and resumes following. Activity pages render at most 50 cards; earlier pages keep the full
-accumulated model available without filling the DOM with every call.
+Each trajectory column scrolls independently. Scrolling into history holds
+that column's reading window; other columns continue following. Its header shows
+changed calls and **Live in this column**. Updates preserve the reading anchor,
+expanded call content, selection, and keyboard focus. Expanded evidence that
+changes offers **New evidence · Refresh details**, so output being read is not
+silently replaced. An inspector with keyboard focus defers changed evidence until
+focus leaves and identifies that pending refresh.
+
+Columns show 50 completed calls and 50 in-flight calls at a time, plus bounded
+inspection pins. **Older calls** and **More in-flight calls** page through the
+source in the same start/ID order. Paging is disabled while frozen. The live
+browser projection retains 2,000 recent completed calls, 200 in-flight calls,
+up to 500 reading/inspection pins, and 2,000 samples per resource series. Coverage
+text identifies the window; live export and recorded review retain complete
+source evidence. Reconnect snapshots and incremental delivery merge by stable
+identity. Moving the time cursor holds the shared overview; **Jump to live**
+returns all reading windows to live.
 
 ## What the evidence establishes
 
@@ -360,9 +378,11 @@ The completed viewer is at
 
 ## Remaining limits and next work
 
-One server observes one configured run directory. History/projection memory
-grows with a run even though reading, updates, semantic work, and feed DOM are
-bounded. The overlay and other saved profiler views are not virtualized.
+One server observes one configured run directory. The server retains its complete
+history/projection in memory. The live browser
+projection, notifications, and trajectory card windows are bounded as described
+above; saved review retains the complete recording. The overlay and other saved
+profiler views are not virtualized.
 Very large raw outputs are loaded whole on demand. Database replacement/truncation
 within a run is not treated as a new execution; use fresh run directories.
 Raw wall-clock timestamps are retained, but host clock skew can limit temporal

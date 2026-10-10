@@ -11,15 +11,22 @@ function page(replay=false,view=null) {
   const flush=()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());};
   class Element {
     constructor(){this.innerHTML='';this.value='';this.options=[];this.children=[];
-      this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];this.style={setProperty:()=>{}};}
+      this.handlers={};this.scrollTop=0;this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];this.style={setProperty:()=>{}};}
     setAttribute(name,value){this[name]=value;}
     focus(){document.activeElement=this;}
-    contains(){return false;}
+    contains(el){return this===el||this.children.some(c=>c.contains(el))||[...this.parts.values()].some(c=>c.contains(el));}
+    get parentElement(){return this.parent;}
+    addEventListener(type,fn){this.handlers[type]=fn;}
+    emit(type){this.handlers[type]?.();}
+    closest(selector){let el=this;while(el){if(selector==='[data-call-card]'&&el.dataset.callCard)return el;el=el.parent||el.host;}return null;}
+    getAttribute(name){return name==='data-action'?this.dataset.action:this[name];}
     scrollIntoView(){throw Error('Unexpected automatic scrolling');}
     get firstElementChild(){return this.children[0];}
     querySelector(selector){
+      if(this.dataset.agentColumn&&['.agent-current-calls','.agent-history-calls'].includes(selector))return this.querySelector('.agent-call-stack').querySelector(selector);
+      if(this.dataset.agentColumn&&selector==='[data-agent-controls]')return this.querySelector('.agent-column-heading').querySelector(selector);
       if(selector==='.empty-state')return null;
-      if(!this.parts.has(selector)){const part=new Element();part.host=this;this.parts.set(selector,part);}
+      if(!this.parts.has(selector)){const part=new Element();part.host=this;if(selector==='[data-action]')part.dataset.action=this.dataset.callCard;this.parts.set(selector,part);}
       return this.parts.get(selector);
     }
     querySelectorAll(selector){
@@ -36,8 +43,8 @@ function page(replay=false,view=null) {
     remove(){if(this.parent){this.parent.children.splice(this.parent.children.indexOf(this),1);this.parent=null;}}
     getBoundingClientRect(){
       let top=0,current=this;
-      while(current){if(current.parent)top+=Math.max(0,current.parent.children.indexOf(current))*100;current=current.parent||current.host;}
-      return {left:0,top};
+      while(current){if(current.parent)top+=Math.max(0,current.parent.children.indexOf(current))*100-(current.parent.scrollTop||0);current=current.parent||current.host;}
+      return {left:0,top,bottom:top+100};
     }
     animate(frames,options){this.animations.push({frames,options});}
   }
@@ -92,7 +99,7 @@ function page(replay=false,view=null) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
+    globalThis.ui={state,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
@@ -109,8 +116,9 @@ function page(replay=false,view=null) {
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, document, node,agentButton,flush,delays,sent,receive:message=>subscription.onMessage(message),transport:value=>subscription.onTransport(value),window:context.window,
-    feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');return (agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');},
+  return {ui:context.ui, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message),transport:value=>subscription.onTransport(value),window:context.window,
+    feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');const body=(agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');const column=body.host;return {get children(){return [...column.querySelector('.agent-current-calls').children,...column.querySelector('.agent-history-calls').children];},get firstElementChild(){return this.children[0];}};},
+    columnFeed:agent=>node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-call-stack'),
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
       actions:[{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success',files:[]}],
@@ -140,6 +148,13 @@ test('inspector opens on selection, closes without clearing identity and stays c
   p.ui.selectAction('new-call');p.ui.renderInspector();
   assert.equal(p.node('inspector').hidden,false);assert.equal(p.ui.state.selected.id,'new-call');
 });
+test('reloading the same selected recording rebuilds its cleared inspector',()=>{
+  const p=page();p.ui.selectAction('old');p.ui.renderInspector();
+  const run=structuredClone(p.ui.state.run);
+  p.ui.loadRun('live',{type:'action',id:'old'});p.receive({type:'snapshot',run});p.ui.renderInspector();
+  assert.match(p.node('inspector').innerHTML,/SELECTION INSPECTOR/);
+  assert.equal(p.ui.state.selected.id,'old');
+});
 test('trajectory and timeline switches retain the same execution and event selection',()=>{
   const p=page();p.ui.selectAction('old');p.ui.renderInspector();p.ui.toggleInspector(false);
   const run=p.ui.state.run,selected=p.ui.state.selected;
@@ -163,6 +178,126 @@ test('live calls keep following while the profiler is hidden and restored',()=>{
   assert.equal(p.ui.state.cursor,2);
   assert.equal(p.ui.state.unread.size,0);
   assert.equal(p.ui.windowEnd(),null);
+});
+
+test('concurrent completions migrate reused selected cards into start-ordered history',()=>{
+  const p=page();p.ui.state.run.actions=[
+    {id:'slow',agent:'a',kind:'tool',start:0,duration:20,outcome:'running',files:[]},
+    {id:'fast',agent:'a',kind:'tool',start:1,duration:2,outcome:'running',files:[]},
+  ];
+  p.ui.renderCallStack();p.ui.selectAction('slow');
+  const original=p.feed('a').firstElementChild.querySelector('.call-group-grid').children.find(c=>c.dataset.callCard==='slow');
+  const button=original.querySelector('[data-action]');button.focus();
+  p.receive({type:'updates',patches:[{actions:[{id:'fast',outcome:'success',duration:2},{id:'slow',outcome:'success',duration:20}]}]});
+  p.flush();p.ui.renderCallStack();p.ui.renderInspector();
+  assert.deepEqual(p.feed('a').children.map(g=>g.dataset.callGroup),['fast','slow']);
+  assert.equal(p.feed('a').children[1].querySelector('.call-group-grid').firstElementChild,original);
+  assert.equal(p.document.activeElement,button);assert.equal(p.ui.state.selected.id,'slow');
+  assert.match(p.node('inspector').innerHTML,/success/);
+  assert.equal(p.ui.state.run.actions.filter(a=>a.id==='slow').length,1);
+});
+test('scrolling holds just that column and preserves expanded reading content during high-volume updates',()=>{
+  const p=page();p.ui.state.run.agents=[{id:'a'},{id:'b'}];p.ui.renderCallStack();
+  const feed=p.columnFeed('a');feed.scrollTop=100;feed.emit('scroll');
+  const column=p.node('call-stack').children[0];
+  const card=p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild;
+  const details=card.querySelector('.tool-details');details.open=true;details.innerHTML='Expanded immutable evidence';
+  p.ui.selectAction('old');
+  for(let batch=0;batch<10;batch++)p.receive({type:'updates',patches:[{actions:Array.from({length:500},(_,i)=>({id:`new-${batch*500+i}`,agent:'a',kind:'tool',start:batch*500+i+1,duration:1,outcome:'success',files:[],event_ids:[`event-${batch*500+i}`]}))}]});
+  p.flush();p.ui.renderCallStack();
+  assert.equal(p.ui.readingState('a').follow,false);assert.equal(p.ui.readingState('b').follow,true);
+  assert.equal(p.node('call-stack').children[0],column);assert.equal(feed.scrollTop,100);
+  assert.equal(card.querySelector('.tool-details'),details);assert.equal(details.open,true);
+  assert.equal(details.innerHTML,'Expanded immutable evidence');
+  assert.equal(p.ui.state.selected.id,'old');assert(p.ui.state.run.actions.length<=2001);
+  assert.equal(p.ui.state.unread.size,256);assert.equal(p.ui.state.unread.overflow,true);
+  assert(p.feed('a').children.length<=102);
+  p.ui.followLatest();p.ui.renderCallStack();
+  assert.equal(feed.scrollTop,0);assert.equal(p.ui.readingState('a').follow,true);
+  assert.equal(p.ui.state.unread.size,0);
+});
+test('visible agents retain their live history page when another agent dominates the buffer',()=>{
+  const p=page();p.ui.state.run.agents=[{id:'a'},{id:'b'}];
+  p.receive({type:'updates',patches:[{actions:Array.from({length:60},(_,i)=>({id:`b-${i}`,agent:'b',kind:'tool',start:i,duration:1,outcome:'success',files:[]}))}]});
+  p.flush();p.ui.renderCallStack();
+  p.ui.readingState('b').follow=false;p.ui.readingState('b').ids=['b-0'];
+  p.receive({type:'updates',patches:[{actions:Array.from({length:3000},(_,i)=>({id:`a-${i}`,agent:'a',kind:'tool',start:i+100,duration:1,outcome:'success',files:[]}))}]});
+  p.flush();p.ui.followLatest();p.ui.renderCallStack();
+  const ids=p.ui.readingState('b').ids;
+  assert.equal(ids.length,50);assert.equal(ids[0],'b-59');assert.equal(ids.at(-1),'b-10');
+  assert(p.ui.state.run.actions.length<=2500);
+});
+test('unfreezing preserves held column position; only Jump to live resets all columns',()=>{
+  const p=page();p.ui.renderCallStack();const feed=p.columnFeed('a');feed.scrollTop=100;feed.emit('scroll');
+  p.ui.pauseDisplay();const held=p.ui.state.run;p.append();
+  p.ui.setView('timeline');p.ui.setView('trajectory');
+  assert.equal(p.ui.state.run,held);assert.equal(p.ui.state.displayPaused,true);
+  assert.equal(held.actions.length,1);assert.equal(p.sent.length,0);
+  p.ui.resumeDisplay();p.ui.renderCallStack();
+  assert.equal(p.ui.readingState('a').follow,false);assert.equal(feed.scrollTop,100);
+  assert.equal(p.ui.state.selected,null);assert.equal(p.ui.state.run.actions.length,2);
+  p.ui.followLatest();assert.equal(feed.scrollTop,0);assert.equal(p.sent.length,0);
+});
+test('detached columns restore their scroll offset before reading-anchor adjustment',()=>{
+  const p=page();p.ui.renderCallStack();const feed=p.columnFeed('a');
+  feed.scrollTop=100;feed.emit('scroll');
+  p.node('call-stack').children[0].remove();feed.scrollTop=0;
+  p.ui.renderCallStack();assert.equal(feed.scrollTop,100);
+});
+test('expanded call evidence is retained and explicitly refreshed after completion',()=>{
+  const p=page(),a=p.ui.state.run.actions[0];a.outcome='running';p.ui.renderCallStack();
+  const card=p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild;
+  const details=card.querySelector('.tool-details'),body=details.querySelector('.tool-detail-body');
+  details.open=true;body.innerHTML='Evidence being read';body.focus();
+  p.receive({type:'updates',patches:[{actions:[{id:'old',outcome:'success',result:'Completed output',event_ids:['end']}]}]});
+  p.flush();p.ui.renderCallStack();
+  assert.equal(body.innerHTML,'Evidence being read');assert.equal(p.document.activeElement,body);
+  assert.equal(details.dataset.stale,'true');assert.match(card.querySelector('.call-card-status').innerHTML,/New evidence · Refresh details/);
+  const button={dataset:{refreshDetails:'old'},closest:()=>card,remove:()=>{}};
+  p.ui.handleClick({target:{closest:()=>button}});
+  assert.match(body.innerHTML,/Completed output/);assert.equal(details.dataset.stale,undefined);
+  assert.equal(p.document.activeElement,details.querySelector('summary'));
+});
+test('unchanged selected inspector preserves loaded payload across view switches',()=>{
+  const p=page();p.ui.selectAction('old');p.ui.renderInspector();
+  p.node('inspector').innerHTML+='Loaded full immutable payload';
+  p.ui.setView('timeline');p.ui.renderInspector();p.ui.setView('trajectory');p.ui.renderInspector();
+  assert.match(p.node('inspector').innerHTML,/Loaded full immutable payload/);
+});
+test('an agent outside the recent live window can load its first historical page',async()=>{
+  const p=page();p.ui.state.run.actions=[];p.ui.state.run.agents=[{id:'a'}];
+  p.ui.state.run.coverage.client_window='Windowed';p.ui.renderCallStack();
+  const urls=[];p.setFetch(async url=>{urls.push(url);return {ok:true,json:async()=>({execution:{id:'live'},actions:[{id:'older',agent:'a',kind:'tool',start:0,duration:1,outcome:'success',files:[]}],has_more:false})};});
+  await p.ui.olderCalls('a');
+  assert.equal(urls.length,1);assert(!urls[0].includes('before_start'));
+  assert.equal(p.ui.state.run.actions[0].id,'older');assert.equal(p.ui.readingState('a').follow,false);
+  assert.equal(p.feed('a').firstElementChild.dataset.callGroup,'older');
+});
+test('history pages from another execution cannot enter the displayed model',async()=>{
+  const p=page();p.ui.state.run.coverage.client_window='Windowed';p.ui.renderCallStack();
+  p.setFetch(async()=>({ok:true,json:async()=>({execution:{id:'live',time_origin:999},actions:[{id:'foreign'}],has_more:false})}));
+  await p.ui.olderCalls('a');
+  assert(!p.ui.state.run.actions.some(a=>a.id==='foreign'));
+  assert.match(p.ui.readingState('a').error,/different or unidentified execution/);
+});
+test('reconnect snapshots merge duplicate delivery without replacing selected action identity',()=>{
+  const p=page();p.ui.selectAction('old');const action=p.ui.state.run.actions[0],selection=p.ui.state.selected;
+  const snapshot=structuredClone(p.ui.state.run);snapshot.actions[0].outcome='running';snapshot.actions.push({...snapshot.actions[0]});
+  p.receive({type:'snapshot',run:snapshot,resynced:true});p.receive({type:'snapshot',run:snapshot,resynced:true});
+  assert.equal(p.ui.state.run.actions.length,1);assert.equal(p.ui.state.run.actions[0],action);
+  assert.equal(action.outcome,'success');assert.equal(p.ui.state.selected,selection);
+});
+test('live control updates never repaint frozen event columns',()=>{
+  const p=debuggerPage();p.ui.renderCallStack();p.ui.pauseDisplay();
+  const card=p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild;
+  p.receive({type:'updates',patches:[{agents:[{id:'a',status:'paused',control_ts:20}],actions:[{id:'old',result:'New evidence'}]}],execution_controls:{available:true,agents:['a','b']}});
+  p.ui.renderSession();
+  assert.equal(p.ui.state.run.actions[0].result,undefined);assert.equal(p.ui.state.liveRun.actions[0].result,'New evidence');
+  assert.equal(p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild,card);
+  assert.match(p.node('display-state').textContent,/agents may still be running/);
+  assert.match(p.node('execution-state').textContent,/1 agent paused/);
+  assert.equal(p.node('follow-live').hidden,false);
+  assert.match(p.node('call-stack').children[0].querySelector('.agent-column-heading').querySelector('.column-follow').querySelector('span').textContent,/View frozen/);
 });
 
 test('inspecting a live call keeps the incoming activity window current',()=>{
@@ -278,7 +413,7 @@ test('a finished call leaves its running peers and reuses its card in serial his
   assert.equal(grid.firstElementChild.dataset.callCard,'a');
   assert.equal(stack.children[1].dataset.callGroup,'b');
   assert.equal(stack.children[1].querySelector('.call-group-grid').firstElementChild,card);
-  assert.ok(card.animations.some(animation=>animation.options.duration===220));
+  assert.equal(card.animations.length,0);
 });
 
 test('rapid stream messages render once per bounded UI batch',()=>{
@@ -427,8 +562,8 @@ test('display pause freezes mutable evidence while live updates continue without
   p.ui.selectAction('old');p.ui.renderInspector();p.ui.renderSession();
   assert.match(p.node('inspector').innerHTML,/Waiting/);
   assert.doesNotMatch(p.node('inspector').innerHTML,/Finished/);
-  assert.equal(p.node('display-toggle').textContent,'▶ Resume Display');
-  assert.match(p.node('display-state').textContent,/2 calls updated/);
+  assert.equal(p.node('display-toggle').textContent,'Unfreeze view');
+  assert.match(p.node('display-state').textContent,/2 calls changed/);
   p.node('display-toggle').onclick();
   assert.equal(p.ui.state.run,run);
   assert.equal(p.ui.state.liveRun,null);
@@ -461,14 +596,15 @@ test('execution controls use live agent state while the display is frozen',()=>{
 test('reconnect snapshots are retained behind the paused display and run switching resets it',()=>{
   const p=page();p.ui.pauseDisplay();
   const frozen=p.ui.state.run;
-  const recovered=structuredClone(p.ui.state.liveRun);
+  const live=p.ui.state.liveRun;
+  const recovered=structuredClone(live);
   recovered.duration=9;recovered.actions.push({id:'recovered',outcome:'success'});
   p.transport('disconnected');p.transport('connected');
   p.receive({type:'snapshot',run:recovered,resynced:true});
   assert.equal(p.ui.state.run,frozen);
-  assert.equal(p.ui.state.liveRun,recovered);
+  assert.equal(p.ui.state.liveRun,live);assert.equal(live.actions.filter(a=>a.id==='recovered').length,1);
   p.ui.resumeDisplay();
-  assert.equal(p.ui.state.run,recovered);
+  assert.equal(p.ui.state.run,live);
   assert.equal(p.ui.state.cursor,9);
   p.ui.pauseDisplay();p.ui.loadRun('live');
   assert.equal(p.ui.state.displayPaused,false);
@@ -661,8 +797,8 @@ test('column controls target their own agent even when another agent is selected
 test('trajectory and tandem column headings contain agent controls while global controls stay separate',()=>{
   const p=debuggerPage();p.ui.renderCallStack();
   for(const column of p.node('call-stack').children) {
-    const html=column.querySelector('.agent-column-heading').innerHTML;
-    assert.match(html,new RegExp(`data-agent-controls="${column.dataset.agentColumn}"`));
+    const html=column.querySelector('[data-agent-controls]').innerHTML;
+    assert.match(html,new RegExp(`data-execution-agent="${column.dataset.agentColumn}"`));
     assert.match(html,/Agent controls/);assert.match(html,/SIGKILL/);
     assert.doesNotMatch(html,/Stop all agents/);
   }

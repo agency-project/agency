@@ -57,7 +57,7 @@ export function groupCallStack(actions) {
   for(const action of actions) {
     if(action.outcome!=='running') {
       groups.push({id:action.id,agent:action.agent,actions:[action],running:false,
-        latest:action.start+Math.max(0,action.duration||0)});
+        latest:action.start});
       continue;
     }
     // Only still-running calls share a box. All open intervals for this
@@ -67,8 +67,11 @@ export function groupCallStack(actions) {
     if(!group){group={id:lane,agent:action.agent,actions:[],running:true,latest:action.start};running.set(lane,group);groups.push(group);}
     group.actions.push(action);group.latest=Math.max(group.latest,action.start);
   }
-  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest||a.id.localeCompare(b.id))
-    .map(group=>({...group,actions:group.actions.sort((a,b)=>b.start-a.start||a.id.localeCompare(b.id))}));
+  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest||(a.id>b.id?1:a.id<b.id?-1:0))
+    .map(group=>({...group,actions:group.actions.sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0))}));
+}
+export function executionIdentity(run) {
+  return run?.time_origin==null?run?.id:JSON.stringify([run.id,run.time_origin]);
 }
 export function readableExecutionTitle(run) {
   const title=typeof run.title==='string'?run.title.trim():'';

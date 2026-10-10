@@ -25,6 +25,38 @@ def model():
     return result
 
 
+def test_history_pages_follow_start_identity_order_and_keep_concurrent_completions():
+    from agency.observability.agwebui.trajectory import trajectory_history
+
+    trajectory = model()
+    for index in range(60):
+        trajectory.apply(
+            event(index + 1, "tool_call", call_id=f"call-{index:02}", ts=index // 2 + 1)
+        )
+    for index in reversed(range(60)):
+        trajectory.apply(
+            event(
+                index + 100,
+                "tool_result",
+                call_id=f"call-{index:02}",
+                ts=200 - index,
+                result="done",
+            )
+        )
+    first = trajectory_history(trajectory.run, "worker")
+    assert len(first["actions"]) == 50 and first["has_more"]
+    expected = sorted(trajectory.run["actions"], key=lambda a: (-a["start"], a["id"]))
+    assert [a["id"] for a in first["actions"]] == [a["id"] for a in expected[:50]]
+    last = first["actions"][-1]
+    second = trajectory_history(
+        trajectory.run, "worker", before_start=last["start"], before_id=last["id"]
+    )
+    assert len(second["actions"]) == 10 and not second["has_more"]
+    assert not set(a["id"] for a in first["actions"]) & set(a["id"] for a in second["actions"])
+    assert not trajectory_history(trajectory.run, "worker", active=True)["actions"]
+    assert not trajectory_history(trajectory.run, "worker", query="nonmatching")["actions"]
+
+
 def test_live_workload_metadata_reaches_snapshot_and_incremental_patch():
     trajectory = Trajectory("live", "Live execution")
     trajectory.apply(
@@ -471,6 +503,34 @@ def test_websocket_replays_running_calls_and_recovers_between_snapshot_and_subsc
             assert (
                 update["patches"][-1]["actions"][0]["result"] == "completed during subscription gap"
             )
+
+
+def test_live_history_endpoint_filters_and_rejects_nonfinite_cursors(tmp_path, monkeypatch):
+    from agency.observability.agwebui import server
+
+    source, actor = registered_source(tmp_path)
+    write_rows(actor, [event(3, "tool_result", call_id="open", result="finished evidence")])
+    source.refresh(force=True)
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    monkeypatch.setattr(server, "_trajectory_source", lambda: source)
+    with TestClient(server.app) as client:
+        page = client.get(
+            "/api/trajectory/live/history", params={"agent": "worker", "query": "FINISHED"}
+        ).json()
+        assert [a["id"] for a in page["actions"]] == ["worker:open"]
+        assert not page["has_more"]
+        assert (
+            client.get(
+                "/api/trajectory/live/history", params={"agent": "worker", "active": True}
+            ).json()["actions"]
+            == []
+        )
+        assert (
+            client.get(
+                "/api/trajectory/live/history", params={"agent": "worker", "before_start": "nan"}
+            ).status_code
+            == 422
+        )
 
 
 def test_replay_socket_exposes_running_start_before_future_completion(tmp_path, monkeypatch):

@@ -2133,6 +2133,17 @@ small,.muted {
 
 .all-agent-controls[hidden],.agent-execution-controls[hidden] {display:none}
 
+/* Each trajectory column owns its reading position; current/history share IDs. */
+#call-stack {align-items:stretch;max-height:none;overflow-x:auto;overflow-y:hidden}
+.agent-column {min-width:0;display:flex!important;flex-direction:column}
+.agent-column-heading {flex:none}
+.agent-call-stack {height:max(280px,calc(100dvh - 470px));overflow:auto;overflow-anchor:none;scrollbar-color:#394858 transparent;padding-right:4px}
+.agent-current h3,.agent-history h3 {font-size:11px;color:var(--muted);margin:6px 0}
+.agent-current {border-bottom:1px solid var(--line);margin-bottom:10px;padding-bottom:8px}
+.current-coverage {font-size:10px;color:var(--muted);margin-bottom:8px}
+.column-follow {flex-basis:100%;display:flex;gap:6px;align-items:center;font-size:10px;color:var(--blue)}
+.column-follow button,.agent-history>button,.agent-current>button {font-size:10px;padding:4px 7px}
+
 /* Investigation chrome stays compact; detailed evidence retains its own space. */
 #workspace {grid-template-columns:170px minmax(0,1fr)}
 .sidebar {padding:20px 14px}
@@ -2222,3 +2233,5 @@ small,.muted {
   .inspector {position:static;border-left:0;border-top:1px solid var(--line)}
   .section-heading {flex-wrap:wrap}
 }
+
+.execution-timeline-scroll { overflow-anchor: none; }
