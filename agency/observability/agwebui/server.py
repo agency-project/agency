@@ -127,6 +127,7 @@ def _execution_controls(source):
                 "time_origin": source.model.run.get("time_origin"),
             },
             "capabilities": session.get("capabilities", {}),
+            "control_observations": session.get("control_observations", False) is True,
             "receipts": sorted(receipts, key=lambda item: item.get("time", 0))[-200:],
             "agents": [
                 agent["id"]

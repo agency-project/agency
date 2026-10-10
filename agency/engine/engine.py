@@ -96,9 +96,11 @@ class AgentEngine:
 
     def cancel(self, *, force: bool = True) -> None:
         with self._services_lock:
+            self._last_control_receipt = None
             client = self._sandbox_interaction_client
             if not self._services_closed and client is not None:
                 client.cancel_harness(self._request_id, force=force)
+                self._last_control_receipt = getattr(client, "_last_control_observation", None)
 
     @property
     def host_server_manager(self) -> "HostServerManager":

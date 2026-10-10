@@ -152,3 +152,8 @@ test('overlapping calls expose individual intervals and never sum wall-clock ela
   assert.equal(one.rows[0].value,10);assert.equal(two.rows[0].value,8);
   assert.match(one.rows[0].note,/not a sum/);assert(!one.rows.some(row=>row.value===18));
 });
+
+test('observed control cards qualify evidence as a local outcome',()=>{
+  const card=eventCard({kind:'control',name:'pause',outcome:'observed'});
+  assert.equal(card.state.label,'Local outcome observed');
+});

@@ -1,4 +1,5 @@
 import {agentRoster, reconcilePinnedAgents, pinAgent} from './agent-roster.js';
+import {requestControlConfirmation, refreshControlConfirmation} from './control-confirmation.js';
 import {eventCard, actionState, eventRelationships, eventMeasurements, payloadWindow, payloadValue} from './event-details.js';
 import {ExecutionTimeline} from './execution-timeline.js';
 import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
@@ -176,7 +177,7 @@ async function loadRun(id, selected=null, replay=false) {
   clearTimeout(trajectoryUpdateTimer);trajectoryUpdateTimer=null;
   pendingTrajectoryChanges.clear();pendingResync=false;
   const generation = ++loadGeneration;
-  clearExecutionPending();state.executionControls=null;state.executionMessage='';state.executionOutcomes=[];if(state.interaction){state.interaction.invalid='Execution changed. Reopen interaction for the intended agent.';renderInteractionStatus();}
+  clearExecutionPending();state.lastExecutionCommand=null;state.executionReceiptTargets=[];state.executionControls=null;state.executionMessage='';state.executionOutcomes=[];if(state.interaction){state.interaction.invalid='Execution changed. Reopen interaction for the intended agent.';renderInteractionStatus();}
   timelineNavigation={scale:null,left:0,top:0,lock:false};openToolDetails.clear();trajectoryColumns.clear();columnReading.clear();clearNotice(state.pendingNew);
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
@@ -387,7 +388,20 @@ function finishExecutionCommand(message) {
 function commandTargetSnapshot() {
   return {relay_id:state.executionControls?.relay_id,execution:state.executionControls?.execution};
 }
+function applicationSummary(target){
+  if(target.state==='failed')return 'request failed';
+  const a=target.application;if(!a)return 'application unconfirmed';
+  if(a.state==='confirmed'){
+    const locals=(a.observations||[]).map(item=>item.local_state),known={suspended:'local suspension observed',continued:'local suspension released',exited:'local task-tree exit observed'};
+    if(locals.length&&locals.every(value=>value===locals[0])&&known[locals[0]])return known[locals[0]];
+  }
+  return `local application ${a.state}`;
+}
 function targetReceiptDescription(target){
+  if(target.application){const a=target.application;
+    const facts=(a.observations||[]).map(item=>`${item.local_state==='suspended'?'Local suspension':item.local_state==='continued'?'Local suspension released':item.local_state==='exited'?'Local task-tree exit':'Local state'}: ${item.state}${item.observed_at?` at ${new Date(item.observed_at*1000).toISOString()}`:''}${item.request_id?` · invocation ${item.request_id}`:''}${item.detail&&item.state!=='confirmed'?' · '+item.detail.replace(/\.$/,''):''}`).join('; ');
+    return `API accepted · local application ${a.state}${a.detail?' · '+a.detail:''}${facts?' · '+facts:''}. Remote operations and cleanup are not established.`;
+  }
   if(target.scope==='future_retained_context'&&target.context_state==='committed')return 'Retained context committed; model consumption unconfirmed'+(target.detail?' · '+target.detail:'');
   if(target.scope==='future_retained_context'&&target.context_state==='failed')return 'Retained context failed to commit'+(target.detail?' · '+target.detail:'');
   if(target.detail)return target.detail;
@@ -403,10 +417,14 @@ function receiveCommandResult(receipt) {
   if(pending?.id===receipt.id){
     if(receipt.error){finishExecutionCommand(receipt.error);return;}
     pending.accepted=receipt.queued||receipt.state==='queued'||receipt.state==='accepted'||receipt.state==='partial';
-    if(receipt.targets?.some(t=>typeof t==='object')){pending.receipts=receipt.targets;state.executionOutcomes=receipt.targets.map(t=>`${agentName(t.agname,currentExecution())}: ${t.state} · ${targetReceiptDescription(t)}`);}
+    if(receipt.targets?.some(t=>typeof t==='object')){pending.receipts=receipt.targets;state.executionReceiptTargets=receipt.targets;state.executionOutcomes=receipt.targets.map(t=>`${agentName(t.agname,currentExecution())}: ${t.state} · ${targetReceiptDescription(t)}`);}
     if(receipt.state==='failed'){finishExecutionCommand('Control failed. '+(state.executionOutcomes.join(' · ')||receipt.detail||'Dispatch was not acknowledged.'));return;}
     state.executionMessage=receipt.state==='partial'?'Some targets failed; waiting for recorded state of accepted targets.':pending.accepted?'Backend accepted the request; waiting for newer recorded agent state.':'Request sent; backend acceptance is unknown.';
     renderSession();
+  }
+  if(!pending&&state.lastExecutionCommand?.id===receipt.id&&state.lastExecutionCommand.execution===executionIdentity(currentExecution())&&state.lastExecutionCommand.relay===state.executionControls?.relay_id&&receipt.targets?.some(t=>typeof t==='object')){
+    state.executionReceiptTargets=receipt.targets;state.executionOutcomes=receipt.targets.map(t=>`${agentName(t.agname,currentExecution())}: ${targetReceiptDescription(t)}`);
+    state.executionMessage='Latest recorded control outcome · '+state.executionOutcomes.join(' · ');renderSession();
   }
   const draft=state.interaction;
   if(draft?.requestId===receipt.id){
@@ -426,6 +444,8 @@ function reconcileExecutionCommand() {
   const results=pending.agents.map(id=>{
     const a=run.agents.find(a=>a.id===id),receipt=pending.receipts?.find(t=>t.agname===id);
     if(receipt?.state==='failed')return {id,done:true,text:`${agentName(id,run)}: failed · ${receipt.detail||'dispatch failed'}`};
+    if(receipt?.application)return {id,done:receipt.application.state!=='pending',text:`${agentName(id,run)}: ${targetReceiptDescription(receipt)}`};
+    if(state.executionControls?.control_observations)return {id,done:false,text:`${agentName(id,run)}: awaiting correlated control receipt; local application unconfirmed`};
     const ended=a&&['completed','failed','cancelled'].includes(a.execution_state||a.status);
     if(pending.stopping&&ended)return {id,done:true,text:`${agentName(id,run)}: terminal state recorded (${a.execution_state||a.status}); process exit not independently confirmed`};
     if(pending.stopping&&a?.stop_ts>pending.observed[id]&&a.stop_force===pending.force)return {id,done:true,text:`${agentName(id,run)}: ${pending.force?'SIGKILL':'SIGTERM'} request recorded; process exit unconfirmed`};
@@ -444,11 +464,14 @@ function pauseResumeExecution(all,agentId=null) {
 function stopExecution(all,force=false,agentId=null) {
   const controls=executionState(agentId);
   if(!(all?controls.allEnabled:controls.agentEnabled)||(!force&&state.executionPending)||force&&state.executionPending?.force)return;
-  const targets=all?controls.active:[controls.target];
-  const names=targets.map(a=>agentName(a.id,currentExecution())).join(', ');
-  const consequence=force?'Send SIGKILL without a cleanup guarantee':'Send SIGTERM; the process may ignore it and exit/cleanup is not guaranteed';
-  if(!window.confirm(`${force?'Force stop':'Stop'} ${targets.length} agent${targets.length===1?'':'s'} in ${readableExecutionTitle(currentExecution())}: ${names}?\n${consequence}. Outstanding requests are cancelled by the agent API.`))return;
-  clearExecutionPending();sendExecutionCommand(`${force?'kill':'stop'}${all?'_all':''}`,all,agentId);
+  const targets=all?controls.active:[controls.target],fence=commandTargetSnapshot(),execution=executionIdentity(currentExecution()),ids=targets.map(a=>a.id);
+  const validate=()=>{
+    const now=executionState(agentId),current=all?now.active:[now.target];
+    return !(all?now.allEnabled:now.agentEnabled)||execution!==executionIdentity(currentExecution())||fence.relay_id!==state.executionControls?.relay_id||JSON.stringify(fence.execution)!==JSON.stringify(state.executionControls?.execution)||JSON.stringify(ids)!==JSON.stringify(current.map(a=>a?.id))?'Target execution or agent scope changed. Cancel and review the current live targets.':(!force&&state.executionPending)||force&&state.executionPending?.force?'A control request is already pending.':'';
+  };
+  requestControlConfirmation({force,execution:readableExecutionTitle(currentExecution()),targets:targets.map(a=>`${agentName(a.id,currentExecution())} (${a.id})`),frozen:state.displayPaused,validate,onConfirm:()=>{
+    if(validate())return;clearExecutionPending();sendExecutionCommand(`${force?'kill':'stop'}${all?'_all':''}`,all,agentId);
+  }});
 }
 function sendExecutionCommand(command,all,agentId=null) {
   const controls=executionState(agentId),targets=all?controls.active:[controls.target];
@@ -460,13 +483,14 @@ function sendExecutionCommand(command,all,agentId=null) {
   const pending={id,command,execution:executionIdentity(currentExecution()),relay:fence.relay_id,agents:targets.map(a=>a.id),paused:command.startsWith('pause'),stopping,force:command.startsWith('kill'),
     observed:Object.fromEntries(targets.map(a=>[a.id,(stopping?a.stop_ts:a.control_ts)||0]))};
   pending.timer=setTimeout(()=>{if(state.executionPending===pending)finishExecutionCommand('No execution confirmation received; outcome unknown. Inspect current state; no automatic retry was sent.');},30000);
-  state.executionPending=pending;state.executionOutcomes=[];state.executionMessage='Requested · waiting for backend acceptance and recorded agent state.';renderSession();
+  state.executionPending=pending;state.executionReceiptTargets=[];state.executionOutcomes=[];state.executionMessage='Requested · waiting for backend acceptance and recorded agent state.';renderSession();
+  state.lastExecutionCommand={id,execution:pending.execution,relay:pending.relay};
 }
 function agentControlButtons(id) {
   const controls=executionState(id),pending=state.executionPending;
   const disabled=!controls.agentEnabled,target=esc(id),name=esc(agentName(id,currentExecution()));
   const own=pending?.agents.includes(id);
-  const label=own?(pending.stopping?(pending.force?'Force stop requested':'Stopping…'):(pending.paused?'Pausing…':'Resuming…')):(controls.target?.status||'unknown');
+  const label=own?(pending.stopping?(pending.force?'Force stop requested':'Stopping…'):(pending.paused?'Pausing…':'Resuming…')):(controls.target?.status==='paused'?'Pause intent recorded':controls.target?.status||'unknown');
   return `<span class="control-section-label">Agent controls · ${esc(label)}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" title="Pause/resume the harness process; already-issued remote work may continue" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Send SIGTERM to ${name}; process exit unconfirmed" ${disabled||pending?'disabled':''}>■ Stop</button><details class="agent-danger-menu"><summary>More</summary><button class="execution-control danger-control" data-execution-kill="${target}" ${disabled||pending?.force?'disabled':''}>Force stop · SIGKILL</button></details><button data-interact="${target}" title="Message this agent or run an explicitly registered task">Interact</button>`;
 }
 
@@ -487,6 +511,7 @@ function updateAgentControls(group,html) {
 }
 
 function renderSession() {
+  refreshControlConfirmation();
   const run=currentExecution(), replay=state.replay;
   const mode=replay?'Replay':run?.id==='live'?'Live':'Review';
   const status=run?.status||'unknown';
@@ -516,9 +541,13 @@ function renderSession() {
   $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
   $('display-state').textContent=state.displayPaused?`View frozen · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.displayChanges)} calls changed · agents may still be running`:state.stream?(state.follow?'View following live':`History held · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.unread)} calls changed`):'';
   $('control-outcomes').textContent=state.executionOutcomes.join(' · ');
+  $('control-evidence').hidden=!state.executionOutcomes.length;
   $('control-scope').textContent=debuggerState.live?`${debuggerState.active.length} active agents · bulk actions include hidden agents. Pause holds harness processes; already-issued remote operations may continue.${state.displayPaused?' Controls target CURRENT LIVE execution while event display is frozen.':''}`:'';
-  $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
-  $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} paused`:''}`;
+  const receiptTargets=state.executionReceiptTargets||[],summaries=receiptTargets.map(applicationSummary);
+  const evidenceSummary=receiptTargets.length>3?[...new Set(summaries)].map(label=>`${summaries.filter(value=>value===label).length} ${label}`).join(' · '):receiptTargets.map((target,index)=>`${agentName(target.agname,run)}: ${summaries[index]}`).join(' · ');
+  const message=state.executionMessage.startsWith('Control result · ')||state.executionMessage.startsWith('Latest recorded control outcome · ')?'Control evidence updated · '+(evidenceSummary||'Review per-agent evidence'):state.executionMessage;
+  $('execution-message').textContent=debuggerState.live?(message||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
+  $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} with pause intent recorded`:''}`;
   $('transport-state').textContent=state.stream?`${state.transport==='connected'?'Connected to updates':state.transport==='disconnected'?'Disconnected from updates · execution state retained':state.transport==='reconnecting'?'Reconnecting to updates':'Connecting to updates'}${replay&&state.replayState?` · ${state.replayState.finished?'replay exhausted':state.replayState.playing?'playing':'paused'} at ${formatTime(state.replayState.clock)}`:''}`:'Saved evidence · no live subscription';
   $('execution-state').dataset.mode=mode.toLowerCase();
   $('open-live').hidden=run?.id==='live'&&!replay;

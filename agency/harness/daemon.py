@@ -38,6 +38,7 @@ from . import interaction_router, mcp_proxy, sandbox_mcp
 from .adapters.base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
+from .control_observation import ControlObservations
 from .executable import prepare_harness_executable_local
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import HarnessInteractionServer
@@ -469,6 +470,7 @@ class HarnessManager:
             sandbox_uds_path,
             self._dispatch_attempt,
             control_handler=self.control,
+            observation_handler=self._control_observation,
             redirect_handler=self.redirect,
             lifecycle_handler=self.lifecycle,
         )
@@ -586,7 +588,14 @@ class HarnessManager:
                 print(f"[harness_daemon] WARNING: redirect delivery failed: {exc}")
                 return False
 
-    def control(self, action: str, *, request_id: str | None = None, force: bool = True) -> None:
+    def _control_observation(self, identifier: str) -> dict:
+        with self._control_lock:
+            registry = getattr(self, "_control_observations", None)
+            return registry.get(identifier) if registry else {"id": identifier, "state": "unknown"}
+
+    def control(
+        self, action: str, *, request_id: str | None = None, force: bool = True
+    ) -> dict | None:
         """Backs HarnessInteractionServer's /control/{action} route.
         No-op (not an error) when nothing is currently registered -- see
         agent.py's cancel()/pause()/resume() for why that's safe."""
@@ -609,8 +618,8 @@ class HarnessManager:
             # A pause cannot begin midway through redirect's native input wait:
             # resume would otherwise block on this lock while input stayed frozen.
             if handle is None:
-                return
-            if action == "pause":
+                pass
+            elif action == "pause":
                 handle.pause()
             elif action == "resume":
                 handle.resume()
@@ -618,6 +627,14 @@ class HarnessManager:
                 (handle.kill if self._current_cancel_force else handle.terminate)()
             else:
                 raise ValueError(f"unknown harness control action {action!r}")
+            if not hasattr(self, "_control_observations"):
+                self._control_observations = ControlObservations()
+            return self._control_observations.add(
+                action,
+                handle,
+                self._current_request_id,
+                getattr(self, "_current_attempt_token", None),
+            )
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token

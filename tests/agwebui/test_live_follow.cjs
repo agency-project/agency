@@ -66,7 +66,7 @@ function page(replay=false,view=null) {
     querySelector:()=>null, querySelectorAll:()=>[...nodes.values()].filter(el=>el.dataset.agentControls), addEventListener:(name,fn)=>{
       (listeners[name]??=[]).push(fn);
     }};
-  let subscription;const sent=[];
+  let subscription;const sent=[],confirmations=[];let autoConfirm=true;
   const context=vm.createContext({document, URLSearchParams, URL, Date, structuredClone,
     setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
     clearTimeout:id=>timers.delete(id),
@@ -79,6 +79,7 @@ function page(replay=false,view=null) {
       sendReplay(type,extra){sent.push({type,...extra});return true;}
     },
     matchesAction:()=>true,
+    requestControlConfirmation:options=>{confirmations.push(options);if(autoConfirm&&!options.validate())options.onConfirm();},refreshControlConfirmation:()=>{},
   });
   const source=fs.readFileSync(path.join(__dirname,
     '../../agency/observability/agwebui/static/investigator.js'),'utf8')
@@ -118,7 +119,7 @@ function page(replay=false,view=null) {
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
+  return {ui:context.ui, confirmations,setAutoConfirm:value=>autoConfirm=value, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');const body=(agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');const column=body.host;return {get children(){return [...column.querySelector('.agent-current-calls').children,...column.querySelector('.agent-history-calls').children];},get firstElementChild(){return this.children[0];}};},
     columnFeed:agent=>node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-call-stack'),
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
@@ -307,7 +308,7 @@ test('live control updates never repaint frozen event columns',()=>{
   assert.equal(p.ui.state.run.actions[0].result,undefined);assert.equal(p.ui.state.liveRun.actions[0].result,'New evidence');
   assert.equal(p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild,card);
   assert.match(p.node('display-state').textContent,/agents may still be running/);
-  assert.match(p.node('execution-state').textContent,/1 agent paused/);
+  assert.match(p.node('execution-state').textContent,/1 agent with pause intent recorded/);
   assert.equal(p.node('follow-live').hidden,false);
   assert.match(p.node('call-stack').children[0].querySelector('.agent-column-heading').querySelector('.column-follow').querySelector('span').textContent,/View frozen/);
 });
@@ -672,7 +673,7 @@ test('debugger controls follow action selection and send named-agent commands',(
   p.ui.renderSession();
   assert.equal(p.ui.state.executionPending,null);
   assert.equal(p.agentButton('agent').textContent,'▶ Resume');
-  assert.match(p.node('execution-state').textContent,/1 agent paused/);
+  assert.match(p.node('execution-state').textContent,/1 agent with pause intent recorded/);
   p.agentButton('agent').onclick();
   assert.equal(p.sent[1].command,'resume');
   assert.equal(p.sent[1].agname,'a');
@@ -853,9 +854,9 @@ test('partial bulk receipts retain specific failed targets and recorded accepted
 });
 
 test('destructive confirmations name the execution, targets and agent count; cancel sends nothing',()=>{
-  const p=debuggerPage();const messages=[];p.window.confirm=message=>{messages.push(message);return false;};
-  p.ui.stopExecution(true,true);assert.equal(p.sent.length,0);assert.match(messages[0],/Force stop 2 agents/);assert.match(messages[0],/A, B/);assert.match(messages[0],/SIGKILL without a cleanup guarantee/);
-  p.ui.pauseResumeExecution(false,'a');assert.equal(messages.length,1);assert.equal(p.sent.length,1);
+  const p=debuggerPage();p.setAutoConfirm(false);
+  p.ui.stopExecution(true,true);assert.equal(p.sent.length,0);assert.equal(p.confirmations[0].force,true);assert.equal(p.confirmations[0].targets.length,2);assert.match(p.confirmations[0].targets[0],/A.*a/);
+  p.ui.pauseResumeExecution(false,'a');assert.equal(p.confirmations.length,1);assert.equal(p.sent.length,1);
 });
 
 test('a replacement relay cannot confirm an older control request',()=>{
@@ -968,4 +969,34 @@ test('six held columns retain their reading pages through high-volume updates',(
   const held=p.ui.readingPins();assert(held.length>=1500);
   const ids=new Set(p.ui.state.run.actions.map(a=>a.id));for(const id of held)assert(ids.has(id),id);
   assert(p.ui.state.run.actions.length<=4200);
+});
+
+test('observation-capable relay waits for applied facts despite a recorded pause intent',()=>{
+  const p=debuggerPage();p.ui.state.executionControls.control_observations=true;p.ui.pauseResumeExecution(false,'a');
+  const run=p.ui.state.run;run.agents[0].status='paused';run.agents[0].control_ts=10;
+  p.receive({type:'snapshot',run,execution_controls:{...p.ui.state.executionControls}});
+  assert(p.ui.state.executionPending);
+  const receipt={type:'execution_command_result',id:p.sent[0].id,state:'accepted',targets:[{agname:'a',state:'accepted',application:{state:'pending'}}]};
+  p.receive(receipt);p.receive({type:'snapshot',run,execution_controls:{...p.ui.state.executionControls}});
+  assert(p.ui.state.executionPending);assert.match(p.ui.agentExecutionControls('a'),/Pausing/);
+  p.receive({...receipt,targets:[{agname:'a',state:'accepted',application:{state:'confirmed',scope:'local_harness_tasks',observations:[{state:'confirmed',local_state:'suspended',request_id:'A',observed_at:100}]}}]});
+  p.receive({type:'snapshot',run,execution_controls:{...p.ui.state.executionControls}});
+  assert.equal(p.ui.state.executionPending,null);assert.match(p.ui.state.executionMessage,/Local suspension: confirmed/);assert.match(p.ui.state.executionMessage,/invocation A/);
+  assert.match(p.ui.state.executionMessage,/Remote operations and cleanup are not established/);
+});
+
+test('confirmation cannot submit after disconnect, replacement relay, changed bulk targets or replay',()=>{
+  for(const change of [p=>p.transport('disconnected'),p=>p.ui.state.executionControls.relay_id='new',p=>p.ui.state.executionControls.agents=['a'],p=>p.ui.state.replay=true]){
+    const p=debuggerPage();p.setAutoConfirm(false);p.ui.stopExecution(true,true);assert.equal(p.sent.length,0);
+    change(p);assert(p.confirmations[0].validate());p.confirmations[0].onConfirm();assert.equal(p.sent.length,0);
+  }
+});
+
+test('frozen confirmation states the live target and partial observed outcomes stay explicit',()=>{
+  const p=debuggerPage();p.ui.pauseDisplay();p.setAutoConfirm(false);p.ui.stopExecution(true,true);
+  assert.equal(p.confirmations[0].frozen,true);p.confirmations[0].onConfirm();
+  const receipt={type:'execution_command_result',id:p.sent[0].id,state:'accepted',targets:[{agname:'a',state:'accepted',application:{state:'confirmed'}},{agname:'b',state:'accepted',application:{state:'unknown',detail:'connection lost'}}]};
+  p.receive(receipt);p.receive({type:'snapshot',run:p.ui.state.liveRun,execution_controls:{...p.ui.state.executionControls}});
+  assert.equal(p.ui.state.executionPending,null);assert.match(p.ui.state.executionMessage,/application confirmed/);assert.match(p.ui.state.executionMessage,/connection lost/);
+  assert.equal(p.ui.state.displayPaused,true);assert.equal(p.sent.length,1);
 });

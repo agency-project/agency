@@ -391,6 +391,9 @@ class agent:
                 try:
                     with handle.client(timeout_s=10) as client:
                         client.pause_harness()
+                        observation = getattr(client, "_last_control_observation", None)
+                        if isinstance(observation, dict):
+                            receipt["observations"] = [observation]
                     receipt["rpc_acknowledged"] = True
                 except Exception as exc:
                     receipt["error"] = str(exc)
@@ -398,7 +401,10 @@ class agent:
             self._last_control_receipt = receipt
         self.data_logger.record_event(
             type="agent_paused",
-            payload={"agname": self.agname, **receipt},
+            payload={
+                "agname": self.agname,
+                **{key: value for key, value in receipt.items() if key != "observations"},
+            },
             term_message=f"[{self.agname}] PAUSE ▶  requested",
         )
 
@@ -415,6 +421,9 @@ class agent:
                 try:
                     with handle.client(timeout_s=10) as client:
                         client.resume_harness()
+                        observation = getattr(client, "_last_control_observation", None)
+                        if isinstance(observation, dict):
+                            receipt["observations"] = [observation]
                     receipt["rpc_acknowledged"] = True
                 except Exception as exc:
                     receipt["error"] = str(exc)
@@ -422,7 +431,10 @@ class agent:
             self._last_control_receipt = receipt
         self.data_logger.record_event(
             type="agent_resumed",
-            payload={"agname": self.agname, **receipt},
+            payload={
+                "agname": self.agname,
+                **{key: value for key, value in receipt.items() if key != "observations"},
+            },
             term_message=f"[{self.agname}] PAUSE ✓  resumed",
         )
 
@@ -476,8 +488,17 @@ class agent:
         engines = self._orchestrator.cancel_agent(self)
         with self._control_lock:
             self._paused = False
+        receipt = {
+            "requested": "kill" if force else "stop",
+            "observations": [],
+            "observation_expected": len(engines),
+        }
+        self._last_control_receipt = receipt
         for engine in engines:
             engine.cancel(force=force)
+            observation = getattr(engine, "_last_control_receipt", None)
+            if isinstance(observation, dict):
+                receipt["observations"].append(observation)
         self.data_logger.record_event(
             type="agent_stop_requested",
             payload={"agname": self.agname, "force": force},

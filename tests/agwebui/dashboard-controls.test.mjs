@@ -9,7 +9,7 @@ function fixture(){
   const sent=[],logs=[],confirmations=[],timers=[];
   let identifier=0;
   const state={timeline:{liveMode:true},executionControls:{available:true,relay_id:'relay-a',execution:{id:'live',time_origin:100},agents:['alpha','beta']},controlRequests:new Map(),agents:new Map([['alpha',{state:'running'}]])};
-  const context=vm.createContext({state,ws:{readyState:1,send:text=>sent.push(JSON.parse(text))},WebSocket:{OPEN:1},crypto:{randomUUID:()=>`command-${++identifier}`},window:{confirm:text=>{confirmations.push(text);return true;}},appendLog:text=>logs.push(text),updateAgentActionsBar:()=>{},setTimeout:callback=>timers.push(callback)});
+  const context=vm.createContext({state,ws:{readyState:1,send:text=>sent.push(JSON.parse(text))},WebSocket:{OPEN:1},crypto:{randomUUID:()=>`command-${++identifier}`},requestControlConfirmation:options=>{confirmations.push(options);if(!options.validate())options.onConfirm();},appendLog:text=>logs.push(text),updateAgentActionsBar:()=>{},setTimeout:callback=>timers.push(callback)});
   vm.runInContext(helpers,context);
   return{state,sent,logs,confirmations,timers,context};
 }
@@ -40,8 +40,8 @@ test('dashboard historical, disconnected, and standalone contexts cannot control
 test('dashboard destructive confirmations name scope and signal while pause has no confirmation',()=>{
   const fixtureState=fixture();
   vm.runInContext("sendDashboardControl('kill_all')",fixtureState.context);
-  assert.match(fixtureState.confirmations[0],/Force stop 2 active agents/);
-  assert.match(fixtureState.confirmations[0],/SIGKILL/);
+  assert.equal(fixtureState.confirmations[0].force,true);
+  assert.deepEqual([...fixtureState.confirmations[0].targets],['alpha','beta']);
   const routine=fixture();
   vm.runInContext("sendDashboardControl('resume','alpha')",routine.context);
   assert.equal(routine.confirmations.length,0);
@@ -54,4 +54,11 @@ test('dashboard timeout preserves uncertain request and does not retry',()=>{
   assert.match(fixtureState.logs.at(-1),/Outcome unknown; request will not be retried/);
   assert.equal(fixtureState.sent.length,1);
   assert.equal(fixtureState.state.controlRequests.size,1);
+});
+
+test('dashboard retains pending application separately from API acceptance',()=>{
+  const f=fixture();vm.runInContext("sendDashboardControl('pause','alpha');receiveDashboardControlResult({id:'command-1',targets:[{agname:'alpha',state:'accepted',application:{state:'pending'}}]})",f.context);
+  assert.equal(f.state.controlRequests.size,1);assert.match(f.logs.at(-1),/local application pending/);
+  vm.runInContext("receiveDashboardControlResult({id:'command-1',targets:[{agname:'alpha',state:'accepted',application:{state:'confirmed'}}]})",f.context);
+  assert.equal(f.state.controlRequests.size,0);assert.match(f.logs.at(-1),/local application confirmed/);
 });

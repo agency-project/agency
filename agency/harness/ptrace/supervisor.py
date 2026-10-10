@@ -404,6 +404,9 @@ class agProxyPtraceHandle:
         with self._loop._lock:
             return bool(self._loop._held_pids & self._loop._known_pids)
 
+    def _control_snapshot(self) -> dict:
+        return self._loop._control_snapshot()
+
     def close(self) -> None:
         self.kill()
         try:

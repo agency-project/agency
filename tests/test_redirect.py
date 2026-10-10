@@ -24,6 +24,7 @@ def runs(monkeypatch, tmp_path):
     transport = TestClient(manager._interaction_server.build_app())
     client = HarnessInteractionClient.__new__(HarnessInteractionClient)
     client._client = transport
+    client._uds_path = "/unused/sandbox"
     started = {name: threading.Event() for name in ("A", "B", "C")}
     finish = {name: threading.Event() for name in started}
     terminal = {name: threading.Event() for name in started}

@@ -86,8 +86,37 @@ RPC acknowledgement may be a no-op. A file-enqueue acknowledgement is only
 acknowledgement or error; recorded state changes arrive separately. Bulk actions
 retain each target's outcome, including partial failure. Stop preserves SIGTERM;
 Force stop preserves SIGKILL. Neither acknowledgement establishes process exit
-or cleanup. Disconnects and missing receipts leave the outcome unknown; the
+or cleanup. Stop and Force stop use an in-page, keyboard-accessible confirmation
+with the execution, target names/count, and SIGTERM/SIGKILL consequences. Cancel
+has initial focus; Escape cancels. Targets and the execution-process UUID are
+validated again before submission; replacement/disconnected targets disable confirmation.
+Disconnects and missing receipts leave the outcome unknown; the
 browser does not automatically retry mutations.
+
+A separate **local application** receipt can now observe the exact harness
+handle that received a pause, resume or cancellation request. Its observation
+ID is bound to the invocation request ID, harness attempt token and action:
+
+- **Suspension observed:** every tracked local task has reached a held ptrace stop,
+  with no pending child registration. Recorded agent pause intent alone is insufficient.
+- **Suspension released:** local holds are cleared and deferred tracer restarts
+  have been processed. This does not establish model progress or remote cancellation.
+- **Task-tree exit observed:** the tracer has completed and no tracked local tasks
+  remain. Root exit alone is insufficient; missing wait evidence stays unknown.
+
+Evidence includes measurement time and available local task/parked counts. It is
+a historical observation, not a continuously measured agent-health state. Native
+and PTY adapters sharing the ptrace handle support it. Old daemons, absent handles,
+unsupported custom handles and checkpoint-detached trees remain unavailable/unknown.
+Acceptance is still separate from application. Backend polling ends after 20 seconds
+with an unknown outcome; it sends no mutation retries. Observation storage keeps
+64 entries per daemon; the relay bounds pending targets to 128, four concurrent
+readers and 16 handles per target. Evicted/superseded evidence stays unknown.
+Bulk controls retain per-target application outcomes, including partial outcomes.
+Requested, accepted and observed facts use the existing `ui_intervention` pipeline;
+per-agent evidence is expandable so it does not displace the investigation workspace.
+Freezing holds the displayed event data and preserves selection; current-live
+controls and their receipts continue updating. Older recordings and receipts remain readable.
 
 Each command carries the live execution identity, an execution-process UUID,
 a unique request ID and a snapshot of target agents. Both server and relay fence

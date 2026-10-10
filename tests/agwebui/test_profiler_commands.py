@@ -84,9 +84,7 @@ def test_file_enqueue_is_not_application_and_duplicate_id_is_not_resubmitted(bri
     second = server._trajectory_execution_command(bridge.source, request(bridge))
     assert second["duplicate"] and len(list(bridge.directory.glob("*.json"))) == 1
     result = bridge.relay.dispatch(json.loads(queued_file(bridge).read_text()))
-    assert (
-        result["state"] == "accepted" and result["targets"][0]["scope"] == "recorded_agent_intent"
-    )
+    assert result["state"] == "accepted" and result["targets"][0]["scope"] == "agent_api_accepted"
     bridge.relay.dispatch(json.loads(queued_file(bridge).read_text()))
     assert bridge.calls == [("alpha", "pause")]
     changed = server._trajectory_execution_command(bridge.source, request(bridge, "resume"))
@@ -95,7 +93,7 @@ def test_file_enqueue_is_not_application_and_duplicate_id_is_not_resubmitted(bri
 
 @pytest.mark.parametrize("operation", ["pause", "resume"])
 def test_real_agent_receipt_shape_does_not_collide_or_override_target_state(bridge, operation):
-    bridge.agents[0]._last_control_receipt = {
+    shape = {
         "scope": "agent_pause_intent",
         "requested": operation,
         "rpc_acknowledged": False,
@@ -103,6 +101,11 @@ def test_real_agent_receipt_shape_does_not_collide_or_override_target_state(brid
         "state": "applied",
         "agname": "different-agent",
     }
+    setattr(
+        bridge.agents[0],
+        operation,
+        lambda: setattr(bridge.agents[0], "_last_control_receipt", dict(shape)),
+    )
     result = bridge.relay.dispatch(
         {
             "id": operation,
@@ -119,12 +122,13 @@ def test_real_agent_receipt_shape_does_not_collide_or_override_target_state(brid
 
 
 def test_real_agent_rpc_error_receipt_remains_failed_after_intent_was_recorded(bridge):
-    bridge.agents[0]._last_control_receipt = {
+    shape = {
         "scope": "agent_pause_intent",
         "requested": "pause",
         "rpc_acknowledged": False,
         "error": "daemon connection lost",
     }
+    bridge.agents[0].pause = lambda: setattr(bridge.agents[0], "_last_control_receipt", dict(shape))
     receipt = bridge.relay.dispatch(
         {
             "id": "failed-pause",
@@ -433,3 +437,228 @@ def test_many_agent_recorded_catalog_review_replay_and_full_evidence(count, tmp_
     )
     evidence = asyncio.run(server.trajectory_replay_event(identifier, long_output["id"]))
     assert len(evidence["payload"]["result"]) > 8000 and "<script>" in evidence["payload"]["result"]
+
+
+def test_public_control_override_cannot_reuse_stale_observation(bridge):
+    bridge.agents[0]._last_control_receipt = {
+        "requested": "pause",
+        "rpc_acknowledged": True,
+        "observations": [{"id": "stale"}],
+    }
+    receipt = bridge.relay.dispatch(
+        {"id": "stale", "type": "pause", "targets": ["alpha"], "relay_id": bridge.relay.identifier}
+    )
+    result = receipt["targets"][0]
+    assert result["scope"] == "agent_api_accepted"
+    assert result["application"]["state"] == "unavailable"
+    assert not bridge.relay._observers
+
+
+class ImmediatePool:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, fn, observations):
+        self.calls.append(observations)
+        future = Future()
+        future.set_result(fn(observations))
+        return future
+
+    def shutdown(self, **kwargs):
+        pass
+
+
+@pytest.mark.parametrize("outcome", ["confirmed", "partial", "unknown"])
+def test_application_is_separate_recorded_evidence_not_api_acceptance(bridge, outcome):
+    target = bridge.agents[0]
+    observations = [
+        {
+            "id": "a" * 32,
+            "request_id": "A",
+            "attempt_token": "attempt-A",
+            "action": "pause",
+            "uds_path": "/unused",
+        }
+    ]
+    target.pause = lambda: setattr(
+        target,
+        "_last_control_receipt",
+        {"requested": "pause", "rpc_acknowledged": True, "observations": observations},
+    )
+    relay = bridge.relay
+    relay._observation_pool.shutdown()
+    relay._observation_pool = ImmediatePool()
+    recorded = []
+    relay._event = lambda command, name, state, result=None: recorded.append(state)
+    relay._read_observations = lambda _: {
+        "state": outcome,
+        "scope": "local_harness_tasks",
+        "observations": [{"state": outcome, "request_id": "A", "observed_at": 100}],
+    }
+    receipt = relay.dispatch(
+        {"id": "observed", "type": "pause", "targets": ["alpha"], "relay_id": relay.identifier}
+    )
+    assert (
+        receipt["state"] == "accepted"
+        and receipt["targets"][0]["application"]["state"] == "pending"
+    )
+    relay.publish()  # Schedule read-only probe.
+    relay.publish()  # Harvest evidence.
+    assert receipt["targets"][0]["application"]["state"] == outcome
+    assert receipt["state"] == "accepted" and not relay._observers
+    assert recorded[-1] == ("observed" if outcome == "confirmed" else "unknown")
+    assert len(relay._observation_pool.calls) == 1
+    relay.close()
+
+
+def test_observation_timeout_does_not_retry_mutation_or_claim_success(bridge):
+    relay = bridge.relay
+    receipt = {"id": "timeout", "targets": []}
+    result = {"agname": "alpha", "state": "accepted"}
+    receipt["targets"].append(result)
+    relay._watch_control(
+        receipt, {"id": "timeout", "type": "pause"}, result, {"observations": [{"id": "a" * 32}]}
+    )
+    next(iter(relay._observers.values()))["deadline"] = 0
+    relay.publish()
+    assert result["application"]["state"] == "unknown"
+    assert "no mutation retry" in result["application"]["detail"]
+    assert bridge.calls == [] and not relay._observers
+    relay.close()
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "attempt_token", "request_id", "action", "disconnect", "partial"]
+)
+def test_read_observations_fences_identity_and_reports_partial_evidence(monkeypatch, change):
+    from agency.engine.clients import HarnessInteractionClient
+
+    expected = {
+        "id": "a" * 32,
+        "uds_path": "/unused",
+        "request_id": "A",
+        "attempt_token": "attempt-A",
+        "action": "pause",
+    }
+    actual = {key: value for key, value in expected.items() if key != "uds_path"}
+    actual.update(state="confirmed", local_state="suspended")
+    if change in actual:
+        actual[change] = "replacement"
+
+    def read(self, identifier):
+        if change == "disconnect":
+            raise OSError("socket closed after acceptance")
+        return {
+            **actual,
+            "id": identifier,
+            "state": "unknown" if identifier == "b" * 32 else actual["state"],
+        }
+
+    monkeypatch.setattr(HarnessInteractionClient, "_control_observation", read)
+    observations = [expected]
+    if change == "partial":
+        observations.append({**expected, "id": "b" * 32})
+    result = ProfilerRelay._read_observations(observations)
+    assert result["state"] == (
+        "confirmed" if change == "none" else "partial" if change == "partial" else "unknown"
+    )
+    assert all("uds_path" not in item for item in result["observations"])
+
+
+def test_dispatch_time_confirmed_evidence_survives_later_socket_loss(monkeypatch):
+    from agency.engine.clients import HarnessInteractionClient
+
+    monkeypatch.setattr(
+        HarnessInteractionClient,
+        "_control_observation",
+        lambda *_: pytest.fail("A confirmed fact must not be probed again"),
+    )
+    result = ProfilerRelay._read_observations(
+        [
+            {
+                "id": "a" * 32,
+                "state": "confirmed",
+                "local_state": "suspended",
+                "observed_at": 100,
+                "uds_path": "/gone",
+                "request_id": "A",
+                "attempt_token": "a",
+                "action": "pause",
+            }
+        ]
+    )
+    assert result["state"] == "confirmed"
+    assert result["observations"][0]["observed_at"] == 100
+    assert "uds_path" not in result["observations"][0]
+
+
+def test_completed_observation_is_not_erased_by_delayed_receipt_harvesting(bridge):
+    relay = bridge.relay
+    receipt = {"id": "delayed", "targets": []}
+    result = {"agname": "alpha", "state": "accepted"}
+    receipt["targets"].append(result)
+    relay._watch_control(
+        receipt, {"id": "delayed", "type": "pause"}, result, {"observations": [{"id": "a" * 32}]}
+    )
+    row = next(iter(relay._observers.values()))
+    row["deadline"] = 0
+    row["future"] = Future()
+    row["future"].set_result(
+        {
+            "state": "confirmed",
+            "scope": "local_harness_tasks",
+            "observations": [{"id": "a" * 32, "state": "confirmed", "observed_at": 100}],
+        }
+    )
+    relay.publish()
+    assert result["application"]["state"] == "confirmed"
+    relay.close()
+
+
+def test_observers_are_bounded_and_missing_targets_never_claim_bulk_success(bridge):
+    relay = bridge.relay
+    for index in range(129):
+        receipt = {"id": str(index), "targets": []}
+        result = {"agname": "alpha", "state": "accepted"}
+        relay._watch_control(
+            receipt,
+            {"id": str(index), "type": "pause"},
+            result,
+            {"observations": [{"id": "a" * 32}]},
+        )
+    assert len(relay._observers) == 128
+    assert result["application"]["state"] == "unavailable"
+    result = {"agname": "beta", "state": "accepted"}
+    relay._watch_control(
+        {"id": "partial"},
+        {"type": "stop"},
+        result,
+        {"observations": [{"id": "a" * 32}], "observation_expected": 2},
+    )
+    assert result["application"]["state"] == "unavailable"
+    relay.close()
+
+
+def test_relay_close_retains_dispatch_time_confirmed_outcome(bridge):
+    relay = bridge.relay
+    receipt = {"id": "closed", "targets": []}
+    result = {"agname": "alpha", "state": "accepted"}
+    receipt["targets"].append(result)
+    relay._watch_control(
+        receipt,
+        {"id": "closed", "type": "pause"},
+        result,
+        {
+            "observations": [
+                {
+                    "id": "a" * 32,
+                    "state": "confirmed",
+                    "local_state": "suspended",
+                    "observed_at": 100,
+                }
+            ]
+        },
+    )
+    relay.close()
+    assert result["application"]["state"] == "confirmed"
+    assert result["application"]["observations"][0]["observed_at"] == 100

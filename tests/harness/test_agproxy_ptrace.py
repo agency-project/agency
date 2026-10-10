@@ -1093,3 +1093,51 @@ def test_clone_discovered_during_pause_cannot_run_before_resume(monkeypatch):
 
     loop.resume()
     assert {pid for pid, _, _ in loop._resume_requests} == {parent, child}
+
+
+@ptrace
+@pytest.mark.parametrize("force", [False, True])
+def test_observed_local_control_outcomes_with_real_task_tree(force):
+    """Cost-free local processes validate parking/restart/exit, including children."""
+    from agency.harness.control_observation import ControlObservations
+
+    handle = agProxyPtrace().launch(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess,time; subprocess.Popen(['/bin/sleep','30']); time.sleep(30)",
+        ],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+    )
+    registry = ControlObservations()
+    try:
+        _wait_until(lambda: len(handle.pids()) >= 2, timeout=5, message="child did not start")
+        handle.pause()
+        pause = registry.add("pause", handle, "local-test", "attempt-1")
+        _wait_until(
+            lambda: registry.get(pause["id"])["state"] == "confirmed",
+            timeout=5,
+            message="local parking was not observed",
+        )
+        evidence = registry.get(pause["id"])
+        assert evidence["task_count"] >= 2 and evidence["parked_count"] == evidence["task_count"]
+        for pid in handle.pids():
+            assert _proc_state(pid).lower().startswith("t")
+        handle.resume()
+        resume = registry.add("resume", handle, "local-test", "attempt-1")
+        _wait_until(
+            lambda: registry.get(resume["id"])["state"] == "confirmed",
+            timeout=5,
+            message="local continuation was not observed",
+        )
+        (handle.kill if force else handle.terminate)()
+        stop = registry.add("cancel", handle, "local-test", "attempt-1")
+        handle.wait(timeout=10)
+        result = registry.get(stop["id"])
+        assert result["state"] == "confirmed" and result["local_state"] == "exited"
+        assert result["task_count"] == 0
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)

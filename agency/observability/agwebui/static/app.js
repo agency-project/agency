@@ -1,3 +1,4 @@
+import {requestControlConfirmation, refreshControlConfirmation} from './control-confirmation.js';
 // app.js — Agency Web UI client
 // Connects to the WebSocket, processes events, and renders the dashboard.
 
@@ -608,6 +609,7 @@ function renderAgentList() {
 }
 
 function updateAgentActionsBar() {
+  refreshControlConfirmation();
   const agname = currentAgent();
   const connected=dashboardExecutionAvailable()&&state.controlRequests.size===0;
   const active=ag=>ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
@@ -1376,22 +1378,37 @@ function sendDashboardControl(type,agname) {
   if(!dashboardExecutionAvailable()||state.controlRequests.size)return;
   const controls=state.executionControls,targets=type.endsWith('_all')?[...controls.agents]:[agname];
   if(!targets.length||targets.some(target=>!controls.agents.includes(target)))return;
-  if(type.startsWith('stop')||type.startsWith('kill')) {
-    const force=type.startsWith('kill'),scope=targets.length===1?targets[0]:`${targets.length} active agents`;
-    if(!window.confirm(`${force?'Force stop':'Stop'} ${scope}? Cancel outstanding work and request ${force?'SIGKILL':'SIGTERM'}. This does not confirm process exit or cleanup.`))return;
-  }
-  const id=globalThis.crypto?.randomUUID?.()||`dashboard-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  state.controlRequests.set(id,{type,targets});
-  ws.send(JSON.stringify({type,agname,id,targets,relay_id:controls.relay_id,execution:controls.execution}));
-  appendLog(`[agent controls] ${type} requested for ${targets.join(', ')}; application unconfirmed.`);
-  updateAgentActionsBar();
-  setTimeout(()=>{if(state.controlRequests.has(id))appendLog(`[agent controls] Timed out waiting for ${type} confirmation for ${targets.join(', ')}. Outcome unknown; request will not be retried.`);},30000);
+  const identity=JSON.stringify(controls.execution),relay=controls.relay_id;
+  const validate=()=>{
+    if(!dashboardExecutionAvailable())return 'The live execution is disconnected or unavailable. Reopen confirmation after reconnecting.';
+    const current=state.executionControls;
+    if(current.relay_id!==relay||JSON.stringify(current.execution)!==identity)return 'The execution changed. Reopen confirmation for the intended execution.';
+    if(targets.some(target=>!current.agents.includes(target))||(type.endsWith('_all')&&JSON.stringify(current.agents)!==JSON.stringify(targets)))return 'The target agents changed. Review the new targets.';
+    return state.controlRequests.size?'Another control request is pending.':'';
+  };
+  const submit=()=>{
+    if(validate())return;
+    const id=globalThis.crypto?.randomUUID?.()||`dashboard-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    state.controlRequests.set(id,{type,targets});
+    ws.send(JSON.stringify({type,agname,id,targets,relay_id:relay,execution:controls.execution}));
+    appendLog(`[agent controls] ${type} requested for ${targets.join(', ')}; application unconfirmed.`);
+    updateAgentActionsBar();
+    setTimeout(()=>{if(state.controlRequests.has(id))appendLog(`[agent controls] Timed out waiting for ${type} confirmation for ${targets.join(', ')}. Outcome unknown; request will not be retried.`);},30000);
+  };
+  if(type.startsWith('stop')||type.startsWith('kill'))requestControlConfirmation({force:type.startsWith('kill'),execution:controls.execution?.id||'Live',targets,validate,onConfirm:submit});
+  else submit();
 }
 function receiveDashboardControlResult(result) {
   if(!state.controlRequests.has(result.id))return;
   if(result.error||result.targets?.some(target=>typeof target==='object')) {
-    state.controlRequests.delete(result.id);
-    appendLog(`[agent controls] ${result.error||result.targets.map(target=>`${target.agname}: ${target.state}${target.detail?' · '+target.detail:''}`).join('; ')}. API receipt does not confirm every process is parked or exited.`);
+    const pending=result.targets?.some(target=>target.application?.state==='pending');
+    const signature=JSON.stringify(result.targets||result.error);
+    const request=state.controlRequests.get(result.id);
+    if(signature!==request.signature){
+      request.signature=signature;
+      appendLog(`[agent controls] ${result.error||result.targets.map(target=>`${target.agname}: API ${target.state}${target.application?' · local application '+target.application.state:''}${target.application?.detail?' · '+target.application.detail:target.detail?' · '+target.detail:''}`).join('; ')}. Observations concern local harness tasks; remote work and cleanup are unconfirmed.`);
+    }
+    if(!pending)state.controlRequests.delete(result.id);
     updateAgentActionsBar();
   }
 }

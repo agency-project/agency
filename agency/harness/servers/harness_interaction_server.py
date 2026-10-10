@@ -33,7 +33,8 @@ class HarnessInteractionServer:
         uds_path: str,
         attempt_handler: Callable[[HarnessAttemptRequest], HarnessAttemptResult],
         *,
-        control_handler: "Callable[..., None] | None" = None,
+        control_handler: "Callable[..., dict | None] | None" = None,
+        observation_handler: "Callable[[str], dict] | None" = None,
         redirect_handler: "Callable[[str, str], bool] | None" = None,
         lifecycle_handler: "Callable[[str], dict] | None" = None,
         startup_timeout_s: float = 10.0,
@@ -42,6 +43,7 @@ class HarnessInteractionServer:
         self.uds_path = uds_path
         self._attempt_handler = attempt_handler
         self._control_handler = control_handler
+        self._observation_handler = observation_handler
         self._redirect_handler = redirect_handler
         self._lifecycle_handler = lifecycle_handler
         self._startup_timeout_s = startup_timeout_s
@@ -112,10 +114,23 @@ class HarnessInteractionServer:
                 force = (payload or {}).get("force", True)
                 if not isinstance(force, bool):
                     return JSONResponse({"error": "force must be a boolean"}, status_code=400)
-                self._control_handler(action, request_id=request_id, force=force)
+                observation = self._control_handler(action, request_id=request_id, force=force)
             else:
-                self._control_handler(action)
-            return JSONResponse({"ok": True})
+                observation = self._control_handler(action)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    **({"observation": observation} if isinstance(observation, dict) else {}),
+                }
+            )
+
+        @app.get("/control_observation/{identifier}")
+        def _observation(identifier: str) -> JSONResponse:
+            if self._observation_handler is None:
+                return JSONResponse({"id": identifier, "state": "unavailable"})
+            if len(identifier) != 32 or any(c not in "0123456789abcdef" for c in identifier):
+                return JSONResponse({"error": "invalid observation identifier"}, status_code=400)
+            return JSONResponse(self._observation_handler(identifier))
 
         @app.post("/lifecycle/{action}")
         def _lifecycle(action: str) -> JSONResponse:

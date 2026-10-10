@@ -2300,3 +2300,9 @@ small,.muted {
 .agent-column-heading>.agent-execution-controls {padding-top:5px}
 .agent-column .call-card .action-row {padding:7px 6px;gap:5px}
 .agent-column .tool-details {margin:5px 0 0;padding-top:4px}
+
+#control-evidence {flex-basis:100%;font-size:11px;overflow-wrap:anywhere}
+#control-evidence summary {cursor:pointer}
+#control-outcomes:focus-visible {outline:2px solid var(--amber);outline-offset:2px}
+
+#execution-message {max-width:none}
