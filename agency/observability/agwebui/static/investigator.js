@@ -1,5 +1,5 @@
 import {ExecutionTimeline} from './execution-timeline.js';
-import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack} from './investigator-model.js';
+import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
 import {changedTrajectoryActions, executionControlState, mergeTrajectory, TrajectoryStream} from './trajectory-stream.js';
 
 const $ = id => document.getElementById(id);
@@ -14,7 +14,7 @@ const views = [
   ['compare','Compare runs','Where did behavior change?']
 ];
 const params = new URLSearchParams(location.search);
-const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
+const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, inspectorOpen:false, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
 let timelineViewer=null;
 let timelineNavigation={scale:null,left:0,lock:false};
 const openToolDetails=new Set();
@@ -55,19 +55,9 @@ const insight = text => `<div class="insight"><span class="insight-icon">↳</sp
 
 function timelineView(){return heading('Execution timeline','Agent calls and measured system resources on a shared wall-clock axis.')+'<div id="execution-timeline" class="panel"></div>';}
 
-function extraMetrics(run,models){
-  const output=models.filter(a=>a.output_tokens!=null),input=models.filter(a=>a.tokens!=null);
-  const totalOut=output.reduce((n,a)=>n+a.output_tokens,0),totalIn=input.reduce((n,a)=>n+a.tokens,0);
-  const result=[['Output tokens',output.length?count(totalOut):'n/a','Cumulative reported usage'],
-    ['Total tokens',input.length&&output.length?count(totalIn+totalOut):'n/a','Cumulative reported input + output'],
-    ['Output rate',output.length&&run.duration?`${(totalOut/run.duration).toFixed(2)}/s`:'n/a','Run average · reported output / wall time'],
-    ['Active agents',String(run.agents.filter(a=>['running','waiting_llm','executing','busy'].includes(a.status)).length),'Paused agents excluded']];
-  const series=Object.entries(run.counters||{});
-  for(const [label,pattern] of [['CPU',/workload.*cpu_pct|cpu.*%/i],['RAM',/workload.*memory|memory_mb|rss_mb/i],['GPU',/^gpu\d+:util_pct/i],['VRAM',/^gpu\d+:mem_mb/i]]){
-    const metric=series.find(([name])=>pattern.test(name)),point=metric?.[1]?.at(-1);
-    result.push([label,point?`${count(point[1])} ${/RAM/.test(label)?'MB':'%'}`:'n/a',point?`${metric[0]} · sample at ${formatTime(point[0])}`:'No recorded sample']);
-  }
-  return result;
+function measurementHTML([label,value,unit,note],detailed=false) {
+  const formatted=unit==='time'?formatTime(value):unit==='rate'?`${value.toFixed(2)}/s`:unit==='count'?count(value):`${count(value)} ${unit}`;
+  return `<div class="metric" title="${esc(note)}"><span class="metric-label">${esc(label)}</span><strong class="metric-value">${esc(formatted)}</strong>${detailed?`<div class="metric-note">${esc(note)}</div>`:''}</div>`;
 }
 function readablePayload(value,limit=4000){
   let text=typeof value==='string'?value:JSON.stringify(value,null,2),json=false;
@@ -174,7 +164,8 @@ async function loadRun(id, selected=null, replay=false) {
   state.follow=true;state.unread.clear();state.windowEnd=null;
   state.displayPaused=false;state.liveRun=null;state.displayChanges.clear();
   state.agentColumns=[];state.columnsCustomized=false;state.activeColumn=null;
-  state.run=null;state.agent='';state.cursor=0;state.selected=selected;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
+  state.run=null;state.agent='';state.cursor=0;state.selected=selected?{...selected,execution:id}:null;state.inspectorOpen=Boolean(selected);state.inspectorSelection=null;state.expanded=new Set();state.contextBlock=null;state.model=null;state.zoom=null;
+  $('inspector').innerHTML='';syncInspector();
   state.comparison=null;state.compareId=null;state.compareError=null;compareGeneration++;
   $('agent-select').innerHTML='<option value="">All agents</option>';
   state.loading = true;
@@ -214,7 +205,7 @@ async function loadRun(id, selected=null, replay=false) {
   try {
     const run = await fetchJson(`/api/investigator/runs/${encodeURIComponent(id)}`);
     if (generation!==loadGeneration) return;
-    state.run=run; state.agent=''; state.cursor=0; state.selected=selected; state.expanded=new Set(); state.contextBlock=null; state.model=null; state.zoom=null; state.comparison=null;
+    state.run=run; state.agent=''; state.cursor=0; state.expanded=new Set(); state.contextBlock=null; state.model=null; state.zoom=null; state.comparison=null;
     if (selected?.type==='action') {
       const action = actionMap(run).get(selected.id);
       if (action) {state.cursor=action.start;state.expanded.add(action.episode);}
@@ -251,7 +242,8 @@ function render() {
     ? ['#call-stack','.trajectory-scroll','#tandem-columns'].map(selector=>{
       const region=content.querySelector(selector);return [selector,region?.scrollLeft||0,region?.scrollTop||0];
     }):[];
-  $('views').innerHTML=views.map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">0${index+1}</span>${label}</button>`).join('');
+  $('views').innerHTML=views.slice(2).map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">${index+3}</span>${label}</button>`).join('');
+  $('execution-views').innerHTML=views.slice(0,2).map(([id,label])=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-pressed="${state.view===id}">${label}</button>`).join('');
   $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
   renderRunChrome();
   const board=$('content').querySelector('#tandem-columns');
@@ -283,22 +275,20 @@ function renderRunChrome() {
   for(const [id,key] of [['model-filter','model'],['harness-filter','harness']]) {
     if(run[key]&&![...$(id).options].some(option=>option.value===run[key]))$(id).add(new Option(run[key],run[key]));
   }
-  $('metrics').hidden=!['trajectory','timeline'].includes(state.view);
-  $('run-title').textContent=run.title;
+  $('run-title').textContent=readableExecutionTitle(run);
+  $('run-title').title=readableExecutionTitle(run);
+  if($('execution-id').value!==run.id){$('execution-id').value=run.id;$('copy-id-status').textContent='';}
+  $('execution-metadata').innerHTML=field('Full execution title',run.title||'Unavailable')+(run.task?field('Task',typeof run.task==='string'?run.task:JSON.stringify(run.task)):'')+field('Source events',Number.isFinite(run.coverage.events)?count(run.coverage.events):'Unavailable')+field('Timed spans',['live','replay'].includes(run.mode)?'Not collected in this event projection':Number.isFinite(run.coverage.spans)?count(run.coverage.spans):'Unavailable')+[run.coverage.context,run.coverage.relationships].filter(Boolean).map(note=>`<p>${esc(note)}</p>`).join('');
   $('run-subtitle').textContent=`${run.condition?.replace('_',' ') || (run.id==='live'?'current execution':state.replay?'recorded replay':'saved execution')} / ${run.harness} / ${run.model}`;
   const agentCount=run.agents.filter(a=>a.id!=='workflow').length;
   $('run-description').textContent=`${agentCount} recorded actor${agentCount===1?'':'s'} · ${run.actions.length} observed calls · ${run.episodes.length} activities`;
-  $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source)+`<div class="provenance-note">${run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.'}</div>`;
-  const modelActions=run.actions.filter(a=>a.kind==='model');
-  const knownTokens=modelActions.filter(a=>a.tokens!=null);
-  const modelSpans=run.intervals.filter(i=>i.kind==='model');
-  const unionWait=overlapDuration(modelSpans.length?modelSpans:modelActions,0,run.duration);
-  $('metrics').innerHTML=[
-    ['Wall time',formatTime(run.duration),run.status==='running'?'From execution start to now':'From execution start to finish'],
-    ['Actions',String(run.actions.filter(a=>a.kind!=='model').length),`${modelActions.length} model calls · ${agentCount} agents`],
-    ['Model intervals',formatTime(unionWait),`${run.duration ? Math.round(unionWait/run.duration*100) : 0}% wall time · union of observed spans`],
-    ['Input tokens',knownTokens.length?count(knownTokens.reduce((sum,a)=>sum+a.tokens,0)):'n/a',knownTokens.length===modelActions.length&&modelActions.length?'Reported across all observed calls':`${knownTokens.length}/${modelActions.length} calls report usage`]
-  ].concat(extraMetrics(run,modelActions)).map(([label,value,note])=>`<div class="metric"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-note">${esc(note)}</div></div>`).join('');
+  $('provenance').innerHTML=pill(run.source==='synthetic'?'Synthetic fixture':'Recorded evidence',run.source);
+  $('provenance').title=run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.';
+  const measurements=executionMeasurements(run);
+  $('metrics').innerHTML=measurements.primary.map(item=>measurementHTML(item)).join('');
+  $('metrics').hidden=!measurements.primary.length;
+  $('secondary-metrics').innerHTML=measurements.primary.concat(measurements.secondary).map(item=>measurementHTML(item,true)).join('');
+  $('telemetry-coverage').textContent=measurements.coverage;
   $('cursor').max=Math.ceil((state.replayState?.duration??run.duration)*10)/10;
   $('cursor').value=state.cursor;
   $('cursor-value').textContent=formatTime(state.cursor);
@@ -310,7 +300,7 @@ function renderRunChrome() {
 }
 
 function actionButton(action) {
-  return `<button class="action-row ${state.selected?.id===action.id?'selected':''}" data-action="${esc(action.id)}"><span class="action-time">${formatTime(action.start)}</span><span class="action-kind" style="color:${colors[action.kind]}">${esc(action.kind)}</span><span class="action-label">${esc(action.intent||action.name)}<small>${esc((action.command || (action.tokens==null?'Token usage not recorded':`${count(action.tokens)} input → ${count(action.output_tokens)} output tokens`)).slice(0,240))}</small></span><span class="action-duration">${formatTime(displayDuration(action))}</span><span class="status-icon ${action.outcome}">${action.outcome==='success'?'✓':action.outcome==='failed'?'×':'·'}</span></button>`;
+  return `<button class="action-row ${state.selected?.run!=='b'&&state.selected?.id===action.id?'selected':''}" data-action="${esc(action.id)}"><span class="action-time">${formatTime(action.start)}</span><span class="action-kind" style="color:${colors[action.kind]}">${esc(action.kind)}</span><span class="action-label">${esc(action.intent||action.name)}<small>${esc((action.command || (action.tokens==null?'Token usage not recorded':`${count(action.tokens)} input → ${count(action.output_tokens)} output tokens`)).slice(0,240))}</small></span><span class="action-duration">${formatTime(displayDuration(action))}</span><span class="status-icon ${action.outcome}">${action.outcome==='success'?'✓':action.outcome==='failed'?'×':'·'}</span></button>`;
 }
 
 function trajectoryView() {
@@ -319,7 +309,7 @@ function trajectoryView() {
   const header=heading('Execution trajectory',overlay?'Compare agent actions on a shared execution clock.':'A narrative of the run, grouped by action intent.',controls);
   const key=legend([['search','Search'],['read','Read'],['edit','Edit'],['test','Test'],['model','Model call']]);
   if(overlay) return header+trajectoryOverlay(visibleActions(state.run),key)+trajectoryWorkflow();
-  return header+`<div id="trajectory-signals"></div><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span></div><div id="hidden-agents" aria-label="Hidden agent activity"></div><div id="call-stack" class="agent-columns"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
+  return header+`<details id="trajectory-attention" class="trajectory-attention"><summary>Execution signals <span id="signal-count"></span></summary><div id="trajectory-signals"></div></details><div class="agent-column-controls"><div id="agent-tabs" role="tablist" aria-label="Visible agents"></div><label>Add agent<select id="add-agent-column" aria-label="Add agent column"></select></label><span id="agent-column-limit" class="muted"></span></div><div id="hidden-agents" aria-label="Hidden agent activity"></div><div id="call-stack" class="agent-columns"></div><details class="activity-history"><summary>Activities grouped by intent</summary><div id="trajectory-glance"></div><div id="trajectory-workflow"></div><div class="activity-window"><button data-older-activities>Earlier activities</button><span id="activity-window-label" class="mono muted"></span><button data-latest-activities>Latest activities</button></div><div id="activity-list"></div><div class="notice">Activity labels use declared purpose when available, otherwise deterministic tool categories. Returned evidence is quoted below each activity. Tool success does not establish task success. Only 50 activities are rendered at once.</div></details>`;
 }
 
 function clearExecutionPending() {
@@ -441,7 +431,7 @@ function renderSession() {
   $('display-toggle').textContent=state.displayPaused?'▶ Resume Display':'⏸ Pause Display';
   $('display-toggle').title=state.displayPaused?'Catch up the display to incoming updates':'Freeze the display while agents continue executing';
   $('display-toggle').setAttribute('aria-pressed',String(state.displayPaused));
-  $('display-state').textContent=state.displayPaused?`Display paused · ${state.displayChanges.size} calls updated · incoming updates retained`:'';
+  $('display-state').textContent=state.displayPaused?`Display paused · ${state.displayChanges.size} calls updated · incoming updates retained`:state.stream?(state.follow?'Display following latest':'Display held at selection'):'';
   $('execution-message').textContent=debuggerState.live?(state.executionMessage||(!state.executionControls?.available&&state.transport==='connected'?'Execution controls unavailable':'')):'';
   $('execution-state').textContent=`${mode} · ${status==='unknown'?'execution state unrecorded':status}${paused?` · ${paused} agent${paused===1?'':'s'} paused`:''}`;
   $('transport-state').textContent=state.stream?`${state.transport==='connected'?'Connected to updates':state.transport==='disconnected'?'Disconnected from updates · execution state retained':state.transport==='reconnecting'?'Reconnecting to updates':'Connecting to updates'}${replay&&state.replayState?` · ${state.replayState.finished?'replay exhausted':state.replayState.playing?'playing':'paused'} at ${formatTime(state.replayState.clock)}`:''}`:'Saved evidence · no live subscription';
@@ -489,7 +479,7 @@ function trajectoryAgents() {
 function visibleAgentColumns() {
   const agents=trajectoryAgents();
   state.agentColumns=state.agentColumns.filter(id=>agents.includes(id));
-  if(!state.columnsCustomized)for(const id of agents)if(state.agentColumns.length<2&&!state.agentColumns.includes(id))state.agentColumns.push(id);
+  if(!state.columnsCustomized)for(const id of agents)if(state.agentColumns.length<3&&!state.agentColumns.includes(id))state.agentColumns.push(id);
   const columns=state.agent?[state.agent]:state.agentColumns;
   if(!columns.includes(state.activeColumn))state.activeColumn=columns[0]||null;
   return columns;
@@ -631,7 +621,7 @@ function reconcileActivities(initial=false) {
     const position=window.indexOf(episode);
     if(list.children[position]!==card)list.insertBefore(card,list.children[position]||null);
     const actions=episode.actions.map(id=>map.get(id)).filter(Boolean).reverse();
-    card.classList.toggle('selected',state.selected?.id===episode.id||actions.some(a=>a.id===state.selected?.id));
+    card.classList.toggle('selected',state.selected?.run!=='b'&&(state.selected?.id===episode.id||actions.some(a=>a.id===state.selected?.id)));
     card.classList.toggle('new-evidence',actions.some(a=>state.unread.has(a.id)));
     card.querySelector('.episode-number').textContent=run.episodes.indexOf(episode)+1;
     const summary=`<span class="chevron">›</span><div class="episode-title"><h3>${esc(episode.title)}</h3><p>${esc(agentName(episode.agent))} · ${episode.label_source==='declared'?'Declared purpose':'Inferred activity'}${episode.late?' · late telemetry':''}</p><div class="activity-result"><span>${episode.kind==='model'?'Model reply':'Observed'}</span> ${esc(episode.latest_result||'No result recorded yet.')}</div></div>${pill(episode.status)}${pausedBadge(episode.agent)}`;
@@ -664,6 +654,13 @@ function reconcileActivities(initial=false) {
   const gap=(run.coverage.catching_up?'<div class="notice">Recovering retained events. This is a partial history until catch-up completes.</div>':'')+(run.coverage.gaps?.length?`<div class="attention-signal"><strong>Telemetry coverage is incomplete</strong><p>${esc(run.coverage.gaps.join(' · '))}. Execution state may be unknown.</p></div>`:'');
   const signalHtml=gap+signals.slice(-5).map(signal=>`<div class="attention-signal ${signal.severity==='required'?'required':''}"><strong>${signal.severity==='required'?'Action requested':'Worth inspecting'} · ${esc(signal.title)}</strong><p>${esc(signal.explanation)}</p><div>${signal.evidence.map((id,i)=>`<button ${map.has(id)?'data-action':'data-raw-event'}="${esc(id)}">Evidence ${i+1} ↗</button>`).join('')}</div></div>`).join('');
   if((state.follow||initial)&&$('trajectory-signals').innerHTML!==signalHtml&&!$('trajectory-signals').contains(document.activeElement))$('trajectory-signals').innerHTML=signalHtml;
+  if(state.follow||initial){
+    $('trajectory-attention').hidden=!signalHtml;
+    $('signal-count').textContent=`· ${signals.length}${gap?' · incomplete coverage':''}${input?' · action requested':''}`;
+    const requiredKey=input?.id||input?.title;
+    if(requiredKey&&requiredKey!==$('trajectory-attention').dataset.required)$('trajectory-attention').open=true;
+    $('trajectory-attention').dataset.required=requiredKey||'';
+  }
   const workflow=trajectoryWorkflow();
   if((state.follow||initial)&&$('trajectory-workflow').innerHTML!==workflow)$('trajectory-workflow').innerHTML=workflow;
 }
@@ -685,7 +682,7 @@ function trajectoryOverlay(actions, key) {
   let height=36;
   for(const lane of lanes) {lane.y=height;lane.height=lane.tracks.length*30+36;height+=lane.height;}
   height+=14;
-  const selectedEpisode=state.selected?.type==='episode'?state.run.episodes.find(e=>e.id===state.selected.id):null;
+  const selectedEpisode=state.selected?.run!=='b'&&state.selected?.type==='episode'?state.run.episodes.find(e=>e.id===state.selected.id):null;
   let svg=`<svg class="timeline-svg trajectory-overlay" viewBox="0 0 ${width} ${height}" role="group" aria-label="Agent trajectories on a shared time axis">`;
   svg+=Array.from({length:6},(_,index)=>{
     const time=state.run.duration*index/5;
@@ -699,7 +696,7 @@ function trajectoryOverlay(actions, key) {
       svg+=`<line class="trajectory-path" x1="${x(track[0].start)}" x2="${x(track.at(-1).start+track.at(-1).duration)}" y1="${y+12}" y2="${y+12}"/>`;
       for(const action of track) {
         const w=Math.max(8,x(action.start+action.duration)-x(action.start));
-        const selected=state.selected?.id===action.id||selectedEpisode?.actions.includes(action.id);
+        const selected=state.selected?.run!=='b'&&(state.selected?.id===action.id||selectedEpisode?.actions.includes(action.id));
         const description=`${name} · ${action.intent||action.name} · ${formatTime(action.start)} → ${formatTime(action.start+action.duration)} · ${action.outcome}`;
         svg+=`<g class="trajectory-action ${selected?'selected':''} ${action.outcome==='failed'?'failed':''}" data-action="${esc(action.id)}" tabindex="0" role="button" aria-label="${esc(description)}"><title>${esc(description)}</title><rect x="${x(action.start)}" y="${y}" width="${w}" height="24" rx="4" fill="${colors[action.kind]||colors.tool}"/>${w>action.kind.length*6+14?`<text x="${x(action.start)+7}" y="${y+16}">${esc(action.kind)}</text>`:''}</g>`;
       }
@@ -736,7 +733,7 @@ function timeline(intervals, agents, compact=false) {
     svg+=`<text class="lane-label" x="0" y="${y+13}">${esc(lane.label)}</text>`;
     svg+=lane.items.map(i=>{
       const a=Math.max(start,i.start),b=Math.min(end,i.start+i.duration);
-      const selected=state.selected?.id===i.id || state.selected?.interval===i.id || state.selected?.type==='episode' && state.run.episodes.find(e=>e.id===state.selected.id)?.actions.includes(i.action);
+      const selected=state.selected?.run!=='b'&&(state.selected?.id===i.id || state.selected?.interval===i.id || state.selected?.type==='episode' && state.run.episodes.find(e=>e.id===state.selected.id)?.actions.includes(i.action));
       return `<rect class="event ${selected?'selected':''}" ${i.direct_action?`data-action="${esc(i.action)}"`:`data-interval="${esc(i.id)}"`} x="${x(a)}" y="${y}" width="${Math.max(2,x(b)-x(a))}" height="20" rx="3" fill="${colors[i.kind]||colors.tool}" opacity="${i.kind==='unknown'?.4:.85}" tabindex="0" role="button" aria-label="${esc(i.label)}, ${formatTime(i.duration)}"><title>${esc(i.label)} · ${formatTime(i.duration)} · ${esc(i.source)}</title></rect>`;
     }).join('');
   });
@@ -773,7 +770,7 @@ function resourcesView() {
 
 function activeModel() {
   const calls=visibleActions(state.run).filter(a=>a.kind==='model');
-  return calls.find(a=>a.id===state.model) || calls.find(a=>a.id===state.selected?.id) || calls.filter(a=>a.start<=state.cursor).at(-1) || calls[0];
+  return calls.find(a=>a.id===state.model) || calls.find(a=>state.selected?.run!=='b'&&a.id===state.selected?.id) || calls.filter(a=>a.start<=state.cursor).at(-1) || calls[0];
 }
 
 function contextView() {
@@ -942,6 +939,7 @@ function compareView() {
 }
 
 function selectedInterval() {
+  if(state.selected?.run==='b')return null;
   if(state.selected?.interval) {const i=state.run.intervals.find(i=>i.id===state.selected.interval);if(i)return [i.start,i.start+i.duration];}
   if(state.selected?.type==='episode') {
     const e=state.run.episodes.find(e=>e.id===state.selected.id);
@@ -953,15 +951,40 @@ function selectedInterval() {
   return interval?[interval.start,interval.start+interval.duration]:null;
 }
 
+function setSelection(selection,run=state.run) {
+  state.selected=selection?{...selection,execution:run.id}:null;
+  state.inspectorOpen=Boolean(selection);
+}
+
+function syncInspector() {
+  const selection=state.selected;
+  const signature=selection?`${selection.execution||state.run?.id}:${selection.run||'a'}:${selection.type}:${selection.id}`:null;
+  if(signature&&signature!==state.inspectorSelection)state.inspectorOpen=true;
+  if(!selection)state.inspectorOpen=false;
+  state.inspectorSelection=signature;
+  $('inspector').hidden=!state.inspectorOpen;
+  $('investigation').classList.toggle('inspector-open',state.inspectorOpen);
+  $('inspector-toggle').disabled=!selection;
+  $('inspector-toggle').setAttribute('aria-expanded',String(state.inspectorOpen));
+}
+
+function toggleInspector(open=!state.inspectorOpen) {
+  if(!state.selected)return;
+  state.inspectorOpen=open;
+  syncInspector();
+  if(open){renderInspector(true);$('inspector').querySelector('[data-inspector-close]')?.focus({preventScroll:true});}
+  else $('inspector-toggle').focus({preventScroll:true});
+}
+
 function renderInspector(preserveEvidence=false) {
-  const top='<div class="inspector-top"><span>SELECTION INSPECTOR</span><span>↗ LINKED</span></div>';
+  syncInspector();
+  if(!state.selected){$('inspector').innerHTML='';return;}
+  const top=`<div class="inspector-top"><span>SELECTION INSPECTOR${state.selected.run==='b'?' · COMPARISON B':''}</span><button data-inspector-close aria-label="Close inspector">Close</button></div>`;
   const run=state.selected?.run==='b'?state.comparison:state.run;
   const map=actionMap(run);
   let content='';
   const selection=state.selected;
-  if(!selection) {
-    content=`<div class="empty-inspector-icon">⌖</div><h2>Follow the evidence.</h2><p>Select an episode, action, model call or obligation. Its details stay here as you move between views.</p><ul class="inspector-list"><li><b>01</b> Expand an episode in the trajectory</li><li><b>02</b> Correlate its resource interval</li><li><b>03</b> Inspect the model’s information</li></ul><div class="detail-label">Measurement coverage</div>${field('Source events',count(run.coverage.events))}${field('Timed spans',['live','replay'].includes(run.mode)?'Not collected in this event projection':count(run.coverage.spans))}<p>${esc(run.coverage.context)}</p><button class="jump" data-view="resources">Inspect resources →</button><button class="jump" data-view="context">Inspect context →</button>`;
-  } else if(selection.type==='action') {
+  if(selection.type==='action') {
     const a=map.get(selection.id);
     if(!a) content='<p>Selection is no longer available.</p>';
     else {
@@ -1005,54 +1028,57 @@ function selectAction(id, comparison=false, intervalId=null) {
   holdSelection();
   const episodeIndex=relevantEpisodes().findIndex(e=>e.id===action.episode);
   if(episodeIndex>=0&&state.windowEnd!=null&&(episodeIndex>=state.windowEnd||episodeIndex<state.windowEnd-50))state.windowEnd=episodeIndex+1;
-  state.selected={type:'action',id,run:comparison?'b':'a',interval:intervalId};state.cursor=intervalId?state.run.intervals.find(i=>i.id===intervalId).start:action.start;state.contextBlock=null;
-  if(action.kind==='model') state.model=id;
+  setSelection({type:'action',id,run:comparison?'b':'a',interval:intervalId},run);
+  if(!comparison)state.cursor=intervalId?state.run.intervals.find(i=>i.id===intervalId).start:action.start;
+  state.contextBlock=null;
+  if(action.kind==='model'&&!comparison) state.model=id;
   if(!comparison) state.expanded.add(action.episode);
   render();
 }
 
 function setView(view) {
   if(!views.some(v=>v[0]===view))return;
-  if(state.selected?.run==='b'&&view!=='compare') {
-    const runId=state.comparison.id,id=state.selected.id;
-    state.view=view;loadRun(runId,{type:'action',id});return;
-  }
+  // Only explicit "Open B" navigation changes execution. A view switch keeps
+  // the selected execution and any comparison evidence in the inspector.
+  const focusedView=document.activeElement?.dataset.view;
   state.view=view;updateUrl();render();
+  if(focusedView)document.querySelector(`nav [data-view="${view}"]`)?.focus({preventScroll:true});
   if(view==='compare'&&!state.comparison) loadComparison();
 }
 
 function handleClick(event) {
-  const el=event.target.closest('[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
+  const el=event.target.closest('[data-inspector-close],[data-execution-agent],[data-execution-stop],[data-execution-kill],[data-add-column],[data-remove-column],[data-agent-tab],[data-view],[data-action],[data-episode],[data-interval],[data-agent],[data-model],[data-block],[data-source],[data-obligation],[data-artifact],[data-compare-action],[data-open-comparison],[data-zoom],[data-reset-zoom],[data-retry],[data-demo],[data-older-activities],[data-latest-activities],[data-raw-event]');
   if(!el||!state.run&&!(el.hasAttribute('data-retry')||el.hasAttribute('data-demo'))) return;
-  if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
+  if(el.hasAttribute('data-inspector-close'))toggleInspector(false);
+  else if(el.hasAttribute('data-execution-agent'))pauseResumeExecution(false,el.dataset.executionAgent);
   else if(el.hasAttribute('data-execution-stop'))stopExecution(false,false,el.dataset.executionStop);
   else if(el.hasAttribute('data-execution-kill'))stopExecution(false,true,el.dataset.executionKill);
   else if(el.dataset.addColumn)addAgentColumn(el.dataset.addColumn);
   else if(el.dataset.removeColumn)removeAgentColumn(el.dataset.removeColumn);
   else if(el.dataset.agentTab)selectAgentColumn(el.dataset.agentTab);
   else if(el.dataset.view) setView(el.dataset.view);
-  else if(el.dataset.action) selectAction(el.dataset.action);
+  else if(el.dataset.action) selectAction(el.dataset.action,$('inspector').contains(el)&&state.selected?.run==='b');
   else if(el.dataset.episode) {
     event.preventDefault();
     holdSelection();
     const id=el.dataset.episode;
     state.expanded.has(id)?state.expanded.delete(id):state.expanded.add(id);
-    state.selected={type:'episode',id};state.cursor=state.run.episodes.find(e=>e.id===id).start;state.contextBlock=null;render();
+    setSelection({type:'episode',id});state.cursor=state.run.episodes.find(e=>e.id===id).start;state.contextBlock=null;render();
   } else if(el.dataset.interval) {
     const interval=state.run.intervals.find(i=>i.id===el.dataset.interval);
     if(interval?.action) selectAction(interval.action,false,interval.id);
-    else if(interval) {state.selected={type:'interval',id:interval.id};state.cursor=interval.start;render();}
+    else if(interval) {setSelection({type:'interval',id:interval.id});state.cursor=interval.start;render();}
   } else if(el.dataset.agent) {
-    state.agent=el.dataset.agent;state.selected={type:'agent',id:state.agent};$('agent-select').value=state.agent;render();
+    state.agent=el.dataset.agent;setSelection({type:'agent',id:state.agent});$('agent-select').value=state.agent;render();
   } else if(el.dataset.model) selectAction(el.dataset.model);
   else if(el.hasAttribute('data-block')) {
     const a=actionMap(state.run).get(el.dataset.modelId);
     const block=a.context.blocks.concat(a.context.dropped)[Number(el.dataset.block)];
-    state.model=a.id;state.selected={type:'action',id:a.id};state.contextBlock=block;state.cursor=a.start;render();
+    state.model=a.id;setSelection({type:'action',id:a.id});state.contextBlock=block;state.cursor=a.start;render();
   } else if(el.dataset.source) {
-    const a=activeModel();state.selected={type:'action',id:a.id};state.model=a.id;state.contextBlock=a.context.blocks.find(b=>b.source===el.dataset.source);render();
-  } else if(el.dataset.obligation) {state.selected={type:'obligation',id:el.dataset.obligation};render();}
-  else if(el.dataset.artifact) {state.selected={type:'artifact',id:el.dataset.artifact};render();}
+    const a=activeModel();setSelection({type:'action',id:a.id});state.model=a.id;state.contextBlock=a.context.blocks.find(b=>b.source===el.dataset.source);render();
+  } else if(el.dataset.obligation) {setSelection({type:'obligation',id:el.dataset.obligation});render();}
+  else if(el.dataset.artifact) {setSelection({type:'artifact',id:el.dataset.artifact});render();}
   else if(el.dataset.compareAction) selectAction(el.dataset.compareAction,el.dataset.side==='b');
   else if(el.hasAttribute('data-open-comparison')) {const id=state.selected.id;state.view='trajectory';loadRun(state.comparison.id,{type:'action',id});}
   else if(el.hasAttribute('data-zoom')) {const interval=selectedInterval();if(interval){state.zoom=[Math.max(0,interval[0]-1),Math.min(state.run.duration,interval[1]+1)];render();}else{$('status').textContent='Select an episode or span to focus its interval.';}}
@@ -1061,7 +1087,7 @@ function handleClick(event) {
   else if(el.hasAttribute('data-demo')) loadRun('demo-baseline');
   else if(el.hasAttribute('data-older-activities')) {holdHistory();state.windowEnd=Math.max(50,(state.windowEnd??relevantEpisodes().length)-50);render();}
   else if(el.hasAttribute('data-latest-activities')) {state.windowEnd=null;render();}
-  else if(el.dataset.rawEvent) showRawEvidence(el.dataset.rawEvent);
+  else if(el.dataset.rawEvent) showRawEvidence(el.dataset.rawEvent,$('inspector').contains(el)&&state.selected?.run==='b'?state.comparison:state.run);
 }
 
 function holdHistory() {
@@ -1089,14 +1115,17 @@ function followLatest() {
   if(state.view==='agents')renderTandemBoard();
 }
 
-async function showRawEvidence(id) {
+async function showRawEvidence(id,run=state.run) {
   holdSelection();
-  const runId=state.run.id;
+  // Evidence buttons can be used without first selecting a call.
+  if(!state.selected){setSelection({type:'source',id},run);renderInspector();}
+  state.inspectorOpen=true;syncInspector();
+  const runId=run.id;
   const url=runId==='live'?`/api/trajectory/live/events/${encodeURIComponent(id)}`:`/api/trajectory/replay/${encodeURIComponent(runId)}/events/${encodeURIComponent(id)}`;
   let panel=$('raw-evidence');
   if(!panel){panel=document.createElement('section');panel.id='raw-evidence';$('inspector').append(panel);}
   panel.innerHTML='<div class="detail-label">Source event</div><p>Reading immutable evidence…</p>';
-  try{const raw=await fetchJson(url);if(state.run.id===runId&&panel.isConnected)panel.innerHTML=`<div class="detail-label">Immutable source event</div><pre>${esc(JSON.stringify(raw,null,2))}</pre>`;}
+  try{const raw=await fetchJson(url);if((state.run?.id===runId||state.comparison?.id===runId)&&panel.isConnected)panel.innerHTML=`<div class="detail-label">Immutable source event</div><pre>${esc(JSON.stringify(raw,null,2))}</pre>`;}
   catch(error){if(panel.isConnected)panel.innerHTML=`<p>${esc(error.message)}</p>`;}
 }
 
@@ -1110,14 +1139,15 @@ document.addEventListener('keydown',event=>{
     $('agent-tabs').querySelector(`[data-agent-tab="${CSS.escape(columns[next])}"]`)?.focus({preventScroll:true});
     return;
   }
+  if(event.key==='Escape'&&state.inspectorOpen) {event.preventDefault();toggleInspector(false);return;}
   if(event.target.matches('input,select,textarea')) return;
   if(event.key>='1'&&Number(event.key)<=views.length&&!event.metaKey&&!event.ctrlKey) {event.preventDefault();setView(views[Number(event.key)-1][0]);}
-  if(event.key==='Escape') {state.selected=null;state.contextBlock=null;render();}
+  if(event.key==='Escape') {setSelection(null);state.contextBlock=null;render();}
   if((event.key==='Enter'||event.key===' ')&&event.target.matches('[data-interval],.trajectory-action')) {event.preventDefault();event.target.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
 });
 $('run-select').onchange=event=>loadRun(event.target.value);
 for(const id of ['model-filter','harness-filter']) $(id).onchange=()=>{const runs=catalogOptions();if(runs.length&&!runs.some(r=>r.id===state.run?.id)) loadRun(runs[0].id);else if(!runs.length){$('status').textContent='No executions match these model and harness filters.';}};
-$('agent-select').onchange=event=>{holdSelection();state.agent=event.target.value;state.selected=state.agent?{type:'agent',id:state.agent}:null;render();};
+$('agent-select').onchange=event=>{holdSelection();state.agent=event.target.value;setSelection(state.agent?{type:'agent',id:state.agent}:null);render();};
 $('search').oninput=event=>{holdSelection();state.query=event.target.value;render();};
 $('cursor').oninput=event=>{
   const clock=Number(event.target.value);
@@ -1127,7 +1157,13 @@ $('cursor').oninput=event=>{
   if(state.replay)state.stream?.sendReplay('seek',{clock});
   else {pendingSeek=clock;loadRun(state.run.id,null,true);}
 };
-$('clear-selection').onclick=()=>{state.selected=null;state.contextBlock=null;state.zoom=null;render();};
+$('clear-selection').onclick=()=>{setSelection(null);state.contextBlock=null;state.zoom=null;render();};
+$('inspector-toggle').onclick=()=>toggleInspector();
+$('copy-execution-id').onclick=async()=>{
+  const id=state.run?.id;if(!id)return;
+  try {await navigator.clipboard.writeText(id);if(state.run?.id===id)$('copy-id-status').textContent='Copied';}
+  catch {if(state.run?.id===id){$('execution-id').focus();$('execution-id').select();$('copy-id-status').textContent='Select and copy the identifier.';}}
+};
 $('demo').onclick=()=>{state.view='trajectory';$('model-filter').value='';$('harness-filter').value='';loadRun('demo-baseline');};
 $('refresh').onclick=refresh;
 $('export').onclick=()=>{

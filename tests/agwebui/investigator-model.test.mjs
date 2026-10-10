@@ -2,7 +2,38 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/investigator-model.js', import.meta.url),'utf8');
-const {alignSequences, overlapDuration, matchesAction, packActionTracks} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {alignSequences, overlapDuration, matchesAction, packActionTracks, readableExecutionTitle, executionMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('readable titles prefer a recorded task over a technical execution heading',()=>{
+  assert.equal(readableExecutionTitle({id:'live',title:'Current execution · 1234',task:'Repair the scheduler\nFurther instructions'}),'Repair the scheduler');
+  assert.equal(readableExecutionTitle({id:'1234',title:'1234',task:'Inspect traces'}),'Inspect traces');
+  assert.equal(readableExecutionTitle({id:'a',title:'Named investigation',task:'Task'}),'Named investigation');
+  assert.equal(readableExecutionTitle({id:'live',title:'Current execution · 1234'}),'Current execution · 1234');
+  assert.equal(readableExecutionTitle({}),'Execution');
+});
+test('empty and older recordings omit absent measurements rather than showing zero',()=>{
+  const metrics=executionMeasurements({duration:0,actions:[],agents:[],counters:{cpu:[]}});
+  assert.deepEqual(metrics.primary,[]);assert.deepEqual(metrics.secondary,[]);
+  assert.match(metrics.coverage,/No model calls recorded/);assert.match(metrics.coverage,/No system samples recorded/);
+  const older=executionMeasurements({duration:10,actions:[{kind:'tool'}],agents:[{id:'worker'}]});
+  assert.deepEqual(older.primary.map(m=>m[0]),['Wall time','Calls','Agents']);
+  assert(!older.secondary.some(m=>m[0]==='Active agents'));
+});
+test('reported zero and partial model usage remain explicit without filling missing usage',()=>{
+  const metrics=executionMeasurements({duration:10,actions:[{kind:'model',tokens:0,start:0,duration:1},{kind:'model',tokens:null,output_tokens:5,start:1,duration:1},{kind:'model',tokens:NaN,start:2,duration:1}]});
+  assert.equal(metrics.primary.find(m=>m[0]==='Input tokens')[1],0);
+  assert.equal(metrics.primary.find(m=>m[0]==='Output tokens')[1],5);
+  assert.match(metrics.coverage,/1\/3 input and 1\/3 output/);
+  assert.match(metrics.secondary.find(m=>m[0]==='Total tokens')[3],/missing usage excluded/);
+});
+test('secondary samples retain scope, exclude invalid samples and use memory units',()=>{
+  const metrics=executionMeasurements({counters:{'workload:cpu_pct':[[0,0],[1,NaN]],'gpu0:mem_mb':[[1,128]],'empty':[]}});
+  assert.equal(metrics.secondary.find(m=>m[0]==='CPU')[1],0);
+  assert.match(metrics.secondary.find(m=>m[0]==='CPU')[3],/workload:cpu_pct/);
+  assert.equal(metrics.secondary.find(m=>m[0]==='VRAM')[2],'MB');
+  assert(!metrics.secondary.some(m=>m[0]==='RAM'));
+  assert.match(metrics.coverage,/2 sampled resource series/);
+});
 
 test('insertion identifies divergence and the next matched reconvergence',()=>{
   const left=['search','read','edit','test'].map(kind=>({kind}));

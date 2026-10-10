@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function page(replay=false) {
+function page(replay=false,view=null) {
   const listeners={}, nodes=new Map();
   const timers=new Map(),delays=[];let timerId=0;
   const flush=()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());};
@@ -13,6 +13,7 @@ function page(replay=false) {
     constructor(){this.innerHTML='';this.value='';this.options=[];this.children=[];
       this.dataset={};this.parts=new Map();this.classList={toggle:()=>{}};this.animations=[];this.style={setProperty:()=>{}};}
     setAttribute(name,value){this[name]=value;}
+    focus(){document.activeElement=this;}
     contains(){return false;}
     scrollIntoView(){throw Error('Unexpected automatic scrolling');}
     get firstElementChild(){return this.children[0];}
@@ -26,6 +27,7 @@ function page(replay=false) {
       const descendants=[...this.children,...this.parts.values()];
       return descendants.flatMap(child=>[...(child.dataset[key]?[child]:[]),...child.querySelectorAll(selector)]);
     }
+    append(child){this.insertBefore(child,null);}
     insertBefore(child,before){
       child.remove();
       const index=before?this.children.indexOf(before):this.children.length;
@@ -60,7 +62,7 @@ function page(replay=false) {
   const context=vm.createContext({document, URLSearchParams, URL, Date, structuredClone,
     setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
     clearTimeout:id=>timers.delete(id),
-    location:{search:replay?'?mode=replay':''},
+    location:{search:view?`?view=${view}`:replay?'?mode=replay':''},
     window:{scrollY:0, addEventListener:()=>{}},
     TrajectoryStream:class {
       constructor(options){subscription=options;}
@@ -90,7 +92,7 @@ function page(replay=false) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
+    globalThis.ui={state,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
@@ -103,7 +105,7 @@ function page(replay=false) {
         return {dataset:{[`execution${kind[0].toUpperCase()+kind.slice(1)}`]:id},hasAttribute:name=>name===attribute};
       }}})};
   };
-  const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success'}],
+  const run={id:'live',duration:1,actions:[{id:'old',agent:'a',episode:'one',start:0,duration:1,kind:'tool',outcome:'success',files:[]}],
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
@@ -111,12 +113,50 @@ function page(replay=false) {
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');return (agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');},
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
     append:(paint=true)=>{subscription.onMessage({type:'patch', patches:[{
-      actions:[{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success'}],
+      actions:[{id:'new-call',agent:'a',episode:'two',start:1,duration:1,kind:'tool',outcome:'success',files:[]}],
       episodes:[{id:'two',actions:['new-call'],status:'running'}],meta:{duration:2},
     }]});if(paint)flush();},
   };
 }
 
+test('trajectory is the default execution view and the inspector starts collapsed',()=>{
+  const p=page();p.ui.renderInspector();
+  assert.equal(p.ui.state.view,'trajectory');
+  assert.equal(p.node('inspector').hidden,true);
+  assert.equal(p.node('inspector-toggle').disabled,true);
+});
+test('explicit alternative execution views remain selected on entry',()=>{
+  assert.equal(page(false,'timeline').ui.state.view,'timeline');
+  assert.equal(page(false,'context').ui.state.view,'context');
+});
+test('inspector opens on selection, closes without clearing identity and stays closed on updates',()=>{
+  const p=page();p.ui.selectAction('old');p.ui.renderInspector();
+  const selected=p.ui.state.selected;
+  assert.equal(selected.execution,'live');assert.equal(selected.id,'old');
+  assert.equal(p.node('inspector').hidden,false);
+  p.ui.toggleInspector(false);p.append();p.ui.renderInspector(true);
+  assert.equal(p.node('inspector').hidden,true);assert.equal(p.ui.state.selected,selected);
+  assert.equal(p.document.activeElement,p.node('inspector-toggle'));
+  p.ui.selectAction('new-call');p.ui.renderInspector();
+  assert.equal(p.node('inspector').hidden,false);assert.equal(p.ui.state.selected.id,'new-call');
+});
+test('trajectory and timeline switches retain the same execution and event selection',()=>{
+  const p=page();p.ui.selectAction('old');p.ui.renderInspector();p.ui.toggleInspector(false);
+  const run=p.ui.state.run,selected=p.ui.state.selected;
+  p.ui.setView('timeline');p.ui.renderInspector();p.ui.setView('trajectory');
+  assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selected);
+  assert.equal(p.ui.state.inspectorOpen,false);
+});
+test('switching away from comparison never silently opens execution B',()=>{
+  const p=page(),run=p.ui.state.run,cursor=p.ui.state.cursor;
+  p.ui.state.comparison={...run,id:'saved-b',actions:[{...run.actions[0],start:5}]};p.ui.selectAction('old',true);
+  const selected=p.ui.state.selected;
+  p.ui.setView('timeline');
+  assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selected);
+  assert.equal(selected.execution,'saved-b');
+  assert.equal(p.ui.state.cursor,cursor);
+  assert.doesNotMatch(p.ui.actionButton(run.actions[0]),/action-row selected/);
+});
 test('live calls keep following while the profiler is hidden and restored',()=>{
   const p=page();p.visibility(true);p.append();p.visibility(false);
   assert.equal(p.ui.state.follow,true);
@@ -261,14 +301,14 @@ test('reduced motion skips card animations',()=>{
   assert.equal(card.animations.length,0);
 });
 
-test('defaults to two stable columns and supports more than three',()=>{
+test('defaults to three stable columns and supports more than three',()=>{
   const p=page();
   p.ui.state.run.agents=['workflow','a','b','c','d'].map(id=>({id}));
   p.ui.renderCallStack();
-  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b']);
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c']);
   const original=p.node('call-stack').firstElementChild;
   p.ui.state.run.agents.unshift({id:'new'});p.ui.renderCallStack();
-  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b']);
+  assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c']);
   assert.equal(p.node('call-stack').firstElementChild,original);
   p.ui.addAgentColumn('c');p.ui.addAgentColumn('d');
   assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c','d']);
@@ -287,7 +327,7 @@ test('hidden agents show activity counts and each column contains its own calls'
     {id:'hidden-running',agent:'c',kind:'tool',start:2,duration:1,outcome:'running'},
     {id:'hidden-failed',agent:'c',kind:'tool',start:3,duration:1,outcome:'failed'},
   ];
-  p.ui.renderCallStack();
+  p.ui.renderCallStack();p.ui.removeAgentColumn('c');p.ui.renderCallStack();
   assert.equal(p.feed('a').firstElementChild.dataset.callGroup,'running:a:tool');
   assert.equal(p.feed('b').firstElementChild.dataset.callGroup,'two');
   assert.match(p.node('hidden-agents').innerHTML,/c · 1 running · 1 failed/);
