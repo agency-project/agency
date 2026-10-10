@@ -2180,6 +2180,17 @@ small,.muted {
 .metrics .metric-label {font-size:9px;letter-spacing:.4px}
 .metrics .metric-value {font-size:14px;margin:0;line-height:1.5}
 #telemetry-coverage {color:var(--muted);font-size:10px;margin:3px 0 0}
+.system-metrics {padding:0 16px 8px}
+.system-metrics-heading {display:flex;align-items:center;gap:10px;margin-bottom:4px;font-size:11px}
+.system-metrics-heading span {color:var(--muted);font-size:10px}
+.system-metrics-heading button {margin-left:auto;padding:3px 6px;font-size:10px}
+.system-metrics-cards {display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px}
+.system-metric {border:1px solid var(--line);border-radius:5px;padding:5px 9px;min-width:0}
+.system-metric-value {display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px}
+.system-metric-value strong {font:14px var(--mono)}
+.system-metric svg {display:block;width:100%;height:26px;color:var(--green)}
+.system-metric small {display:block;color:var(--muted);font-size:9px;overflow-wrap:anywhere}
+.system-metrics-empty {color:var(--muted);font-size:11px;margin:4px 0}
 .cursor-bar {padding:5px 16px;gap:10px;min-height:32px}
 #clear-selection {padding:4px 7px}
 .session-bar {padding:4px 16px;gap:6px 12px;position:relative}
@@ -2306,3 +2317,20 @@ small,.muted {
 #control-outcomes:focus-visible {outline:2px solid var(--amber);outline-offset:2px}
 
 #execution-message {max-width:none}
+
+/* Receipt/status changes must not resize the live workspace or move its menus. */
+.session-bar,.summary-strip {overflow-anchor:none}
+.session-state {width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);min-height:18px}
+.session-state>* {min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.session-actions {width:100%}
+.control-feedback {flex-basis:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;min-height:30px}
+#execution-message {display:block;height:30px;line-height:15px;overflow:auto;font-size:10px}
+#control-evidence {position:relative;white-space:nowrap;font-size:10px}
+#control-outcomes {position:absolute;right:0;top:100%;z-index:12;width:min(500px,70vw);max-height:180px;margin:5px 0 0;padding:12px;border:1px solid var(--line);border-radius:5px;background:var(--panel);box-shadow:0 8px 20px #0006;white-space:normal}
+#control-scope {height:30px;line-height:15px;overflow:auto}
+.agent-execution-controls .control-section-label {flex-basis:100%;height:14px;line-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-execution-controls [data-execution-agent] {min-width:78px}
+@media(max-width:700px) {
+  .session-state {grid-template-columns:minmax(0,1fr);gap:2px}
+  .control-feedback {grid-template-columns:minmax(0,1fr);min-height:46px;gap:2px}
+}

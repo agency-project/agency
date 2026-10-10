@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -268,6 +269,14 @@ class agwebui:
             run_dir = _DEFAULT_LOG_DIR
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        # The collector and the server must agree even when callers use a
+        # custom log_dir. An already-running session owns its output path.
+        profile_dir = (
+            agprof.active_output_dir()
+            or Path(os.environ.get("AGENCY_PROFILE_DIR", run_dir.parent / "profiler"))
+        ).resolve()
+        server_env = {**os.environ, "AGENCY_PROFILE_DIR": str(profile_dir)}
+
         ui = cls(run_dir=run_dir, port=port)
         from .relay import ProfilerRelay
 
@@ -287,6 +296,7 @@ class agwebui:
             ],
             stdout=server_log,
             stderr=server_log,
+            env=server_env,
         )
 
         # Wait up to 10 s for the server to be ready.
@@ -367,7 +377,7 @@ class agwebui:
                     object="agwebui",
                     flush=True,
                 )
-                with agprof.workload():
+                with agprof.workload(out_dir=profile_dir):
                     fn(*args, **kwargs)
             except Exception:
                 execution_status = "failed"

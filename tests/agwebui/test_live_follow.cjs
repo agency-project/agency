@@ -63,7 +63,7 @@ function page(replay=false,view=null) {
       }});
       return el;
     },
-    querySelector:()=>null, querySelectorAll:()=>[...nodes.values()].filter(el=>el.dataset.agentControls), addEventListener:(name,fn)=>{
+    querySelector:()=>null, querySelectorAll:selector=>[...nodes.values()].filter(el=>selector==='[data-agent-controls]'?el.dataset.agentControls:el.controlMenu), addEventListener:(name,fn)=>{
       (listeners[name]??=[]).push(fn);
     }};
   let subscription;const sent=[],confirmations=[];let autoConfirm=true;
@@ -95,15 +95,15 @@ function page(replay=false,view=null) {
     // Isolate follow behavior from chart/inspector markup, retaining the
     // real stream callback, selection handlers and updateTrajectory path.
     var realRenderSession=renderSession,realRenderInspector=renderInspector;
-    render=()=>{};renderRunChrome=()=>{};renderSession=()=>{};
+    render=()=>{};renderRunChrome=()=>renderSystemMetrics();renderSession=()=>{};
     renderInspector=()=>{};catalogOptions=()=>{};updateUrl=()=>{};
     var realReconcile=reconcileActivities;
     reconcileActivities=()=>{lastWindowEnd=state.windowEnd;};
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,moveColumn,revealEvent,renderRoster,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
-      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,
+    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,moveColumn,revealEvent,renderRoster,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
+      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
   `,context);
   const agentButton=(kind,id='a')=>{
@@ -135,6 +135,23 @@ test('trajectory is the default execution view and the inspector starts collapse
   assert.equal(p.ui.state.view,'trajectory');
   assert.equal(p.node('inspector').hidden,true);
   assert.equal(p.node('inspector-toggle').disabled,true);
+});
+test('top system dashboard follows resource-only patches and freezes with the held display',()=>{
+  const p=page(),run=p.ui.state.run;
+  run.duration=1;run.status='running';run.counters={'proc:42-100:rss_mb':[[1,999]],'workload:memory_mb':[[1,100]],'workload:cpu_pct':[[1,200]]};
+  p.transport('connected');p.ui.renderSystemMetrics();
+  const panel=p.node('system-metrics');
+  assert.match(panel.innerHTML,/Live samples/);assert.match(panel.innerHTML,/200 %/);
+  assert.match(panel.innerHTML,/Workload/);assert.doesNotMatch(panel.innerHTML,/999 MB/);
+  p.receive({type:'patch',patches:[{counter_samples:{'workload:memory_mb':[[2,150]]},meta:{duration:2}}]});p.flush();
+  assert.match(panel.innerHTML,/150 MB/);
+  p.ui.pauseDisplay();p.ui.renderSystemMetrics();
+  const held=panel.innerHTML;assert.match(held,/Frozen view/);
+  p.receive({type:'patch',patches:[{counter_samples:{'workload:memory_mb':[[3,250]]},meta:{duration:3}}]});p.flush();
+  p.ui.renderSystemMetrics();assert.equal(panel.innerHTML,held);
+  p.ui.resumeDisplay();assert.match(panel.innerHTML,/250 MB/);
+  p.transport('disconnected');p.ui.renderSystemMetrics();assert.match(panel.innerHTML,/Disconnected/);
+  run.counters={};p.ui.renderSystemMetrics();assert.match(panel.innerHTML,/No usable system samples/);
 });
 test('first-use prompt is removed when agent columns become available',()=>{
   const p=page(),stack=p.node('call-stack'),run=structuredClone(p.ui.state.run);
@@ -832,8 +849,31 @@ test('column controls update from live state while the displayed evidence stays 
   assert.equal(p.ui.state.run.agents[1].status,'running');
   p.agentButton('agent','b').onclick();
   assert.equal(p.sent[0].command,'resume');assert.equal(p.sent[0].agname,'b');
-  p.ui.renderSession();assert.match(group.innerHTML,/data-execution-stop="b"[^>]*disabled/);
-  assert.doesNotMatch(group.innerHTML,/data-execution-kill="b"[^>]*disabled/);
+  p.ui.renderSession();assert.equal(group.querySelector('[data-execution-stop]').disabled,true);
+  assert.equal(group.querySelector('[data-execution-kill]').disabled,false);
+});
+
+test('pause closes control menus and updates controls without replacing their focus targets',()=>{
+  const p=debuggerPage(),group=p.node('column-controls');group.dataset.agentControls='a';
+  p.ui.renderSession();
+  const button=group.querySelector('[data-execution-agent]');button.focus();
+  const menu=p.node('open-control-menu');menu.controlMenu=true;menu.open=true;
+  p.ui.pauseResumeExecution(false,'a');p.ui.renderSession();
+  assert.equal(menu.open,false);assert.equal(button.disabled,true);
+  assert.equal(group.querySelector('[data-execution-agent]'),button);assert.equal(p.document.activeElement,button);
+  p.receive({type:'execution_command_result',id:p.sent[0].id,queued:false,error:'Fixture rejection'});
+  p.ui.state.run.agents[0].status='paused';p.ui.renderSession();
+  assert.equal(button.textContent,'▶ Resume');assert.equal(button.disabled,false);
+  assert.equal(group.querySelector('[data-execution-agent]'),button);
+  assert.equal(p.window.scrollY,0);
+});
+
+test('tandem heading updates keep live agent controls mounted',()=>{
+  const p=debuggerPage();p.ui.renderTandemBoard();
+  const head=p.node('tandem-columns').children[0].querySelector('.col-head');
+  const markup=head.innerHTML,controls=head.querySelector('[data-agent-controls]');
+  p.ui.state.run.agents[0].status='paused';p.ui.renderTandemBoard();
+  assert.equal(head.innerHTML,markup);assert.equal(head.querySelector('[data-agent-controls]'),controls);
 });
 
 test('pending pause blocks duplicate submissions and remains requested until recorded state',()=>{
@@ -999,4 +1039,15 @@ test('frozen confirmation states the live target and partial observed outcomes s
   p.receive(receipt);p.receive({type:'snapshot',run:p.ui.state.liveRun,execution_controls:{...p.ui.state.executionControls}});
   assert.equal(p.ui.state.executionPending,null);assert.match(p.ui.state.executionMessage,/application confirmed/);assert.match(p.ui.state.executionMessage,/connection lost/);
   assert.equal(p.ui.state.displayPaused,true);assert.equal(p.sent.length,1);
+});
+
+
+test('Profiler hides the summary dashboard and trajectory restores it',()=>{
+  const p=page(false,'profiler');
+  p.ui.renderMetricsDashboard();
+  assert.equal(p.node('summary-strip').hidden,true);
+  assert.equal(p.node('metrics').hidden,true);
+  p.ui.state.run=null;p.ui.setView('trajectory');p.ui.renderMetricsDashboard();
+  assert.equal(p.node('summary-strip').hidden,false);
+  assert.equal(p.node('metrics').hidden,false);
 });

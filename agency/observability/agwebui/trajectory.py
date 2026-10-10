@@ -121,6 +121,8 @@ class Trajectory:
             "model": "Recorded in event metadata",
             "harness": "Agency",
             "duration": 0,
+            "execution_started_at": None,
+            "execution_wall_time": 0,
             "status": "unknown",
             "resolved": None,
             "actions": [],
@@ -563,6 +565,18 @@ class Trajectory:
         actor = event.get("actor") or "unattributed"
         event = {**event, "actor": actor}
         payload, kind = event["payload"], event["type"]
+        # UI/program startup includes setup and human input. Start elapsed
+        # agent time only at an observed execution boundary; keep the original
+        # trace origin so earlier resource samples and setup remain aligned.
+        if self.finished_at is None and (
+            kind in {"request_started", "skill_start", "tool_call"}
+            or kind == "agent_state"
+            and payload.get("state") in {"running", "waiting_llm"}
+        ):
+            started = self.run["execution_started_at"]
+            self.run["execution_started_at"] = (
+                event["ts"] if started is None else min(started, event["ts"])
+            )
         if kind == "resource_sample":
             at = max(0, event["ts"] - self.origin)
             for name, value in payload.get("values", {}).items():
@@ -830,11 +844,22 @@ class Trajectory:
                 self.dirty["signals"].add("unfinished")
             if not missing:
                 self._close_signal("unfinished")
+        self._execution_clock()
         return True
+
+    def _execution_clock(self):
+        started = self.run["execution_started_at"]
+        end = (
+            self.finished_at
+            if self.finished_at is not None
+            else (self.origin or 0) + self.run["duration"]
+        )
+        self.run["execution_wall_time"] = 0 if started is None else max(0, end - started)
 
     def tick(self, now, *, force=False):
         if self.finished_at is None and self.origin is not None:
             self.run["duration"] = max(self.run["duration"], now - self.origin)
+        self._execution_clock()
         for action_id in self.running:
             action = self.actions[action_id]
             if action["outcome"] == "running":
@@ -855,7 +880,18 @@ class Trajectory:
                     self._interval(action)
                     self._refresh_episode(action)
 
+    def _metrics(self):
+        from .metrics import ExecutionCounters
+
+        if not hasattr(self, "metrics_counters"):
+            self.metrics_counters = ExecutionCounters()
+            calls = self.actions.values()
+        else:
+            calls = (self.actions[key] for key in self.dirty["actions"])
+        self.run["metrics_totals"] = self.metrics_counters.update(calls)
+
     def patch(self):
+        self._metrics()
         maps = {
             "actions": self.actions,
             "episodes": self.episodes,
@@ -874,8 +910,11 @@ class Trajectory:
         patch["meta"] = {
             key: copy.deepcopy(self.run[key])
             for key in (
+                "metrics_totals",
                 "status",
                 "duration",
+                "execution_started_at",
+                "execution_wall_time",
                 "coverage",
                 "task",
                 "model",
@@ -892,6 +931,7 @@ class Trajectory:
         return patch
 
     def snapshot(self):
+        self._metrics()
         self.run["signals"] = list(self.signals.values())
         return copy.deepcopy(self.run)
 

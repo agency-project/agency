@@ -1,8 +1,9 @@
+import {renderMetricsSummary, profilerView, handleMetricEvent, filterMetrics} from './metrics-ui.js';
 import {agentRoster, reconcilePinnedAgents, pinAgent} from './agent-roster.js';
 import {requestControlConfirmation, refreshControlConfirmation} from './control-confirmation.js';
 import {eventCard, actionState, eventRelationships, eventMeasurements, payloadWindow, payloadValue} from './event-details.js';
 import {ExecutionTimeline} from './execution-timeline.js';
-import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle} from './investigator-model.js';
+import {alignSequences, matchesAction, overlapDuration, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle, systemMeasurements} from './investigator-model.js';
 import {executionControlState, mergeTrajectory, mergeTrajectorySnapshot, boundTrajectory, TrajectoryStream} from './trajectory-stream.js';
 
 const $ = id => document.getElementById(id);
@@ -14,10 +15,14 @@ const sources = {'System instructions':'#b39ee5','Original task':'#70b4ed','Supe
 const views = [
   ['trajectory','Trajectory','What did the agent do?'], ['timeline','Timeline','When did agents and resources overlap?'], ['resources','Resources & waits','Where did the time go?'],
   ['context','Context & information','What did the model know?'], ['agents','Tandem trace board','How did agents work together?'],
-  ['compare','Compare runs','Where did behavior change?']
+  ['compare','Compare runs','Where did behavior change?'],
+  ['profiler','Profiler','Detailed activity, inference, tools and resource measurements']
 ];
 const params = new URLSearchParams(location.search);
-const state = {catalog:[], run:null, comparison:null, view:views.some(v=>v[0]===params.get('view')) ? params.get('view') : 'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, inspectorOpen:false, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
+const profilerCategories={activity:'Activity',llm:'LLM',tools:'Tools',systems:'Systems'};
+const requestedView=params.get('view');
+const initialProfiler=profilerCategories[params.get('profiler')]?params.get('profiler'):profilerCategories[requestedView]?requestedView:'activity';
+const state = {profilerCategory:initialProfiler,catalog:[], run:null, comparison:null, view:profilerCategories[requestedView]?'profiler':views.some(v=>v[0]===requestedView)?requestedView:'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, inspectorOpen:false, expanded:new Set(), model:null, contextBlock:null, zoom:null, loading:false, compareId:null};
 let timelineViewer=null;
 let timelineNavigation={scale:null,left:0,top:0,lock:false};
 const fullPayloads=new WeakMap();
@@ -70,6 +75,23 @@ function timelineView(){return heading('Execution timeline','Agent calls and mea
 function measurementHTML([label,value,unit,note],detailed=false) {
   const formatted=unit==='time'?formatTime(value):unit==='rate'?`${value.toFixed(2)}/s`:unit==='count'?count(value):`${count(value)} ${unit}`;
   return `<div class="metric" title="${esc(note)}"><span class="metric-label">${esc(label)}</span><strong class="metric-value">${esc(formatted)}</strong>${detailed?`<div class="metric-note">${esc(note)}</div>`:''}</div>`;
+}
+function renderSystemMetrics() {
+  const panel=$('system-metrics'),run=state.run;
+  if(!panel)return;
+  if(!run){panel.innerHTML='<div class="system-metrics-heading"><strong>System metrics</strong><span>Waiting for recorded samples…</span></div>';return;}
+  const metrics=systemMeasurements(run),totals=metrics.filter(m=>m.aggregate);
+  const shown=(totals.length?totals:metrics.filter(m=>m.label!=='Virtual memory')).slice(0,8);
+  const mode=state.displayPaused?'Frozen view':state.replay?'Replay samples':run.source==='synthetic'?'Synthetic samples':run.id==='live'&&run.status==='running'?(state.transport==='connected'?'Live samples':'Disconnected · last received samples'):'Recorded samples';
+  const heading=`<div class="system-metrics-heading"><strong>System metrics</strong><span>${esc(mode)}</span><button data-view="timeline">All resource timelines ↗</button></div>`;
+  const cards=shown.map(metric=>{
+    const [at,value]=metric.latest,start=Math.max(0,at-60),points=metric.points.filter(p=>p[0]>=start);
+    const high=Math.max(1,...points.map(p=>p[1])),x=t=>2+(t-start)/(at-start||1)*116,y=v=>30-v/high*26;
+    const line=points.map(p=>`${x(p[0])},${y(p[1])}`).join(' '),last=points.at(-1);
+    const note=`${metric.name} · ${metric.derived?'Rate calculated from counter deltas':'Recorded sample'} at ${formatTime(at)}${metric.label==='CPU'?' · 100% = one CPU core; multiple cores can exceed 100%':''}`;
+    return `<div class="system-metric" title="${esc(note)}"><div class="system-metric-value"><span>${esc(metric.label)}</span><strong>${count(value)} ${metric.unit}</strong></div><svg viewBox="0 0 120 34" role="img" aria-label="${esc(metric.scope+' '+metric.label)} · recent recorded samples"><polyline points="${line}" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="${x(last[0])}" cy="${y(last[1])}" r="2" fill="currentColor"/></svg><small>${esc(metric.scope)} · at ${formatTime(at)}</small></div>`;
+  }).join('');
+  panel.innerHTML=heading+(cards?`<div class="system-metrics-cards">${cards}</div>`:'<p class="system-metrics-empty">No usable system samples recorded yet. Profiling must be enabled to collect CPU, memory, I/O and available GPU counters.</p>');
 }
 function readablePayload(value,limit=4000){
   let text=typeof value==='string'?value:JSON.stringify(value,null,2),json=false;
@@ -263,6 +285,7 @@ function updateUrl() {
   const url = new URL(location.href);
   if (state.run) url.searchParams.set('run',state.run.id);
   url.searchParams.set('view',state.view);
+  if(state.view==='profiler')url.searchParams.set('profiler',state.profilerCategory);else url.searchParams.delete('profiler');
   if(state.replay) url.searchParams.set('mode','replay');else url.searchParams.delete('mode');
   if(state.trajectoryLayout==='overlay') url.searchParams.set('layout','overlay');
   else url.searchParams.delete('layout');
@@ -291,7 +314,7 @@ function render() {
     scroll:[...board.children].map(el=>[el.dataset.tandemAgent,el.querySelector('.col-body').scrollTop])
   }:null;
   timelineViewer?.destroy();timelineViewer=null;
-  $('content').innerHTML=({timeline:timelineView,trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView})[state.view]();
+  $('content').innerHTML=({profiler:detailedProfilerView,timeline:timelineView,trajectory:trajectoryView,resources:resourcesView,context:contextView,agents:agentsView,compare:compareView})[state.view]();
   if(state.view==='timeline'){if(state.displayPaused)timelineNavigation.lock=false;timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id),()=>holdHistory());timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.setSelection?.(state.selected?.run!=='b'&&state.selected?.execution===executionIdentity(run)?state.selected.id:null);timelineViewer.scroll.scrollLeft=timelineNavigation.left;timelineViewer.scroll.scrollTop=timelineNavigation.top||0;timelineViewer.setFrozen(state.displayPaused);}
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes'){reconcileActivities(true);$('agent-roster').open=state.rosterOpen;for(const el of content.querySelectorAll('[data-roster-parent]'))el.open=state.rosterExpanded.includes(el.dataset.rosterParent);}
   if(state.view==='agents'){
@@ -307,6 +330,12 @@ function render() {
   renderInspector();
 }
 
+function renderMetricsDashboard(preferencesOnly=false){
+ const visible=state.view!=='profiler';
+ $('summary-strip').hidden=!visible;
+ $('metrics').hidden=!visible;
+ if(visible&&state.run)renderMetricsSummary($('metrics'),state.run,{preferencesOnly});
+}
 function renderRunChrome() {
   const run=state.run;
   if(!run)return;
@@ -324,10 +353,10 @@ function renderRunChrome() {
   $('run-description').textContent=`${agentCount} recorded actor${agentCount===1?'':'s'} · ${run.actions.length} observed calls · ${run.episodes.length} activities`;
   $('provenance').innerHTML=pill(run.source==='synthetic'?'Recorded example · synthetic':state.replay?'Replay · recorded':run.id==='live'?'Live evidence':'Recorded evidence',run.source);
   $('provenance').title=run.source==='synthetic'?'All timings, context and relationships are synthetic.':'Activity grouping is derived; returned results remain observations.';
-  const measurements=executionMeasurements(run);
-  $('metrics').innerHTML=measurements.primary.map(item=>measurementHTML(run.coverage.client_window&&item[0]==='Calls'?['Retained calls',...item.slice(1)]:item)).join('');
-  $('metrics').hidden=!measurements.primary.length;
-  $('secondary-metrics').innerHTML=measurements.primary.concat(measurements.secondary).map(item=>measurementHTML(item,true)).join('');
+  renderMetricsDashboard();
+  const detailsOpen=$('execution-details').open;
+  const measurements=executionMeasurements(run,{includeResources:!!detailsOpen});
+  if(detailsOpen)$('secondary-metrics').innerHTML=measurements.primary.concat(measurements.secondary).map(item=>measurementHTML(item,true)).join('');
   $('telemetry-coverage').textContent=measurements.coverage+(run.coverage.client_window?' Live view is windowed: page older calls in each column; full evidence remains in recorded review/export.':'');
   $('cursor').max=Math.ceil((state.replayState?.duration??run.duration)*10)/10;
   $('cursor').value=state.cursor;
@@ -474,6 +503,7 @@ function stopExecution(all,force=false,agentId=null) {
   }});
 }
 function sendExecutionCommand(command,all,agentId=null) {
+  closeControlMenus();
   const controls=executionState(agentId),targets=all?controls.active:[controls.target];
   const id=`ui-${Date.now()}-${++commandSequence}`,fence=commandTargetSnapshot();
   if(!state.stream?.sendExecution(command,{id,...fence,targets:targets.map(a=>a.id),...(all?{}:{agname:controls.target.id})})) {
@@ -486,12 +516,16 @@ function sendExecutionCommand(command,all,agentId=null) {
   state.executionPending=pending;state.executionReceiptTargets=[];state.executionOutcomes=[];state.executionMessage='Requested · waiting for backend acceptance and recorded agent state.';renderSession();
   state.lastExecutionCommand={id,execution:pending.execution,relay:pending.relay};
 }
-function agentControlButtons(id) {
+function agentControlState(id) {
   const controls=executionState(id),pending=state.executionPending;
-  const disabled=!controls.agentEnabled,target=esc(id),name=esc(agentName(id,currentExecution()));
+  const disabled=!controls.agentEnabled,target=esc(id),name=agentName(id,currentExecution());
   const own=pending?.agents.includes(id);
   const label=own?(pending.stopping?(pending.force?'Force stop requested':'Stopping…'):(pending.paused?'Pausing…':'Resuming…')):(controls.target?.status==='paused'?'Pause intent recorded':controls.target?.status||'unknown');
-  return `<span class="control-section-label">Agent controls · ${esc(label)}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${controls.agentCommand==='resume'?'Resume':'Pause'} ${name}" title="Pause/resume the harness process; already-issued remote work may continue" ${disabled||pending?'disabled':''}>${controls.agentCommand==='resume'?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" title="Send SIGTERM to ${name}; process exit unconfirmed" ${disabled||pending?'disabled':''}>■ Stop</button><details class="agent-danger-menu"><summary>More</summary><button class="execution-control danger-control" data-execution-kill="${target}" ${disabled||pending?.force?'disabled':''}>Force stop · SIGKILL</button></details><button data-interact="${target}" title="Message this agent or run an explicitly registered task">Interact</button>`;
+  return {target,name,label,resume:controls.agentCommand==='resume',disabled:Boolean(disabled||pending),killDisabled:Boolean(disabled||pending?.force)};
+}
+function agentControlButtons(id) {
+  const {target,name,label,resume,disabled,killDisabled}=agentControlState(id);
+  return `<span class="control-section-label">Agent controls · ${esc(label)}</span><button class="execution-control" data-execution-agent="${target}" aria-label="${resume?'Resume':'Pause'} ${esc(name)}" aria-describedby="control-scope" ${disabled?'disabled':''}>${resume?'▶ Resume':'⏸ Pause'}</button><button class="execution-control" data-execution-stop="${target}" aria-label="Stop ${esc(name)}" ${disabled?'disabled':''}>■ Stop</button><details class="agent-danger-menu"><summary>More</summary><button class="execution-control danger-control" data-execution-kill="${target}" ${killDisabled?'disabled':''}>Force stop · SIGKILL</button></details><button data-interact="${target}">Interact</button>`;
 }
 
 function agentExecutionControls(id) {
@@ -499,18 +533,28 @@ function agentExecutionControls(id) {
 }
 
 function updateAgentControls(group,html) {
-  if(group.innerHTML===html)return;
-  const focused=group.contains(document.activeElement)?document.activeElement:null;
-  const attribute=['executionAgent','executionStop','executionKill','interact'].find(key=>focused?.dataset[key]);
-  const menu=group.querySelector('.agent-danger-menu'),open=menu?.open,summary=focused?.tagName==='SUMMARY';
-  group.innerHTML=html;
-  const replacementMenu=group.querySelector('.agent-danger-menu');if(replacementMenu)replacementMenu.open=Boolean(open);
-  const replacement=summary?replacementMenu?.querySelector('summary'):attribute?group.querySelector(`[data-${attribute.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`):null;
-  if(replacement&&!replacement.disabled)replacement.focus({preventScroll:true});
-  else if(focused){group.tabIndex=-1;group.focus({preventScroll:true});}
+  const layout=html.includes('data-execution-agent=')?'live':'recorded';
+  if(group.controlLayout!==layout){group.innerHTML=html;group.controlLayout=layout;return;}
+  if(layout==='recorded'){group.querySelector('.control-section-label').textContent=`Recorded agent state · ${state.run.agents.find(a=>a.id===group.dataset.agentControls)?.status||'unknown'}`;return;}
+  // Keep the pointer/focus target mounted as pause receipts and telemetry arrive.
+  const {name,label,resume,disabled,killDisabled}=agentControlState(group.dataset.agentControls);
+  group.querySelector('.control-section-label').textContent=`Agent controls · ${label}`;
+  const pause=group.querySelector('[data-execution-agent]');
+  pause.textContent=resume?'▶ Resume':'⏸ Pause';pause.setAttribute('aria-label',`${resume?'Resume':'Pause'} ${name}`);pause.disabled=disabled;
+  group.querySelector('[data-execution-stop]').disabled=disabled;
+  group.querySelector('[data-execution-kill]').disabled=killDisabled;
+}
+function closeControlMenus() {
+  for(const menu of document.querySelectorAll('.execution-menu,.agent-danger-menu,.session-menu')) {
+    if(!menu.open)continue;
+    const focused=menu.contains(document.activeElement);menu.open=false;
+    if(focused)menu.querySelector('summary')?.focus({preventScroll:true});
+  }
 }
 
 function renderSession() {
+  // Scoped systems samples are available in the expandable panel and profiler.
+  $('system-metrics').hidden=true;
   refreshControlConfirmation();
   const run=currentExecution(), replay=state.replay;
   const mode=replay?'Replay':run?.id==='live'?'Live':'Review';
@@ -519,7 +563,7 @@ function renderSession() {
   const paused=run?.agents.filter(a=>a.status==='paused').length||0;
   $('execution-all').hidden=!debuggerState.live;
   $('execution-all').textContent=state.executionPending&&!state.executionPending.stopping?(state.executionPending.paused?'Pausing agents…':'Resuming agents…'):debuggerState.allCommand==='resume_all'?'▶ Resume all active agents':'⏸ Pause all active agents';
-  $('execution-all').title='Targets every active agent in this execution, including hidden columns; harness pause does not cancel already-issued remote work';
+  $('execution-all').setAttribute('aria-describedby','control-scope');
   $('execution-all').disabled=!debuggerState.allEnabled||Boolean(state.executionPending);
   $('all-agent-controls').hidden=!debuggerState.live;
   for(const force of [false,true]) {
@@ -576,6 +620,7 @@ function updateTrajectory(changed,resynced=false) {
       if(focused)$('content').querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
     }
   }
+  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='agents')renderTandemBoard();
   if(state.view==='timeline')timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
   const target=executionState().target;
@@ -607,6 +652,7 @@ function addAgentColumn(id) {
   if(!pinned.changed){$('agent-column-limit').textContent=pinned.reason;return;}
   state.columnsCustomized=true;state.agentColumns=pinned.ids;state.activeColumn=id;
   state.agent='';$('agent-select').value='';
+  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='agents')renderTandemBoard();else renderCallStack();
   scrollAgentColumn(id);
 }
@@ -614,6 +660,7 @@ function addAgentColumn(id) {
 function removeAgentColumn(id) {
   if(!state.agentColumns.includes(id))return;
   state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);if(state.agent===id){state.agent='';$('agent-select').value='';}
+  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='agents')renderTandemBoard();else renderCallStack();
 }
 
@@ -1108,8 +1155,12 @@ function renderTandemBoard() {
     if(host.children[index]!==col)host.insertBefore(col,host.children[index]||null);
     const parent=run.agents.some(a=>a.parent===agent.id),role=parent?'Supervisor':agent.parent?'Worker':'Agent';
     col.classList.toggle('supervisor-column',parent);
-    const header=`<div class="agent"><button data-agent="${esc(agent.id)}">${esc(agent.label)}</button><button data-remove-column="${esc(agent.id)}" ${state.agent||columns.length===1?'disabled':''}>Hide</button></div><div class="meta"><span class="badge ${parent?'sup':'wrk'}">${role}</span><span class="badge">${esc(agent.model||run.model)}</span>${pausedBadge(agent.id)}</div><p class="muted">${agentActivityCounts(agent.id)}${agent.parent?` · parent ${esc(agentName(agent.parent))}`:''}</p>${agentExecutionControls(agent.id)}`;
-    const head=col.querySelector('.col-head');if(head.innerHTML!==header)head.innerHTML=header;
+    const header=`<div class="agent"><button data-agent="${esc(agent.id)}">${esc(agent.label)}</button><button data-remove-column="${esc(agent.id)}" ${state.agent||columns.length===1?'disabled':''}>Hide</button></div><div class="meta"><span class="badge ${parent?'sup':'wrk'}">${role}</span><span class="badge">${esc(agent.model||run.model)}</span>${pausedBadge(agent.id)}</div><p class="muted">${agentActivityCounts(agent.id)}${agent.parent?` · parent ${esc(agentName(agent.parent))}`:''}</p>`;
+    const head=col.querySelector('.col-head');
+    if(!head.controlsMounted){head.innerHTML=`<div class="tandem-agent-heading"></div><div class="agent-execution-controls" data-agent-controls="${esc(agent.id)}" role="group" aria-label="Controls for ${esc(agent.label)}"></div>`;head.controlsMounted=true;}
+    if(head.agentMarkup!==header){head.querySelector('.tandem-agent-heading').innerHTML=header;head.agentMarkup=header;}
+    const controls=head.querySelector('[data-agent-controls]');controls.hidden=!executionState(agent.id).live;
+    if(!controls.hidden)updateAgentControls(controls,agentControlButtons(agent.id));
     const body=col.querySelector('.col-body'),actions=visibleActions(run).filter(a=>a.agent===agent.id),map=new Map(actions.map(a=>[a.id,a])),ids=new Set(map.keys());
     const episodes=run.episodes.filter(e=>e.agent===agent.id&&e.actions.some(id=>ids.has(id))).slice().reverse();
     const old=new Map([...body.children].map(el=>[el.dataset.tandemEpisode,el]));
@@ -1424,7 +1475,11 @@ function selectAction(id, comparison=false, intervalId=null) {
   render();
 }
 
+function detailedProfilerView(){return `<nav class="prof-tabs prof-detail-tabs" role="tablist" aria-label="Detailed profiler categories">${Object.entries(profilerCategories).map(([key,label])=>`<button role="tab" aria-selected="${state.profilerCategory===key}" data-profiler-category="${key}">${label}</button>`).join('')}</nav><section role="tabpanel" aria-label="${profilerCategories[state.profilerCategory]} profiler">${profilerView(state.run,profilerCategories[state.profilerCategory])}</section>`;}
+document.addEventListener('click',event=>{const tab=event.target.closest('[data-profiler-category]');if(tab)setView(tab.dataset.profilerCategory);});
+
 function setView(view) {
+  if(profilerCategories[view]){state.profilerCategory=view;view='profiler';}
   if(!views.some(v=>v[0]===view))return;
   // Only explicit "Open B" navigation changes execution. A view switch keeps
   // the selected execution and any comparison evidence in the inspector.
@@ -1513,6 +1568,7 @@ function followLatest() {
   if(state.run)state.cursor=state.replayState?.clock??state.run.duration;
   renderRunChrome();
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes')reconcileActivities();
+  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='agents')renderTandemBoard();
   if(state.view==='timeline'){timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);timelineViewer?.latest();}
 }
@@ -1599,4 +1655,14 @@ $('replay-step').onclick=()=>state.stream?.sendReplay('step');
 $('replay-speed').onchange=()=>{if(state.replayState?.playing)state.stream?.sendReplay('play',{speed:Number($('replay-speed').value)});};
 $('follow-live').onclick=()=>{followLatest();$('call-stack')?.firstElementChild?.scrollIntoView({block:'start'});};
 $('reconnect-updates').onclick=()=>state.stream?.reconnect();
+// Transient control menus close after acting, clicking elsewhere, or Escape.
+document.addEventListener('click',event=>{
+  for(const menu of document.querySelectorAll('.execution-menu,.agent-danger-menu,.session-menu'))if(!menu.contains(event.target))menu.open=false;
+});
+document.addEventListener('keydown',event=>{if(event.key==='Escape')closeControlMenus();});
 refresh();
+
+document.addEventListener('click',event=>handleMetricEvent(event,{render:()=>{if(state.view==='profiler')$('content').innerHTML=detailedProfilerView();else renderMetricsDashboard(true);},navigate:setView,reveal:id=>{selectAction(id);revealEvent('trajectory');}}));
+document.addEventListener('change',event=>{if(event.target.id==='prof-filter'){filterMetrics(event.target.value);render();}});
+
+document.addEventListener('toggle',event=>{if(event.target.id==='execution-details'&&event.target.open)renderRunChrome();},true);

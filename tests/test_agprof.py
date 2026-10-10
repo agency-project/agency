@@ -1375,6 +1375,36 @@ def test_workload_scope_stops_session_when_workload_raises(monkeypatch):
     assert events == ["start", "workload", "stop"]
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_workload_uses_supplied_output_directory_unless_environment_overrides(
+    monkeypatch, tmp_path, override
+):
+    starts = []
+    destination = tmp_path / "run" / "profiler"
+    configured = str(tmp_path / "configured-profiler")
+    monkeypatch.setenv("AGENCY_PROFILE", "1")
+    monkeypatch.setenv("AGENCY_PROFILE_SCOPE", "workload")
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    if override:
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", configured)
+    monkeypatch.setattr(agprof, "enabled", lambda: False)
+    monkeypatch.setattr(agprof, "start", lambda out_dir: starts.append(out_dir))
+    monkeypatch.setattr(agprof, "stop", lambda: None)
+
+    with agprof.workload(out_dir=destination):
+        pass
+
+    assert starts == [configured if override else destination]
+
+
+def test_active_output_directory_belongs_only_to_active_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_out_dir", tmp_path)
+    monkeypatch.setattr(agprof, "_session", None)
+    assert agprof.active_output_dir() is None
+    monkeypatch.setattr(agprof, "_session", object())
+    assert agprof.active_output_dir() == tmp_path
+
+
 @pytest.mark.parametrize(
     ("profile_value", "scope"),
     [
@@ -1576,13 +1606,26 @@ def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
     agprof._maybe_autostart()
 
 
-def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
+@pytest.mark.parametrize("destination", ["custom_run", "environment", "active_session"])
+def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path, destination):
     import agency.observability.agwebui as agwebui_module
 
     events = []
+    run_dir = tmp_path / "custom-run" / "logs"
+    expected_profile_dir = run_dir.parent / "profiler"
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    active_dir = None
+    if destination == "environment":
+        expected_profile_dir = tmp_path / "configured-profiler"
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", str(expected_profile_dir))
+    elif destination == "active_session":
+        expected_profile_dir = active_dir = tmp_path / "active-profiler"
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", str(tmp_path / "unused-profiler"))
+    monkeypatch.setattr(agprof, "active_output_dir", lambda: active_dir)
 
     @contextmanager
-    def workload():
+    def workload(*, out_dir):
+        assert out_dir == expected_profile_dir
         events.append("profile-start")
         try:
             yield
@@ -1613,7 +1656,12 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
             return 1
 
     monkeypatch.setattr(agwebui_module.agprof, "workload", workload)
-    monkeypatch.setattr(agwebui_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    def start_server(*args, **kwargs):
+        assert kwargs["env"]["AGENCY_PROFILE_DIR"] == str(expected_profile_dir)
+        return FakeProcess()
+
+    monkeypatch.setattr(agwebui_module.subprocess, "Popen", start_server)
     monkeypatch.setattr(agwebui_module.urllib.request, "urlopen", lambda *args, **kwargs: None)
     monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
     monkeypatch.setattr(agwebui_module.atexit, "register", lambda fn: None)
@@ -1621,7 +1669,7 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     def fn():
         events.append("workload")
 
-    agwebui_module.agwebui.run(fn, run_dir=tmp_path, port=17860, linger=False)
+    agwebui_module.agwebui.run(fn, run_dir=run_dir, port=17860, linger=False)
 
     assert events[:3] == ["profile-start", "workload", "profile-stop"]
 

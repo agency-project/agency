@@ -796,6 +796,11 @@ def enabled() -> bool:
     return _session is not None
 
 
+def active_output_dir() -> "Path | None":
+    """On-disk destination owned by the active session, if any."""
+    return _out_dir if enabled() else None
+
+
 def span(name: str, *, parent_context=None):
     """A timed, named interval in the current execution context. No-op
     unless a session is active; nesting produces parent/child spans, and
@@ -3404,20 +3409,24 @@ def _env_out_dir() -> str:
 
 
 @contextmanager
-def workload():
+def workload(*, out_dir=None):
     """Profile a workload boundary when environment profiling requests it.
 
     The context owns a session only for ``AGENCY_PROFILE_SCOPE=workload`` (the
     default) and only when no explicit session is already active. This keeps
     callers free of scope conditionals and prevents the context from stopping
-    a session it did not start. A failed start() degrades to running
+    a session it did not start. *out_dir* supplies a default destination for
+    callers with custom run directories; AGENCY_PROFILE_DIR takes precedence.
+    A failed start() degrades to running
     unprofiled rather than blocking the actual work.
     """
     owns_session = False
     prof = _profiler
     if _env_enabled() and profile_scope() == "workload" and not enabled():
         try:
-            prof = start(_env_out_dir())
+            prof = start(
+                _env_out_dir() if out_dir is None else os.environ.get("AGENCY_PROFILE_DIR", out_dir)
+            )
             owns_session = True
         except RuntimeError as exc:
             _agprof_print(

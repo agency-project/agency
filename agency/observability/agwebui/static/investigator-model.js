@@ -80,9 +80,66 @@ export function readableExecutionTitle(run) {
   return (generic&&task?task:title)||task||'Execution';
 }
 
+// Live events contain cumulative CPU/I/O counters; saved traces contain rates.
+// Keep their recorded scope rather than adding overlapping workload/PID totals.
+const systemMeasurementCache=new WeakMap(),latestMeasurementCache=new WeakMap();
+export function systemMeasurements(run,{latestOnly=false}={}) {
+  const counters=run.counters||{},metrics=[];
+  // Resource samples are append/insert-only in the trajectory stream. Reuse
+  // the projection between renders of the same recording/window.
+  const future=Object.values(counters).some(v=>Array.isArray(v)&&v.at(-1)?.[0]>run.duration);
+  const window=Number.isFinite(run.duration)?(latestOnly&&!future?'all':run.duration):'all';
+  const signature=JSON.stringify([window,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
+  const cache=latestOnly?latestMeasurementCache:systemMeasurementCache;
+  const cached=cache.get(run);
+  if(cached?.counters===counters&&cached.signature===signature)return cached.metrics;
+  for(const [name,samples] of Object.entries(counters)) {
+    if(!Array.isArray(samples))continue;
+    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
+    if(!match)continue;
+    const kind=match[1],prefix=name.slice(0,name.length-kind.length);
+    const cpu=/^cpu/.test(kind),rawCPU=/^cpu_(us|s)$/.test(kind);
+    if(rawCPU&&Array.isArray(counters[prefix+'cpu_pct'])&&counters[prefix+'cpu_pct'].some(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&(!Number.isFinite(run.duration)||p[0]<=run.duration)))continue;
+    const bytes=['io_r','io_w','net_rx','net_tx'].includes(kind);
+    const label=cpu?'CPU':kind==='rss_mb'?'RSS':/^(memory|mem)_mb$/.test(kind)?'RAM':kind==='vms_mb'?'Virtual memory':kind==='util_pct'?'GPU':kind==='power_w'?'Power':kind==='power_w_est'?'Power estimate':/^(io_r|io_read|io read)/.test(kind)?'Disk read':/^(io_w|io_write|io write)/.test(kind)?'Disk write':/^net_(rx|receive)|^net rx/.test(kind)?'Network RX':'Network TX';
+    const unit=cpu||kind==='util_pct'?'%':kind.startsWith('power')?'W':/(_mb|MB)$/.test(kind)?'MB':'MB/s';
+    const usable=p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&p[0]>=0&&(!Number.isFinite(run.duration)||p[0]<=run.duration);
+    let source;
+    if(latestOnly){
+      // Live counter arrays are sorted by timestamp. Summary cards need only
+      // the latest gauge or the most recent valid counter delta, not history.
+      source=[];
+      for(let i=samples.length-1;i>=0;i--){
+        const point=samples[i];if(!usable(point))continue;
+        if(!(rawCPU||bytes)){source=[point];break;}
+        const next=source[0];
+        if(next&&next[0]>point[0]&&next[1]>=point[1]){source.unshift(point);break;}
+        source=[point];
+      }
+    }else source=samples.filter(usable).sort((a,b)=>a[0]-b[0]);
+    const points=[];
+    let previous=null;
+    for(const point of source) {
+      if(rawCPU||bytes) {
+        if(previous&&point[0]>previous[0]&&point[1]>=previous[1])points.push([point[0],(point[1]-previous[1])/(point[0]-previous[0])*(rawCPU?(kind==='cpu_us'?0.0001:100):1/2**20)]);
+        previous=point;
+      }else points.push(point);
+    }
+    if(!points.length)continue;
+    const parts=name.split(':');
+    const workload=/^workload(?:_total)?[: ]/.test(name),host=/^(host|system):/.test(name);
+    const device=/^gpu\d+:/.test(name)&&parts.length===2;
+    const process=/^(proc|process):/.test(name),sandbox=/^(cg|sandbox):/.test(name);
+    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:parts.length>2&&/^gpu\d+$/.test(parts[0])?`${parts[0]} · ${parts[1]}`:'Recorded scope';
+    metrics.push({name,label:/^gpu\d+:/.test(name)&&kind==='mem_mb'?'VRAM':label,unit,scope,aggregate:workload||host||device,points,latest:points.at(-1),derived:rawCPU||bytes});
+  }
+  cache.set(run,{counters,signature,metrics});
+  return metrics;
+}
+
 // A value is displayed only when its observation exists. Zero remains valid
 // reported usage; absent usage and empty resource series are not zero samples.
-export function executionMeasurements(run) {
+export function executionMeasurements(run,{includeResources=true}={}) {
   const actions=run.actions||[],agents=(run.agents||[]).filter(a=>a.id!=='workflow');
   const models=actions.filter(a=>a.kind==='model');
   const input=models.filter(a=>Number.isFinite(a.tokens)),output=models.filter(a=>Number.isFinite(a.output_tokens));
@@ -102,10 +159,11 @@ export function executionMeasurements(run) {
   if(output.length&&run.duration>0)secondary.push(['Output rate',sum(output,'output_tokens')/run.duration,'rate',`Run average · reported output / wall time (${output.length}/${models.length} calls)`]);
   const knownStates=agents.filter(a=>a.status&&a.status!=='unknown');
   if(knownStates.length===agents.length&&agents.length)secondary.push(['Active agents',agents.filter(a=>['running','running_skill','running_tool','waiting_llm','executing','busy'].includes(a.status)).length,'count','Recorded states; paused agents excluded']);
-  const samples=Object.entries(run.counters||{}).map(([name,points])=>[name,points.filter(p=>Number.isFinite(p[0])&&Number.isFinite(p[1])).at(-1)]).filter(([,point])=>point);
-  for(const [label,pattern,unit] of [['CPU',/workload.*cpu_pct|cpu.*%/i,'%'],['RAM',/workload.*memory|memory_mb|rss_mb/i,'MB'],['GPU',/^gpu\d+:util_pct/i,'%'],['VRAM',/^gpu\d+:mem_mb/i,'MB']]) {
-    const metric=samples.find(([name])=>pattern.test(name));
-    if(metric)secondary.push([label,metric[1][1],unit,`${metric[0]} · sample at ${metric[1][0]}s`]);
+  const samples=Object.values(run.counters||{}).filter(points=>Array.isArray(points)&&points.some(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])));
+  const resourcesMeasured=includeResources?systemMeasurements(run,{latestOnly:true}):[];
+  for(const label of ['CPU','RAM','GPU','VRAM']) {
+    const metric=resourcesMeasured.find(m=>m.label===label&&m.aggregate)||resourcesMeasured.find(m=>m.label===label);
+    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s`]);
   }
   const usage=models.length?`Usage reported for ${input.length}/${models.length} input and ${output.length}/${models.length} output calls.`:'No model calls recorded.';
   const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';

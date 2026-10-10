@@ -2,7 +2,39 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/investigator-model.js', import.meta.url),'utf8');
-const {alignSequences, overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {alignSequences, overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements, systemMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('live cumulative CPU and disk counters become rates without double-counting recorded CPU percentages',()=>{
+  const metrics=systemMeasurements({duration:2,counters:{
+    'workload:cpu_us':[[0,1000000],[2,5000000]],
+    'workload:io_r':[[0,100],[2,4194404]],
+    'proc:42-100:cpu_s':[[0,1],[2,2]],
+    'proc:42-100:cpu_pct':[[2,50]],
+  }});
+  assert.equal(metrics.find(m=>m.name==='workload:cpu_us').latest[1],200);
+  assert.equal(metrics.find(m=>m.name==='workload:io_r').latest[1],2);
+  assert.equal(metrics.filter(m=>m.scope==='Process 42-100').length,1);
+  assert.equal(metrics.find(m=>m.scope==='Process 42-100').aggregate,false);
+});
+test('rates reject counter resets, missing baselines, bad points and future replay samples',()=>{
+  const counters={'workload:cpu_us':[[3,4000000],[0,1000000],[1,0],[2,1000000],[4,9000000],[null,1],[1,null]],'workload:io_r':[[2,100]],'broken':null};
+  const before=structuredClone(counters),metrics=systemMeasurements({duration:3,counters});
+  assert.deepEqual(metrics[0].points,[[2,100],[3,300]]);
+  assert.equal(metrics.length,1);
+  assert.deepEqual(counters,before);
+});
+test('saved rates and GPU gauges retain recorded units and scopes',()=>{
+  const metrics=systemMeasurements({counters:{
+    'workload_total cpu %':[[1,0]],'workload_total memory_mb':[[1,512]],
+    'workload_total io read MB/s':[[1,4]],'sandbox:worker:cpu_pct':[[1,175]],
+    'gpu0:mem_mb':[[1,1024]],'gpu1:util_pct':[[1,20]],'gpu0:worker:power_w_est':[[1,12]],
+  }});
+  assert.deepEqual(metrics.filter(m=>m.aggregate).map(m=>[m.label,m.unit,m.scope]),[
+    ['CPU','%','Workload'],['RAM','MB','Workload'],['Disk read','MB/s','Workload'],['VRAM','MB','gpu0'],['GPU','%','gpu1'],
+  ]);
+  assert.equal(metrics.find(m=>m.name==='sandbox:worker:cpu_pct').scope,'Sandbox worker');
+  assert.equal(metrics.find(m=>m.label==='Power estimate').aggregate,false);
+});
 
 test('history order depends on starts and stable IDs, never completion duration',()=>{
   const calls=[{id:'slow',agent:'a',start:0,duration:50,outcome:'running'},
@@ -85,4 +117,27 @@ test('instant events reserve their visible width without losing actions',()=>{
   const actions=[{id:'one',start:0,duration:0},{id:'two',start:0,duration:0},{id:'three',start:1,duration:0}];
   assert.deepEqual(packActionTracks(actions,1).map(track=>track.map(a=>a.id)),[['one','three'],['two']]);
   assert.deepEqual(packActionTracks([]),[]);
+});
+
+
+test('summary resource projection reads latest samples without scanning history',()=>{
+  let reads=0;
+  const samples=new Proxy(Array.from({length:10000},(_,i)=>[i,i]),{get(target,key,receiver){if(/^\d+$/.test(String(key)))reads++;return Reflect.get(target,key,receiver);}});
+  const run={duration:10000,counters:{'workload:memory_mb':samples,'workload:cpu_us':[[0,0],[2,2000000],[4,3000000]]}};
+  const latest=systemMeasurements(run,{latestOnly:true});
+  assert.equal(latest.find(m=>m.label==='RAM').latest[1],9999);
+  assert.equal(latest.find(m=>m.label==='CPU').latest[1],50);
+  assert(reads<20,`read ${reads} historical samples for a summary`);
+  run.duration++;
+  assert.equal(systemMeasurements(run,{latestOnly:true}),latest);
+});
+test('summary resources respect held time, appended samples and counter resets',()=>{
+  const run={duration:2,counters:{'workload:cpu_us':[[0,0],[2,2000000],[4,3000000]],'workload:memory_mb':[[0,10],[2,20],[4,30]]}};
+  assert.deepEqual(systemMeasurements(run,{latestOnly:true}).map(m=>m.latest),[[2,100],[2,20]]);
+  run.duration=4;
+  assert.deepEqual(systemMeasurements(run,{latestOnly:true}).map(m=>m.latest),[[4,50],[4,30]]);
+  run.counters['workload:cpu_us'].push([5,0]);run.duration=5;
+  assert.deepEqual(systemMeasurements(run,{latestOnly:true}).find(m=>m.label==='CPU').latest,[4,50]);
+  run.counters['workload:cpu_us'].push([6,1000000]);run.duration=6;
+  assert.deepEqual(systemMeasurements(run,{latestOnly:true}).find(m=>m.label==='CPU').latest,[6,100]);
 });
