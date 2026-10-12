@@ -16,6 +16,20 @@ export function eventTimeRange(action, clock) {
   return {start: action.start, end: action.start + action.duration};
 }
 
+// The selected wall-clock end is drawn over the trace, never applied to it:
+// calls after the boundary stay visible. Positions come from the backend.
+export function measurementMarkers(run, extent) {
+  const m = run?.measurement;
+  if (!m) return [];
+  const mark = (offset, kind, label) => Number.isFinite(offset) && offset >= 0
+    ? [{kind, at: Math.min(offset, extent), label: `${label} · ${seconds(offset)}${offset > extent ? ' · beyond the trace' : ''}`}] : [];
+  const manual = m.policy === 'manual';
+  return [
+    ...(manual && m.automatic_end_offset !== m.end_offset ? mark(m.automatic_end_offset, 'superseded', 'Automatic end · not selected') : []),
+    ...mark(m.end_offset, manual ? 'manual' : 'automatic', `Wall clock end · ${manual ? 'manual' : 'automatic'}`),
+  ];
+}
+
 export class ExecutionTimeline {
   constructor(host, navigation, select, onHistory=()=>{}) {
     this.host=host; this.nav=navigation; this.select=select;this.onHistory=onHistory;this.restoreNavigation=true;
@@ -78,7 +92,16 @@ export class ExecutionTimeline {
     const step=10**Math.floor(Math.log10(100/scale)),tickStep=[1,2,5,10].map(n=>n*step).find(n=>n*scale>=80)||step*10;
     let ticks='<span class="timeline-track-label">WALL-CLOCK TIME</span>';
     for(let t=Math.ceil(from/tickStep)*tickStep;t<=Math.min(to,this.extent);t+=tickStep)ticks+=`<span class="timeline-tick" style="left:${left+t*scale}px">${seconds(t)}</span>`;
+    const markers=measurementMarkers(run,this.extent);
+    for(const marker of markers)ticks+=`<span class="timeline-measure-flag ${marker.kind}" style="left:${left+marker.at*scale}px" title="${escape(marker.label)}">${escape(marker.label)}</span>`;
     if(axis.innerHTML!==ticks)axis.innerHTML=ticks;
+    this.markers ||= new Map();
+    for(const [kind,line] of this.markers)if(!markers.some(marker=>marker.kind===kind)){line.remove();this.markers.delete(kind);}
+    for(const marker of markers){
+      let line=this.markers.get(marker.kind);
+      if(!line){line=document.createElement('div');line.className=`timeline-measure-line ${marker.kind}`;line.setAttribute?.('aria-hidden','true');this.markers.set(marker.kind,line);this.canvas.append(line);}
+      line.style.left=`${left+marker.at*scale}px`;
+    }
     const agents=new Map();for(const a of this.actions||[]){if(this.agentFilter&&a.agent!==this.agentFilter)continue;if(!agents.has(a.agent))agents.set(a.agent,[]);agents.get(a.agent).push(a);}
     for(const agent of run.agents)if((!this.agentFilter||this.agentFilter===agent.id)&&!agents.has(agent.id)&&agent.id!=='workflow')agents.set(agent.id,[]);
     const rows=[];let omittedTiming=0;

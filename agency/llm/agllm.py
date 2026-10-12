@@ -42,6 +42,18 @@ _VLLM_EXTRA_GEN_FIELDS = frozenset(
 )
 
 
+_WARNED_ONCE: "set[tuple]" = set()
+
+
+def _warn_once(key: tuple, message: str) -> None:
+    """A harness that keeps the offending message in its history would
+    otherwise repeat the warning on every call of an agent loop; one per
+    process per distinct cause is enough. Same as anthropic.py's."""
+    if key not in _WARNED_ONCE:
+        _WARNED_ONCE.add(key)
+        print(f"[agllm] WARNING: {message}")
+
+
 # ---------------------------------------------------------------------------
 # agllm class -- one instance per agconfig, built via agllm.for_config().
 # The per-provider backend (config holding, client building, capability
@@ -335,12 +347,13 @@ class agllm:
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 if not text:
                     continue
-                print(
-                    f"[agllm] WARNING: harness emitted a second system-class "
+                _warn_once(
+                    ("second_system_class", role),
+                    f"harness emitted a second system-class "
                     f'(role:"{role}") message -- sending it as a `user` message '
                     "at its original position instead, since not every "
                     "OpenAI-compatible server's chat template tolerates more "
-                    "than one"
+                    "than one",
                 )
                 wire_msg = {"role": "user", "content": text}
             else:

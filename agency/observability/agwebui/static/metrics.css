@@ -43,3 +43,56 @@
 .metric-pin-picker p{font-size:12px;color:var(--muted,#91a0b0)}
 .metric-pin-slots{display:grid;gap:8px;margin:16px 0}
 .metric-pin-slots button{text-align:left;padding:10px 12px}
+
+/* Wall-clock measurement menu: reversible, measurement-only, never an agent control. */
+.measure-menu{position:absolute;right:22px;top:2px;font-size:11px;color:var(--muted,#91a0b0)}
+.measure-menu[hidden]{display:none}
+.measure-menu summary{cursor:pointer;list-style:none;padding:0 5px;border-radius:4px;line-height:16px}
+.measure-menu summary::-webkit-details-marker{display:none}
+.measure-menu summary:hover,.measure-menu[open] summary{color:var(--text,#e5edf5);background:var(--line,#293542)}
+.measure-menu>div{position:absolute;z-index:10;left:0;top:calc(100% + 4px);width:230px;max-width:calc(100vw - 40px);padding:12px;background:var(--panel,#111a24);border:1px solid var(--line,#293542);border-radius:5px;box-shadow:0 8px 20px #0006;display:grid;gap:8px}
+.measure-menu p{margin:0;line-height:1.4}
+.measure-menu button{text-align:left}
+.measure-menu [hidden]{display:none}
+.measure-end-at{display:flex;align-items:center;gap:5px}
+.measure-end-at input{width:70px;min-width:0}
+.measure-status{color:var(--text,#e5edf5)}
+.measure-message:empty{display:none}
+.measure-message{color:#e8a65c}
+.prof-metric[data-metric-card="wall"] .prof-value small{padding-right:34px}
+/* Open toward the page centre whichever column the card is pinned in. */
+.prof-summary .prof-metric:nth-child(n+4) .measure-menu>div{left:auto;right:0}
+@media(max-width:1100px){.prof-summary .prof-metric:nth-child(n+4) .measure-menu>div{left:0;right:auto}.prof-summary .prof-metric:nth-child(3n) .measure-menu>div{left:auto;right:0}}
+@media(max-width:650px){.prof-summary .prof-metric:nth-child(3n) .measure-menu>div{left:0;right:auto}.prof-summary .prof-metric:nth-child(2n) .measure-menu>div{left:auto;right:0}}
+.timeline-measure-line{position:absolute;top:0;bottom:0;width:0;z-index:2;pointer-events:none;border-left:2px solid #83c5d5}
+.timeline-measure-line.manual{border-left-color:#e8a65c}
+.timeline-measure-line.superseded{border-left:1px dashed var(--muted,#91a0b0)}
+.timeline-measure-flag{position:absolute;top:24px;transform:translateX(-100%);font:9px var(--mono,monospace);white-space:nowrap;padding:0 4px;border-right:2px solid #83c5d5;color:#83c5d5}
+.timeline-measure-flag.manual{border-right-color:#e8a65c;color:#e8a65c}
+.timeline-measure-flag.superseded{border-right:1px dashed var(--muted,#91a0b0);color:var(--muted,#91a0b0);top:2px}
+
+/* Agent scope selector: one compact multi-select beside the summary cards. */
+.prof-summary-actions{display:flex;flex-direction:column;gap:6px;min-width:0;width:132px}
+.prof-summary-actions>button{flex:1}
+.metric-scope{position:relative;font-size:11px}
+.metric-scope summary{cursor:pointer;list-style:none;padding:5px 8px;border:1px solid var(--line,#293542);border-radius:5px;background:var(--panel,#111a24)}
+.metric-scope summary::-webkit-details-marker{display:none}
+.metric-scope summary small{display:block;text-transform:uppercase;font-size:9px;letter-spacing:.05em;color:var(--muted,#91a0b0)}
+.metric-scope-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.metric-scope-label::after{content:" ▾";color:var(--muted,#91a0b0)}
+.metric-scope[data-scoped=true] summary{border-color:#83c5d5}
+.metric-scope[data-scoped=true] .metric-scope-label{color:#83c5d5}
+.metric-scope-menu{position:absolute;z-index:11;right:0;top:calc(100% + 4px);width:240px;max-width:calc(100vw - 40px);max-height:min(320px,60dvh);overflow:auto;padding:8px;background:var(--panel,#111a24);border:1px solid var(--line,#293542);border-radius:5px;box-shadow:0 8px 20px #0006}
+.metric-scope-menu label{display:flex;align-items:center;gap:7px;padding:4px 2px;cursor:pointer;min-width:0}
+.metric-scope-menu label span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.metric-scope-menu label small{color:var(--muted,#91a0b0);white-space:nowrap}
+.metric-scope-agents{border-top:1px solid var(--line,#293542);margin-top:4px;padding-top:4px}
+.metric-scope-menu p{margin:6px 2px 0;font-size:10px;line-height:1.4;color:var(--muted,#91a0b0)}
+/* No agents selected: a deliberate empty state in place of the cards, sized like them so the page does not jump. */
+.prof-scope-empty{grid-column:1/-2;box-sizing:border-box;min-height:94px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:10px 14px;border:1px dashed var(--line,#293542);border-radius:5px;font-size:12px;color:var(--muted,#91a0b0)}
+.prof-scope-empty strong{color:var(--text,#e5edf5);font-weight:600}
+.prof-scope-empty span{flex:1;min-width:200px;line-height:1.45}
+.prof-scope-empty-note{grid-column:1/-1;margin:0;font-size:12px;color:var(--muted,#91a0b0)}
+/* Cards that keep their execution-wide meaning while an agent scope is active. */
+.prof-metric[data-unscoped=true]{border-style:dashed}
+@media(max-width:650px){.prof-scope-empty{grid-column:1/-1}.prof-summary-actions{width:auto;grid-column:1/-1;flex-direction:row}.metric-scope{flex:1}.metric-scope-menu{left:0;right:auto}}

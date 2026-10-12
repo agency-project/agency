@@ -126,3 +126,29 @@ test('late counter samples preserve series identity and temporal ordering',()=>{
   assert.equal(run.counters.cpu,points);
   assert.deepEqual(points,[[1,10],[2,20],[3,30]]);
 });
+
+test('measurement commands use their own path, stay out of replay and keep the recovery cursor',()=>{
+  const previousSocket=globalThis.WebSocket,previousLocation=globalThis.location;
+  const sockets=[];
+  class Socket {static OPEN=1;readyState=1;constructor(){this.sent=[];sockets.push(this);}close(){}send(value){this.sent.push(JSON.parse(value));}}
+  globalThis.WebSocket=Socket;globalThis.location={protocol:'http:',host:'localhost'};
+  const received=[];
+  const live=new TrajectoryStream({runId:'live',replay:false,onMessage:m=>received.push(m),onTransport:()=>{}});
+  const replay=new TrajectoryStream({runId:'live',replay:true,onMessage:()=>{},onTransport:()=>{}});
+  const saved=new TrajectoryStream({runId:'saved',replay:false,onMessage:()=>{},onTransport:()=>{}});
+  try {
+    sockets[0].onmessage({data:JSON.stringify({type:'snapshot',cursor:7,epoch:'one',run:{}})});
+    assert.equal(live.sendMeasurement('end',{id:'m1',elapsed:20}),true);
+    assert.deepEqual(sockets[0].sent[0],{type:'measurement_command',command:'end',id:'m1',elapsed:20});
+    assert.equal(live.sendMeasurement('hold',{id:'m2'}),true);assert.equal(live.sendMeasurement('reset',{id:'m3'}),true);
+    // Agent controls and measurement controls cannot be confused for one another.
+    for(const command of ['stop','kill_all','pause','end-at',''])assert.equal(live.sendMeasurement(command,{id:'x'}),false);
+    assert.equal(live.sendExecution('end',{id:'x'}),false);
+    assert.equal(sockets[0].sent.every(message=>message.type==='measurement_command'),true);assert.equal(sockets[0].sent.length,3);
+    sockets[0].onmessage({data:JSON.stringify({type:'measurement_command_result',id:'m1',recorded:true})});
+    assert.equal(live.cursor,7);assert.equal(live.epoch,'one');assert.equal(received.at(-1).type,'measurement_command_result');
+    assert.equal(replay.sendMeasurement('end',{id:'m4'}),false);assert.equal(saved.sendMeasurement('end',{id:'m5'}),false);
+    assert.equal(sockets[1].sent.length+sockets[2].sent.length,0);
+    sockets[0].readyState=3;assert.equal(live.sendMeasurement('end',{id:'m6'}),false);
+  } finally {live.close();replay.close();saved.close();globalThis.WebSocket=previousSocket;globalThis.location=previousLocation;}
+});

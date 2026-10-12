@@ -1,28 +1,4 @@
-// Shared, deterministic projections used by all six views.
-export function alignSequences(left, right, key = item => item.kind) {
-  const grid = Array.from({length: left.length + 1}, () => new Uint16Array(right.length + 1));
-  for (let i = left.length - 1; i >= 0; i--) {
-    for (let j = right.length - 1; j >= 0; j--) {
-      grid[i][j] = key(left[i]) === key(right[j]) ? 1 + grid[i + 1][j + 1] : Math.max(grid[i + 1][j], grid[i][j + 1]);
-    }
-  }
-  const rows = [];
-  let i = 0, j = 0, diverged = false;
-  while (i < left.length || j < right.length) {
-    if (i < left.length && j < right.length && key(left[i]) === key(right[j])) {
-      rows.push({left: left[i++], right: right[j++], match: true, reconverged: diverged});
-      diverged = false;
-    } else if (i < left.length && (j >= right.length || grid[i + 1][j] >= grid[i][j + 1])) {
-      rows.push({left: left[i++], right: null, match: false});
-      diverged = true;
-    } else {
-      rows.push({left: null, right: right[j++], match: false});
-      diverged = true;
-    }
-  }
-  return rows;
-}
-
+// Shared, deterministic projections used by every view.
 export function matchesAction(action, agent, query) {
   if (agent && action.agent !== agent) return false;
   return !query || `${action.name} ${action.intent} ${action.command} ${action.result} ${(action.files || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
@@ -184,6 +160,25 @@ export function executionMeasurements(run,{includeResources=true}={}) {
   const usage=models.length?`Usage reported for ${input.length}/${models.length} input and ${output.length}/${models.length} output calls.`:'No model calls recorded.';
   const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';
   return {primary,secondary,coverage:`${usage} ${resources}`};
+}
+
+// Reported usage summed over one agent's model calls: input (prompt) plus
+// output (completion) tokens. Execution-wide per-agent counters are preferred
+// because a live view retains only a bounded window of calls.
+export function agentTokens(run,id) {
+  let totals=run.metrics_by_agent?.[id];
+  if(!totals&&!run.metrics_by_agent) {
+    totals={models:0,input:0,output:0,input_samples:0,output_samples:0};
+    for(const a of run.actions||[]) {
+      if(a.agent!==id||a.kind!=='model')continue;
+      totals.models++;
+      if(Number.isFinite(a.tokens)){totals.input+=a.tokens;totals.input_samples++;}
+      if(Number.isFinite(a.output_tokens)){totals.output+=a.output_tokens;totals.output_samples++;}
+    }
+  }
+  if(!totals||!(totals.input_samples||totals.output_samples))return null;
+  return {total:totals.input+totals.output,input:totals.input_samples?totals.input:null,output:totals.output_samples?totals.output:null,
+    reported:Math.max(totals.input_samples,totals.output_samples),models:totals.models};
 }
 
 // Container (cgroup) measurements of the sandboxes the engine recorded for

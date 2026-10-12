@@ -3,7 +3,7 @@ import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 import vm from 'node:vm';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/execution-timeline.js', import.meta.url), 'utf8');
-const {eventTimeRange} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {eventTimeRange, measurementMarkers} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 test('timeline intervals use recorded timing and never total overlapping duration', () => {
   assert.deepEqual(eventTimeRange({start: 10, duration: 5, outcome: 'success'}, 90), {start: 10, end: 15});
@@ -158,4 +158,38 @@ test('open and incomplete tooltip boundaries never claim a confirmed completion'
   assert.match(incompleteTip, /end not recorded/);assert(!incompleteTip.includes('→'));
   assert.match(openTip, /open through displayed clock/);
   assert.match(openTip, /1.0s → 120.0s/);
+});
+
+test('the selected wall-clock end is marked without hiding or changing later calls', () => {
+  const automatic = {policy: 'automatic', end_offset: 50, automatic_end_offset: 50};
+  assert.deepEqual(measurementMarkers({measurement: automatic}, 120), [{kind: 'automatic', at: 50, label: 'Wall clock end · automatic · 50.0s'}]);
+  const manual = measurementMarkers({measurement: {policy: 'manual', end_offset: 20, automatic_end_offset: 50}}, 120);
+  assert.deepEqual(manual.map(marker => [marker.kind, marker.at]), [['superseded', 50], ['manual', 20]]);
+  assert.match(manual[1].label, /Wall clock end · manual · 20\.0s/);
+  // Kept running: no selected end yet; the original automatic boundary stays visible.
+  assert.deepEqual(measurementMarkers({measurement: {policy: 'manual', held: true, end_offset: null, automatic_end_offset: 50}}, 120).map(marker => marker.kind), ['superseded']);
+  // A boundary chosen after the trace ended is pinned to its edge and says so.
+  const late = measurementMarkers({measurement: {policy: 'manual', end_offset: 400, automatic_end_offset: 50}}, 120)[1];
+  assert.equal(late.at, 120);assert.match(late.label, /400\.0s · beyond the trace/);
+  for (const absent of [{}, {measurement: {policy: 'automatic', end_offset: null, automatic_end_offset: null}}, null]) assert.deepEqual(measurementMarkers(absent, 120), []);
+
+  const p = viewer(), execution = run(3);
+  execution.measurement = {policy: 'manual', end_offset: 11, automatic_end_offset: 60};
+  p.timeline.update(execution);
+  const blocks = () => p.canvas.children.filter(node => node.dataset.track?.startsWith('agent:')).map(row => row.innerHTML).join('');
+  // call-1 and call-2 start after the 11s boundary and are still drawn.
+  for (const id of ['call-0', 'call-1', 'call-2']) assert.match(blocks(), new RegExp(`data-timeline-action="${id}"`));
+  const axis = p.canvas.querySelector('.execution-time-axis').innerHTML;
+  assert.match(axis, /timeline-measure-flag manual/);assert.match(axis, /timeline-measure-flag superseded/);
+  const lines = () => p.canvas.children.filter(node => String(node.className).startsWith('timeline-measure-line'));
+  assert.deepEqual(lines().map(line => line.className), ['timeline-measure-line superseded', 'timeline-measure-line manual']);
+  const scale = p.nav.scale, kept = lines()[1];
+  assert.equal(kept.style.left, `${180 + 11 * scale}px`);
+  // Tracks keep their order ahead of the overlay lines.
+  assert.deepEqual(p.canvas.children.slice(1, 4).map(node => node.dataset.track), ['agent:a-0', 'agent:a-1', 'agent:a-2']);
+  execution.measurement = {policy: 'automatic', end_offset: 60, automatic_end_offset: 60};
+  p.timeline.update(execution);
+  assert.deepEqual(lines().map(line => line.className), ['timeline-measure-line automatic']);
+  assert.equal(execution.actions.length, 3);assert.match(blocks(), /call-2/);
+  delete execution.measurement;p.timeline.update(execution);assert.equal(lines().length, 0);
 });

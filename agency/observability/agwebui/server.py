@@ -250,6 +250,26 @@ def _trajectory_execution_command(source, message):
     return {**result, "queued": True, "state": "queued", "targets": targets}
 
 
+def _trajectory_measurement_command(source, message):
+    """Edit the wall-clock boundary without touching agents or the execution relay.
+
+    The relay may already be closed after workload completion; this path only
+    appends to the run's measurement log."""
+    result = {"type": "measurement_command_result", "id": message.get("id")}
+    try:
+        outcome = source.measure(
+            message.get("command"),
+            message.get("id"),
+            elapsed=message.get("elapsed"),
+            execution=message.get("execution"),
+        )
+    except ValueError as exc:
+        return {**result, "error": str(exc)}
+    except OSError:
+        return {**result, "error": "Could not persist the measurement boundary."}
+    return {**result, **outcome}
+
+
 def _db_path() -> Path:
     """The orchestrator's global agDataLogger's db path, duplicated inline
     (not imported) since this process stays free of agency package imports."""
@@ -1026,6 +1046,31 @@ async def investigator_runs():
 
 
 @app.get("/api/investigator/runs/{run_id}")
+async def investigator_run_review(run_id: str):
+    run = await investigator_run(run_id)
+    if isinstance(run, dict) and run_id != "live" and run.get("measurement") is None:
+        from .investigator import catalog
+
+        entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
+        entry = next((e for e in entries if e["id"] == run_id), None)
+        if entry and Path(entry["path"]) == _profile_trace_path():
+            # This server's own profiler trace describes the execution whose
+            # canonical events and measurement log sit in the run directory.
+            # Use that recorded boundary, not the trace's final span endpoint.
+            source = _trajectory_source()
+            await asyncio.to_thread(source.refresh, force=True)
+            with source.lock:
+                if source.model.run["execution_started_at"] is not None:
+                    recorded = {
+                        key: copy.deepcopy(source.model.run[key])
+                        for key in ("measurement", "execution_started_at", "execution_wall_time")
+                    }
+                    # Profiler traces use a different clock; no trace-axis position.
+                    recorded["measurement"].update(end_offset=None, automatic_end_offset=None)
+                    run = {**run, **recorded}
+    return run
+
+
 async def investigator_run(run_id: str):
     from .investigator import catalog
     from .investigator_demo import DEMO_ENTRIES
@@ -1114,8 +1159,13 @@ def _trajectory_source_for(directory: str):
     return LiveSource(directory)
 
 
+_source_lock = threading.Lock()
+
+
 def _trajectory_source():
-    return _trajectory_source_for(str(_run_dir.resolve()))
+    # lru_cache alone can build two readers for concurrent first callers.
+    with _source_lock:
+        return _trajectory_source_for(str(_run_dir.resolve()))
 
 
 @app.get("/api/trajectory/live")
@@ -1178,6 +1228,7 @@ async def _trajectory_replay_data(run_id):
                     "title",
                     "source",
                     "duration",
+                    "status",
                     "model",
                     "harness",
                     "condition",
@@ -1188,6 +1239,11 @@ async def _trajectory_replay_data(run_id):
             }
             origin = source.model.origin or 0
             rows = [{**event, "ts": max(0, event["ts"] - origin)} for event in source.events]
+            # Recorded user boundaries accompany the replayed events on their clock.
+            run["measurements"] = [
+                {**record, "at": record["at"] - origin} if "at" in record else record
+                for record in source.measurements
+            ]
         return run, sorted(rows, key=lambda event: (event["ts"], event["id"]))
     run = await investigator_run(run_id)
     if isinstance(run, JSONResponse):
@@ -1264,12 +1320,24 @@ async def trajectory_stream(ws: WebSocket):
                 # Replay's plain 'pause' is never routed to the execution relay.
                 if command.get("type") == "execution_command":
                     await ws.send_json(_trajectory_execution_command(source, command))
+                elif command.get("type") == "measurement_command":
+                    await ws.send_json(
+                        await asyncio.to_thread(_trajectory_measurement_command, source, command)
+                    )
             except asyncio.TimeoutError:
                 pass
     except (WebSocketDisconnect, RuntimeError):
         return
     except (ValueError, OSError):
         await ws.close(code=1008, reason="Trajectory source unavailable")
+
+
+def _replay_speed(value, default):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(1000, max(0.1, speed)) if math.isfinite(speed) else default
 
 
 async def _replay_stream(ws):
@@ -1283,7 +1351,15 @@ async def _replay_stream(ws):
         selected_clock = float(ws.query_params["clock"])
         clock = max(0, min(selected_clock, run["duration"])) if math.isfinite(selected_clock) else 0
         cursor = sum(event["ts"] <= clock for event in events)
-    playing, speed = False, 4.0
+    # Playback matches the wall clock unless the client asks for another rate.
+    # A client that seeks out of a live view, or reconnects, resumes as it was.
+    playing = ws.query_params.get("play") == "1"
+    speed = _replay_speed(ws.query_params.get("speed"), 1.0)
+
+    def exhausted():
+        # A running execution keeps producing evidence: its playback idles
+        # through quiet intervals rather than stopping at the last event.
+        return cursor == len(events) and (run_id != "live" or run.get("status") != "running")
 
     def rebuild():
         model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
@@ -1295,13 +1371,18 @@ async def _replay_stream(ws):
         )
         for event in events[:cursor]:
             model.apply(event)
+        for record in run.get("measurements", []):
+            model.apply_measurement(record)
         return model
 
     model = rebuild()
     previous = _time.monotonic()
     snapshot = True
     while True:
-        model.tick(clock)
+        # An exhausted replay shows the recording's final state, including a
+        # user-selected boundary later than the last recorded event.
+        end = model.run["measurement"]["effective_end_at"]
+        model.tick(max(clock, end) if cursor == len(events) and end is not None else clock)
         # Saved trace counters already share its relative clock. Canonical live
         # counters enter through resource_sample events and incremental patches.
         if run_id != "live":
@@ -1315,7 +1396,7 @@ async def _replay_stream(ws):
             "clock": clock,
             "duration": max(run["duration"], events[-1]["ts"] if events else 0),
             "playing": playing,
-            "finished": cursor == len(events),
+            "finished": exhausted(),
             "speed": speed,
         }
         patch = model.patch()
@@ -1345,11 +1426,21 @@ async def _replay_stream(ws):
                     "error": "Execution controls are unavailable during replay.",
                 }
             )
+        elif kind == "measurement_command":
+            await ws.send_json(
+                {
+                    "type": "measurement_command_result",
+                    "id": command.get("id"),
+                    "error": "Measurement controls are unavailable during replay.",
+                }
+            )
         if run_id == "live":
             latest_run, latest_events = await _trajectory_replay_data(run_id)
             # A late event must also be reflected in a historical prefix. Rebuild
             # only on changed evidence; the selected clock never follows ingestion.
-            if len(latest_events) != len(events):
+            if len(latest_events) != len(events) or latest_run["measurements"] != run.get(
+                "measurements"
+            ):
                 run, events = latest_run, latest_events
                 cursor = sum(event["ts"] <= clock for event in events)
                 model = rebuild()
@@ -1362,13 +1453,13 @@ async def _replay_stream(ws):
                 target = 0
             clock = max(0, min(target, run["duration"]))
             cursor = sum(event["ts"] <= clock for event in events)
-            playing = False
+            # Like a video scrubber: playback continues from the new position,
+            # and a paused replay stays paused there.
             model = rebuild()
             snapshot = True
         elif kind == "play":
             playing = True
-            requested_speed = float(command.get("speed", speed))
-            speed = min(1000, max(0.1, requested_speed)) if math.isfinite(requested_speed) else 4
+            speed = _replay_speed(command.get("speed"), speed)
         elif kind == "pause":
             playing = False
         elif kind == "step" and cursor < len(events):
@@ -1386,7 +1477,7 @@ async def _replay_stream(ws):
             if cursor < len(events):
                 clock = min(clock, events[cursor]["ts"])
         previous = now
-        if cursor == len(events):
+        if exhausted():
             playing = False
 
 
@@ -1612,6 +1703,9 @@ async def _tail_and_broadcast() -> None:
             for event_id, data in rows:
                 _agent_log_cursors[agname] = event_id
                 batch.append((json.loads(data)["ts"], data))
+
+        # A held-open wall-clock measurement lasts only while a server runs.
+        await asyncio.to_thread(_trajectory_source().renew_hold)
 
         if batch:
             batch.sort(key=lambda item: item[0])

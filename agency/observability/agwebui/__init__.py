@@ -369,6 +369,7 @@ class agwebui:
 
         with sigterm_as_exit("agwebui") as sigterm_received:
             execution_status = "completed"
+            workload_completed_at = None
             try:
                 get_orchestrator().data_logger.record_event(
                     "workload_started",
@@ -378,7 +379,35 @@ class agwebui:
                     flush=True,
                 )
                 with agprof.workload(out_dir=profile_dir):
-                    fn(*args, **kwargs)
+                    try:
+                        fn(*args, **kwargs)
+                    except Exception:
+                        execution_status = "failed"
+                        raise
+                    except BaseException:
+                        execution_status = "cancelled"
+                        raise
+                    finally:
+                        # Callback return is the automatic wall-clock boundary.
+                        # Record it before the profiler context exits: trace
+                        # export, summaries and telemetry flushing that follow
+                        # are not workload time. It reports that the callback
+                        # ended and how, never whether the task succeeded.
+                        workload_completed_at = time.time()
+                        try:
+                            get_orchestrator().data_logger.record_event(
+                                "workload_completed",
+                                {
+                                    "status": "cancelled"
+                                    if sigterm_received.is_set()
+                                    else execution_status
+                                },
+                                name="webui",
+                                object="agwebui",
+                                flush=True,
+                            )
+                        except Exception as _e:
+                            print(f"[agwebui] WARNING: failed to emit workload_completed: {_e}")
             except Exception:
                 execution_status = "failed"
                 import traceback
@@ -392,9 +421,16 @@ class agwebui:
                 try:
                     from ...orchestrator import get_orchestrator
 
+                    done = {
+                        "status": "cancelled" if sigterm_received.is_set() else execution_status
+                    }
+                    if workload_completed_at is not None:
+                        # Keeps the boundary recoverable if the event above was
+                        # lost or profiler cleanup failed.
+                        done["finalization_seconds"] = max(0.0, time.time() - workload_completed_at)
                     get_orchestrator().data_logger.record_event(
                         "done",
-                        {"status": "cancelled" if sigterm_received.is_set() else execution_status},
+                        done,
                         name="webui",
                         object="agwebui",
                         update_latest_snapshot=True,

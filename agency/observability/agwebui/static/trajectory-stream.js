@@ -78,8 +78,9 @@ export function boundTrajectory(run, pins=[]) {
 }
 
 export class TrajectoryStream {
-  constructor({runId, replay, onMessage, onTransport}) {
-    Object.assign(this, {runId, replay, onMessage, onTransport});
+  // `clock`/`play` open a replay at a chosen instant, already playing or held.
+  constructor({runId, replay, onMessage, onTransport, clock, play=false, speed}) {
+    Object.assign(this, {runId, replay, onMessage, onTransport, replayClock:clock, replayPlaying:play, replaySpeed:speed});
     this.cursor = 0;
     this.epoch = '';
     this.closed = false;
@@ -90,19 +91,19 @@ export class TrajectoryStream {
     if (this.closed) return;
     this.onTransport(this.attempt ? 'reconnecting' : 'connecting');
     const query = new URLSearchParams({cursor: this.cursor, epoch: this.epoch});
-    if (this.replay) {query.set('mode', 'replay'); query.set('run', this.runId);if(Number.isFinite(this.replayClock))query.set('clock',this.replayClock);}
+    if (this.replay) {query.set('mode', 'replay'); query.set('run', this.runId);if(Number.isFinite(this.replayClock))query.set('clock',this.replayClock);if(this.replayPlaying){query.set('play','1');if(Number.isFinite(this.replaySpeed))query.set('speed',this.replaySpeed);}}
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/trajectory?${query}`);
     this.socket = ws;
     ws.onopen = () => {if (!this.closed) {this.attempt = 0; this.onTransport('connected');}};
     ws.onmessage = event => {
       if (this.closed || ws !== this.socket) return;
       const message = JSON.parse(event.data);
-      if (message.type === 'execution_command_result') {this.onMessage(message); return;}
+      if (message.type === 'execution_command_result' || message.type === 'measurement_command_result') {this.onMessage(message); return;}
       // Ignore duplicate or stale revisions, including delayed frames after reconnect.
       if (!this.replay && this.received && message.epoch === this.epoch && (message.type==='updates'?message.cursor<=this.cursor:message.cursor<this.cursor)) return;
       this.received=true;
       this.cursor = message.cursor;
-      if(message.replay)this.replayClock=message.replay.clock;
+      if(message.replay){this.replayClock=message.replay.clock;this.replayPlaying=message.replay.playing;this.replaySpeed=message.replay.speed;}
       this.epoch = message.epoch || '';
       this.onMessage(message);
     };
@@ -121,6 +122,11 @@ export class TrajectoryStream {
   sendExecution(command, extra = {}) {
     return !this.replay && this.runId === 'live' && ['pause','resume','pause_all','resume_all','stop','kill','stop_all','kill_all','queue_message','redirect','run'].includes(command)
       && this.send('execution_command', {...extra, command});
+  }
+  // Wall-clock boundary edits are not execution commands: they never reach the agent relay.
+  sendMeasurement(command, extra = {}) {
+    return !this.replay && this.runId === 'live' && ['end','hold','reset'].includes(command)
+      && this.send('measurement_command', {...extra, command});
   }
   sendReplay(type, extra = {}) {
     return this.replay && ['play','pause','step','seek'].includes(type) && this.send(type, extra);

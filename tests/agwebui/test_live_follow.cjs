@@ -67,6 +67,7 @@ function page(replay=false,view=null) {
       (listeners[name]??=[]).push(fn);
     }};
   let subscription;const sent=[],confirmations=[];let autoConfirm=true;
+  let metricScope=null,summaryRenders=0,clipboardFails=false;const copied=[];
   const context=vm.createContext({document, URLSearchParams, URL, Date, structuredClone,
     setTimeout:(fn,delay)=>{const id=++timerId;timers.set(id,fn);delays.push(delay);return id;},
     clearTimeout:id=>timers.delete(id),
@@ -79,6 +80,9 @@ function page(replay=false,view=null) {
       sendReplay(type,extra){sent.push({type,...extra});return true;}
     },
     matchesAction:()=>true,
+    // The summary module is not loaded here; its scope contract is this small.
+    metricScope:()=>metricScope,setMetricScope:ids=>{metricScope=ids==null?null:new Set(ids);},renderMetricsSummary:()=>{summaryRenders++;},
+    navigator:{clipboard:{writeText:async text=>{if(clipboardFails)throw Error('denied');copied.push(text);}}},
     requestControlConfirmation:options=>{confirmations.push(options);if(autoConfirm&&!options.validate())options.onConfirm();},refreshControlConfirmation:()=>{},
   });
   const source=fs.readFileSync(path.join(__dirname,
@@ -102,9 +106,9 @@ function page(replay=false,view=null) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,moveColumn,revealEvent,renderRoster,pauseReplay,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
+    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
-      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,renderTandemBoard,systemMetricTimelines,tandemConcurrentWork,tandemMetricTable,agentsView};
+      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,renderAgentColumnControls};
   `,context);
   const agentButton=(kind,id='a')=>{
     const attribute=`data-execution-${kind}`,html=context.ui.agentExecutionControls(id);
@@ -119,7 +123,7 @@ function page(replay=false,view=null) {
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, confirmations,setAutoConfirm:value=>autoConfirm=value, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
+  return {ui:context.ui, copied, failClipboard:value=>clipboardFails=value, metricScope:()=>metricScope&&[...metricScope],summaryRenders:()=>summaryRenders, confirmations,setAutoConfirm:value=>autoConfirm=value, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');const body=(agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');const column=body.host;return {get children(){return [...column.querySelector('.agent-current-calls').children,...column.querySelector('.agent-history-calls').children];},get firstElementChild(){return this.children[0];}};},
     columnFeed:agent=>node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-call-stack'),
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
@@ -165,7 +169,9 @@ test('first-use prompt is removed when agent columns become available',()=>{
 });
 test('explicit alternative execution views remain selected on entry',()=>{
   assert.equal(page(false,'timeline').ui.state.view,'timeline');
-  assert.equal(page(false,'context').ui.state.view,'context');
+  assert.equal(page(false,'profiler').ui.state.view,'profiler');
+  // Links to the removed views open the trajectory instead of failing.
+  for(const removed of ['context','resources','agents','compare'])assert.equal(page(false,removed).ui.state.view,'trajectory');
 });
 test('inspector opens on selection, closes without clearing identity and stays closed on updates',()=>{
   const p=page();p.ui.selectAction('old');p.ui.renderInspector();
@@ -191,16 +197,6 @@ test('trajectory and timeline switches retain the same execution and event selec
   p.ui.setView('timeline');p.ui.renderInspector();p.ui.setView('trajectory');
   assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selected);
   assert.equal(p.ui.state.inspectorOpen,false);
-});
-test('switching away from comparison never silently opens execution B',()=>{
-  const p=page(),run=p.ui.state.run,cursor=p.ui.state.cursor;
-  p.ui.state.comparison={...run,id:'saved-b',actions:[{...run.actions[0],start:5}]};p.ui.selectAction('old',true);
-  const selected=p.ui.state.selected;
-  p.ui.setView('timeline');
-  assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selected);
-  assert.equal(selected.execution,'saved-b');
-  assert.equal(p.ui.state.cursor,cursor);
-  assert.doesNotMatch(p.ui.actionButton(run.actions[0]),/action-row selected/);
 });
 test('live calls keep following while the profiler is hidden and restored',()=>{
   const p=page();p.visibility(true);p.append();p.visibility(false);
@@ -515,42 +511,8 @@ test('agent filtering temporarily focuses one column without losing chosen colum
 });
 
 
-test('tandem live updates preserve expanded episodes and isolate agent calls',()=>{
-  const p=page(),run=p.ui.state.run;
-  run.agents=[{id:'a',label:'A'},{id:'b',label:'B',parent:'a'}];
-  run.episodes[0].agent='a';run.episodes[0].title='First';
-  run.counters={};run.intervals=[];
-  p.ui.state.view='agents';p.ui.renderTandemBoard();
-  const column=p.node('tandem-columns').children[0],body=column.querySelector('.col-body'),episode=body.children[0];
-  episode.open=true;
-  p.append();p.flush();
-  assert.equal(p.node('tandem-columns').children[0],column);
-  assert.equal(body.children[0],episode);
-  assert.equal(episode.open,true);
-  assert.match(p.node('tandem-system-metrics').innerHTML,/System metrics unavailable/);
-  assert.match(p.node('tandem-concurrent').innerHTML,/data-action="new-call"/);
-  p.ui.removeAgentColumn('b');
-  assert.equal(p.node('tandem-columns').children.length,1);
-});
 
-test('metric tracks share interval coordinates, filter invalid samples and never fabricate data',()=>{
-  const p=page(),run=p.ui.state.run;
-  run.duration=10;run.counters={'cpu %':[[0,5],[5,25],[10,10],[20,100],[2,null]]};
-  const chart=p.ui.systemMetricTimelines();
-  assert.match(chart,/3 samples · peak 25/);
-  assert.match(chart,/cx="439"/); // 130 + half the 618px plot
-  assert.doesNotMatch(chart,/NaN|undefined/);
-  run.counters={};assert.match(p.ui.systemMetricTimelines(),/no recorded resource samples/);
-});
 
-test('concurrent work separates overlapping calls and supports live actions without profiler spans',()=>{
-  const p=page(),run=p.ui.state.run;
-  run.duration=5;run.actions=[{id:'one',agent:'a',start:0,duration:4,kind:'tool',name:'read'},
-    {id:'two',agent:'a',start:1,duration:3,kind:'tool',name:'test'}];
-  const html=p.ui.tandemConcurrentWork([{id:'a',label:'A'}]);
-  assert.match(html,/A \/ 2/);
-  assert.match(html,/data-action="one"/);assert.match(html,/data-action="two"/);
-});
 
 
 function debuggerPage() {
@@ -715,7 +677,7 @@ test('replay and saved review hide execution controls and replay pause uses only
   assert.equal(p.node('execution-all').hidden,true);
   p.ui.pauseResumeExecution(true);
   assert.equal(p.sent.length,0);
-  p.ui.state.replayState={playing:true};p.node('replay-play').onclick();
+  p.ui.state.replayState={playing:true};p.node('display-toggle').onclick();
   assert.equal(p.sent[0].type,'pause');assert.equal(p.sent[0].command,undefined);
   p.ui.state.replay=false;p.ui.state.run.id='saved';p.ui.renderSession();
   assert.equal(p.node('execution-all').hidden,true);
@@ -824,7 +786,7 @@ test('column controls target their own agent even when another agent is selected
 });
 
 
-test('trajectory and tandem column headings contain agent controls while global controls stay separate',()=>{
+test('column headings contain agent controls while global controls sit under the trajectory heading',()=>{
   const p=debuggerPage();p.ui.renderCallStack();
   for(const column of p.node('call-stack').children) {
     const html=column.querySelector('[data-agent-controls]').innerHTML;
@@ -832,12 +794,19 @@ test('trajectory and tandem column headings contain agent controls while global 
     assert.match(html,/Agent controls/);assert.match(html,/SIGKILL/);
     assert.doesNotMatch(html,/Stop all agents/);
   }
-  p.ui.renderTandemBoard();
-  for(const column of p.node('tandem-columns').children) {
-    assert.match(column.querySelector('.col-head').innerHTML,/data-agent-controls=/);
-  }
   const pageHtml=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
-  assert.match(pageHtml,/id="all-agent-controls"/);
+  // One mounted control group holds the bulk agent controls and the session actions; the old middle bar is gone.
+  const strip=pageHtml.slice(pageHtml.indexOf('<section id="trajectory-controls"'),pageHtml.indexOf('</section>',pageHtml.indexOf('<section id="trajectory-controls"')));
+  for(const id of ['all-agent-controls','execution-all','execution-stop-all','execution-kill-all','open-live','start-replay','replay-restart','reconnect-updates','execution-message','control-scope'])assert.match(strip,new RegExp(`id="${id}"`));
+  assert.doesNotMatch(pageHtml,/trajectory-session|session-bar|session-actions/);
+  const view=p.ui.trajectoryView();
+  assert.match(view,/<h2>Execution Trajectory<\/h2>[\s\S]*?<div id="trajectory-controls-slot"><\/div>[\s\S]*id="call-stack"/);
+  p.ui.setContent(view);
+  assert.equal(p.node('trajectory-controls').parentElement,p.node('trajectory-controls-slot'));
+  // Every replacement of the view markup goes through setContent, so the mounted controls are never destroyed with it.
+  const script=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.js'),'utf8');
+  const writes=[...script.matchAll(/\$\('content'\)\.innerHTML\s*=\s*([^;]{0,24})/g)].map(match=>match[1]);
+  assert.deepEqual([...new Set(writes)],['html','detailedProfilerView()']);
   assert.doesNotMatch(pageHtml,/id="execution-agent"|id="execution-stop-agent"|id="execution-kill-agent"/);
 });
 
@@ -868,13 +837,6 @@ test('pause closes control menus and updates controls without replacing their fo
   assert.equal(p.window.scrollY,0);
 });
 
-test('tandem heading updates keep live agent controls mounted',()=>{
-  const p=debuggerPage();p.ui.renderTandemBoard();
-  const head=p.node('tandem-columns').children[0].querySelector('.col-head');
-  const markup=head.innerHTML,controls=head.querySelector('[data-agent-controls]');
-  p.ui.state.run.agents[0].status='paused';p.ui.renderTandemBoard();
-  assert.equal(head.innerHTML,markup);assert.equal(head.querySelector('[data-agent-controls]'),controls);
-});
 
 test('pending pause blocks duplicate submissions and remains requested until recorded state',()=>{
   const p=debuggerPage();p.ui.pauseResumeExecution(false,'a');p.ui.pauseResumeExecution(false,'a');
@@ -955,7 +917,6 @@ test('filtered roster return and unpin preserve actual pinned order',()=>{
   const p=page();p.ui.state.run.agents=[{id:'a'},{id:'b'},{id:'c'}];p.ui.visibleAgentColumns();p.ui.state.agent='a';
   p.ui.selectAgentColumn('b');assert.equal(p.ui.state.agent,'');assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','b','c']);
   p.ui.state.agent='b';p.ui.removeAgentColumn('b');assert.equal(p.ui.state.agent,'');assert.deepEqual(Array.from(p.ui.state.agentColumns),['a','c']);
-  p.ui.moveColumn('c',-1);assert.deepEqual(Array.from(p.ui.state.agentColumns),['c','a']);
 });
 
 
@@ -1050,4 +1011,201 @@ test('Profiler hides the summary dashboard and trajectory restores it',()=>{
   p.ui.state.run=null;p.ui.setView('trajectory');p.ui.renderMetricsDashboard();
   assert.equal(p.node('summary-strip').hidden,false);
   assert.equal(p.node('metrics').hidden,false);
+});
+
+test('time cursor starts with the wall clock, not with setup before the first agent execution',()=>{
+  const p=page(),run=p.ui.state.run;
+  Object.assign(run,{duration:30,time_origin:100,execution_started_at:null});
+  assert.deepEqual({...p.ui.wallClockRange()},{start:0,end:0,pending:true});
+  run.execution_started_at=120;
+  const started=p.ui.wallClockRange();
+  assert.equal(started.start,20);assert.equal(started.end,30);assert.equal(started.pending,undefined);
+  delete run.execution_started_at;
+  assert.equal(p.ui.wallClockRange().start,0);assert.equal(p.ui.wallClockRange().end,30);
+});
+
+test('projected clock never retreats when reports arrive with uneven delay',()=>{
+  const p=page(),{followClock,projectClock}=p.ui;
+  // The server clock runs 1:1; each report is delivered 0–600 ms late, in order.
+  const delays=[50,600,20,400,0,550,30,300,10,500];
+  let clock=null,last=-Infinity,now=0;
+  for(const [index,delay] of delays.entries()){
+    const sent=1000+index*300;now=Math.max(now+1,sent+delay);
+    for(const at of [now-1,now]){
+      if(at===now)clock=followClock(clock,sent/1000,1,now);
+      if(!clock)continue;
+      const shown=projectClock(clock,at);
+      assert.ok(shown>=last-1e-9,`retreated at report ${index}`);last=shown;
+    }
+  }
+  // It settles on the least-delayed report rather than drifting ahead of the server.
+  assert.ok(projectClock(clock,now)<=now/1000+1e-9&&projectClock(clock,now)>now/1000-.05);
+  // A real jump (seek or pause) is taken as reported, and silence holds the value.
+  assert.equal(projectClock(followClock(clock,1,1,now),now),1);
+  assert.equal(projectClock(followClock(clock,2,0,now),now+9000),2);
+  assert.equal(projectClock(clock,now+60000),projectClock(clock,now+3000));
+});
+
+// Agent-scoped metrics: compact column status and column-to-dashboard selection.
+const usage=(p,agent)=>p.node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-column-heading').querySelector('.column-usage');
+test('column status shows live per-agent sandbox CPU and compact tokens beside the existing in-flight count',()=>{
+  const p=page(),run=p.ui.state.run;
+  p.receive({type:'patch',patches:[{agents:[{id:'a',label:'Agent A',status:'running',sandbox:'sandbox_a_0000'},{id:'b',label:'Agent B',status:'running'}],
+    actions:[{id:'m',agent:'a',episode:'one',start:1,duration:1,kind:'model',outcome:'success',tokens:8000,output_tokens:200,files:[]},{id:'bt',agent:'b',episode:'b1',start:1,duration:1,kind:'tool',outcome:'running',files:[]}],
+    episodes:[{id:'b1',agent:'b',actions:['bt'],status:'running'}],
+    counter_samples:{'workload:cpu_pct':[[2,640]],'host:cpu_pct':[[2,900]],'cg:sandbox_a_0000:cpu_pct':[[2,12.4]]},meta:{duration:2}}]});
+  p.flush();p.ui.reconcile();
+  assert.equal(usage(p,'a').textContent,'CPU 12% · 8.2K tok');
+  assert.match(usage(p,'a').title,/sandbox container.*100% = one core.*8,000 input \+ 200 output/);
+  // Missing measurements are dashes; the workload or host value is never shown as an agent's CPU.
+  assert.equal(usage(p,'b').textContent,'CPU — · — tok');assert.match(usage(p,'b').title,/no sandbox measurement recorded.*no usage reported/);
+  const heading=p.node('call-stack').children.find(c=>c.dataset.agentColumn==='b').querySelector('.agent-column-heading');
+  assert.equal(heading.querySelector('.column-call-count').textContent,'1 in flight');
+  // Values follow the existing stream; execution-wide counters win over the retained window.
+  p.receive({type:'patch',patches:[{counter_samples:{'cg:sandbox_a_0000:cpu_pct':[[3,3.44]]},meta:{duration:3,metrics_by_agent:{a:{models:90,input:1390000,output:10000,input_samples:90,output_samples:90}}}}]});
+  p.flush();p.ui.reconcile();
+  assert.equal(usage(p,'a').textContent,'CPU 3.4% · 1.4M tok');
+  // A container that stopped reporting has no current utilization.
+  p.receive({type:'patch',patches:[{meta:{duration:60}}]});p.flush();p.ui.reconcile();
+  assert.equal(usage(p,'a').textContent,'CPU — · 1.4M tok');assert.match(usage(p,'a').title,/no current container sample/);
+  assert.equal(run.agents.length>=2,true);
+});
+test('selecting a column header scopes the dashboard to that agent without changing columns or controls',()=>{
+  const p=page();
+  p.receive({type:'patch',patches:[{agents:[{id:'a',label:'Agent A',status:'running'},{id:'b',label:'Agent B',status:'running'}],
+    actions:[{id:'bt',agent:'b',episode:'b1',start:1,duration:1,kind:'tool',outcome:'running',files:[]}],episodes:[{id:'b1',agent:'b',actions:['bt'],status:'running'}],meta:{duration:2}}]});
+  p.flush();p.ui.reconcile();
+  const columns=()=>p.node('call-stack').querySelectorAll('[data-agent-column]').map(c=>c.dataset.agentColumn);
+  const before=columns(),follow=p.ui.state.follow,renders=p.summaryRenders();
+  const header=agent=>({target:{closest:selector=>selector==='[data-scope-column]'?{dataset:{scopeColumn:agent}}:null}});
+  p.ui.handleClick(header('b'));
+  assert.deepEqual(p.metricScope(),['b']);assert.equal(p.summaryRenders(),renders+1);
+  assert.deepEqual(columns(),before);assert.equal(p.ui.state.follow,follow);assert.equal(p.ui.state.agent,'');
+  p.ui.renderCallStack();
+  assert.match(p.node('call-stack').children.find(c=>c.dataset.agentColumn==='b').className,/metric-scoped-column/);
+  assert.doesNotMatch(p.node('call-stack').children.find(c=>c.dataset.agentColumn==='a').className,/metric-scoped-column/);
+  // Another header replaces the single selection; the same header again returns to all agents.
+  p.ui.handleClick(header('a'));assert.deepEqual(p.metricScope(),['a']);
+  p.ui.handleClick(header('a'));assert.equal(p.metricScope(),null);
+  // Controls inside the header keep their own action and never change the scope.
+  const live=p.ui.readingState('a');live.follow=false;
+  p.ui.handleClick({target:{closest:selector=>selector==='[data-scope-column]'?{dataset:{scopeColumn:'a'}}:selector.startsWith('button,')||selector.includes('[data-column-live]')?{dataset:{columnLive:'a'},hasAttribute:()=>false}:null}});
+  assert.equal(p.metricScope(),null);assert.equal(live.follow,true);assert.deepEqual(columns(),before);
+  // Live updates keep flowing into both columns while one agent is selected.
+  p.ui.handleClick(header('b'));p.append();p.ui.reconcile();
+  assert.deepEqual(p.metricScope(),['b']);assert.equal(columns().length,2);
+  assert.equal(p.feed('a').children.some(card=>card.dataset.callCard==='new-call'||card.dataset.callGroup==='new-call'),true);
+});
+
+// UI reorganisation: three views, relocated controls, readable payloads, typed cards.
+const pageSource=()=>fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
+test('navigation is Execution Trajectory, Timeline, Profiler and the removed views are gone',()=>{
+  const p=page();
+  assert.equal(JSON.stringify(p.ui.views),JSON.stringify([['trajectory','Execution Trajectory'],['timeline','Timeline'],['profiler','Profiler']]));
+  assert.equal(p.ui.state.view,'trajectory');
+  const selection=(p.ui.selectAction('old'),p.ui.state.selected),run=p.ui.state.run;
+  for(const view of ['timeline','profiler','trajectory']){p.ui.setView(view);assert.equal(p.ui.state.view,view);assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selection);}
+  // Profiler categories still deep-link into the Profiler view.
+  p.ui.setView('llm');assert.equal(p.ui.state.view,'profiler');assert.equal(p.ui.state.profilerCategory,'llm');
+  for(const removed of ['agents','compare','context','resources']){p.ui.setView(removed);assert.equal(p.ui.state.view,'profiler');}
+  const script=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.js'),'utf8');
+  assert.doesNotMatch(script,/Tandem|Compare runs|Context & information|Resources & waits|compareView|contextView|resourcesView|agentsView/);
+  assert.doesNotMatch(pageSource(),/id="execution-views"/);
+});
+test('the global agent dropdown is gone while roster focus stays reversible',()=>{
+  const p=page(),html=pageSource();
+  assert.doesNotMatch(html,/agent-select/);
+  p.ui.state.run.agents=[{id:'a',label:'Agent A'},{id:'b',label:'Agent B'}];
+  // Focusing an agent from the roster still filters the trajectory to it.
+  p.ui.handleClick({target:{closest:selector=>selector.includes('[data-agent]')?{dataset:{agent:'b'},hasAttribute:()=>false}:null}});
+  assert.equal(p.ui.state.agent,'b');assert.deepEqual(Array.from(p.ui.visibleAgentColumns()),['b']);
+  p.ui.renderAgentColumnControls(p.ui.visibleAgentColumns());
+  assert.equal(p.node('agent-focus-clear').hidden,false);assert.match(p.node('agent-focus-clear').textContent,/Showing only Agent B/);
+  p.ui.handleClick({target:{closest:selector=>selector.includes('[data-clear-agent]')?{dataset:{},hasAttribute:name=>name==='data-clear-agent'}:null}});
+  assert.equal(p.ui.state.agent,'');
+  p.ui.renderAgentColumnControls(p.ui.visibleAgentColumns());assert.equal(p.node('agent-focus-clear').hidden,true);
+});
+test('Jump to live sits beside Freeze view and column headings have no reorder buttons',()=>{
+  const html=pageSource();
+  assert.match(html,/<div class="display-controls"[^>]*><button id="display-toggle" class="display-control"[^>]*>Freeze view<\/button><button id="follow-live" class="display-control"[^>]*>Jump to live<\/button><\/div>/);
+  const p=page();p.ui.renderCallStack();
+  const column=p.node('call-stack').children[0];
+  assert.doesNotMatch(column.innerHTML,/data-column-order|Move .* column/);
+  assert.match(column.innerHTML,/data-remove-column="a"/);assert.match(column.innerHTML,/data-agent-controls="a"/);
+  // The two display controls keep their separate behaviour.
+  p.ui.pauseDisplay();assert.equal(p.ui.state.displayPaused,true);
+  p.ui.followLatest();assert.equal(p.ui.state.displayPaused,false);assert.equal(p.ui.state.follow,true);
+});
+test('tool calls and model requests carry a type class and a text label',()=>{
+  const p=page();
+  const tool=p.ui.actionButton({id:'t',agent:'a',kind:'tool',name:'bash',command:'ls',start:0,duration:1,outcome:'success'});
+  const model=p.ui.actionButton({id:'m',agent:'a',kind:'model',name:'chat',model:'model-x',start:0,duration:1,outcome:'success'});
+  assert.match(tool,/class="action-row type-tool /);assert.match(tool,/<span class="call-type">Tool<\/span>bash/);
+  assert.match(model,/class="action-row type-model /);assert.match(model,/<span class="call-type">Model request<\/span>/);
+  // Status indicators keep their own meaning beside the type.
+  assert.match(tool,/class="status-icon success"/);
+  p.ui.state.run.actions.push({id:'m1',agent:'a',episode:'one',kind:'model',name:'chat',start:1,duration:1,outcome:'success',files:[]});p.ui.renderCallStack();
+  const cards=p.node('call-stack').querySelectorAll('[data-call-card]');
+  assert.equal(cards.find(card=>card.dataset.callCard==='old').className,'call-card type-tool');
+  assert.equal(cards.find(card=>card.dataset.callCard==='m1').className,'call-card type-model');
+});
+test('JSON payloads are pretty by default with a per-payload raw toggle; other text is untouched',()=>{
+  const p=page(),recorded='{"path":"a.py","big":12345678901234567890,"nested":{"ok":true,"items":[1,2.50]}}';
+  const html=p.ui.payloadSection({id:'call',kind:'tool',arguments:recorded,result:'plain <b>text</b> output'},'input');
+  assert.match(html,/data-payload-view="pretty"/);
+  assert.match(html,/<span class="payload-format" role="group" aria-label="Input format" ><button data-payload-format="pretty" aria-pressed="true">Pretty<\/button><button data-payload-format="raw" aria-pressed="false">Raw<\/button>/);
+  // Pretty: indented and highlighted, values spelled exactly as recorded.
+  assert.match(html,/payload-pretty">\{\n  <span class="json-key">&quot;path&quot;:<\/span> <span class="json-string">&quot;a\.py&quot;<\/span>/);
+  assert.match(html,/<span class="json-number">12345678901234567890<\/span>/);assert.match(html,/<span class="json-number">2\.50<\/span>/);
+  // Raw: the recorded text itself.
+  assert.ok(html.includes(`<pre class="payload-text payload-raw">${recorded.replace(/"/g,'&quot;')}</pre>`));
+  assert.match(html,/data-copy-payload="call" data-payload-kind="input"/);
+  const plain=p.ui.payloadSection({id:'call',kind:'tool',arguments:recorded,result:'plain <b>text</b> output'},'output');
+  assert.match(plain,/role="group" aria-label="Output format" hidden>/);assert.doesNotMatch(plain,/payload-pretty/);
+  assert.match(plain,/<pre class="payload-text">plain &lt;b&gt;text&lt;\/b&gt; output<\/pre>/);assert.match(plain,/data-copy-payload="call" data-payload-kind="output"/);
+  // Invalid or clipped JSON is never reformatted.
+  assert.doesNotMatch(p.ui.payloadSection({id:'x',kind:'tool',arguments:'{"cut": "off'},'input'),/payload-pretty/);
+});
+function payloadFixture(view='pretty'){
+  const pre={focus(){}},format={hidden:true},options=['pretty','raw'].map(payloadFormat=>({dataset:{payloadFormat},setAttribute(name,value){this[name]=value;}}));
+  const section={dataset:{payloadView:view,payloadKey:'old:input'},classList:{add(name){section.loaded=name;}},querySelector:selector=>selector==='.payload-format'?format:viewer,querySelectorAll:()=>options};
+  const viewer={closest:()=>section,querySelector:()=>pre,set innerHTML(html){this.html=html;}};
+  return {pre,format,options,section,viewer};
+}
+test('the full payload viewer switches between pretty and raw without changing the text and pages on line breaks',()=>{
+  const p=page(),f=payloadFixture(),recorded='{"a":1,"b":{"c":"<tag>"}}';
+  p.ui.renderFullPayload(f.viewer,recorded);
+  assert.equal(f.format.hidden,false);assert.match(f.viewer.html,/Formatted JSON/);
+  assert.match(f.pre.innerHTML,/<span class="json-key">&quot;a&quot;:<\/span> <span class="json-number">1<\/span>/);assert.match(f.pre.innerHTML,/&lt;tag&gt;/);
+  // Toggling to Raw re-renders the same stored text, unformatted.
+  const raw={target:{closest:selector=>selector==='[data-payload-format]'?Object.assign(f.options[1],{closest:()=>f.section}):null}};
+  p.ui.handlePayloadClick(raw);
+  assert.equal(f.section.dataset.payloadView,'raw');assert.equal(f.options[1]['aria-pressed'],'true');assert.equal(f.options[0]['aria-pressed'],'false');
+  assert.equal(f.pre.textContent,recorded);assert.match(f.viewer.html,/Captured text · characters 1–25 of 25/);
+  assert.equal(p.ui.fullPayloads.get(f.viewer).text,recorded);
+  // The choice is per payload and survives the section being rebuilt.
+  assert.match(p.ui.payloadSection({id:'old',kind:'tool',arguments:recorded},'input'),/data-payload-view="raw"/);
+  assert.match(p.ui.payloadSection({id:'old',kind:'tool',result:recorded},'output'),/data-payload-view="pretty"/);
+  // Non-JSON text never offers the toggle.
+  const text=payloadFixture();p.ui.renderFullPayload(text.viewer,'just output');assert.equal(text.format.hidden,true);assert.equal(text.pre.textContent,'just output');
+  // Long pretty JSON pages end on a line break and can go back.
+  const long=payloadFixture(),big=JSON.stringify({rows:Array.from({length:3000},(_,i)=>({index:i,label:'row '+i}))});
+  p.ui.renderFullPayload(long.viewer,big);
+  const first=p.ui.fullPayloads.get(long.viewer);assert.ok(first.next<=20000);assert.match(long.viewer.html,/data-payload-page="next" >/);
+  const pageButton=direction=>({dataset:{payloadPage:direction},closest:()=>long.viewer});
+  p.ui.pagePayload(pageButton('next'));
+  assert.deepEqual(Array.from(p.ui.fullPayloads.get(long.viewer).starts),[0,first.next]);assert.doesNotMatch(long.pre.innerHTML,/^[^\s<]*"/);
+  p.ui.pagePayload(pageButton('previous'));assert.deepEqual(Array.from(p.ui.fullPayloads.get(long.viewer).starts),[0]);
+});
+test('copy takes the complete recorded payload in either view and reports the outcome on the button',async()=>{
+  const p=page(),recorded='{"command":"'+'x'.repeat(9000)+'","n":1.0}';
+  p.ui.state.run.actions[0].arguments=recorded;
+  for(const view of ['pretty','raw']){
+    const f=payloadFixture(view),button={dataset:{copyPayload:'old',payloadKind:'input'},textContent:'Copy',closest:selector=>selector==='.payload-section'?f.section:null};
+    await p.ui.handlePayloadClick({target:{closest:selector=>selector==='[data-full-payload],[data-copy-payload]'?button:null}});
+    // Longer than the 4,000-character preview, and never the reformatted text.
+    assert.equal(p.copied.at(-1),recorded);assert.equal(button.textContent,'Copied ✓');assert.equal(button.disabled,false);
+    p.flush();assert.equal(button.textContent,'Copy');
+  }
+  assert.equal(p.copied.length,2);
 });

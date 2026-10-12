@@ -231,7 +231,11 @@ class AgentEngine:
         self._agtype_cleanup_paths = set()
         self._agent.data_logger.record_event(
             type="agent_state",
-            payload={"state": "running_harness"},
+            # The label keys this sandbox's sampled resource series (agprof
+            # container registry), so observers can attribute them to the agent.
+            payload={"state": "running_harness", "sandbox": str(sandbox._agname)}
+            if getattr(sandbox, "_agname", None)
+            else {"state": "running_harness"},
             update_latest_snapshot=True,
             flush=True,
         )

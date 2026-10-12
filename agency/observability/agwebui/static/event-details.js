@@ -33,6 +33,42 @@ export function renderPayloadWindow(value,options={}) {
   return `<pre class="payload-text" tabindex="0" aria-label="Captured text">${escapeHTML(window.text)}</pre>${window.previous||window.next?`<p class="muted">Characters ${window.offset+1}–${window.end} of ${window.total}. Additional captured text is available.</p>`:''}`;
 }
 
+// JSON is re-indented token by token, never parsed and re-serialised: numbers,
+// escapes, key order and duplicate keys keep their recorded spelling. Only a
+// complete, valid JSON object or array qualifies; anything else returns null.
+export function prettyJson(value) {
+  if(typeof value!=='string'||value.length>200000)return null;
+  const source=value.trim();
+  if(source[0]!=='{'&&source[0]!=='[')return null;
+  try{JSON.parse(source);}catch{return null;}
+  let out='',depth=0;
+  const line=()=>'\n'+'  '.repeat(depth),blank=char=>char===' '||char==='\n'||char==='\t'||char==='\r';
+  for(let i=0;i<source.length;i++){
+    const char=source[i];
+    if(char==='"'){let end=i+1;while(source[end]!=='"')end+=source[end]==='\\'?2:1;out+=source.slice(i,end+1);i=end;}
+    else if(char==='{'||char==='['){
+      let next=i+1;while(blank(source[next]))next++;
+      if(source[next]===(char==='{'?'}':']')){out+=char+source[next];i=next;}else{depth++;out+=char+line();}
+    }
+    else if(char==='}'||char===']'){depth--;out+=line()+char;}
+    else if(char===',')out+=','+line();
+    else if(char===':')out+=': ';
+    else if(!blank(char))out+=char;
+  }
+  return out;
+}
+
+// Every character is escaped, including text outside a recognised token: a
+// clipped preview can end inside a string.
+export function highlightJson(value) {
+  const source=String(value??'');let html='',last=0;
+  for(const match of source.matchAll(/"(?:\\.|[^"\\])*"(\s*:)?|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi)){
+    const token=match[0],kind=token[0]==='"'?(match[1]?'key':'string'):/^[tfn]/i.test(token)?'literal':'number';
+    html+=escapeHTML(source.slice(last,match.index))+`<span class="json-${kind}">${escapeHTML(token)}</span>`;last=match.index+token.length;
+  }
+  return html+escapeHTML(source.slice(last));
+}
+
 export function actionState(action) {
   const status=action.request_state||action.outcome||'unknown';
   const type=modelCall(action)?'Request':controlCall(action)?'Control':['queue','dependency','setup'].includes(action.kind)?'Operation':'Tool';
@@ -93,12 +129,15 @@ export function eventCard(action,run={}) {
     if(action.error||state.semantic==='failed')previewLabel='Recorded call failure';
     if(!preview)preview=state.status==='running'?'Result not captured yet':'No result captured';
   }
-  return {primary:clipped(primary,360),secondary,state,elapsed,elapsedText:elapsed==null?'Elapsed unavailable':`${state.status==='running'?'Elapsed':'Wall interval'} ${time(elapsed)}`,preview,previewLabel,usage,modelSource,scope:modelCall(action)?'model request':controlCall(action)?'human intervention':'tool call'};
+  // A command or argument set recorded as JSON is shown formatted, like every other payload.
+  const formatted=prettyJson(primary);
+  const type=modelCall(action)?'model':controlCall(action)?'control':['queue','dependency','setup'].includes(action.kind)?'operation':'tool';
+  return {primary:clipped(formatted??primary,360),json:formatted!=null,type,typeLabel:{model:'Model',control:'Control',operation:'Operation',tool:'Tool'}[type],secondary,state,elapsed,elapsedText:elapsed==null?'Elapsed unavailable':`${state.status==='running'?'Elapsed':'Wall interval'} ${time(elapsed)}`,preview,previewLabel,usage,modelSource,scope:modelCall(action)?'model request':controlCall(action)?'human intervention':'tool call'};
 }
 
 export function renderEventCard(action,run={}) {
   const card=eventCard(action,run);
-  return `<span class="call-kind">${escapeHTML(card.secondary)}</span><strong class="call-meaning">${escapeHTML(card.primary)}</strong><span class="call-state ${escapeHTML(card.state.semantic)}">${escapeHTML(card.state.icon)} ${escapeHTML(card.state.label)} · ${escapeHTML(card.elapsedText)}</span><span class="call-result"><span class="muted">${escapeHTML(card.previewLabel)}: </span>${escapeHTML(card.preview)}</span>${card.usage.length?`<span class="call-usage">${escapeHTML(card.usage.join(' · '))}</span>`:''}`;
+  return `<span class="call-kind">${escapeHTML(card.secondary)}</span><strong class="call-meaning${card.json?' json-label':''}">${card.json?highlightJson(card.primary):escapeHTML(card.primary)}</strong><span class="call-state ${escapeHTML(card.state.semantic)}">${escapeHTML(card.state.icon)} ${escapeHTML(card.state.label)} · ${escapeHTML(card.elapsedText)}</span><span class="call-result"><span class="muted">${escapeHTML(card.previewLabel)}: </span>${escapeHTML(card.preview)}</span>${card.usage.length?`<span class="call-usage">${escapeHTML(card.usage.join(' · '))}</span>`:''}`;
 }
 
 export function eventRelationships(action,run={}) {

@@ -144,3 +144,43 @@ def test_replay_history_bounds_payloads_but_keeps_original_evidence(tmp_path):
         replay.run["actions"][0]["result_preview"]
         == source.model.run["actions"][0]["result_preview"]
     )
+
+
+def test_seek_keeps_playing_and_a_held_replay_stays_held(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect(
+            "/ws/trajectory?mode=replay&run=demo-baseline&clock=20&play=1"
+        ) as ws,
+    ):
+        opened = ws.receive_json()["replay"]
+        assert opened["playing"] and opened["speed"] == 1
+        ws.send_json({"type": "seek", "clock": 60})
+        while (frame := ws.receive_json())["type"] != "snapshot":
+            pass
+        # Playback continues from the new position at the wall-clock rate.
+        assert frame["replay"]["playing"] and 60 <= frame["replay"]["clock"] < 62
+        assert ws.receive_json()["replay"]["clock"] > frame["replay"]["clock"]
+        ws.send_json({"type": "pause"})
+        while ws.receive_json()["replay"]["playing"]:
+            pass
+        held = receive_seek(ws, 30)
+        assert not held["replay"]["playing"]
+        assert ws.receive_json()["replay"]["clock"] == 30
+
+
+def test_running_live_replay_idles_through_quiet_time_instead_of_finishing(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    rows = [
+        event(0, "workload_started", ts=100),
+        event(1, "tool_call", ts=101, call_id="one", tool="read", arguments={}),
+    ]
+    write_rows(tmp_path / "global_data.sqlite3", rows)
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/ws/trajectory?mode=replay&run=live&clock=1&play=1") as ws,
+    ):
+        frames = [ws.receive_json()["replay"] for _ in range(3)]
+        assert all(frame["playing"] and not frame["finished"] for frame in frames)
+        assert frames[-1]["position"] == frames[-1]["total"]
