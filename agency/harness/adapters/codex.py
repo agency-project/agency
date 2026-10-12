@@ -90,8 +90,20 @@ def _forward_usage_to_responses(usage: "dict | None") -> dict:
     return usage
 
 
+# A tool output can carry non-text parts (e.g. the image from Codex's view_image). They reach the
+# LLM as text only, so each one becomes a placeholder rather than a KeyError that kills the turn.
+_NON_TEXT_OUTPUT_PLACEHOLDER = "[{kind} omitted: tool output is passed to the model as text only]"
+
+
 def _responses_content_to_text(content) -> str:
-    return "".join(b["text"] for b in _responses_content_to_blocks(content))
+    return "".join(
+        b["text"]
+        if b["type"] == "text"
+        else _NON_TEXT_OUTPUT_PLACEHOLDER.format(
+            kind=b.get("data", {}).get("type") or "non-text part"
+        )
+        for b in _responses_content_to_blocks(content)
+    )
 
 
 _TOOL_WIRE_NAME_MAX_LEN = 64  # Chat Completions' tool-name cap; no namespace field.

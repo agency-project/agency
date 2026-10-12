@@ -149,6 +149,27 @@ def test_harness_to_agency_function_call_output_with_block_list():
     assert agency["messages"][0]["blocks"][0]["text"] == "result text"
 
 
+def test_harness_to_agency_function_call_output_image_becomes_placeholder():
+    # Codex's view_image returns an input_image part; it used to raise KeyError: 'text'.
+    body = {
+        "model": "m",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call1",
+                "output": [
+                    {"type": "input_text", "text": "page 5: "},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                ],
+            }
+        ],
+    }
+    agency = _backend()._format_context_harness_to_agency(body)
+    assert agency["messages"][0]["blocks"][0]["text"] == (
+        "page 5: [input_image omitted: tool output is passed to the model as text only]"
+    )
+
+
 def test_harness_to_agency_tools_and_tool_choice():
     body = {
         "model": "m",

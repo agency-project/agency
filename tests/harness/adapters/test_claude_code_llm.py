@@ -345,7 +345,11 @@ def test_harness_to_agency_tool_result_with_image_content_preserves_raw():
     }
     agency = _backend()._format_context_harness_to_agency(body)
     tool_result_block = agency["messages"][0]["blocks"][0]
-    assert tool_result_block["text"] == ""
+    # Text-only backends get a visible placeholder; the Anthropic backend sends raw_content.
+    assert (
+        tool_result_block["text"]
+        == "[image omitted: tool output is passed to the model as text only]"
+    )
     assert tool_result_block["raw_content"] == [
         {"type": "image", "source": {"type": "base64", "data": "abc"}}
     ]
