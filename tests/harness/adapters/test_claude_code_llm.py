@@ -9,7 +9,7 @@ import json
 import pytest
 
 from agency.configs.agconfig import agconfig
-from agency.harness.adapters.claude_code import ClaudeCodeAdapter
+from agency.harness.adapters.claude_code import ClaudeCodeAdapter, _forward_usage_to_anthropic
 
 
 def _backend() -> ClaudeCodeAdapter:
@@ -418,6 +418,48 @@ def test_agency_to_harness_text_only():
     assert out["usage"]["prompt_tokens"] == 5
     assert out["usage"]["completion_tokens"] == 3
     assert out["usage"]["total_tokens"] == 8
+
+
+def test_forward_usage_subtracts_cache_from_openai_prompt_tokens():
+    # OpenAI-style prompt_tokens include cached tokens; Claude Code adds
+    # input + cache_read + cache_creation, so input must exclude them.
+    out = _forward_usage_to_anthropic(
+        {
+            "prompt_tokens": 34101,
+            "completion_tokens": 192,
+            "prompt_tokens_details": {"cached_tokens": 32732},
+            "cache_read_input_tokens": 32732,
+            "cache_creation_input_tokens": 1365,
+            "cache_read_tokens": 32732,
+            "cache_write_tokens": 1365,
+        }
+    )
+    assert out["input_tokens"] == 4
+    assert out["cache_read_input_tokens"] == 32732
+    assert out["cache_creation_input_tokens"] == 1365
+    assert out["prompt_tokens"] == 34101
+
+
+def test_forward_usage_keeps_anthropic_input_tokens():
+    out = _forward_usage_to_anthropic(
+        {
+            "input_tokens": 4,
+            "prompt_tokens": 4,
+            "output_tokens": 192,
+            "cache_read_input_tokens": 32732,
+            "cache_read_tokens": 32732,
+            "cache_write_tokens": 1365,
+        }
+    )
+    assert out["input_tokens"] == 4
+    assert out["cache_read_input_tokens"] == 32732
+
+
+def test_forward_usage_input_tokens_never_negative():
+    out = _forward_usage_to_anthropic(
+        {"prompt_tokens": 10, "cache_read_tokens": 8, "cache_write_tokens": 5}
+    )
+    assert out["input_tokens"] == 0
 
 
 def test_agency_to_harness_tool_use():

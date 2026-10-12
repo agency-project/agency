@@ -169,6 +169,8 @@ class NativeAdapter(HarnessAdapter):
                 # cases; --resume is no longer needed.
                 "--session-id",
                 session_id,
+                "--tool-timeout",
+                str(runtime.agconfig.tool.timeout_s),
             ]
 
             envp = {

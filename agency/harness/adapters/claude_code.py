@@ -280,9 +280,15 @@ def _sse(event_type: str, data: dict) -> str:
 def _forward_usage_to_anthropic(
     usage: "dict | None", *, output_tokens: "int | None" = None
 ) -> dict:
-    """Full copy, plus Anthropic's own field names layered on top."""
+    """Full copy, plus Anthropic's own field names layered on top.
+
+    Anthropic's input_tokens excludes cached tokens, and Claude Code adds
+    input + cache_read + cache_creation to size its context. OpenAI-style
+    prompt_tokens already include the cached tokens, so they are subtracted
+    here; otherwise the cache is counted twice and Claude Code autocompacts
+    at roughly half its real context limit.
+    """
     usage = dict(usage or {})
-    usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     usage["output_tokens"] = (
         output_tokens
         if output_tokens is not None
@@ -294,6 +300,14 @@ def _forward_usage_to_anthropic(
     usage["cache_creation_input_tokens"] = usage.get(
         "cache_write_tokens", usage.get("cache_creation_input_tokens", 0)
     )
+    if "input_tokens" in usage or "inputTokens" in usage:
+        # Anthropic/Bedrock backends: prompt_tokens is already uncached input.
+        usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    else:
+        cached = (usage["cache_read_input_tokens"] or 0) + (
+            usage["cache_creation_input_tokens"] or 0
+        )
+        usage["input_tokens"] = max(0, (usage.get("prompt_tokens") or 0) - cached)
     return usage
 
 
