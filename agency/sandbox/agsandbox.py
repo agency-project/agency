@@ -311,6 +311,7 @@ class agSandbox:
         state = self.__dict__.copy()
         for key in ("_lock", "_guest_lock", "_guest_threads", "_transaction_owner"):
             del state[key]
+        state.pop("_sysinfo", None)  # host-side counters; rebuilt on demand
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -373,6 +374,25 @@ class agSandbox:
             if admitted:
                 with self._guest_lock:
                     self._guest_threads.discard(me)
+
+    def sysinfo(self):
+        """This sandbox's SysInfoTracker (agency/observability/sysinfo.py), or None when
+        agconfig.sysinfo neither records nor exposes anything, or the backend has no cgroup."""
+        cfg = self.agconfig.sysinfo
+        if not cfg.record and cfg.expose == "none":
+            return None
+        tracker = getattr(self, "_sysinfo", None)
+        if tracker is None:
+            cgroup_dir_fn = getattr(self._backend, "container_cgroup_dir", None)
+            if cgroup_dir_fn is None:
+                return None
+            from ..observability.sysinfo import SysInfoTracker
+
+            tracker = SysInfoTracker(
+                cgroup_dir_fn, record=cfg.record, expose=cfg.expose, max_procs=cfg.max_procs
+            )
+            self._sysinfo = tracker
+        return tracker
 
     def _guard(self):
         if threading.current_thread() in self._guest_threads:

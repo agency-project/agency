@@ -354,7 +354,34 @@ class HostInteractionServer:
             allowed,
             reason,
         )
+        if allowed and call_id is not None:
+            self._sysinfo_call(lambda t: t.tool_started(call_id, tool_name))
         return {"allowed": allowed, "reason": reason, "call_id": call_id}
+
+    def _sysinfo_call(self, fn):
+        """Run fn(tracker) best-effort: system context must never break a tool call."""
+        sandbox = self._sandbox
+        sysinfo = getattr(sandbox, "sysinfo", None) if sandbox is not None else None
+        if sysinfo is None:
+            return None
+        try:
+            tracker = sysinfo()
+            return fn(tracker) if tracker is not None else None
+        except Exception:  # noqa: BLE001 - counters are best-effort
+            return None
+
+    def _record_sysinfo_window(self, call_id: str) -> None:
+        def _complete(tracker):
+            done = tracker.tool_completed(call_id)
+            if done is not None and tracker.record:
+                window, tool_name = done
+                self._data_logger.record_event(
+                    "sysinfo_window",
+                    {"call_id": call_id, "tool": tool_name, **window.to_event()},
+                    print_to_terminal=False,
+                )
+
+        self._sysinfo_call(_complete)
 
     def complete_tool_call(
         self,
@@ -364,6 +391,7 @@ class HostInteractionServer:
         duration_ns: int | None = None,
         started_wall_ns: int | None = None,
     ) -> None:
+        self._record_sysinfo_window(call_id)
         self._record_completion(
             "tool",
             call_id,
@@ -394,6 +422,8 @@ class HostInteractionServer:
             allowed,
             reason,
         )
+        if allowed and syscall.syscall in ("execve", "execveat"):
+            self._sysinfo_call(lambda t: t.note_exec(syscall.pid, syscall.argv))
         return {
             "allowed": allowed,
             "reason": reason,

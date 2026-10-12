@@ -141,11 +141,26 @@ class HostMcpServer:
     def collected_output(self) -> dict:
         return dict(self._persistent_vars.get("submitted_output_store", {}))
 
+    def _system_state_tool(self):
+        """get_system_state, when agconfig.sysinfo exposes it and the skill has no tool of
+        that name already."""
+        cfg = getattr(getattr(self._sandbox, "agconfig", None), "sysinfo", None)
+        if cfg is None or cfg.expose not in ("tool", "both"):
+            return None
+        from ...observability.sysinfo import TOOL_NAME, system_state_tool
+
+        if any(tool.name == TOOL_NAME for tool in self._skill.host_mcp_tools):
+            return None
+        return system_state_tool()
+
     def build_app(self) -> "Starlette":
         server = MCPServer(name="agency-host-mcp-server")
 
         for tool in self._skill.host_mcp_tools:
             self._register_tool(server, tool)
+        sysinfo_tool = self._system_state_tool()
+        if sysinfo_tool is not None:
+            self._register_tool(server, sysinfo_tool)
 
         self._mcp_server = server
         return build_http_app(server, live_session=self._live_session)

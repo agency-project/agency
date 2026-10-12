@@ -300,6 +300,20 @@ class ptraceconfig(confignamespace):
 
 
 @dataclass(slots=True)
+class sysinfoconfig(confignamespace):
+    """System context for the agent (agency/observability/sysinfo.py): what the machine was
+    doing while each tool call ran. Off by default."""
+
+    # Log one `sysinfo_window` event per tool call to the agent's data logger.
+    record: bool = False
+    # What the agent sees: "none", "tool" (the get_system_state host MCP tool), "context"
+    # (appended to tool results; not wired yet), or "both".
+    expose: str = "none"
+    # Most processes listed per window.
+    max_procs: int = 5
+
+
+@dataclass(slots=True)
 class dataloggerconfig(confignamespace):
     """Per-agent data logger (agency/observability/agdatalogger.py). db_path
     is computed once per agent (log_dir/<agname>_data.sqlite3) if not
@@ -332,6 +346,7 @@ class agconfig:
     tool: toolconfig
     harness_adapter: harnessadapterconfig
     ptrace: ptraceconfig
+    sysinfo: sysinfoconfig
     data_logger: dataloggerconfig
     host_server: hostserverconfig
 
@@ -349,6 +364,7 @@ class agconfig:
         toolconfig: "tool",
         harnessadapterconfig: "harness_adapter",
         ptraceconfig: "ptrace",
+        sysinfoconfig: "sysinfo",
         dataloggerconfig: "data_logger",
         hostserverconfig: "host_server",
     }
@@ -368,6 +384,7 @@ class agconfig:
         self.tool = toolconfig()
         self.harness_adapter = harnessadapterconfig()
         self.ptrace = ptraceconfig()
+        self.sysinfo = sysinfoconfig()
         self.data_logger = dataloggerconfig()
         self.host_server = hostserverconfig()
 

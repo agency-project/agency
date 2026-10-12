@@ -888,6 +888,21 @@ class _ContainerBackendBase(agsandbox_backend):
         label = self._prof_container_label()
         if agprof.container_registered(label):
             return
+        container_id, cgroup_dir = self._resolve_container_cgroup()
+        self._register_prof_cgroup(label, container_id, cgroup_dir)
+
+    def container_cgroup_dir(self) -> str:
+        """This running container's kernel cgroup v2 directory (cached until it disappears,
+        e.g. after the container is recreated). Used by agency.observability.sysinfo."""
+        cached = getattr(self, "_cgroup_dir_cache", None)
+        if cached is not None and os.path.isdir(cached):
+            return cached
+        _container_id, cgroup_dir = self._resolve_container_cgroup()
+        self._cgroup_dir_cache = cgroup_dir
+        return cgroup_dir
+
+    def _resolve_container_cgroup(self) -> "tuple[str, str]":
+        """(container id, cgroup v2 dir) from the runtime-reported host init PID."""
         result = self._run(
             [
                 self._runtime,
@@ -946,6 +961,9 @@ class _ContainerBackendBase(agsandbox_backend):
                 f"agprof: local cgroup for runtime PID {pid} does not match container "
                 f"{container_id[:12]} — the docker/podman daemon may be remote or VM-backed"
             )
+        return container_id, cgroup_dir
+
+    def _register_prof_cgroup(self, label: str, container_id: str, cgroup_dir: str) -> None:
 
         daemon_dir = None
         daemon_kind = "conmon"
