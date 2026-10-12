@@ -941,3 +941,237 @@ def test_stop_confirmation_preserves_execution_state_until_scheduler_reports_exi
     assert actor["stop_force"]
     trajectory.apply(event(6, "request_cancelled", request_id="r"))
     assert actor["status"] == "cancelled"
+
+
+def measured_source(tmp_path, *, finished=True):
+    rows = [
+        event(0, "workload_started", ts=100, actor="webui"),
+        event(1, "request_started", ts=110, request_id="r"),
+        event(2, "tool_call", ts=112, call_id="open", tool="Bash"),
+    ]
+    if finished:
+        rows += [
+            event(3, "workload_completed", ts=130, actor="webui", status="completed"),
+            event(4, "done", ts=133, actor="webui", status="completed", finalization_seconds=3),
+        ]
+    write_rows(tmp_path / "global_data.sqlite3", rows)
+    source = LiveSource(tmp_path)
+    source.refresh(force=True)
+    return source, {"id": "live", "time_origin": 100}
+
+
+def test_manual_boundaries_persist_separately_and_survive_reload(tmp_path):
+    source, execution = measured_source(tmp_path)
+    cursor = source.message()
+    assert source.model.run["execution_wall_time"] == 20
+    assert source.measure("end", "one", elapsed=45.5, execution=execution) == {"recorded": True}
+    # Repeated delivery of the same command (a retry or reconnect) is inert.
+    assert source.measure("end", "one", elapsed=99, execution=execution) == {
+        "recorded": False,
+        "duplicate": True,
+    }
+    log = (tmp_path / "measurement.jsonl").read_text().splitlines()
+    assert len(log) == 1
+    stored = json.loads(log[0])
+    assert stored["type"] == "end" and stored["at"] == 155.5 and stored["source"] == "user"
+    assert stored["recorded_at"] > 1e9  # The server's clock, not a client value.
+    # The boundary reaches connected clients through the ordinary patch journal.
+    update = source.message(cursor["cursor"], cursor["epoch"])
+    assert update["type"] == "updates"
+    meta = update["patches"][-1]["meta"]
+    assert meta["execution_wall_time"] == 45.5 and meta["measurement"]["policy"] == "manual"
+    assert meta["measurement"]["automatic_end_at"] == 130
+
+    reopened = LiveSource(tmp_path)
+    reopened.refresh(force=True)
+    run = reopened.message()["run"]
+    assert run["execution_wall_time"] == 45.5
+    assert run["measurement"]["effective_end_at"] == 155.5
+    assert run["measurement"]["end_source"] == "user" and run["measurement"]["end_offset"] == 55.5
+    # Execution evidence is unchanged by the overlay.
+    assert run["status"] == "completed" and run["duration"] == 33
+    assert [a["outcome"] for a in run["actions"]] == ["incomplete"]
+
+    assert reopened.measure("reset", "two", execution=execution) == {"recorded": True}
+    assert reopened.measure("reset", "three", execution=execution) == {
+        "recorded": False,
+        "unchanged": True,
+    }
+    assert reopened.model.run["execution_wall_time"] == 20
+    assert reopened.model.run["measurement"]["policy"] == "automatic"
+    source.refresh(force=True)  # The first reader converges from the shared log.
+    assert source.model.run["execution_wall_time"] == 20
+    assert len((tmp_path / "measurement.jsonl").read_text().splitlines()) == 2
+
+
+def test_measurement_commands_and_user_supplied_times_are_validated(tmp_path):
+    import pytest
+
+    source, execution = measured_source(tmp_path)
+    for command, identifier, options in [
+        ("stop", "a", {}),
+        ("end", "", {}),
+        ("end", "x" * 129, {}),
+        ("end", 7, {}),
+        ("end", "a", {"elapsed": -1}),
+        ("end", "a", {"elapsed": float("nan")}),
+        ("end", "a", {"elapsed": float("inf")}),
+        ("end", "a", {"elapsed": "20"}),
+        ("end", "a", {"elapsed": True}),
+        ("end", "a", {"elapsed": 1e12}),  # Later than the present.
+        ("hold", "a", {"elapsed": 5}),
+        ("reset", "a", {"elapsed": 5}),
+    ]:
+        with pytest.raises(ValueError):
+            source.measure(command, identifier, execution=execution, **options)
+    for stale in (None, {"id": "live", "time_origin": 99}, {"id": "other", "time_origin": 100}):
+        with pytest.raises(ValueError, match="Execution changed"):
+            source.measure("end", "a", execution=stale)
+    assert not (tmp_path / "measurement.jsonl").exists()
+    assert source.model.run["measurement"]["policy"] == "automatic"
+
+    idle = tmp_path / "idle"
+    idle.mkdir()
+    write_rows(idle / "global_data.sqlite3", [event(0, "workload_started", ts=100)])
+    unstarted = LiveSource(idle)
+    unstarted.refresh(force=True)
+    with pytest.raises(ValueError, match="has not started"):
+        unstarted.measure("end", "a", execution=execution)
+    # Declaring "do not stop automatically" before the first agent runs is harmless.
+    assert unstarted.measure("hold", "b", execution=execution) == {"recorded": True}
+
+
+def test_damaged_measurement_records_are_ignored_and_reported(tmp_path):
+    lines = [
+        json.dumps({"id": "ok", "type": "end", "at": 120, "recorded_at": 1}),
+        "{not json",
+        json.dumps({"id": "bad-time", "type": "end", "at": "soon", "recorded_at": 1}),
+        json.dumps({"id": "bad-type", "type": "kill_all", "recorded_at": 1}),
+        json.dumps({"id": "", "type": "hold", "recorded_at": 1}),
+        json.dumps(["end"]),
+        json.dumps({"id": "partial", "type": "reset", "recorded_at": 2}),  # No newline yet.
+    ]
+    (tmp_path / "measurement.jsonl").write_text("\n".join(lines))
+    source, execution = measured_source(tmp_path)
+    assert source.model.run["execution_wall_time"] == 10
+    assert source.model.run["measurement"]["policy"] == "manual"
+    assert any("5 unreadable" in gap for gap in source.model.run["coverage"]["gaps"])
+    with open(tmp_path / "measurement.jsonl", "a") as stream:
+        stream.write("\n")  # The writer finishes the pending line.
+    source.refresh(force=True)
+    assert source.model.run["execution_wall_time"] == 20
+    assert source.model.run["measurement"]["policy"] == "automatic"
+
+
+def test_keep_running_survives_reload_but_not_the_server_that_held_it(tmp_path):
+    import time as clock
+
+    from agency.observability.agwebui import measurement
+
+    source, execution = measured_source(tmp_path)
+    now = clock.time()
+    assert source.measure("hold", "hold", execution=execution) == {"recorded": True}
+    assert source.measure("hold", "again", execution=execution) == {
+        "recorded": False,
+        "unchanged": True,
+    }
+    source.renew_hold()
+    assert abs(measurement.read_lease(tmp_path) - now) < 5
+    # A page reload or websocket reconnect, even a restarted server, keeps counting.
+    reloaded = LiveSource(tmp_path)
+    reloaded.refresh(force=True)
+    held = reloaded.model.run
+    assert held["measurement"]["held"] and held["measurement"]["state"] == "running"
+    assert held["measurement"]["automatic_end_at"] == 130
+    assert held["execution_wall_time"] == approximately(now - 110)
+
+    # Days later the server that held it is long gone: the timer must not have run on.
+    measurement.write_lease(tmp_path, now - 3600)
+    stored = [
+        json.loads(line)
+        for line in (tmp_path / "measurement.jsonl").read_text().split("\n")
+        if line
+    ]
+    stored[0]["recorded_at"] = now - 7200
+    (tmp_path / "measurement.jsonl").write_text("".join(json.dumps(row) + "\n" for row in stored))
+    later = LiveSource(tmp_path)
+    later.refresh(force=True)
+    expired = later.model.run["measurement"]
+    assert expired["state"] == "ended" and not expired["held"]
+    assert expired["end_source"] == "hold_expired" and expired["policy"] == "manual"
+    assert later.model.run["execution_wall_time"] == approximately(now - 3600 - 110)
+    assert json.loads((tmp_path / "measurement.jsonl").read_text().splitlines()[-1])["at"] == (
+        now - 3600
+    )
+    assert later.measure("reset", "auto", execution=execution) == {"recorded": True}
+    assert later.model.run["execution_wall_time"] == 20
+
+
+def approximately(value):
+    import pytest
+
+    return pytest.approx(value, abs=5)
+
+
+def test_missing_completion_does_not_run_the_live_clock_indefinitely(tmp_path):
+    import os
+    import time as clock
+
+    now = clock.time()
+    write_rows(
+        tmp_path / "global_data.sqlite3",
+        [
+            event(0, "workload_started", ts=now - 5000, actor="webui"),
+            event(1, "request_started", ts=now - 4990, request_id="r"),
+            event(2, "tool_call", ts=now - 4980, call_id="open", tool="Bash"),
+        ],
+    )
+    commands = tmp_path / "ui_commands"
+    commands.mkdir()
+    heartbeat = commands / ".heartbeat"
+    heartbeat.touch()
+    source = LiveSource(tmp_path)
+    source.refresh(force=True)
+    assert source.model.run["execution_wall_time"] == approximately(4990)  # Still alive.
+
+    # The execution process was killed: its relay heartbeat stops and no `done` arrives.
+    crashed = LiveSource(tmp_path)
+    os.utime(heartbeat, (now - 4000, now - 4000))
+    crashed.refresh(force=True)
+    assert crashed.model.run["execution_wall_time"] == approximately(990)
+    assert crashed.model.run["duration"] == approximately(1000)
+    assert crashed.model.run["measurement"]["state"] == "running"
+
+
+def test_legacy_and_saved_recordings_without_measurement_metadata_stay_readable():
+    from agency.observability.agwebui.trajectory import historical_projection
+
+    # A legacy live recording: only `done`, and no measurement log.
+    legacy = Trajectory("live", "Legacy")
+    legacy.apply(event(1, "request_started", ts=10))
+    legacy.apply(event(2, "done", ts=30, status="completed"))
+    legacy.tick(10_000)
+    assert legacy.run["execution_wall_time"] == 20
+    assert legacy.run["measurement"]["automatic_end_source"] == "done"
+
+    saved = {
+        "id": "saved",
+        "title": "Saved trace",
+        "source": "recorded",
+        "duration": 12,
+        "status": "unknown",
+        "actions": [],
+        "edges": [],
+    }
+    events = replay_events(saved)
+    assert events[-1]["type"] == "done" and events[-1]["ts"] == 12
+    replay = Trajectory("saved", "Saved trace", mode="replay")
+    replay.apply(event(0, "tool_call", ts=2, call_id="c"))
+    for row in events:
+        replay.apply(row)
+    replay.tick(10_000)
+    # The synthesized end is bounded and labelled, never passed off as recorded.
+    assert replay.run["execution_wall_time"] == 10
+    assert replay.run["measurement"]["automatic_end_source"] == "replay_boundary"
+    projected = historical_projection(dict(saved))
+    assert "measurement" not in projected and projected["duration"] == 12

@@ -1468,3 +1468,172 @@ def test_dashboard_standalone_or_unfenced_commands_cannot_target_ambient_executi
         while (response := ws.receive_json())["type"] != "execution_command_result":
             pass
         assert "Execution changed" in response["error"] and not _read_command_files(run_dir)
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock measurement commands
+# ---------------------------------------------------------------------------
+
+
+def _measured_run(run_dir):
+    from tests.agwebui.test_trajectory import event, write_rows
+
+    write_rows(
+        run_dir / "global_data.sqlite3",
+        [
+            event(0, "workload_started", ts=100, actor="webui"),
+            event(1, "request_started", ts=110, request_id="r"),
+            event(2, "tool_call", ts=112, call_id="open", tool="Bash"),
+            event(3, "workload_completed", ts=130, actor="webui", status="completed"),
+            event(4, "done", ts=133, actor="webui", status="completed", finalization_seconds=3),
+        ],
+    )
+
+
+def _measure(ws, command, identifier, execution, **extra):
+    ws.send_json(
+        {
+            "type": "measurement_command",
+            "command": command,
+            "id": identifier,
+            "execution": execution,
+            **extra,
+        }
+    )
+    while (message := ws.receive_json())["type"] != "measurement_command_result":
+        pass
+    return message
+
+
+def _measurement_update(ws, accept):
+    """The next state delivered by an ordinary trajectory snapshot or patch."""
+    for _ in range(50):
+        message = ws.receive_json()
+        states = [message["run"]] if message["type"] == "snapshot" else []
+        states += [patch["meta"] for patch in message.get("patches", [])]
+        for state in states:
+            if accept(state["measurement"]):
+                return state
+    raise AssertionError("No matching measurement state was delivered")
+
+
+def test_measurement_commands_outlive_the_relay_and_never_reach_agents(server):
+    client, run_dir, srv = server
+    _measured_run(run_dir)
+    # The workload finished: the execution relay removed its heartbeat and session.
+    assert not (run_dir / "ui_commands" / ".heartbeat").exists()
+
+    with client.websocket_connect("/ws/trajectory") as ws:
+        first = ws.receive_json()
+        assert first["type"] == "snapshot" and first["run"]["execution_wall_time"] == 20
+        assert first["run"]["measurement"]["policy"] == "automatic"
+        assert not first["execution_controls"]["available"]
+        execution = first["execution_controls"]["execution"]
+        ws.send_json(
+            {
+                "type": "execution_command",
+                "command": "pause_all",
+                "id": "x",
+                "execution": execution,
+            }
+        )
+        while (refused := ws.receive_json())["type"] != "execution_command_result":
+            pass
+        assert "No active execution command bridge" in refused["error"]
+
+        assert _measure(ws, "end", "later", execution, elapsed=50)["recorded"]
+        state = _measurement_update(ws, lambda m: m["policy"] == "manual")
+        assert state["execution_wall_time"] == 50 and state["status"] == "completed"
+        assert state["measurement"]["automatic_end_at"] == 130
+        # A repeated delivery and malformed requests change nothing.
+        assert _measure(ws, "end", "later", execution, elapsed=5)["duplicate"]
+        for bad in (
+            {"command": "end", "elapsed": "soon"},
+            {"command": "end", "elapsed": -3},
+            {"command": "kill_all"},
+            {"command": "hold", "execution": {"id": "live", "time_origin": 1}},
+        ):
+            reply = _measure(
+                ws,
+                bad["command"],
+                f"bad-{len(bad)}-{bad['command']}",
+                bad.get("execution", execution),
+                **({"elapsed": bad["elapsed"]} if "elapsed" in bad else {}),
+            )
+            assert reply.get("error") and "recorded" not in reply
+
+    # Stopping the measurement queued nothing for the agents.
+    assert _read_command_files(run_dir) == []
+    assert len((run_dir / "measurement.jsonl").read_text().splitlines()) == 1
+
+    # Browser reload / websocket reconnect: the snapshot carries the manual boundary.
+    with client.websocket_connect("/ws/trajectory") as ws:
+        reloaded = ws.receive_json()["run"]
+        assert reloaded["execution_wall_time"] == 50
+        assert reloaded["measurement"]["end_source"] == "user"
+        assert [a["outcome"] for a in reloaded["actions"]] == ["incomplete"]
+
+        assert _measure(ws, "hold", "keep", execution)["recorded"]
+        held = _measurement_update(ws, lambda m: m["held"])
+        assert held["measurement"]["state"] == "running"
+        assert held["execution_wall_time"] > 1e6  # Continuous since the original start.
+        assert held["measurement"]["automatic_end_at"] == 130
+
+        assert _measure(ws, "reset", "auto", execution)["recorded"]
+        restored = _measurement_update(ws, lambda m: m["policy"] == "automatic")
+        assert restored["execution_wall_time"] == 20
+        assert restored["measurement"]["end_source"] == "workload_done"
+    assert _read_command_files(run_dir) == []
+
+
+def test_replay_keeps_the_recorded_manual_boundary_and_is_read_only(server):
+    from tests.agwebui.test_timeline_replay import receive_seek
+
+    client, run_dir, srv = server
+    _measured_run(run_dir)
+    source = srv._trajectory_source()
+    source.refresh(force=True)
+    execution = {"id": "live", "time_origin": 100}
+    source.measure("end", "later", elapsed=50, execution=execution)
+
+    with client.websocket_connect("/ws/trajectory?mode=replay&run=live") as ws:
+        ws.receive_json()
+        middle = receive_seek(ws, 20)["run"]
+        # The prefix has not reached the boundary; it is not replaced by a synthetic one.
+        assert middle["execution_wall_time"] == 10
+        assert middle["measurement"]["state"] == "running"
+        assert middle["measurement"]["policy"] == "manual"
+        assert middle["measurement"]["end_offset"] == 60
+        finished = receive_seek(ws, 33)
+        assert finished["replay"]["finished"]
+        assert finished["run"]["execution_wall_time"] == 50
+        assert finished["run"]["measurement"]["state"] == "ended"
+        assert finished["run"]["measurement"]["end_source"] == "user"
+        assert finished["run"]["measurement"]["automatic_end_offset"] == 30
+        reply = _measure(ws, "reset", "from-replay", execution)
+        assert "during replay" in reply["error"]
+    assert len((run_dir / "measurement.jsonl").read_text().splitlines()) == 1
+
+
+def test_saved_review_of_this_run_uses_the_recorded_boundary(server, monkeypatch, tmp_path):
+    client, run_dir, srv = server
+    _measured_run(run_dir)
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    monkeypatch.setenv("AGENCY_PROFILE_DIR", str(profile_dir))
+    trace = {"traceEvents": [{"ph": "X", "name": "skill", "ts": 0, "dur": 90_000_000, "pid": 1}]}
+    (profile_dir / "agprof.trace.json").write_text(json.dumps(trace))
+
+    runs = client.get("/api/investigator/runs").json()["runs"]
+    saved = next(run for run in runs if run["title"] == "Current run")
+    before = client.get(f"/api/investigator/runs/{saved['id']}").json()
+    # The trace's span extent (90s, profiler clock) is not the wall-clock measurement.
+    assert before["duration"] == 90 and before["execution_wall_time"] == 20
+    assert before["measurement"]["policy"] == "automatic"
+    assert before["measurement"]["end_offset"] is None
+
+    source = srv._trajectory_source()
+    source.measure("end", "manual", elapsed=42, execution={"id": "live", "time_origin": 100})
+    after = client.get(f"/api/investigator/runs/{saved['id']}").json()
+    assert after["execution_wall_time"] == 42 and after["measurement"]["policy"] == "manual"
+    assert after["measurement"]["automatic_end_at"] == 130

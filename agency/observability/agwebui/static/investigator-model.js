@@ -1,28 +1,4 @@
-// Shared, deterministic projections used by all six views.
-export function alignSequences(left, right, key = item => item.kind) {
-  const grid = Array.from({length: left.length + 1}, () => new Uint16Array(right.length + 1));
-  for (let i = left.length - 1; i >= 0; i--) {
-    for (let j = right.length - 1; j >= 0; j--) {
-      grid[i][j] = key(left[i]) === key(right[j]) ? 1 + grid[i + 1][j + 1] : Math.max(grid[i + 1][j], grid[i][j + 1]);
-    }
-  }
-  const rows = [];
-  let i = 0, j = 0, diverged = false;
-  while (i < left.length || j < right.length) {
-    if (i < left.length && j < right.length && key(left[i]) === key(right[j])) {
-      rows.push({left: left[i++], right: right[j++], match: true, reconverged: diverged});
-      diverged = false;
-    } else if (i < left.length && (j >= right.length || grid[i + 1][j] >= grid[i][j + 1])) {
-      rows.push({left: left[i++], right: null, match: false});
-      diverged = true;
-    } else {
-      rows.push({left: null, right: right[j++], match: false});
-      diverged = true;
-    }
-  }
-  return rows;
-}
-
+// Shared, deterministic projections used by every view.
 export function matchesAction(action, agent, query) {
   if (agent && action.agent !== agent) return false;
   return !query || `${action.name} ${action.intent} ${action.command} ${action.result} ${(action.files || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
@@ -82,6 +58,9 @@ export function readableExecutionTitle(run) {
 
 // Live events contain cumulative CPU/I/O counters; saved traces contain rates.
 // Keep their recorded scope rather than adding overlapping workload/PID totals.
+const gpuStates=['valid','no_new_samples','unsupported','collection_failure','stale','unavailable'];
+const gpuStateLabels={no_new_samples:'No new samples',unsupported:'Unsupported metric',collection_failure:'Collection failure',stale:'Stale measurement',unavailable:'Unavailable'};
+const decodeIdentity=value=>{try{return decodeURIComponent(value);}catch{return value;}};
 const systemMeasurementCache=new WeakMap(),latestMeasurementCache=new WeakMap();
 export function systemMeasurements(run,{latestOnly=false}={}) {
   const counters=run.counters||{},metrics=[];
@@ -89,13 +68,15 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
   // the projection between renders of the same recording/window.
   const future=Object.values(counters).some(v=>Array.isArray(v)&&v.at(-1)?.[0]>run.duration);
   const window=Number.isFinite(run.duration)?(latestOnly&&!future?'all':run.duration):'all';
-  const signature=JSON.stringify([window,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
+  const signature=JSON.stringify([window,Object.keys(counters).some(name=>/^gpu\d+:/.test(name))?run.duration:null,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
   const cache=latestOnly?latestMeasurementCache:systemMeasurementCache;
   const cached=cache.get(run);
   if(cached?.counters===counters&&cached.signature===signature)return cached.metrics;
-  for(const [name,samples] of Object.entries(counters)) {
+  const names=new Set(Object.keys(counters).map(name=>/^gpu\d+:.*:state$/.test(name)?name.slice(0,-6):name));
+  for(const name of names) {
+    const samples=counters[name]||[];
     if(!Array.isArray(samples))continue;
-    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
+    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|process_mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
     if(!match)continue;
     const kind=match[1],prefix=name.slice(0,name.length-kind.length);
     const cpu=/^cpu/.test(kind),rawCPU=/^cpu_(us|s)$/.test(kind);
@@ -125,13 +106,24 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
         previous=point;
       }else points.push(point);
     }
-    if(!points.length)continue;
     const parts=name.split(':');
+    const gpu=/^gpu\d+:/.test(name);
+    const state=gpu?(counters[name+':state']||[]).findLast(usable):null;
+    if(!points.length&&!state)continue;
+    const last=points.at(-1);
+    let status=state?gpuStates[state[1]]||'unavailable':'valid';
+    if(gpu&&['valid','no_new_samples'].includes(status)&&last&&Number.isFinite(run.duration)&&run.duration-last[0]>10)status='stale';
+    if(!last&&status==='valid')status='unavailable';
+    const latest=status==='valid'?last:[state?.[0]??last?.[0]??0,null];
     const workload=/^workload(?:_total)?[: ]/.test(name),host=/^(host|system):/.test(name);
     const device=/^gpu\d+:/.test(name)&&parts.length===2;
     const process=/^(proc|process):/.test(name),sandbox=/^(cg|sandbox):/.test(name);
-    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:parts.length>2&&/^gpu\d+$/.test(parts[0])?`${parts[0]} · ${parts[1]}`:'Recorded scope';
-    metrics.push({name,label:/^gpu\d+:/.test(name)&&kind==='mem_mb'?'VRAM':label,unit,scope,aggregate:workload||host||device,points,latest:points.at(-1),derived:rawCPU||bytes});
+    const gpuProcess=gpu&&parts[1]==='proc'&&parts[3]==='sandbox';
+    const processMemory=gpu&&(parts[1]==='processes'&&kind==='mem_mb'||kind==='process_mem_mb');
+    const gpuScope=gpuProcess?`${parts[0]} · Process ${parts[2]}${parts[4]!=='~'?` · Sandbox ${decodeIdentity(parts[4])}`:''}`:gpu&&parts[1]==='sandbox'?`${parts[0]} · Sandbox ${decodeIdentity(parts[2])}`:gpu&&parts[1]==='processes'?`${parts[0]} · Compute processes`:parts.length>2&&gpu?`${parts[0]} · ${parts[1]}`:'Recorded scope';
+    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:gpuScope;
+    const metricLabel=processMemory?'Process VRAM':gpu&&kind==='mem_mb'?'VRAM':gpuProcess&&kind==='util_pct'?'Process SM activity':label;
+    metrics.push({name,label:metricLabel,unit,scope,aggregate:workload||host||device,points,latest,derived:rawCPU||bytes,status,statusLabel:gpuStateLabels[status]||'',processIdentity:gpuProcess?parts[2]:null,sandbox:gpuProcess&&parts[4]!=='~'?decodeIdentity(parts[4]):null});
   }
   cache.set(run,{counters,signature,metrics});
   return metrics;
@@ -163,9 +155,62 @@ export function executionMeasurements(run,{includeResources=true}={}) {
   const resourcesMeasured=includeResources?systemMeasurements(run,{latestOnly:true}):[];
   for(const label of ['CPU','RAM','GPU','VRAM']) {
     const metric=resourcesMeasured.find(m=>m.label===label&&m.aggregate)||resourcesMeasured.find(m=>m.label===label);
-    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s`]);
+    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s${metric.statusLabel?` · ${metric.statusLabel}`:''}`]);
   }
   const usage=models.length?`Usage reported for ${input.length}/${models.length} input and ${output.length}/${models.length} output calls.`:'No model calls recorded.';
   const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';
   return {primary,secondary,coverage:`${usage} ${resources}`};
+}
+
+// Reported usage summed over one agent's model calls: input (prompt) plus
+// output (completion) tokens. Execution-wide per-agent counters are preferred
+// because a live view retains only a bounded window of calls.
+export function agentTokens(run,id) {
+  let totals=run.metrics_by_agent?.[id];
+  if(!totals&&!run.metrics_by_agent) {
+    totals={models:0,input:0,output:0,input_samples:0,output_samples:0};
+    for(const a of run.actions||[]) {
+      if(a.agent!==id||a.kind!=='model')continue;
+      totals.models++;
+      if(Number.isFinite(a.tokens)){totals.input+=a.tokens;totals.input_samples++;}
+      if(Number.isFinite(a.output_tokens)){totals.output+=a.output_tokens;totals.output_samples++;}
+    }
+  }
+  if(!totals||!(totals.input_samples||totals.output_samples))return null;
+  return {total:totals.input+totals.output,input:totals.input_samples?totals.input:null,output:totals.output_samples?totals.output:null,
+    reported:Math.max(totals.input_samples,totals.output_samples),models:totals.models};
+}
+
+// Container (cgroup) measurements of the sandboxes the engine recorded for
+// these agents: CPU is every process in the container, 100% = one core. A
+// sandbox also used by an agent outside *ids* is shared and is not attributed.
+// Host, workload, orchestrator and runtime-daemon series are never included.
+export function agentResources(run,ids,stale=10) {
+  const wanted=new Set(ids),owners=new Map();
+  const remember=(sandbox,id)=>{
+    if(typeof sandbox!=='string'||!sandbox||typeof id!=='string'||!id)return;
+    const agents=owners.get(sandbox)||[];
+    if(!agents.includes(id))agents.push(id);
+    owners.set(sandbox,agents);
+  };
+  for(const a of run.agents||[])for(const sandbox of new Set([a.sandbox,...(Array.isArray(a.sandboxes)?a.sandboxes:[])]))remember(sandbox,a.id);
+  // Saved presentation metadata can name a shared owner with no retained
+  // spans. Keep it in the ownership set instead of treating the box as sole-owned.
+  for(const [sandbox,agents] of Object.entries(run.sandbox_owners||{}))if(Array.isArray(agents))for(const id of agents)remember(sandbox,id);
+  const linked=[...owners].filter(([,agents])=>agents.some(id=>wanted.has(id)));
+  const own=linked.filter(([,agents])=>agents.every(id=>wanted.has(id))).map(([sandbox])=>sandbox);
+  const metrics=own.length?systemMeasurements(run,{latestOnly:true}):[];
+  const read=(label,prefixes)=>{
+    let value=0,sandboxes=0;
+    for(const sandbox of own) {
+      // cg:* is the live series; sandbox:* is the saved canonical series.
+      // Pick one latest observation, never add aliases of the same cgroup.
+      const metric=metrics.filter(m=>m.label===label&&prefixes.some(prefix=>m.name.startsWith(`${prefix}:${sandbox}:`))&&Number.isFinite(m.latest[1])).sort((a,b)=>b.latest[0]-a.latest[0])[0];
+      // A container that stopped reporting has no current utilization.
+      if(!metric||Number.isFinite(run.duration)&&run.duration-metric.latest[0]>stale)continue;
+      value+=metric.latest[1];sandboxes++;
+    }
+    return sandboxes?{value,sandboxes}:null;
+  };
+  return {cpu:read('CPU',['cg','sandbox']),memory:read('RAM',['sandbox']),sandboxes:own.length,shared:linked.length-own.length};
 }

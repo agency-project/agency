@@ -1,5 +1,6 @@
 """Tests for agllm — LLM client wrapper and kwarg building."""
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,7 +21,14 @@ def build_llm_kwargs(cfg, messages, openai_tools=None):
     return agllm.for_config(cfg).build_kwargs(messages, openai_tools)
 
 
-LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
+@pytest.fixture(autouse=True)
+def _reset_warn_once(monkeypatch):
+    # agency.llm re-exports the agllm class over the module's own name, so a
+    # dotted-string target would resolve to the class.
+    monkeypatch.setattr(sys.modules["agency.llm.agllm"], "_WARNED_ONCE", set())
+
+
+LLM_COMPACT_CONFIG ={"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
 
 
 def test_build_llm_kwargs_includes_reasoning_effort():
@@ -248,6 +256,17 @@ def test_build_llm_kwargs_leading_developer_after_system_becomes_user(capsys):
         {"role": "user", "content": "do X"},
     ]
     assert "second system-class" in capsys.readouterr().out
+
+
+def test_build_llm_kwargs_second_system_class_warns_once_per_process(capsys):
+    messages = [
+        _sys_msg("You are Codex."),
+        _msg("developer", "Some developer-level instructions."),
+        _msg("user", "do X"),
+    ]
+    build_llm_kwargs(_cfg(), messages, None)
+    build_llm_kwargs(_cfg(), messages, None)
+    assert capsys.readouterr().out.count("second system-class") == 1
 
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():

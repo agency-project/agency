@@ -6,6 +6,9 @@ import math
 class ExecutionCounters:
     def __init__(self):
         self.calls = {}
+        # The same counters keyed by recorded actor, so a client holding only a
+        # bounded window of calls can still scope execution totals to agents.
+        self.by_agent = {}
         self.totals = dict(
             tools=0,
             models=0,
@@ -35,8 +38,14 @@ class ExecutionCounters:
                     if isinstance(value, (float, int)) and math.isfinite(value):
                         values[target] = value
                         values[target + "_samples"] = 1
-            previous = self.calls.get(action["id"], {})
+            previous, owner = self.calls.get(action["id"], ({}, None))
+            agent = action.get("agent")
             for key, value in values.items():
                 self.totals[key] += value - previous.get(key, 0)
-            self.calls[action["id"]] = values
+                # A call keeps its identity if its recorded actor is corrected.
+                if owner is not None:
+                    self.by_agent[owner][key] -= previous.get(key, 0)
+                if agent is not None:
+                    self.by_agent.setdefault(agent, dict.fromkeys(self.totals, 0))[key] += value
+            self.calls[action["id"]] = (values, agent)
         return dict(self.totals)

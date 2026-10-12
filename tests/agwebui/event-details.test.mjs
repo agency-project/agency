@@ -157,3 +157,36 @@ test('observed control cards qualify evidence as a local outcome',()=>{
   const card=eventCard({kind:'control',name:'pause',outcome:'observed'});
   assert.equal(card.state.label,'Local outcome observed');
 });
+
+const {prettyJson,highlightJson}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+test('JSON is pretty-printed without changing any recorded value',()=>{
+  const recorded='{"id":12345678901234567890,"ratio":1.0,"exp":1e3,"text":"a \\"quoted\\" {brace}, [comma]: \\u00e9\\n","empty":{},"none":[ ],"list":[1,{"deep":null}],"flag":false}';
+  const pretty=prettyJson(recorded);
+  assert.equal(pretty,['{','  "id": 12345678901234567890,','  "ratio": 1.0,','  "exp": 1e3,','  "text": "a \\"quoted\\" {brace}, [comma]: \\u00e9\\n",','  "empty": {},','  "none": [],','  "list": [','    1,','    {','      "deep": null','    }','  ],','  "flag": false','}'].join('\n'));
+  // Same data; re-serialising would have rounded the integer and rewritten 1.0 and the escape.
+  assert.deepEqual(JSON.parse(pretty),JSON.parse(recorded));
+  assert.notEqual(JSON.stringify(JSON.parse(recorded),null,2),pretty);
+  assert.equal(prettyJson('  [1,2]\n'),'[\n  1,\n  2\n]');
+  assert.equal(prettyJson(prettyJson(recorded)),pretty);
+});
+test('only complete, valid JSON objects and arrays are treated as JSON',()=>{
+  for(const text of ['plain output','{"cut": "off','{not: json}','[1,2','42','"a string"','true','','Exit 1 · {"a":1}',null,undefined,{a:1},7])assert.equal(prettyJson(text),null);
+  assert.equal(prettyJson('['+'1,'.repeat(100001)+'1]'),null);
+});
+test('JSON highlighting classifies tokens and escapes everything, including clipped strings',()=>{
+  const html=highlightJson('{\n  "key": "va<l>ue",\n  "n": -1.5e3,\n  "ok": true,\n  "none": null\n}');
+  assert.match(html,/<span class="json-key">&quot;key&quot;:<\/span> <span class="json-string">&quot;va&lt;l&gt;ue&quot;<\/span>/);
+  assert.match(html,/<span class="json-number">-1\.5e3<\/span>/);assert.match(html,/<span class="json-literal">true<\/span>/);assert.match(html,/<span class="json-literal">null<\/span>/);
+  const clipped=highlightJson('{\n  "html": "<img src=x onerror=alert(1)>');
+  assert.doesNotMatch(clipped,/<img/);assert.match(clipped,/&quot;&lt;img src=x onerror=alert\(/);assert.match(clipped,/\)&gt;$/);
+});
+test('cards expose the call type and format a JSON command while leaving text commands alone',()=>{
+  assert.equal(eventCard({kind:'model',outcome:'success'}).type,'model');assert.equal(eventCard({kind:'model',outcome:'success'}).typeLabel,'Model');
+  assert.equal(eventCard({kind:'tool',name:'bash',outcome:'success'}).type,'tool');assert.equal(eventCard({kind:'test',outcome:'failed'}).type,'tool');
+  assert.equal(eventCard({kind:'control',outcome:'requested'}).type,'control');assert.equal(eventCard({kind:'queue',outcome:'success'}).type,'operation');
+  const structured=eventCard({kind:'tool',name:'search',arguments:'{"pattern":"TODO","paths":["src","tests"]}',outcome:'success'});
+  assert.equal(structured.json,true);assert.equal(structured.primary,'{\n  "pattern": "TODO",\n  "paths": [\n    "src",\n    "tests"\n  ]\n}');
+  const text=eventCard({kind:'tool',name:'bash',arguments:'{"command":"pytest -q"}',outcome:'success'});
+  assert.equal(text.json,false);assert.equal(text.primary,'pytest -q');
+  assert.match(renderEventCard({kind:'tool',name:'search',arguments:'{"pattern":"<b>"}',outcome:'success'}),/call-meaning json-label">\{\n  <span class="json-key">&quot;pattern&quot;:<\/span> <span class="json-string">&quot;&lt;b&gt;&quot;<\/span>/);
+});

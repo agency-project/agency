@@ -20,11 +20,13 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+from . import measurement
 from .investigator import classify, object_value
 
 EVENT_TYPES = (
     "resource_sample",
     "workload_started",
+    "workload_completed",
     "done",
     "agent_registered",
     "agent_created",
@@ -123,6 +125,21 @@ class Trajectory:
             "duration": 0,
             "execution_started_at": None,
             "execution_wall_time": 0,
+            # Wall-clock measurement is distinct from agent execution and from
+            # workload completion: the automatic boundary comes from recorded
+            # events, the effective one may be a user override. Timestamps
+            # share the event clock; *_offset is seconds on the trace axis.
+            "measurement": {
+                "state": "pending",
+                "policy": "automatic",
+                "held": False,
+                "automatic_end_at": None,
+                "automatic_end_source": None,
+                "automatic_end_offset": None,
+                "effective_end_at": None,
+                "end_source": None,
+                "end_offset": None,
+            },
             "status": "unknown",
             "resolved": None,
             "actions": [],
@@ -162,6 +179,11 @@ class Trajectory:
         self.signals = {}
         self.dirty["signals"] = set()
         self.finished_at = None
+        # Latest observed instant. Unlike the trace duration it keeps advancing
+        # after the final lifecycle event, so a held measurement can continue.
+        self.clock = None
+        self.override = None
+        self.measured = set()
         self.running = set()
         self.intervals = {}
         self.dirty["intervals"] = set()
@@ -562,6 +584,7 @@ class Trajectory:
             self.origin = event["ts"]
             self.run["time_origin"] = self.origin
         self.run["duration"] = max(self.run["duration"], event["ts"] - self.origin)
+        self.clock = event["ts"] if self.clock is None else max(self.clock, event["ts"])
         actor = event.get("actor") or "unattributed"
         event = {**event, "actor": actor}
         payload, kind = event["payload"], event["type"]
@@ -591,7 +614,26 @@ class Trajectory:
             for field in ("model", "harness", "dataset"):
                 if payload.get(field):
                     self.run[field] = payload[field]
+        elif kind == "workload_completed":
+            # The workload callback returned. Profiler finalization follows and
+            # the terminal lifecycle still arrives as `done`; this says nothing
+            # about task success.
+            self.run["measurement"].update(
+                automatic_end_at=event["ts"], automatic_end_source="workload_completed"
+            )
         elif kind == "done":
+            if self.run["measurement"]["automatic_end_at"] is None:
+                # Legacy and programmatic recordings have only this boundary.
+                # A recorded gap back to callback return survives a lost
+                # workload_completed event and is valid on any event clock.
+                gap = payload.get("finalization_seconds")
+                self.run["measurement"].update(
+                    automatic_end_at=event["ts"]
+                    - (gap if measurement.finite(gap) and gap >= 0 else 0),
+                    automatic_end_source="replay_boundary"
+                    if event.get("source") == "replay_boundary_not_recorded_lifecycle"
+                    else "done",
+                )
             self.run["status"] = payload.get("status", "unknown")
             if self.run["status"] == "unknown":
                 self._signal(
@@ -698,6 +740,10 @@ class Trajectory:
                 if event["ts"] >= agent.get("state_ts", 0):
                     self._agent_status(agent, payload.get("state", "unknown"))
                     agent["state_ts"] = event["ts"]
+                # The engine names the sandbox this agent executes in; resource
+                # series of that label are the agent's container measurements.
+                if isinstance(payload.get("sandbox"), str):
+                    agent["sandbox"] = payload["sandbox"]
                 if payload.get("state") == "waiting_llm" and event.get("call_label"):
                     self._call(event, "model", f"model:{event['call_label']}")
             elif kind in {"tool_call", "tool_result", "model_result"}:
@@ -847,16 +893,49 @@ class Trajectory:
         self._execution_clock()
         return True
 
+    def apply_measurement(self, record):
+        """Overlay one user measurement command; execution events are never altered."""
+        if record["id"] in self.measured:
+            return False
+        self.measured.add(record["id"])
+        self.override = None if record["type"] == "reset" else record
+        self._execution_clock()
+        return True
+
     def _execution_clock(self):
         started = self.run["execution_started_at"]
-        end = (
-            self.finished_at
-            if self.finished_at is not None
-            else (self.origin or 0) + self.run["duration"]
+        state = self.run["measurement"]
+        now = self.clock if self.clock is not None else (self.origin or 0) + self.run["duration"]
+        held = bool(self.override) and self.override["type"] == "hold"
+        if self.override and not held:
+            end, source = self.override["at"], self.override.get("source", "user")
+        elif held:
+            end, source = None, None
+        else:
+            end = state["automatic_end_at"]
+            source = None if end is None else "workload_done"
+        origin = self.origin or 0
+        automatic = state["automatic_end_at"]
+        state.update(
+            # A boundary later than the displayed instant (a replay prefix) has
+            # not been reached yet.
+            state="pending"
+            if started is None
+            else "ended"
+            if end is not None and end <= now
+            else "running",
+            policy="manual" if self.override else "automatic",
+            held=held,
+            automatic_end_offset=None if automatic is None else automatic - origin,
+            effective_end_at=end,
+            end_source=source,
+            end_offset=None if end is None else end - origin,
         )
-        self.run["execution_wall_time"] = 0 if started is None else max(0, end - started)
+        measured_to = now if end is None else min(now, end)
+        self.run["execution_wall_time"] = 0 if started is None else max(0, measured_to - started)
 
     def tick(self, now, *, force=False):
+        self.clock = now if self.clock is None else max(self.clock, now)
         if self.finished_at is None and self.origin is not None:
             self.run["duration"] = max(self.run["duration"], now - self.origin)
         self._execution_clock()
@@ -889,6 +968,7 @@ class Trajectory:
         else:
             calls = (self.actions[key] for key in self.dirty["actions"])
         self.run["metrics_totals"] = self.metrics_counters.update(calls)
+        self.run["metrics_by_agent"] = self.metrics_counters.by_agent
 
     def patch(self):
         self._metrics()
@@ -911,10 +991,12 @@ class Trajectory:
             key: copy.deepcopy(self.run[key])
             for key in (
                 "metrics_totals",
+                "metrics_by_agent",
                 "status",
                 "duration",
                 "execution_started_at",
                 "execution_wall_time",
+                "measurement",
                 "coverage",
                 "task",
                 "model",
@@ -984,6 +1066,11 @@ class LiveSource:
             / "profile_data.sqlite3"
         )
         self.cursors = {}
+        self.measurement_path = self.directory / measurement.LOG_NAME
+        self.measurement_offset = 0
+        self.measurements = []
+        self.measurement_rejected = 0
+        self.lease_written = 0
         self.epoch = uuid.uuid4().hex
         self.revision = 0
         self.journal = deque(maxlen=512)
@@ -997,6 +1084,113 @@ class LiveSource:
         self.model.run["coverage"]["semantics"] = (
             "Deterministic grouping; optional semantic refinement disabled."
         )
+        self._measurements()
+        self._expire_abandoned_hold()
+
+    def _measurements(self):
+        records, self.measurement_offset, rejected = measurement.read(
+            self.measurement_path, self.measurement_offset
+        )
+        self.measurement_rejected += rejected
+        for record in records:
+            if self.model.apply_measurement(record):
+                self.measurements.append(record)
+
+    def _expire_abandoned_hold(self):
+        """A measurement held open by a server that has since stopped ended with it.
+
+        Without this, reopening an old run would keep counting to the present."""
+        hold = self.model.override
+        if not hold or hold["type"] != "hold":
+            return
+        held_until = max(hold["recorded_at"], measurement.read_lease(self.directory) or 0)
+        if time.time() - held_until <= measurement.LEASE_STALE:
+            return
+        record = {
+            "id": f"hold-expired:{hold['id']}"[:128],
+            "type": "end",
+            "at": held_until,
+            "recorded_at": time.time(),
+            "source": "hold_expired",
+        }
+        try:
+            measurement.append(self.measurement_path, record)
+            self._measurements()
+        except OSError:
+            # A read-only recording still gets a bounded, in-memory boundary.
+            if self.model.apply_measurement(record):
+                self.measurements.append(record)
+
+    def renew_hold(self):
+        """Called by the running server so a held measurement outlives reloads, not the server."""
+        with self.lock:
+            hold = self.model.override
+            if (
+                hold
+                and hold["type"] == "hold"
+                and time.monotonic() - self.lease_written >= measurement.LEASE_INTERVAL
+            ):
+                self.lease_written = time.monotonic()
+                try:
+                    measurement.write_lease(self.directory, time.time())
+                except OSError:
+                    pass  # The hold then expires at its last successful renewal.
+
+    def _now(self):
+        """Present time, unless the execution process died without recording completion.
+
+        Its relay heartbeat is removed on a clean shutdown; one left stale means
+        the process is gone, so time stops at its last recorded sign of life
+        instead of running indefinitely."""
+        now = time.time()
+        if self.model.finished_at is not None:
+            return now
+        try:
+            beat = (self.directory / "ui_commands" / ".heartbeat").stat().st_mtime
+        except OSError:
+            return now
+        return now if now - beat < 30 else max(beat, self.model.clock or beat)
+
+    def measure(self, command, identifier, *, elapsed=None, execution=None):
+        """Validate and persist one user boundary command, then project it.
+
+        The timestamp is this server's; raises ValueError for a rejected command."""
+        if command not in measurement.COMMANDS:
+            raise ValueError("Unsupported measurement command.")
+        if not isinstance(identifier, str) or not identifier or len(identifier) > 128:
+            raise ValueError("A nonblank command ID of at most 128 characters is required.")
+        with self.lock:
+            self.refresh(force=True)
+            model = self.model
+            if execution != {"id": model.run["id"], "time_origin": model.run.get("time_origin")}:
+                raise ValueError("Execution changed; reopen the current run before measuring.")
+            if identifier in model.measured:
+                return {"recorded": False, "duplicate": True}
+            now, started = time.time(), model.run["execution_started_at"]
+            record = {"id": identifier, "type": command, "recorded_at": now}
+            if command == "end":
+                if started is None:
+                    raise ValueError("Wall-clock measurement has not started.")
+                if elapsed is None:
+                    record["at"] = now
+                elif not measurement.finite(elapsed) or elapsed < 0:
+                    raise ValueError("Elapsed seconds must be a finite, non-negative number.")
+                elif started + elapsed > now:
+                    raise ValueError("The measurement cannot end in the future.")
+                else:
+                    record["at"] = started + elapsed
+                record["source"] = "user"
+            elif elapsed is not None:
+                raise ValueError("Only an end boundary accepts elapsed seconds.")
+            elif (command == "hold" and model.run["measurement"]["held"]) or (
+                command == "reset" and model.override is None
+            ):
+                return {"recorded": False, "unchanged": True}
+            if len(self.measurements) >= measurement.MAX_RECORDS:
+                raise ValueError("This run reached its measurement edit limit.")
+            measurement.append(self.measurement_path, record)
+            self.refresh(force=True)
+            return {"recorded": True}
 
     def _rows(self, source, path):
         if not path.is_file():
@@ -1151,7 +1345,12 @@ class LiveSource:
                 return
             self.last_poll = time.monotonic()
             self.model.run["coverage"]["catching_up"] = False
+            self._measurements()
             events, gaps = [], []
+            if self.measurement_rejected:
+                gaps.append(
+                    f"measurement: {self.measurement_rejected} unreadable override records ignored"
+                )
             if self.profile_path.is_file():
                 self.paths["profiler"] = self.profile_path
             # Read global registration first, including agents created after connection.
@@ -1190,7 +1389,7 @@ class LiveSource:
             for event in events:
                 self.model.apply(event)
             self.model.run["coverage"]["gaps"] = gaps
-            self.model.tick(time.time())
+            self.model.tick(self._now())
             if self.refiner:
                 self.refiner.update(self.model)
             self.revision += 1

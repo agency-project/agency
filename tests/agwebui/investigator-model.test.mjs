@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/investigator-model.js', import.meta.url),'utf8');
-const {alignSequences, overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements, systemMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements, systemMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 test('live cumulative CPU and disk counters become rates without double-counting recorded CPU percentages',()=>{
   const metrics=systemMeasurements({duration:2,counters:{
@@ -83,19 +83,6 @@ test('secondary samples retain scope, exclude invalid samples and use memory uni
   assert.match(metrics.coverage,/2 sampled resource series/);
 });
 
-test('insertion identifies divergence and the next matched reconvergence',()=>{
-  const left=['search','read','edit','test'].map(kind=>({kind}));
-  const right=['search','read','read','edit','test'].map(kind=>({kind}));
-  const rows=alignSequences(left,right);
-  assert.equal(rows.filter(r=>!r.match).length,1);
-  assert.equal(rows[2].left,null);
-  assert.equal(rows[3].reconverged,true);
-});
-test('deletion and empty sequences retain all unmatched actions',()=>{
-  assert.equal(alignSequences([{kind:'edit'}],[])[0].right,null);
-  assert.equal(alignSequences([],[{kind:'test'}])[0].left,null);
-  assert.deepEqual(alignSequences([],[]),[]);
-});
 test('parallel nested model spans do not double count wall time',()=>{
   const intervals=[{start:1,duration:5},{start:2,duration:2},{start:5,duration:4}];
   assert.equal(overlapDuration(intervals,0,10),8);
@@ -140,4 +127,38 @@ test('summary resources respect held time, appended samples and counter resets',
   assert.deepEqual(systemMeasurements(run,{latestOnly:true}).find(m=>m.label==='CPU').latest,[4,50]);
   run.counters['workload:cpu_us'].push([6,1000000]);run.duration=6;
   assert.deepEqual(systemMeasurements(run,{latestOnly:true}).find(m=>m.label==='CPU').latest,[6,100]);
+});
+
+const {agentTokens, agentResources} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+test('agent tokens are reported input plus output, prefer execution counters and stay absent without usage',()=>{
+  const run={actions:[{id:'m1',agent:'a',kind:'model',tokens:1000,output_tokens:200},{id:'m2',agent:'a',kind:'model',tokens:500},{id:'m3',agent:'a',kind:'model'},{id:'m4',agent:'b',kind:'model'},{id:'t',agent:'a',kind:'tool',tokens:99}]};
+  assert.deepEqual(agentTokens(run,'a'),{total:1700,input:1500,output:200,reported:2,models:3});
+  assert.equal(agentTokens(run,'b'),null);assert.equal(agentTokens(run,'nobody'),null);
+  const counted={...run,metrics_by_agent:{a:{models:40,input:8000,output:200,input_samples:40,output_samples:40},b:{models:2,input:0,output:0,input_samples:0,output_samples:0}}};
+  assert.equal(agentTokens(counted,'a').total,8200);assert.equal(agentTokens(counted,'b'),null);assert.equal(agentTokens(counted,'spawned'),null);
+  // Zero is valid reported usage, not a missing measurement.
+  assert.equal(agentTokens({metrics_by_agent:{a:{models:1,input:0,output:0,input_samples:1,output_samples:1}}},'a').total,0);
+});
+test('agent CPU is the recorded sandbox container only, never host or workload, and is summed per selected sandbox',()=>{
+  const run={duration:10,agents:[{id:'a',sandbox:'sandbox_a_0000'},{id:'b',sandbox:'sandbox_b_0000'},{id:'c'}],counters:{
+    'host:cpu_pct':[[10,640]],'workload:cpu_pct':[[10,300]],'workload:memory_mb':[[10,9000]],'cg:conmon:cpu_pct':[[10,5]],
+    'cg:sandbox_a_0000:cpu_pct':[[9,10],[10,12.5]],'sandbox:sandbox_a_0000:mem_mb':[[10,256]],
+    'cg:sandbox_b_0000:cpu_pct':[[10,150]],'sandbox:sandbox_b_0000:mem_mb':[[10,100]]}};
+  assert.deepEqual(agentResources(run,['a']).cpu,{value:12.5,sandboxes:1});assert.equal(agentResources(run,['a']).memory.value,256);
+  assert.deepEqual(agentResources(run,['a','b']).cpu,{value:162.5,sandboxes:2});assert.equal(agentResources(run,['a','b']).memory.value,356);
+  // No sandbox recorded: unavailable, and a similarly named series is not guessed.
+  const unlinked=agentResources({...run,counters:{...run.counters,'cg:sandbox_c_0000:cpu_pct':[[10,77]]}},['c']);
+  assert.equal(unlinked.cpu,null);assert.equal(unlinked.memory,null);assert.equal(unlinked.sandboxes,0);
+  assert.equal(agentResources(run,['a','c']).cpu.value,12.5);
+});
+test('shared sandboxes, stopped containers and cumulative-only counters are handled without invented attribution',()=>{
+  const shared={duration:10,agents:[{id:'a',sandbox:'box'},{id:'b',sandbox:'box'}],counters:{'cg:box:cpu_pct':[[10,80]]}};
+  assert.equal(agentResources(shared,['a']).cpu,null);assert.equal(agentResources(shared,['a']).shared,1);
+  assert.equal(agentResources(shared,['a','b']).cpu.value,80);
+  const stopped={duration:60,agents:[{id:'a',sandbox:'box'}],counters:{'cg:box:cpu_pct':[[10,80]]}};
+  assert.equal(agentResources(stopped,['a']).cpu,null);assert.equal(agentResources(stopped,['a']).sandboxes,1);
+  // A saved cumulative counter becomes a rate: 0.5 CPU-seconds over one second is 50%.
+  const cumulative={duration:2,agents:[{id:'a',sandbox:'box'}],counters:{'cg:box:cpu_us':[[1,1000000],[2,1500000]]}};
+  assert.equal(agentResources(cumulative,['a']).cpu.value,50);
+  assert.equal(agentResources({duration:1,agents:[{id:'a',sandbox:'box'}]},['a']).cpu,null);
 });
