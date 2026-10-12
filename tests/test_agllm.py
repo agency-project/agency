@@ -4,8 +4,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import importlib
 from agency.llm.agllm import agllm
 from agency.configs.agconfig import agconfig, llmconfig
+
+
+@pytest.fixture(autouse=True)
+def _rearm_second_system_class_warning(monkeypatch):
+    """The warning is once per process; every test starts with it armed."""
+    # ``agency.llm.agllm`` the attribute is the class, so import the module.
+    module = importlib.import_module("agency.llm.agllm")
+    monkeypatch.setattr(module, "_warned_second_system_class", False)
 
 
 def _cfg(**fields) -> agconfig:
@@ -248,6 +257,21 @@ def test_build_llm_kwargs_leading_developer_after_system_becomes_user(capsys):
         {"role": "user", "content": "do X"},
     ]
     assert "second system-class" in capsys.readouterr().out
+
+
+def test_second_system_class_warning_is_printed_once_per_process(capsys):
+    messages = [
+        _sys_msg("You are Codex."),
+        _msg("developer", "Some developer-level instructions."),
+        _msg("user", "do X"),
+    ]
+    for _ in range(3):
+        kw = build_llm_kwargs(_cfg(), messages, None)
+        assert kw["messages"][1] == {
+            "role": "user",
+            "content": "Some developer-level instructions.",
+        }
+    assert capsys.readouterr().out.count("second system-class") == 1
 
 
 def test_build_llm_kwargs_unknown_params_not_forwarded():

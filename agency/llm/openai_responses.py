@@ -18,6 +18,7 @@ as a reasoning input item next turn.
 from __future__ import annotations
 
 from .openai import _OpenAICompatibleBackend
+from .message_store import split_tool_schema
 
 _RESPONSES_TYPE_PREFIX = "openai_responses_"
 _METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
@@ -357,9 +358,10 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         llm = self.agconfig.llm
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
         kwargs: dict = dict(
             model=llm.model or "",
-            input=_agency_messages_to_responses_input(request["messages"]),
+            input=_agency_messages_to_responses_input(messages),
             max_output_tokens=llm.max_completion_tokens or llm.max_tokens or llm.default_max_tokens,
             store=False,
             # Without this, reasoning items come back with no
@@ -374,12 +376,12 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
             kwargs["top_p"] = llm.top_p
         if llm.extra_body:
             kwargs["extra_body"] = dict(llm.extra_body)
-        tools = _agency_tools_to_responses(request.get("tools"))
-        if tools:
-            kwargs["tools"] = tools
+        responses_tools = _agency_tools_to_responses(tools)
+        if responses_tools:
+            kwargs["tools"] = responses_tools
             # OpenAI rejects tool_choice when no tools are present, so it's
             # only ever sent alongside them.
-            tool_choice = _agency_tool_choice_to_responses(request.get("tool_choice"))
+            tool_choice = _agency_tool_choice_to_responses(tool_choice)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
         return kwargs

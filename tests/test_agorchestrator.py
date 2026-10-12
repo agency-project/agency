@@ -167,10 +167,9 @@ def test_same_agent_requests_never_reorder_even_when_earlier_is_blocked(monkeypa
         order.append(label)
         if label == "ready":
             ready_started.set()
-        context.recent_transcript = [
-            *context.recent_transcript,
-            {"role": "user", "content": label},
-        ]
+        context.set_transcript(
+            [*context.get_resolved_transcript(), {"role": "user", "content": label}]
+        )
         return _result(context, label=label)
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
@@ -341,7 +340,7 @@ def test_reused_worker_gets_fresh_context_and_exact_profile_parent(monkeypatch, 
 
 def test_engine_exception_preserves_context_and_releases_agent_slot(monkeypatch, tmp_path):
     ag = _agent(tmp_path)
-    ag.context = agcontext(recent_transcript=[{"role": "user", "content": "committed"}])
+    ag.context = agcontext.from_messages([{"role": "user", "content": "committed"}])
 
     def fail(self, **_kwargs):
         raise RuntimeError("engine exploded")
@@ -352,7 +351,9 @@ def test_engine_exception_preserves_context_and_releases_agent_slot(monkeypatch,
     assert ag.history.messages == [{"role": "user", "content": "committed"}]
 
     def succeed(self, *, context, **_kwargs):
-        context.recent_transcript.append({"role": "assistant", "content": "recovered"})
+        context.set_transcript(
+            [*context.get_resolved_transcript(), {"role": "assistant", "content": "recovered"}]
+        )
         return _result(context, ok=True)
 
     monkeypatch.setattr(AgentEngine, "execute", succeed)
@@ -388,7 +389,9 @@ def test_completion_callback_can_submit_followup_without_deadlocking(monkeypatch
 
 def test_completion_callback_can_read_committed_history(monkeypatch, tmp_path):
     def execute(self, *, context, **_kwargs):
-        context.recent_transcript.append({"role": "assistant", "content": "committed"})
+        context.set_transcript(
+            [*context.get_resolved_transcript(), {"role": "assistant", "content": "committed"}]
+        )
         return _result(context, ok=True)
 
     monkeypatch.setattr(AgentEngine, "execute", execute)

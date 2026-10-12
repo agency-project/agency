@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from agency.llm.message_store import split_tool_schema
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 
@@ -182,7 +183,7 @@ def test_harness_to_agency_tools_and_tool_choice():
         "tool_choice": {"type": "tool", "name": "get_weather"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"] == [
+    assert split_tool_schema(agency["messages"])[1] == [
         {
             "type": "function",
             "function": {
@@ -192,7 +193,10 @@ def test_harness_to_agency_tools_and_tool_choice():
             },
         }
     ]
-    assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+    assert split_tool_schema(agency["messages"])[2] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
 
 
 def test_harness_to_agency_tool_schema_drops_dollar_schema_key():
@@ -212,7 +216,7 @@ def test_harness_to_agency_tool_schema_drops_dollar_schema_key():
         ],
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"][0]["function"]["parameters"] == {
+    assert split_tool_schema(agency["messages"])[1][0]["function"]["parameters"] == {
         "type": "object",
         "properties": {"city": {"type": "string"}},
     }
@@ -245,7 +249,7 @@ def test_harness_to_agency_tool_schema_drops_noop_property_names():
         ],
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"][0]["function"]["parameters"] == {
+    assert split_tool_schema(agency["messages"])[1][0]["function"]["parameters"] == {
         "type": "object",
         "properties": {
             "answers": {
@@ -282,7 +286,9 @@ def test_harness_to_agency_tool_schema_keeps_real_property_names_constraint():
     }
     agency = _backend()._format_context_harness_to_agency(body)
     assert (
-        agency["tools"][0]["function"]["parameters"]["properties"]["perms"]["propertyNames"]
+        split_tool_schema(agency["messages"])[1][0]["function"]["parameters"]["properties"][
+            "perms"
+        ]["propertyNames"]
         == real_property_names
     )
 
@@ -358,7 +364,7 @@ def test_harness_to_agency_tool_choice_none():
         "tool_choice": {"type": "none"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == "none"
+    assert split_tool_schema(agency["messages"])[2] == "none"
 
 
 def test_harness_to_agency_mid_array_system_message_kept_in_place():

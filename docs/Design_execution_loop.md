@@ -11,8 +11,9 @@ agent.run() / agskill.run()
 
 ## Host and sandbox services
 
-Each dispatched skill gets a fresh engine and a working copy of its predecessor
-context. The engine lazily obtains the agent's sandbox and holds its lock for
+Each dispatched skill gets a fresh engine and edits its predecessor context in
+place; the engine writes `message_hash_list`, `harness_sessions` and the retained
+cursors only once the sandbox transaction has committed. The engine lazily obtains the agent's sandbox and holds its lock for
 input preparation, harness execution, service teardown, and commit or discard.
 Host services provide model routing, interaction/policy callbacks, and host MCP
 tools. The engine calls the sandbox daemon through a Unix socket; the daemon

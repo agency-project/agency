@@ -14,6 +14,10 @@ except ImportError:
 # unknown-field fallthrough when replaying history in build_kwargs.
 _UNKNOWN_FIELD_PREFIXES = ("openai_chatcompletions_", "anthropic_")
 
+# The second-system-class-message warning below repeats on every LLM call of a
+# harness that always does this, so it is printed once per process.
+_warned_second_system_class = False
+
 
 # Common per-call generation params every OpenAI-compatible server accepts as
 # top-level chat.completions.create() kwargs (see agllm.build_kwargs's
@@ -357,13 +361,16 @@ class agllm:
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 if not text:
                     continue
-                print(
-                    f"[agllm] WARNING: harness emitted a second system-class "
-                    f'(role:"{role}") message -- sending it as a `user` message '
-                    "at its original position instead, since not every "
-                    "OpenAI-compatible server's chat template tolerates more "
-                    "than one"
-                )
+                global _warned_second_system_class
+                if not _warned_second_system_class:
+                    _warned_second_system_class = True
+                    print(
+                        f"[agllm] WARNING: harness emitted a second system-class "
+                        f'(role:"{role}") message -- sending it as a `user` message '
+                        "at its original position instead, since not every "
+                        "OpenAI-compatible server's chat template tolerates more "
+                        "than one (this warning is printed once)"
+                    )
                 wire_msg = {"role": "user", "content": text}
             else:
                 if is_system_class:

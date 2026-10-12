@@ -14,6 +14,7 @@ import uuid
 
 from fastapi import Request
 
+from ...llm.message_store import with_tool_schema
 from ..common import extract_bearer_token
 from .streaming import start_streaming_response, stream_response, upstream_error
 
@@ -185,9 +186,9 @@ class ChatCompletionsProtocol:
             messages.append({"role": role, "blocks": blocks})
 
         return {
-            "messages": messages,
-            "tools": raw_request.get("tools"),
-            "tool_choice": raw_request.get("tool_choice"),
+            "messages": with_tool_schema(
+                messages, raw_request.get("tools"), raw_request.get("tool_choice")
+            )
         }
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:

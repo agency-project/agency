@@ -19,6 +19,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
 from .streaming import start_streaming_response, stream_response, upstream_error
+from ...llm.message_store import with_tool_schema
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -75,9 +76,10 @@ _AUTOCOMPACT_SAFETY_MARGIN = 0.9
 # recovers the exact original conversation, with real prompt-cache hits;
 # without the file, --resume fails cleanly ("No conversation found").
 #
-# Deliberately NOT the source of truth for history -- ag.context.recent_transcript
-# stays that. This is a per-engine, opt-in optimization: extracted from and
-# reinjected into whatever sandbox handles the next call, stored on
+# Deliberately NOT the source of truth for history -- the hash list and tables
+# in ag.context (see llm/message_store.py) stay that. This is a per-engine,
+# opt-in optimization: extracted from and reinjected into whatever sandbox
+# handles the next call, stored on
 # ag.context.harness_sessions (and agent.save()/load()'s state.json), never on
 # the sandbox's own filesystem.
 _SESSION_SLUG_RE = re.compile(r"[^a-zA-Z0-9]")
@@ -779,9 +781,11 @@ class ClaudeCodeAdapter(HarnessAdapter):
             )
 
         return {
-            "messages": messages,
-            "tools": _anthropic_tools_to_agency(raw_request.get("tools")),
-            "tool_choice": _anthropic_tool_choice_to_agency(raw_request.get("tool_choice")),
+            "messages": with_tool_schema(
+                messages,
+                _anthropic_tools_to_agency(raw_request.get("tools")),
+                _anthropic_tool_choice_to_agency(raw_request.get("tool_choice")),
+            )
         }
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:

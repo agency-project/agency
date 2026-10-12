@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from agency.llm.message_store import with_tool_schema
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.openai import _OpenAICompatibleBackend
 
@@ -93,9 +94,11 @@ class TestFormatContextAgencyToBackend:
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [],
-                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-                "tool_choice": "required",
+                "messages": with_tool_schema(
+                    [],
+                    [{"type": "function", "function": {"name": "get_weather"}}],
+                    "required",
+                )
             }
         )
         assert kwargs["tool_choice"] == "required"
@@ -105,23 +108,27 @@ class TestFormatContextAgencyToBackend:
         tool_choice = {"type": "function", "function": {"name": "get_weather"}}
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [],
-                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-                "tool_choice": tool_choice,
+                "messages": with_tool_schema(
+                    [],
+                    [{"type": "function", "function": {"name": "get_weather"}}],
+                    tool_choice,
+                )
             }
         )
         assert kwargs["tool_choice"] == tool_choice
 
     def test_tool_choice_without_tools_is_dropped(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
-        kwargs = backend._format_context_agency_to_backend({"messages": [], "tool_choice": "auto"})
+        kwargs = backend._format_context_agency_to_backend(
+            {"messages": with_tool_schema([], tool_choice="auto")}
+        )
         assert "tool_choice" not in kwargs
 
     def test_foreign_origin_tool_choice_dropped(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         tool_choice = {"type": "openai_responses_file_search", "data": {"type": "file_search"}}
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [], "tool_choice": tool_choice}
+            {"messages": with_tool_schema([], tool_choice=tool_choice)}
         )
         assert "tool_choice" not in kwargs
 

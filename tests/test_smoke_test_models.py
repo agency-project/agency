@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.exchange_helpers import record_exchange
+
 from agency.llm.agllm import agllm
 from agency.llm.anthropic import _AnthropicBackend
 from agency.llm.openai import _OpenAICompatibleBackend
@@ -209,13 +211,24 @@ def test_success_without_expectation_requires_the_secret_word():
 
 def test_upstream_error_log_keeps_only_failed_exchange_errors():
     log = smt.UpstreamErrorLog()
-    log.record_llm_exchange(
-        "a", exchange_type="llm_stream_success", response_chain=[("h", {"role": "assistant"})]
+    record_exchange(
+        log,
+        "a",
+        exchange_type="llm_stream_success",
+        response=[{"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "ok"}]}],
     )
-    log.record_llm_exchange(
-        "b", exchange_type="llm_stream_cancelled", response_chain=[("h", {"cancelled": True})]
+    record_exchange(
+        log,
+        "b",
+        exchange_type="llm_stream_cancelled",
+        response=[{"role": "assistant", "blocks": [{"type": "cancelled", "index": 0}]}],
     )
-    log.record_llm_exchange(
-        "c", exchange_type="llm_stream_error", response_chain=[("h", {"error": "boom"})]
+    record_exchange(
+        log,
+        "c",
+        exchange_type="llm_stream_error",
+        response=[
+            {"role": "assistant", "blocks": [{"type": "error", "index": 0, "error": "boom"}]}
+        ],
     )
     assert log.errors == ["boom"]
