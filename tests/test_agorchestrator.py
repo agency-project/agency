@@ -596,3 +596,44 @@ def test_agents_keep_separate_data_loggers(tmp_path):
     assert second_path.name == f"{second.agname}_data.sqlite3"
     assert first_path.exists()
     assert second_path.exists()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_stop_cancels_running_and_queued_work_for_only_the_named_agent(
+    monkeypatch, tmp_path, force
+):
+    entered, finish = threading.Event(), threading.Event()
+    cancellations = []
+
+    def execute(self, *, context, is_cancelled, **kwargs):
+        entered.set()
+        assert finish.wait(5)
+        return agerror("cancelled") if is_cancelled() else _result(context, ok=True)
+
+    def cancel(self, *, force=True):
+        cancellations.append(force)
+
+    monkeypatch.setattr(AgentEngine, "execute", execute)
+    monkeypatch.setattr(AgentEngine, "cancel", cancel)
+    a, b = _agent(tmp_path), _agent(tmp_path)
+    skill = agskill("s", "")
+    running = a.run(skill, agdata())
+    assert entered.wait(5)
+    queued = a.run(skill, agdata())
+    upstream = Future()
+    other = b.run(skill, agdata(value=agdata(_future=upstream)))
+    try:
+        a.stop()
+        assert cancellations == [False]
+        if force:
+            a.stop(force=True)
+            assert cancellations == [False, True]
+        requests = list(get_orchestrator()._requests.values())
+        assert all(r.cancelled for r in requests if r.agent is a)
+        assert all(not r.cancelled for r in requests if r.agent is b)
+    finally:
+        finish.set()
+        upstream.set_result(agdata(value=1))
+    assert running.error == "agent invocation cancelled"
+    assert queued.error == "agent invocation cancelled"
+    assert other.ok is True

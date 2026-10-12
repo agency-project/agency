@@ -21,7 +21,7 @@ uv run pytest tests/test_examples.py
 
 Operational references remain at [host setup](host-setup.md),
 [checkpoint configuration](checkpoints.md), and
-[raw trace viewer setup](profiling.md#raw-trace-viewer). Benchmark instructions stay in
+[profiling and trace artifacts](profiling.md#raw-trace-artifacts). Benchmark instructions stay in
 their respective `benchmarks/` directories.
 
 Previous documentation and validation reports are preserved in

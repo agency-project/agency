@@ -27,7 +27,7 @@ directory under `agency_runs/`. Add `--webui` using the
 | [07_sandbox_api.py](07_sandbox_api.py) | Execute commands and read/write sandbox files directly. | Local container engine; no LLM key needed. |
 | [08_checkpoints.py](08_checkpoints.py) | Save and restore agent state. | Numbered tutorial settings; no ZFS requirement. |
 | [09_observability.py](09_observability.py) | Record an explicit profile and inspect timing reports. | Linux profiler prerequisites. |
-| [10_harnesses_and_webui.py](10_harnesses_and_webui.py) | Run native and Codex agents with a dashboard. | Codex executable and Perfetto build. |
+| [10_harnesses_and_webui.py](10_harnesses_and_webui.py) | Run native and Codex agents with a dashboard. | Codex executable. |
 | [11_live_trajectory.py](11_live_trajectory.py) | Generate real local file/subprocess telemetry without an agent. | No model or container; [startup instructions](../docs/guides/profiling/live-trajectory.md#run-it-locally). |
 | [12_swebench_live.py](12_swebench_live.py) | Run a prepared SWE-bench task through Codex. | Prepared dataset row, instance image, env file, and compatible Codex binary; inspect `--help`. |
 

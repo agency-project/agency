@@ -1227,7 +1227,14 @@ def test_controlled_paths_preserve_logger_call_labels_and_finalization():
     assert _drain(handle)[-1]["type"] == "done"
     handle._thread.join(timeout=2.0)
     logger = server._data_logger
-    assert logger.events == [("agent_state", {"state": "waiting_llm"}, handle.call_label, True)]
+    assert logger.events == [
+        (
+            "agent_state",
+            {"state": "waiting_llm", "request_id": "test-request", "model": "recording"},
+            handle.call_label,
+            True,
+        )
+    ]
     assert logger.finalized[-1][0] == handle.call_label
     assert logger.finalized[-1][1] == "llm_block"
 

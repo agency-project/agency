@@ -51,3 +51,121 @@ export function packActionTracks(actions, minimumDuration = 0) {
   }
   return tracks;
 }
+
+export function groupCallStack(actions) {
+  const groups=[],running=new Map();
+  for(const action of actions) {
+    if(action.outcome!=='running') {
+      groups.push({id:action.id,agent:action.agent,actions:[action],running:false,
+        latest:action.start});
+      continue;
+    }
+    // Only still-running calls share a box. All open intervals for this
+    // actor overlap now; model calls remain separate from tool calls.
+    const lane=`running:${action.agent}:${action.kind==='model'?'model':'tool'}`;
+    let group=running.get(lane);
+    if(!group){group={id:lane,agent:action.agent,actions:[],running:true,latest:action.start};running.set(lane,group);groups.push(group);}
+    group.actions.push(action);group.latest=Math.max(group.latest,action.start);
+  }
+  return groups.sort((a,b)=>Number(b.running)-Number(a.running)||b.latest-a.latest||(a.id>b.id?1:a.id<b.id?-1:0))
+    .map(group=>({...group,actions:group.actions.sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0))}));
+}
+export function executionIdentity(run) {
+  return run?.time_origin==null?run?.id:JSON.stringify([run.id,run.time_origin]);
+}
+export function readableExecutionTitle(run) {
+  const title=typeof run.title==='string'?run.title.trim():'';
+  const task=typeof run.task==='string'?run.task.trim().split('\n').find(line=>line.trim()):'';
+  const generic=!title||title===run.id||/^(Current (live )?execution|Current run|Recorded execution)(?:\s*·|$)/i.test(title);
+  return (generic&&task?task:title)||task||'Execution';
+}
+
+// Live events contain cumulative CPU/I/O counters; saved traces contain rates.
+// Keep their recorded scope rather than adding overlapping workload/PID totals.
+const systemMeasurementCache=new WeakMap(),latestMeasurementCache=new WeakMap();
+export function systemMeasurements(run,{latestOnly=false}={}) {
+  const counters=run.counters||{},metrics=[];
+  // Resource samples are append/insert-only in the trajectory stream. Reuse
+  // the projection between renders of the same recording/window.
+  const future=Object.values(counters).some(v=>Array.isArray(v)&&v.at(-1)?.[0]>run.duration);
+  const window=Number.isFinite(run.duration)?(latestOnly&&!future?'all':run.duration):'all';
+  const signature=JSON.stringify([window,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
+  const cache=latestOnly?latestMeasurementCache:systemMeasurementCache;
+  const cached=cache.get(run);
+  if(cached?.counters===counters&&cached.signature===signature)return cached.metrics;
+  for(const [name,samples] of Object.entries(counters)) {
+    if(!Array.isArray(samples))continue;
+    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
+    if(!match)continue;
+    const kind=match[1],prefix=name.slice(0,name.length-kind.length);
+    const cpu=/^cpu/.test(kind),rawCPU=/^cpu_(us|s)$/.test(kind);
+    if(rawCPU&&Array.isArray(counters[prefix+'cpu_pct'])&&counters[prefix+'cpu_pct'].some(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&(!Number.isFinite(run.duration)||p[0]<=run.duration)))continue;
+    const bytes=['io_r','io_w','net_rx','net_tx'].includes(kind);
+    const label=cpu?'CPU':kind==='rss_mb'?'RSS':/^(memory|mem)_mb$/.test(kind)?'RAM':kind==='vms_mb'?'Virtual memory':kind==='util_pct'?'GPU':kind==='power_w'?'Power':kind==='power_w_est'?'Power estimate':/^(io_r|io_read|io read)/.test(kind)?'Disk read':/^(io_w|io_write|io write)/.test(kind)?'Disk write':/^net_(rx|receive)|^net rx/.test(kind)?'Network RX':'Network TX';
+    const unit=cpu||kind==='util_pct'?'%':kind.startsWith('power')?'W':/(_mb|MB)$/.test(kind)?'MB':'MB/s';
+    const usable=p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&p[0]>=0&&(!Number.isFinite(run.duration)||p[0]<=run.duration);
+    let source;
+    if(latestOnly){
+      // Live counter arrays are sorted by timestamp. Summary cards need only
+      // the latest gauge or the most recent valid counter delta, not history.
+      source=[];
+      for(let i=samples.length-1;i>=0;i--){
+        const point=samples[i];if(!usable(point))continue;
+        if(!(rawCPU||bytes)){source=[point];break;}
+        const next=source[0];
+        if(next&&next[0]>point[0]&&next[1]>=point[1]){source.unshift(point);break;}
+        source=[point];
+      }
+    }else source=samples.filter(usable).sort((a,b)=>a[0]-b[0]);
+    const points=[];
+    let previous=null;
+    for(const point of source) {
+      if(rawCPU||bytes) {
+        if(previous&&point[0]>previous[0]&&point[1]>=previous[1])points.push([point[0],(point[1]-previous[1])/(point[0]-previous[0])*(rawCPU?(kind==='cpu_us'?0.0001:100):1/2**20)]);
+        previous=point;
+      }else points.push(point);
+    }
+    if(!points.length)continue;
+    const parts=name.split(':');
+    const workload=/^workload(?:_total)?[: ]/.test(name),host=/^(host|system):/.test(name);
+    const device=/^gpu\d+:/.test(name)&&parts.length===2;
+    const process=/^(proc|process):/.test(name),sandbox=/^(cg|sandbox):/.test(name);
+    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:parts.length>2&&/^gpu\d+$/.test(parts[0])?`${parts[0]} · ${parts[1]}`:'Recorded scope';
+    metrics.push({name,label:/^gpu\d+:/.test(name)&&kind==='mem_mb'?'VRAM':label,unit,scope,aggregate:workload||host||device,points,latest:points.at(-1),derived:rawCPU||bytes});
+  }
+  cache.set(run,{counters,signature,metrics});
+  return metrics;
+}
+
+// A value is displayed only when its observation exists. Zero remains valid
+// reported usage; absent usage and empty resource series are not zero samples.
+export function executionMeasurements(run,{includeResources=true}={}) {
+  const actions=run.actions||[],agents=(run.agents||[]).filter(a=>a.id!=='workflow');
+  const models=actions.filter(a=>a.kind==='model');
+  const input=models.filter(a=>Number.isFinite(a.tokens)),output=models.filter(a=>Number.isFinite(a.output_tokens));
+  const sum=(items,key)=>items.reduce((total,a)=>total+a[key],0);
+  const primary=[],secondary=[];
+  if(Number.isFinite(run.duration)&&(run.duration>0||actions.length||run.time_origin!=null))primary.push(['Wall time',run.duration,'time','Observed execution wall interval']);
+  if(actions.length)primary.push(['Calls',actions.length,'count','Observed model and tool/activity calls']);
+  if(agents.length)primary.push(['Agents',agents.length,'count','Recorded actors']);
+  if(input.length)primary.push(['Input tokens',sum(input,'tokens'),'count',`${input.length}/${models.length} model calls report input usage`]);
+  if(output.length)primary.push(['Output tokens',sum(output,'output_tokens'),'count',`${output.length}/${models.length} model calls report output usage`]);
+  if(models.length&&Number.isFinite(run.duration)) {
+    const intervals=(run.intervals||[]).filter(i=>i.kind==='model');
+    const measured=(intervals.length?intervals:models).filter(i=>Number.isFinite(i.start)&&Number.isFinite(i.duration));
+    if(measured.length)secondary.push(['Model intervals',overlapDuration(measured,0,run.duration),'time','Union of observed model intervals']);
+  }
+  if(input.length&&output.length)secondary.push(['Total tokens',sum(input,'tokens')+sum(output,'output_tokens'),'count',`Reported input (${input.length}/${models.length}) + output (${output.length}/${models.length}); missing usage excluded`]);
+  if(output.length&&run.duration>0)secondary.push(['Output rate',sum(output,'output_tokens')/run.duration,'rate',`Run average · reported output / wall time (${output.length}/${models.length} calls)`]);
+  const knownStates=agents.filter(a=>a.status&&a.status!=='unknown');
+  if(knownStates.length===agents.length&&agents.length)secondary.push(['Active agents',agents.filter(a=>['running','running_skill','running_tool','waiting_llm','executing','busy'].includes(a.status)).length,'count','Recorded states; paused agents excluded']);
+  const samples=Object.values(run.counters||{}).filter(points=>Array.isArray(points)&&points.some(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])));
+  const resourcesMeasured=includeResources?systemMeasurements(run,{latestOnly:true}):[];
+  for(const label of ['CPU','RAM','GPU','VRAM']) {
+    const metric=resourcesMeasured.find(m=>m.label===label&&m.aggregate)||resourcesMeasured.find(m=>m.label===label);
+    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s`]);
+  }
+  const usage=models.length?`Usage reported for ${input.length}/${models.length} input and ${output.length}/${models.length} output calls.`:'No model calls recorded.';
+  const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';
+  return {primary,secondary,coverage:`${usage} ${resources}`};
+}

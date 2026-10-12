@@ -43,6 +43,7 @@
         "queue_message",
         "redirect",
         "cancel",
+        "stop",
         "pause",
         "resume",
         "is_paused",
@@ -421,6 +422,7 @@
         "submit_context_message",
         "redirect_request",
         "cancel_request",
+        "cancel_agent",
         "snapshot",
         "flush",
         "shutdown"

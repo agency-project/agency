@@ -80,6 +80,17 @@ def tutorial_config(
         if api_key:
             llm_kwargs["api_key"] = api_key
         llm_kwargs["base_url"] = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    elif provider == "litellm":
+        api_key = os.environ.get("LITELLM_API_KEY")
+        base_url = os.environ.get("LITELLM_BASE_URL")
+        if not api_key and require_llm:
+            raise SystemExit("LITELLM_API_KEY is required for AGENCY_LLM_PROVIDER=litellm")
+        if not base_url and require_llm:
+            raise SystemExit("LITELLM_BASE_URL is required for AGENCY_LLM_PROVIDER=litellm")
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        if base_url:
+            llm_kwargs["base_url"] = base_url
     elif provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key and require_llm:

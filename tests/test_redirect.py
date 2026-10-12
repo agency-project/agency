@@ -24,6 +24,7 @@ def runs(monkeypatch, tmp_path):
     transport = TestClient(manager._interaction_server.build_app())
     client = HarnessInteractionClient.__new__(HarnessInteractionClient)
     client._client = transport
+    client._uds_path = "/unused/sandbox"
     started = {name: threading.Event() for name in ("A", "B", "C")}
     finish = {name: threading.Event() for name in started}
     terminal = {name: threading.Event() for name in started}
@@ -154,6 +155,24 @@ def test_redirect_after_resolved_target_finishes_queues(runs):
     finish(runs, later, "B")
     assert runs.received == []
     assert retained(runs, "B") == ["after A"]
+
+
+def test_redirect_fallback_preserves_public_queue_message_override(runs, monkeypatch):
+    queued = []
+    original = runs.ag.queue_message
+
+    def override(message):
+        queued.append(message)
+        return original("override: " + message)
+
+    monkeypatch.setattr(runs.ag, "queue_message", override)
+    first = submit(runs, "A")
+    finish(runs, first, "A")
+    assert runs.ag.redirect(first, "after A") is None
+    later = submit(runs, "B")
+    finish(runs, later, "B")
+    assert queued == ["after A"]
+    assert retained(runs, "B") == ["override: after A"]
 
 
 def test_late_redirect_for_a_cannot_interrupt_active_b(runs, monkeypatch):

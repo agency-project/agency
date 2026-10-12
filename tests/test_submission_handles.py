@@ -150,3 +150,29 @@ def test_pause_resume_skips_unreachable_cached_daemon(tmp_path, monkeypatch):
     ag.resume()
 
     daemon.client.assert_not_called()
+
+
+def test_pause_resume_receipts_retain_local_observations_without_recording_socket_paths(
+    tmp_path, monkeypatch
+):
+    ag = _agent(tmp_path)
+    daemon = MagicMock()
+    client = daemon.client.return_value.__enter__.return_value
+    recorded = []
+    monkeypatch.setattr(ag, "_daemon_handle", lambda: daemon)
+    monkeypatch.setattr(ag.data_logger, "record_event", lambda **event: recorded.append(event))
+    for operation in ("pause", "resume"):
+        observation = {
+            "id": "a" * 32,
+            "state": "pending",
+            "request_id": "A",
+            "attempt_token": "attempt-A",
+            "action": operation,
+            "uds_path": "/private/control.sock",
+        }
+        client._last_control_observation = observation
+        getattr(ag, operation)()
+        assert ag._last_control_receipt["observations"] == [observation]
+        assert ag._last_control_receipt["rpc_acknowledged"] is True
+        assert "observations" not in recorded[-1]["payload"]
+    assert not ag.is_paused()

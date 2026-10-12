@@ -1,7 +1,7 @@
 # Profiler views and interpretation
 
 A working, read-only investigator at `/profiler`, alongside the existing live
-run dashboard and raw Perfetto viewer. Six views share a run, selected agent,
+run dashboard. Six views share a run, selected agent,
 action/episode, inspector, event search, and time cursor. No frontend package
 installation or build step is needed.
 
@@ -22,11 +22,10 @@ is selected automatically in Compare runs. Numbers **1–6** switch views;
 **Escape** clears the selected event. Export run downloads the normalized data,
 including source labels.
 
-`--no-perfetto` skips the optional upstream viewer build. All six investigator
-views work without it. Omit that flag to build/use the existing raw Perfetto
-viewer. For a selected Chrome trace, the sidebar raw-viewer link passes the
-selected run rather than opening an unrelated current trace. Native observer
-JSONL is not a Chrome trace; it stays in the investigator.
+All six investigator views start without a viewer build. The embedded
+Perfetto viewer has been removed; recorded Chrome traces remain available
+through the raw trace download endpoints. Native observer JSONL remains
+available in the investigator.
 
 For incremental execution, replay, provenance, and verification details, see
 [Live trajectory](live-trajectory.md). The current run is available at
@@ -38,8 +37,9 @@ For incremental execution, replay, provenance, and verification details, see
   incremental reducer; declared-purpose/category episodes with fixed actor and
   request boundaries; evidence-backed attention and history/follow controls;
   expandable model/tool actions, commands, results, timing, files, and metadata.
-  The Layout dropdown switches between Episode list and Agent overlay. The
-  overlay places each agent's actions on a shared time axis, separates nested
+  Episode list includes selectable agent columns, pinned running calls, and
+  completed history with newest activity first. The Layout dropdown switches
+  between Episode list and Agent overlay. The overlay places each agent's actions on a shared time axis, separates nested
   actions into tracks, and retains the same selection, inspector, agent/search
   filters, and time cursor. `layout=overlay` preserves the layout in shared URLs.
 - **Resources & waits:** common time axis with model/tool/queue/dependency/gap
@@ -48,8 +48,10 @@ For incremental execution, replay, provenance, and verification details, see
 - **Context & information:** model-call navigation; source composition; added,
   repeated, and dropped prompt blocks; content previews; supervisor/worker
   information boundary in the demo.
-- **Multi-agent:** explicit parent relationships, selectable agent nodes,
-  concurrent work, recorded/synthetic handoffs, and identical-command detection.
+- **Multi-agent:** selectable agent transcript columns with expandable
+  activities, token/time summaries, concurrent work and sampled system counters
+  on a shared time axis, explicit parent relationships, recorded/synthetic
+  handoffs, and identical-command detection.
 - **Compare runs:** matching-task defaults; longest-common-subsequence alignment
   of action categories; inserted/deleted actions, first divergence, reconvergence,
   per-action duration changes, resource peaks, models/harnesses, referenced-path
@@ -70,7 +72,7 @@ metadata, decodes named resource counters, and groups consecutive actions per
 agent. Explicit measured durations remain separate from coverage gaps.
 The catalog refreshes every 30 seconds; four normalized saved runs are cached
 by file modification time. Counter series are reduced to at most about 800
-points for rendering. Full raw traces remain available in Perfetto.
+points for rendering. Full raw traces remain available through the download endpoints.
 
 The frontend is native HTML/CSS/ES modules, matching the repository's existing
 frontend architecture. `investigator.js` owns shared selection and rendering;

@@ -3,8 +3,9 @@
 Open `/profiler?run=live&view=trajectory` on the existing Agency web server.
 The Trajectory tab shows activity starts, running calls, returned evidence,
 attention signals, and a final execution state. Layout switches between the
-activity feed and agent trajectories on a shared clock. Other profiler tabs,
-the native dashboard at `/`, and the existing Perfetto route remain available.
+activity feed and agent trajectories on a shared clock. Other profiler tabs
+and the native dashboard at `/` remain available. The embedded Perfetto viewer
+has been removed; raw trace downloads remain available.
 
 ## Run it locally
 
@@ -17,7 +18,7 @@ Terminal one, from the repository root:
 
 ```sh
 .venv/bin/python -m agency.observability.agwebui.server \
-  --run-dir /tmp/agency-trajectory-example-1/logs --port 7860 --no-perfetto
+  --run-dir /tmp/agency-trajectory-example-1/logs --port 7860
 ```
 
 Open <http://localhost:7860/profiler?run=live&view=trajectory>, then terminal two:
@@ -48,17 +49,220 @@ Without the wrapper, start a separate server against the application's log
 directory. If no workload-final event exists, execution status remains unknown
 after the last recorded request; a quiet connection does not establish a stop.
 
-`--no-perfetto` skips the upstream viewer build. Omit it for the existing
-advanced trace viewer. No dependency installation or frontend build is added.
+Server startup requires no viewer download or frontend build.
+
+## Pause and inspect live execution
+
+The session bar separates **Freeze view** / **Unfreeze view** from
+**Pause Agents** / **Resume Agents**. Freeze view holds event cards, details,
+timeline spans, and metrics while backend ingestion continues. Connection and
+authoritative agent controls remain live, and the frozen-view label reminds you
+that agents may still be running. Counts distinguish newly buffered calls from
+changed calls; each count retains 256 distinct IDs and displays `256+` beyond
+that limit. These are changes to the buffered call projection, not raw event counts.
+
+Unfreeze view applies buffered evidence while preserving selection and held
+column reading positions. **Jump to live** unfreezes and returns all columns
+and the timeline to live. Neither action sends an agent or replay command.
+Trajectory and Timeline switches retain the execution, selection, and freeze
+state. **Lock to Present** is disabled while the view is frozen.
+
+With an active `agwebui.run(...)` workload, **Pause Agents** / **Resume Agents**
+controls execution of all active agents. Selecting an agent, episode, or action also
+exposes **Pause agent** / **Resume agent** for its owning agent. The agent
+inspector has the same control. If any active agent is paused, the global
+button offers **Resume Agents**. Execution controls continue to reflect the latest
+agent state while the display is held.
+
+These commands use the existing webui relay and `agent.pause()` / `resume()`
+to request local harness-process pause or continuation. Pause does not cancel
+an already-issued remote model or tool operation or pause scheduler admission.
+The trajectory connection stays
+open, so actions, context, resources, and source evidence remain inspectable.
+Recorded pause/resume events supply the agent's recorded pause intent. They do
+not prove that every process has parked: the daemon can be absent, and a daemon
+RPC acknowledgement may be a no-op. A file-enqueue acknowledgement is only
+**Queued**. A correlated relay receipt reports per-agent API acceptance, RPC
+acknowledgement or error; recorded state changes arrive separately. Bulk actions
+retain each target's outcome, including partial failure. Stop preserves SIGTERM;
+Force stop preserves SIGKILL. Neither acknowledgement establishes process exit
+or cleanup. Stop and Force stop use an in-page, keyboard-accessible confirmation
+with the execution, target names/count, and SIGTERM/SIGKILL consequences. Cancel
+has initial focus; Escape cancels. Targets and the execution-process UUID are
+validated again before submission; replacement/disconnected targets disable confirmation.
+Disconnects and missing receipts leave the outcome unknown; the
+browser does not automatically retry mutations.
+
+A separate **local application** receipt can now observe the exact harness
+handle that received a pause, resume or cancellation request. Its observation
+ID is bound to the invocation request ID, harness attempt token and action:
+
+- **Suspension observed:** every tracked local task has reached a held ptrace stop,
+  with no pending child registration. Recorded agent pause intent alone is insufficient.
+- **Suspension released:** local holds are cleared and deferred tracer restarts
+  have been processed. This does not establish model progress or remote cancellation.
+- **Task-tree exit observed:** the tracer has completed and no tracked local tasks
+  remain. Root exit alone is insufficient; missing wait evidence stays unknown.
+
+Evidence includes measurement time and available local task/parked counts. It is
+a historical observation, not a continuously measured agent-health state. Native
+and PTY adapters sharing the ptrace handle support it. Old daemons, absent handles,
+unsupported custom handles and checkpoint-detached trees remain unavailable/unknown.
+Acceptance is still separate from application. Backend polling ends after 20 seconds
+with an unknown outcome; it sends no mutation retries. Observation storage keeps
+64 entries per daemon; the relay bounds pending targets to 128, four concurrent
+readers and 16 handles per target. Evicted/superseded evidence stays unknown.
+Bulk controls retain per-target application outcomes, including partial outcomes.
+Requested, accepted and observed facts use the existing `ui_intervention` pipeline;
+per-agent evidence is expandable so it does not displace the investigation workspace.
+Freezing holds the displayed event data and preserves selection; current-live
+controls and their receipts continue updating. Older recordings and receipts remain readable.
+
+Each command carries the live execution identity, an execution-process UUID,
+a unique request ID and a snapshot of target agents. Both server and relay fence
+replacement executions. The relay deduplicates the session's first 2,000 command
+IDs and retains its latest 200 receipts; further submissions require a new relay
+session. Requested actions and known outcomes are recorded as `ui_intervention`
+events when the existing global logger is available. Replay and recordings
+cannot send these commands. While Freeze view is active, controls still target
+the current live execution and explicitly say so.
+
+## Messages, redirects and task submission
+
+An active `agwebui.run(...)` relay exposes **Queue retained message** on each
+owned agent. This is the same `agent.queue_message(message)` publication boundary:
+**A submitted → B submitted → message → C submitted** delivers retained context
+to C and later invocations, not A or B, even if B is still queued. It neither
+injects into the current model turn nor starts an engine. **Queued** means the
+ordered context request was published; **Context committed** means its predecessor
+resolved and the retained context was appended. Neither means a model consumed
+or followed the message. Multiline content is preserved.
+
+**Redirect active invocation** is offered only for an active, unpaused invocation
+on the existing PTY adapters (`claude_code`, `codex`, `opencode`, `kimi`, `grok`).
+Its exact owned invocation ID is fenced. Successful native prompt acknowledgement
+is **Delivered**, continuing that same Agency invocation; it creates no successor
+invocation. If delivery loses the race after dispatch or fails, the unchanged SDK
+falls back to one future-context publication at the then-current chain tail.
+The receipt states **Queued** and names that context request. A target already
+gone before relay dispatch is rejected, so the composer cannot silently redirect
+a replacement. Native harnesses expose future-context queueing without a working
+looking interrupt control.
+
+**Run task** requires an explicit allowlist of existing skills in the execution
+script; a browser cannot import classes, choose arbitrary methods or change
+provider/sandbox configuration:
+
+```python
+from agency import agent, agdata, agskill
+from agency.observability.agwebui import agwebui
+
+answer = agskill("Answer", "Answer the supplied question.", input_schema=agdata(question=str))
+
+def workload():
+    # Construct/configure agents using the application's normal setup.
+    worker = agent()
+    worker.run(answer, agdata(question="Initial task")).wait()
+    # The relay remains available only while this workload is running.
+
+agwebui.run(workload, ui_tasks={"answer": answer})
+```
+
+This example illustrates the opt-in contract, not a cost-free smoke test: actual
+skill execution requires the normal configured Linux runtime, sandbox and model
+credentials. Selecting a task does not submit it. The explicit submit action
+validates a JSON input object with the skill's existing input schema, then calls
+`agent.run(skill, agdata(...))`. **Submitted** names the real invocation and means
+scheduler publication, not successful execution. No task allowlist means no Run
+task capability. A standalone log server, finished wrapper, or recorded example
+has no execution-owned relay and remains read-only.
+
+Cards show the calculated wall interval, including recorded pauses. Detailed
+execution duration and the legacy overlay labels exclude recorded pauses and
+are qualified separately; trace boundaries and the timeline use wall-clock time. The
+run's wall time continues advancing. Controls disable after completion,
+during disconnection, or when the execution command relay is unavailable.
+The standalone log-viewing server and the cost-free smoke example above have
+no live agent relay, so their execution controls stay disabled.
+
+## Readable cards and focused agents
+
+Trajectory is the default when no explicit view is selected. The short execution
+header retains the full copyable identifier in its disclosure; the metric strip
+shows available measurements only. Empty first visits offer a recorded synthetic
+example and the verified run/connect path without replacing a selected execution.
+
+Each agent column has a stable header, current in-flight calls, and newest-start-first
+history. Tool commands, specific returned failures, model identity/output/usage,
+and intervention acknowledgements are visible without expanding every metric.
+A failing tool call does not establish an unhealthy agent. Unknown timing and
+state remain unavailable. Card height is not elapsed time.
+
+Select a card to open captured input/output and scoped measurements beside the
+trajectory. Output and source evidence use plain text in 20,000-character windows;
+all remaining captured text stays accessible. Historical measurements show their
+recorded scope and sample time or interval. Current host telemetry is never
+substituted for missing event-time evidence. Explicit model/tool IDs establish
+links, including one response requesting several tools; adjacency establishes none.
+Older recordings remain readable with missing correlation and identity called out.
+
+The searchable roster retains every recorded agent. Pin up to six columns, hide
+without stopping, reorder explicitly, or return to a hidden agent. Hidden failure
+counts cover **retained calls**, not complete execution lifetime. Parent/child
+entries require explicit metadata. Long-call locators show calculated elapsed
+from available starts, not a proven bottleneck. Per-column reading pages, event
+selection, expanded details and focus are retained during live updates. Up to
+2,000 bounded inspection/reading IDs cover six columns alongside the live window.
+
+**Reveal on timeline** zooms to the selected event's actual available interval;
+**Reveal in trajectory** pins/reveals that same event. Clearing incompatible
+filters requires an explicit choice. Unknown timing is explained rather than
+invented. Each view retains its navigation while selection and execution identity
+stay shared. Recorded examples and replay have no mutation controls.
+
+Agency agent execution requires the repository's Linux x86-64 runtime, Python
+3.12 or newer, and its configured local Docker/Podman sandbox and model setup.
+The browser may open the server's reachable URL separately; the SDK workload and
+its owned command relay run on the execution host. This pass does not validate
+other operating systems, VMs, or container deployment arrangements. For loopback
+viewing, the standalone server accepts `--host 127.0.0.1`; its existing default
+binding is unchanged.
 
 ## Replay and investigation
 
-Select a saved execution, then **Replay recorded events**. Replay starts
+Select a live or saved execution, then **Replay recorded events**. Replay starts
 paused; use **Next event**, **Play replay**, speed, or **Restart replay**.
 `mode=replay` is preserved in the URL. Actual saved spans supply start/end
 boundaries, and results, usage, context, and final metadata arrive only at the
 recorded end. Reconstructed boundaries are identified as such in raw detail.
 Replay exhaustion is separate from a recorded final execution status.
+Replay pause controls playback only; saved/replay runs never expose live
+execution controls. Scrubbing the time cursor rebuilds the canonical event prefix,
+including paused/resumed agent state and resource samples. Live replay continues
+reading new evidence while its selected clock stays fixed. Reconnect preserves
+the selected time, including positions between sparse events.
+
+The **Timeline** tab follows Trajectory. Agent rows and sampled resource tracks
+share one wall-clock origin; overlapping calls occupy separate subrows. Zoom,
+fit, horizontal pan, tooltips, and click-to-inspect work on the same action IDs.
+**Lock to Present** defaults off. Enabling it follows the newest activity;
+manually scrolling backward releases it. Tab switches preserve zoom and pan.
+Metric dots represent observations without interpolation across missing samples.
+
+**Show details** on a call reveals formatted input/output, execution metadata,
+and system samples nearest the call start, with sample time and distance shown.
+Long content stays bounded until **Show full output** loads immutable source
+evidence. Copy controls retain the original data. Up to six focused columns
+retain a minimum readable width; the board scrolls horizontally, and the roster
+keeps all remaining agents reachable.
+
+The existing summary includes cumulative input/output/total tokens, model-call
+counts, run-average output rate, active agents, and available CPU/RAM/GPU/VRAM
+samples. Missing telemetry is shown as unavailable; cost is not estimated.
+The profiler persists its existing samples through the buffered data logger in
+`profile_data.sqlite3`; the shared live reader ingests them without an extra
+sampler or browser polling endpoint. CPU percentages are derived from measured
+CPU-time deltas and can exceed 100% across cores.
 
 The catalog includes separate synthetic fixtures:
 
@@ -70,17 +274,35 @@ The catalog includes separate synthetic fixtures:
 - The earlier three-agent research demos retain context/resources/comparison
   examples. Their values and relationships are synthetic.
 
-Expand an activity for ordered calls. Select a call for arguments, lifecycle,
+Use **Add agent** to display agent columns side by side. Each column has a stable
+header and a **Current activity** area that supports
+multiple in-flight calls. Completed calls move into history ordered by newest
+start time, with stable action IDs breaking ties. Completion time does not reorder
+history. An inspected call keeps its execution/action identity as it moves.
+The **Multi-agent** view preserves expanded transcripts while live updates
+arrive and aligns concurrent work with any recorded system metrics.
+Expand an activity for its calls. Select a call for arguments, lifecycle,
 timing, output, artifacts, model links, and immutable source identifiers.
 Signals link to supporting calls or raw events. Agent focus retains explicit
 neighboring workflow notes. The overlay preserves actual parallel lanes.
 
-Selecting earlier evidence, scrolling back, or leaving the page holds history.
-Changed-call counts and highlighted cards show what arrived meanwhile. The
-overview stays at the held point; the session bar still reports current
-execution/transport state. **Follow latest** refreshes the overview and resumes
-following. Activity pages render at most 50 cards; earlier pages keep the full
-accumulated model available without filling the DOM with every call.
+Each trajectory column scrolls independently. Scrolling into history holds
+that column's reading window; other columns continue following. Its header shows
+changed calls and **Live in this column**. Updates preserve the reading anchor,
+expanded call content, selection, and keyboard focus. Expanded evidence that
+changes offers **New evidence · Refresh details**, so output being read is not
+silently replaced. An inspector with keyboard focus defers changed evidence until
+focus leaves and identifies that pending refresh.
+
+Columns show 50 completed calls and 50 in-flight calls at a time, plus bounded
+inspection pins. **Older calls** and **More in-flight calls** page through the
+source in the same start/ID order. Paging is disabled while frozen. The live
+browser projection retains 2,000 recent completed calls, 200 in-flight calls,
+up to 500 reading/inspection pins, and 2,000 samples per resource series. Coverage
+text identifies the window; live export and recorded review retain complete
+source evidence. Reconnect snapshots and incremental delivery merge by stable
+identity. Moving the time cursor holds the shared overview; **Jump to live**
+returns all reading windows to live.
 
 ## What the evidence establishes
 
@@ -93,7 +315,7 @@ accumulated model available without filling the DOM with every call.
 | Edit/artifact | Reported result references, with a digest when the producer records one. An edit-shaped command alone is not proof of a changed file. |
 | Activity grouping | Derived deterministically from actor, request, workstream, category, and call ordering. One primary assignment per call; groups hold at most eight calls. Late calls get stable separate groups. |
 | Attention | Exact failures; repeated matching assertion/check fingerprints without an intervening recorded edit; explicit input requests; scheduler/dependency waits; missing coverage. Successful equivalent checks close prior matching-check signals, without a task-success claim. Parallel overlapping checks are not called consecutive failures. |
-| Resources, transfers, evaluator outcome | Existing saved views retain their recorded data. Live resource attribution and absent transfer manifests remain unavailable. Recorded evaluator evidence stays separate from execution completion. |
+| Resources, transfers, evaluator outcome | Existing saved views retain their recorded data. Live resource samples retain their recorded workload/process/device scope; proximity to a call is not attribution. Absent transfer manifests remain unavailable. Recorded evaluator evidence stays separate from execution completion. |
 | Semantic suggestions | Optional interpretation beside the stable original label, with exact supporting IDs and quoted result evidence. It cannot move calls, merge actors, or change outcomes. |
 
 The declared-purpose label conveys what the agent says it is attempting.
@@ -250,7 +472,7 @@ python examples/12_swebench_live.py \
   --codex-binary /absolute/path/to/codex-0.147.0 \
   --model gpt-6-luna
 python -m agency.observability.agwebui.server \
-  --run-dir /absolute/path/to/fresh-run/logs --port 7865 --no-perfetto
+  --run-dir /absolute/path/to/fresh-run/logs --port 7865
 ```
 
 The example image requires `/opt/agency-harness-venv/bin/python` with Agency's
@@ -296,9 +518,11 @@ The completed viewer is at
 
 ## Remaining limits and next work
 
-One server observes one configured run directory. History/projection memory
-grows with a run even though reading, updates, semantic work, and feed DOM are
-bounded. The overlay and other saved profiler views are not virtualized.
+One server observes one configured run directory. The server retains its complete
+history/projection in memory. The live browser
+projection, notifications, and trajectory card windows are bounded as described
+above; saved review retains the complete recording. The overlay and other saved
+profiler views are not virtualized.
 Very large raw outputs are loaded whole on demand. Database replacement/truncation
 within a run is not treated as a new execution; use fresh run directories.
 Raw wall-clock timestamps are retained, but host clock skew can limit temporal
@@ -307,9 +531,11 @@ alignment; late events do not reorganize published episode membership.
 Native annotations and explicit model IDs are connected; external harnesses
 may lack tool/context correlation and therefore display unlinked evidence.
 Input/delegation/handoff event types are supported, but all harnesses do not
-currently emit them. The dashboard link is preserved; no new pause/redirect/
-cancel buttons imply backend capabilities. Pause/resume remain existing stubs
-and cancellation requires an invocation handle.
+currently emit them. Live pause/resume reuse the existing process controls.
+Redirect uses an owned active invocation on supported PTY adapters, while
+future-context messages and explicitly registered tasks use the SDK paths
+documented above. Invocation-specific cancellation remains programmatic and
+requires its invocation handle.
 
 The highest-value next step is consistent invocation-scoped input, delegation,
 transfer, and artifact/validation events across harnesses. That would turn

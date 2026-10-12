@@ -40,6 +40,8 @@ print(payload["summary"])
 
 `pause()`, `resume()`, `cancel(handle)`, `redirect(handle, message)` return `None`; `is_paused()` returns bool. Pause is agent-wide, persistent across requests and best-effort at the harness boundary. Paused work can still be admitted and consume a slot. See [targeting and timing](results.md#targeting-and-timing) before relying on cancellation or redirect delivery.
 
+`stop(*, force=False)` cancels this agent's currently outstanding work and clears its pause intent. Request-owned active engines receive a cancellation request using SIGTERM by default or SIGKILL with `force=True`; queued work can be cancelled without an engine. A successful return is `None` and does not independently confirm process exit or cleanup. Stop does not unregister the agent or prevent later `run()` submissions. It does not stop other agents or shut down the process orchestrator.
+
 `get_config_copy()` returns an independent deep clone. `change_config(config)` clones the replacement and cascades to this agent's logger, existing sandbox and engine. It does not reconfigure the process orchestrator or change the constructor-selected `harness` attribute. Apply updates between runs. Class defaults `log_dir`, `output_dir` and `default_agconfig` affect construction/path selection; prefer explicit config for reproducibility. [Configuration](configuration.md) explains scopes.
 
 `output_path` is a host `Path` or `None`; `container_output_path` is `/agent_output` or `None`. Configured output is mounted automatically when a sandbox is created. Output-path properties read current config; changing output_dir after sandbox creation does not move its existing mount. Caller owns files there. There is no `Agent.close()` or agent context manager. Keep references to background work and wait before leaving your workload; explicitly `destroy()` directly owned sandboxes when finished. Process/agent cleanup also performs best-effort teardown.
@@ -63,4 +65,4 @@ Saved LLM metadata omits API keys and AWS credentials; the whole configuration i
 
 ::: agency.agent.agent
     options:
-      members: ["__init__", "run", "asyncio_run", "queue_message", "redirect", "cancel", "pause", "resume", "is_paused", "history", "output_path", "container_output_path", "change_config", "get_config_copy", "record_state", "fork", "all", "save", "load", "save_all", "load_all"]
+      members: ["__init__", "run", "asyncio_run", "queue_message", "redirect", "cancel", "stop", "pause", "resume", "is_paused", "history", "output_path", "container_output_path", "change_config", "get_config_copy", "record_state", "fork", "all", "save", "load", "save_all", "load_all"]

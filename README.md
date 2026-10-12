@@ -152,9 +152,9 @@ AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=workload \
 
 Open [the dashboard](http://localhost:7860/) or
 [profiler](http://localhost:7860/profiler) for live trajectory and model/tool
-activity. After completion, **Raw trace → Reload trace** loads the finalized
-systems trace. First Perfetto startup needs internet; the server binds to
-`0.0.0.0`. [Profiling guide](docs/guides/profiling.md) covers saved runs and setup.
+activity. The profiler starts without a viewer build and retains raw trace
+downloads for completed profiles. The server binds to `0.0.0.0`.
+[Profiling guide](docs/guides/profiling.md) covers saved runs and setup.
 
 ## Compare runs
 

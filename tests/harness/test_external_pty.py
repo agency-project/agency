@@ -29,6 +29,19 @@ def runtime():
     )
 
 
+def test_exited_harness_reports_terminal_startup_error(runtime, tmp_path):
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    execution.handle = Mock(returncode=1)
+    execution.handle.terminal_screen.return_value = (
+        ["", "Error: Codex executable path is not configured", ""],
+        0,
+        0,
+        1,
+    )
+    with pytest.raises(RuntimeError, match="Codex executable path is not configured"):
+        execution._check_alive()
+
+
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
 def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, tmp_path):
     driver = driver_for(

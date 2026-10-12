@@ -7,6 +7,8 @@ and replay prefixes; raw rows stay in their original databases or trace files.
 from __future__ import annotations
 
 import copy
+import bisect
+import math
 import hashlib
 import json
 import os
@@ -21,12 +23,17 @@ from pathlib import Path
 from .investigator import classify, object_value
 
 EVENT_TYPES = (
+    "resource_sample",
     "workload_started",
     "done",
     "agent_registered",
     "agent_created",
     "agent_forked",
     "agent_state",
+    "agent_paused",
+    "agent_resumed",
+    "agent_stop_requested",
+    "ui_intervention",
     "tool_call",
     "tool_result",
     "skill_start",
@@ -114,6 +121,8 @@ class Trajectory:
             "model": "Recorded in event metadata",
             "harness": "Agency",
             "duration": 0,
+            "execution_started_at": None,
+            "execution_wall_time": 0,
             "status": "unknown",
             "resolved": None,
             "actions": [],
@@ -156,6 +165,8 @@ class Trajectory:
         self.running = set()
         self.intervals = {}
         self.dirty["intervals"] = set()
+        self.pauses = {}
+        self.counter_updates = {}
 
     def _agent(self, actor):
         if actor not in self.agents:
@@ -183,6 +194,19 @@ class Trajectory:
             "active": active,
         }
         self.dirty["signals"].add(key)
+
+    def _agent_status(self, agent, status):
+        agent["execution_state"] = status
+        agent["status"] = "paused" if agent.get("paused") else status
+
+    def _execution_duration(self, action, end):
+        """Exclude recorded control intervals without changing the trace's time axis."""
+        start = action["started_ts"]
+        paused = sum(
+            max(0, min(end, right if right is not None else end) - max(start, left))
+            for left, right in self.pauses.get(action["agent"], [])
+        )
+        return max(0, end - start - paused)
 
     def _close_signal(self, key):
         if key in self.signals and self.signals[key]["active"]:
@@ -288,6 +312,8 @@ class Trajectory:
                 "intent": intent,
                 "command": command[:8000],
                 "arguments": text(arguments)[:8000],
+                "input_truncated": payload.get("input_truncated", False)
+                or len(text(arguments)) > 8000,
                 "result": "",
                 "error": "",
                 "start": max(0, timestamp - self.origin),
@@ -304,10 +330,25 @@ class Trajectory:
                 "context": None,
                 "event_ids": [],
                 "call_id": payload.get("call_id") or event.get("call_label"),
-                "model_tool_call_id": annotation.get("model_tool_call_id"),
-                "model_id": self.model_links.get((actor, annotation.get("model_tool_call_id"))),
+                "model_tool_call_id": payload.get("model_tool_call_id")
+                or annotation.get("model_tool_call_id"),
+                "model_id": payload.get("model_id")
+                or self.model_links.get(
+                    (
+                        actor,
+                        payload.get("model_tool_call_id") or annotation.get("model_tool_call_id"),
+                    )
+                ),
                 "parent_id": payload.get("parent_id"),
                 "request_id": payload.get("request_id") or self.actor_request.get(actor),
+                "request_correlation": payload.get("request_correlation")
+                or (
+                    "explicit"
+                    if payload.get("request_id")
+                    else "actor_context_fallback"
+                    if self.actor_request.get(actor)
+                    else "unavailable"
+                ),
                 "workstream_ids": declared.get("workstream_ids", []),
                 "missing_start": ending,
                 "result_hash": None,
@@ -322,6 +363,29 @@ class Trajectory:
                 ).append(action_id)
             self._episode(action, late)
         action["event_ids"].append(event["id"])
+        if payload.get("request_id"):
+            action["request_id"] = payload["request_id"]
+            action["request_correlation"] = payload.get("request_correlation") or "explicit"
+        if payload.get("model"):
+            action["model"] = payload["model"]
+        tool_identity = payload.get("model_tool_call_id") or (payload.get("annotation") or {}).get(
+            "model_tool_call_id"
+        )
+        if tool_identity and not action.get("model_tool_call_id"):
+            action["model_tool_call_id"] = tool_identity
+            action["model_id"] = payload.get("model_id") or self.model_links.get(
+                (actor, tool_identity)
+            )
+            if not action["model_id"]:
+                self.pending_model_links.setdefault((actor, tool_identity), []).append(action_id)
+        if isinstance(payload.get("tool_call_ids"), list):
+            action["tool_call_ids"] = list(
+                dict.fromkeys(
+                    item
+                    for item in [*action.get("tool_call_ids", []), *payload["tool_call_ids"]]
+                    if isinstance(item, str) and item
+                )
+            )
         if not ending:
             missing_start = action["missing_start"]
             action["missing_start"] = False
@@ -346,9 +410,18 @@ class Trajectory:
         else:
             result = payload.get("result", payload.get("output", ""))
             action["result"] = text(result)[:8000]
+            action["output_truncated"] = (
+                payload.get("output_truncated", False)
+                or len(text(result)) > 8000
+                or len(text(payload.get("error", ""))) > 8000
+            )
             action["error"] = text(payload["error"])[:8000] if payload.get("error") else ""
             action["result_hash"] = fingerprint(action["error"] or result)
-            action["result_preview"] = action["error"][:240] or returned_preview(result)
+            action["result_preview"] = (
+                action["error"][:240]
+                or payload.get("recorded_result_preview")
+                or returned_preview(result)
+            )
             first_result = action["end_ts"] if "end_ts" in action else None
             action["end_ts"] = timestamp
             action["duration"] = max(0, timestamp - self.origin - action["start"])
@@ -356,6 +429,10 @@ class Trajectory:
             action["tokens"] = payload.get("tokens") if kind == "model" else None
             action["output_tokens"] = payload.get("output_tokens") if kind == "model" else None
             action["context"] = payload.get("context")
+            if kind == "model" and payload.get("model_response") is not None:
+                action["model_response"] = payload["model_response"]
+            if kind == "model" and isinstance(action["context"], dict):
+                action["input_truncated"] = bool(action["context"].get("truncated"))
             action["files"] = payload.get("files") or []
             action["timing"] = payload.get("timing", action["timing"])
             parsed_result = object_value(result)
@@ -371,15 +448,20 @@ class Trajectory:
                 self._attention(action)
         if action["outcome"] == "running" and self.finished_at is not None:
             action["outcome"] = "incomplete"
+        action["execution_duration"] = self._execution_duration(
+            action, action.get("end_ts", timestamp)
+        )
         if action["outcome"] == "running":
             self.running.add(action_id)
         else:
             self.running.discard(action_id)
         action["metadata"] = {
+            **action["metadata"],
             **payload.get("metadata", {}),
             "event_ids": action["event_ids"],
             "call_id": action["call_id"],
             "request_id": action["request_id"],
+            "request_correlation": action["request_correlation"],
             "missing_start": action["missing_start"],
             "parent_id": action["parent_id"],
             "source": action["source"],
@@ -470,13 +552,40 @@ class Trajectory:
             return False
         self.seen.add(event["id"])
         self.run["coverage"]["events"] += 1
+        if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+            event = {
+                **event,
+                "ts": (self.origin or 0) + self.run["duration"],
+                "source": "timestamp_missing_ordered_at_last_observation",
+            }
         if self.origin is None:
             self.origin = event["ts"]
+            self.run["time_origin"] = self.origin
         self.run["duration"] = max(self.run["duration"], event["ts"] - self.origin)
         actor = event.get("actor") or "unattributed"
         event = {**event, "actor": actor}
         payload, kind = event["payload"], event["type"]
-        if kind == "workload_started":
+        # UI/program startup includes setup and human input. Start elapsed
+        # agent time only at an observed execution boundary; keep the original
+        # trace origin so earlier resource samples and setup remain aligned.
+        if self.finished_at is None and (
+            kind in {"request_started", "skill_start", "tool_call"}
+            or kind == "agent_state"
+            and payload.get("state") in {"running", "waiting_llm"}
+        ):
+            started = self.run["execution_started_at"]
+            self.run["execution_started_at"] = (
+                event["ts"] if started is None else min(started, event["ts"])
+            )
+        if kind == "resource_sample":
+            at = max(0, event["ts"] - self.origin)
+            for name, value in payload.get("values", {}).items():
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    point = [at, value]
+                    series = self.run["counters"].setdefault(name, [])
+                    bisect.insort(series, point)
+                    self.counter_updates.setdefault(name, []).append(point)
+        elif kind == "workload_started":
             self.run["status"] = "running"
             self.run["task"] = payload.get("task")
             for field in ("model", "harness", "dataset"):
@@ -509,14 +618,85 @@ class Trajectory:
             for episode in self.episodes.values():
                 episode["closed"] = True
                 self.dirty["episodes"].add(episode["id"])
+            for agent in self.agents.values():
+                if agent.get("paused"):
+                    agent["paused"] = False
+                    self._agent_status(agent, self.run["status"])
+                    self.dirty["agents"].add(agent["id"])
         else:
             agent = self._agent(actor)
             if kind in {"agent_created", "agent_forked", "agent_registered"}:
                 # Process ancestry is deliberately not turned into delegation.
                 agent["identity"] = "execution_actor"
+                if payload.get("parent_agname"):
+                    agent["parent"] = payload["parent_agname"]
+                    agent["parent_source"] = "recorded_parent_agname"
+                config = payload.get("llm_config") or {}
+                if isinstance(config, dict) and config.get("model"):
+                    agent["model"] = config["model"]
+                if payload.get("harness"):
+                    agent["harness"] = payload["harness"]
+            elif kind == "ui_intervention":
+                state = payload.get("state", "unknown")
+                command = payload.get("requested_action", "unknown")
+                arguments = {
+                    "command": payload.get("message") or command,
+                    "input": payload.get("input"),
+                    "task": payload.get("task"),
+                }
+                action = self._call(
+                    {
+                        **event,
+                        "payload": {
+                            "action_id": f"{actor}:control:{payload.get('relay_id', '')}:{payload.get('command_id', event['id'])}",
+                            "name": command,
+                            "kind": "control",
+                            "arguments": arguments,
+                            "request_id": payload.get("invocation"),
+                            "outcome": state,
+                            "result": payload.get("result", {}),
+                            "metadata": {"scope": "human_intervention", "recorded_state": state},
+                        },
+                    },
+                    "control",
+                    payload.get("command_id", event["id"]),
+                    ending=state != "requested",
+                )
+                action.update(
+                    target_agent=payload.get("target_agent", actor),
+                    requested_action=command,
+                    outcome=state,
+                    command=payload.get("message") or command,
+                    control_scope="human_intervention",
+                )
+                self.running.discard(action["id"])
+                self._refresh_episode(action)
+            elif kind in {"agent_paused", "agent_resumed"}:
+                if event["ts"] >= agent.get("control_ts", 0) and self.finished_at is None:
+                    agent["control_ts"] = event["ts"]
+                    intervals = self.pauses.setdefault(actor, [])
+                    if kind == "agent_paused" and not agent.get("paused"):
+                        intervals.append([event["ts"], None])
+                        agent["paused"] = True
+                    elif kind == "agent_resumed" and agent.get("paused"):
+                        intervals[-1][1] = event["ts"]
+                        agent["paused"] = False
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
+                    self.tick(event["ts"], force=True)
+            elif kind == "agent_stop_requested":
+                if event["ts"] >= agent.get("stop_ts", 0):
+                    agent["stop_ts"] = event["ts"]
+                    agent["stop_force"] = bool(payload.get("force"))
+                    # This confirms delivery, not process exit. Terminal state
+                    # still comes from the scheduler's existing request events.
+                    agent["paused"] = False
+                    intervals = self.pauses.get(actor, [])
+                    if intervals and intervals[-1][1] is None:
+                        intervals[-1][1] = event["ts"]
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
             elif kind == "agent_state":
                 if event["ts"] >= agent.get("state_ts", 0):
-                    agent["status"] = payload.get("state", "unknown")
+                    self._agent_status(agent, payload.get("state", "unknown"))
                     agent["state_ts"] = event["ts"]
                 if payload.get("state") == "waiting_llm" and event.get("call_label"):
                     self._call(event, "model", f"model:{event['call_label']}")
@@ -525,10 +705,10 @@ class Trajectory:
                 key = payload.get("call_id") or event.get("call_label") or event["id"]
                 if call_kind == "model":
                     key = f"model:{key}"
-                self._call(event, call_kind, key, ending=kind.endswith("result"))
+                action = self._call(event, call_kind, key, ending=kind.endswith("result"))
                 if call_kind == "model":
                     model_id = payload.get("action_id") or f"{actor}:{key}"
-                    for tool_id in payload.get("tool_call_ids", []):
+                    for tool_id in action.get("tool_call_ids", []):
                         self.model_links[(actor, tool_id)] = model_id
                         for action_id in self.pending_model_links.pop((actor, tool_id), []):
                             self.actions[action_id]["model_id"] = model_id
@@ -593,7 +773,7 @@ class Trajectory:
                         text(payload.get("error") or payload),
                         [event["id"]],
                     )
-                agent["status"] = kind.removeprefix("request_")
+                self._agent_status(agent, kind.removeprefix("request_"))
             elif kind == "skill_start":
                 self._call(
                     {**event, "payload": {**payload, "name": payload.get("skill")}},
@@ -631,7 +811,7 @@ class Trajectory:
                     [event["id"]],
                     "required",
                 )
-                agent["status"] = "waiting_input"
+                self._agent_status(agent, "waiting_input")
             elif kind == "input_resolved" and f"input:{actor}" in self.signals:
                 self._close_signal(f"input:{actor}")
             elif kind in {"delegation", "handoff"}:
@@ -664,22 +844,54 @@ class Trajectory:
                 self.dirty["signals"].add("unfinished")
             if not missing:
                 self._close_signal("unfinished")
+        self._execution_clock()
         return True
 
-    def tick(self, now):
+    def _execution_clock(self):
+        started = self.run["execution_started_at"]
+        end = (
+            self.finished_at
+            if self.finished_at is not None
+            else (self.origin or 0) + self.run["duration"]
+        )
+        self.run["execution_wall_time"] = 0 if started is None else max(0, end - started)
+
+    def tick(self, now, *, force=False):
         if self.finished_at is None and self.origin is not None:
             self.run["duration"] = max(self.run["duration"], now - self.origin)
+        self._execution_clock()
         for action_id in self.running:
             action = self.actions[action_id]
             if action["outcome"] == "running":
-                duration = max(0, self.run["duration"] - action["start"])
-                if int(duration) != int(action["duration"]):
+                end = self.origin + self.run["duration"]
+                pauses = self.pauses.get(action["agent"], [])
+                if pauses and pauses[-1][1] is None:
+                    end = min(end, pauses[-1][0])
+                duration = max(0, end - action["started_ts"])
+                execution_duration = self._execution_duration(action, end)
+                if (
+                    force
+                    or int(duration) != int(action["duration"])
+                    or int(execution_duration) != int(action.get("execution_duration", 0))
+                ):
                     action["duration"] = duration
+                    action["execution_duration"] = execution_duration
                     self.dirty["actions"].add(action["id"])
                     self._interval(action)
                     self._refresh_episode(action)
 
+    def _metrics(self):
+        from .metrics import ExecutionCounters
+
+        if not hasattr(self, "metrics_counters"):
+            self.metrics_counters = ExecutionCounters()
+            calls = self.actions.values()
+        else:
+            calls = (self.actions[key] for key in self.dirty["actions"])
+        self.run["metrics_totals"] = self.metrics_counters.update(calls)
+
     def patch(self):
+        self._metrics()
         maps = {
             "actions": self.actions,
             "episodes": self.episodes,
@@ -697,16 +909,66 @@ class Trajectory:
         }
         patch["meta"] = {
             key: copy.deepcopy(self.run[key])
-            for key in ("status", "duration", "coverage", "task", "model", "harness", "dataset")
+            for key in (
+                "metrics_totals",
+                "status",
+                "duration",
+                "execution_started_at",
+                "execution_wall_time",
+                "coverage",
+                "task",
+                "model",
+                "harness",
+                "dataset",
+                "time_origin",
+            )
             if key in self.run
         }
+        patch["counter_samples"] = self.counter_updates
+        self.counter_updates = {}
         for ids in self.dirty.values():
             ids.clear()
         return patch
 
     def snapshot(self):
+        self._metrics()
         self.run["signals"] = list(self.signals.values())
         return copy.deepcopy(self.run)
+
+
+def trajectory_history(
+    run, agent, *, before_start=None, before_id="", active=False, query="", limit=50
+):
+    """Page observed calls by start time and identity, independent of completion time."""
+    calls = sorted(
+        (
+            a
+            for a in run["actions"]
+            if a["agent"] == agent
+            and (a["outcome"] == "running") == active
+            and query.lower()
+            in " ".join(
+                str(a.get(k, "")) for k in ("name", "intent", "command", "result", "files")
+            ).lower()
+        ),
+        key=lambda a: (-a["start"], a["id"]),
+    )
+    if before_start is not None:
+        calls = [
+            a
+            for a in calls
+            if a["start"] < before_start or (a["start"] == before_start and a["id"] > before_id)
+        ]
+    page = calls[:limit]
+    episode_ids = {a.get("episode") for a in page}
+    return copy.deepcopy(
+        {
+            "actions": page,
+            "execution": {"id": run["id"], "time_origin": run.get("time_origin")},
+            "episodes": [e for e in run["episodes"] if e["id"] in episode_ids],
+            "has_more": len(calls) > limit,
+        }
+    )
 
 
 class LiveSource:
@@ -716,6 +978,11 @@ class LiveSource:
         self.directory = Path(directory).resolve()
         self.model = Trajectory("live", f"Current execution · {self.directory.parent.name}")
         self.paths = {"global": self.directory / "global_data.sqlite3"}
+        self.events = []
+        self.profile_path = (
+            Path(os.environ.get("AGENCY_PROFILE_DIR", self.directory.parent / "profiler"))
+            / "profile_data.sqlite3"
+        )
         self.cursors = {}
         self.epoch = uuid.uuid4().hex
         self.revision = 0
@@ -768,7 +1035,7 @@ class LiveSource:
                     event = {
                         "id": f"{source}/{table}/{row_id}",
                         "type": kind,
-                        "ts": ts,
+                        "ts": body.get("sampled_at", ts) if kind == "resource_sample" else ts,
                         "actor": actor,
                         "call_label": label,
                         "payload": body,
@@ -798,11 +1065,44 @@ class LiveSource:
             if block.get("type") not in {"thinking", "reasoning", "redacted_thinking"}:
                 chains[chain_kind].append(block)
         metadata = next((b for b in chains["response"] if b.get("type") == "metadata"), {})
+        native = metadata.get("data")
+        if isinstance(native, list):
+            native = next(
+                (item for item in reversed(native) if isinstance(item, dict) and item.get("model")),
+                {},
+            )
+        recorded_model = metadata.get("model") or (
+            native.get("model") if isinstance(native, dict) else None
+        )
         visible = [b.get("text", "") for b in chains["response"] if b.get("type") == "text"]
+        response_blocks = [b for b in chains["response"] if b.get("type") != "metadata"]
+        # Keep source-backed previews bounded without dropping tool-use evidence.
+        # The raw-event endpoint calls full=True and returns these captured
+        # visible blocks unchanged; provider metadata/private reasoning stays out.
+        response_preview = response_blocks if full else response_blocks[:80]
+        response_truncated = not full and (
+            len(response_blocks) > 80 or any(len(text(block)) > 1200 for block in response_preview)
+        )
+        model_response = {
+            "blocks": [
+                block
+                if full or len(text(block)) <= 1200
+                else {
+                    **{key: block[key] for key in ("type", "id", "name") if key in block},
+                    "preview": text(block)[:1200],
+                    "chars": len(text(block)),
+                    "truncated": True,
+                }
+                for block in response_preview
+            ]
+        }
         markers = next((b for b in chains["response"] if b.get("error") or b.get("cancelled")), {})
         prompt = chains["prompt"] if full else chains["prompt"][:80]
         preview_limit = None if full else 1200
         return {
+            "model": recorded_model if isinstance(recorded_model, str) else None,
+            "model_response": model_response,
+            "output_truncated": response_truncated,
             "result": "\n".join(visible),
             "error": markers.get("error"),
             "outcome": "failed"
@@ -815,6 +1115,14 @@ class LiveSource:
             "tool_call_ids": [
                 b["id"] for b in chains["response"] if b.get("type") == "tool_use" and b.get("id")
             ],
+            "request_id": metadata.get("request_id"),
+            # Provider-native data may include hidden reasoning. Expose only
+            # captured identity / usage timing, never the opaque native body.
+            "metadata": {
+                key: metadata[key]
+                for key in ("request_id", "skill", "stop_reason", "ttft_ms", "new_prompt_tokens")
+                if metadata.get(key) is not None
+            },
             "context": {
                 "source": "recorded",
                 "available": bool(chains["prompt"]),
@@ -844,6 +1152,8 @@ class LiveSource:
             self.last_poll = time.monotonic()
             self.model.run["coverage"]["catching_up"] = False
             events, gaps = [], []
+            if self.profile_path.is_file():
+                self.paths["profiler"] = self.profile_path
             # Read global registration first, including agents created after connection.
             rows, gap = self._rows("global", self.paths["global"])
             events.extend(rows)
@@ -856,7 +1166,27 @@ class LiveSource:
                 events.extend(rows)
                 if gap:
                     gaps.append(gap)
+            for event in events:
+                if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+                    event["ts"] = (self.model.origin or 0) + self.model.run["duration"]
+                    event["source"] = "timestamp_missing_ordered_at_last_observation"
             events.sort(key=lambda e: (e["ts"], e["id"]))
+            # Retain bounded replay evidence, not a second copy of huge tool
+            # outputs. Immutable originals remain available in their SQLite rows.
+            for event in events:
+                payload = dict(event["payload"])
+                for key, flag in (
+                    ("arguments", "input_truncated"),
+                    ("result", "output_truncated"),
+                    ("output", "output_truncated"),
+                    ("error", "output_truncated"),
+                ):
+                    if key in payload and len(text(payload[key])) > 8000:
+                        if key in {"result", "output"}:
+                            payload["recorded_result_preview"] = returned_preview(payload[key])
+                        payload[key] = text(payload[key])[:8000]
+                        payload[flag] = True
+                self.events.append({**event, "payload": payload})
             for event in events:
                 self.model.apply(event)
             self.model.run["coverage"]["gaps"] = gaps
@@ -922,9 +1252,15 @@ def replay_events(run):
             "call_id": action["id"],
             "kind": action["kind"],
             "tool": action["name"],
-            "arguments": {"command": action["command"]},
+            "arguments": object_value(action["arguments"])
+            if action.get("arguments")
+            else {"command": action["command"]},
             "intent": action.get("intent", ""),
             "request_id": action.get("request_id"),
+            "request_correlation": action.get("request_correlation"),
+            "model": action.get("model"),
+            "model_id": action.get("model_id"),
+            "model_tool_call_id": action.get("model_tool_call_id"),
             "metadata": {
                 key: value
                 for key, value in action.get("metadata", {}).items()
@@ -966,6 +1302,8 @@ def replay_events(run):
                         "outcome": action["outcome"],
                         "tokens": action.get("tokens"),
                         "output_tokens": action.get("output_tokens"),
+                        "tool_call_ids": action.get("tool_call_ids", []),
+                        "model_response": action.get("model_response"),
                         "context": action.get("context"),
                         "files": action.get("files"),
                         "timing": action.get("timing"),

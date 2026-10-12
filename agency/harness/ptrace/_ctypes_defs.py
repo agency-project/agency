@@ -42,6 +42,8 @@ def _configure_libc() -> None:
     libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
     libc.process_vm_readv.restype = ctypes.c_ssize_t
     libc.process_vm_writev.restype = ctypes.c_ssize_t
+    libc.tgkill.restype = ctypes.c_int
+    libc.tgkill.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
 
 _configure_libc()

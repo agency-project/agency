@@ -1,8 +1,8 @@
 # Profiling and viewing runs
 
 Use this guide to launch the dashboard, reopen logs, or record a profile.
-The dashboard shows live work, the profiler investigates recorded activity,
-and Raw trace opens finalized traces in Perfetto.
+The dashboard shows live work, and the execution profiler follows live calls
+and investigates saved activity. Raw trace artifacts remain available for download.
 
 First complete [getting started](../getting-started.md). Profiling requires
 Linux with readable `/proc` and a cgroup v2 hierarchy. OpenTelemetry is a core
@@ -22,39 +22,36 @@ server, then runs the same native task as the README. The workload calls
 `result.wait()` before returning, so pending agent work is included in the trace.
 
 Open [http://localhost:7860/](http://localhost:7860/) for the run dashboard.
-Use **Raw trace** for the embedded Perfetto viewer, or open
-[http://localhost:7860/profiler](http://localhost:7860/profiler) for the existing
+Use **Profiler**, or open
+[http://localhost:7860/profiler](http://localhost:7860/profiler), for the execution
 profiler UI. The server binds to **0.0.0.0**, not only loopback; use an
 appropriate host/network boundary. On a remote Linux host, forward port 7860
 to your browser machine. A port already in use prevents `agwebui.run()` from starting.
 
-## Raw trace viewer
+## Live execution profiler
 
-Missing or stale Perfetto assets are built automatically **before** the server
-starts. This needs Git, internet access, and a writable checkout/cache; allow
-several minutes. The builder fetches pinned Perfetto sources, runs
-`tools/install-build-deps --ui`, and builds the UI and WebAssembly trace processor.
-Build dependencies are prepared by that upstream script. Current cached assets
-are reused without a download or rebuild; no separate Perfetto server runs.
+Open `/profiler?run=live&view=trajectory` and keep **Following latest** enabled
+for incoming calls and results. Running calls stay at the top of each selected
+agent column; completed calls move into history. Use **Add agent** to inspect
+agents side by side, or **Agent overlay** for a shared time axis.
 
-If the build fails, the Web UI does not start. Read the terminal build error
-and retry after fixing the reported dependency or network problem:
+The **Multi-agent** view combines agent transcripts, token/time summaries,
+concurrent work, and recorded system counters. Missing measurements stay
+unavailable. See [live trajectory](profiling/live-trajectory.md) for replay
+and history controls.
 
-```bash
-uv run python -m agency.observability.agwebui.build_perfetto
-```
+<a id="raw-trace-viewer"></a>
 
-The builder installs assets under
-`agency/observability/agwebui/static/perfetto/`; its sources and generated
-assets are Git-ignored. It retains upstream's Apache license. `--force`
-rebuilds a current viewer; `--skip-deps` assumes its build dependencies are
-already installed. Concurrent starts share a build lock.
+## Raw trace artifacts
 
-Agency patches flow arrows to connect source-span starts to destination-span
-starts, including across tracks. Exported traces remain compatible with stock
-Perfetto, whose public viewer uses its own rendering. Search, SQL queries,
-zoom and span arguments are Perfetto's UI. Switching back to Run preserves
-the viewer; reloading a trace creates a fresh viewer.
+The embedded Perfetto viewer and its automatic build have been removed.
+Neither `agwebui.run(...)` nor the standalone server downloads or builds
+viewer assets, and the standalone CLI no longer accepts `--no-perfetto`.
+Exported Chrome trace JSON remains compatible with external trace viewers.
+
+Download the configured profile from `/api/profiler/trace`, or retrieve a
+cataloged saved trace from `/api/investigator/runs/{id}/trace`. These endpoints
+serve recorded files; they do not accept arbitrary filesystem paths.
 
 ## When the trace is ready
 
@@ -67,9 +64,9 @@ The example prints that run's directory. `AGENCY_RUNS_ROOT` changes the root;
 `AGENCY_PROFILE_DIR` overrides only the profiler output directory, which the
 server also reads.
 
-After the terminal says the workload is done, click **Raw trace → Reload trace**.
-This viewer loads a completed file; in-progress spans are not streamed into
-Perfetto. The dashboard stays available until Ctrl+C. If you choose
+The profiler follows live calls from the canonical event databases while the
+workload runs. Finalized trace files become available after profiling ends.
+The dashboard stays available until Ctrl+C. If you choose
 `AGENCY_PROFILE_SCOPE=process`, the final trace is written on process exit,
 so reopen the saved run afterward. Use workload scope for this first run.
 If profiling reports that startup failed and continues unprofiled, there will
@@ -84,8 +81,8 @@ uv run python -m agency.observability.agwebui.server \
   --run-dir agency_runs/YOUR_RUN/logs --port 7860
 ```
 
-Open the same URLs and reload the trace. The standalone server reads the
-sibling `profiler/` directory by default. If the run used a custom output
+Open the profiler and select the saved execution from the catalog. The
+standalone server reads the sibling `profiler/` directory by default. If the run used a custom output
 directory, supply that same path:
 
 ```bash
@@ -94,10 +91,9 @@ AGENCY_PROFILE_DIR=/absolute/path/to/profile \
   --run-dir /absolute/path/to/run/logs --port 7860
 ```
 
-For the existing dashboard and profiler UI without the Perfetto build, add
-`--no-perfetto` to the standalone command; the embedded raw viewer then needs
-already built assets. **Open trace file** in the raw viewer can also open a
-saved `agprof.trace.json` directly from your browser.
+Select **Replay recorded events** to inspect saved execution boundaries with
+**Next event** or **Play replay**. Synthetic examples are explicitly labeled
+and do not execute agents.
 
 ## Record a profile
 

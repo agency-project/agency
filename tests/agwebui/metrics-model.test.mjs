@@ -1,0 +1,11 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+const source=await readFile(new URL('../../agency/observability/agwebui/static/metrics-model.js',import.meta.url),'utf8');
+const {projectMetrics,percentile,peak,union,readPreferences}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const call=(id,start,duration,outcome='success',kind='tool')=>({id,agent:'a',start,duration,outcome,kind});
+test('identity deduplication, active calls and missing usage',()=>{const a=call('a',0,2);const m=projectMetrics({duration:10,actions:[a,a,call('b',4,6,'running'),call('m',2,1,'success','model')],agents:[]});assert.equal(m.totals.tools,2);assert.equal(m.dt.length,1);assert.equal(m.totals.input,null);assert.equal(m.oldest.id,'b');});
+test('nearest rank quantiles, missing observations, overlapping coverage',()=>{assert.equal(percentile([],0.95),null);assert.equal(percentile([1,2,3,4],.5),2);assert.equal(percentile([1,2,3,4],.95),4);const calls=[call('a',0,5),call('b',2,5)];assert.equal(peak(calls,7),2);assert.equal(union(calls,7),7);});
+test('rolling rates and execution totals survive client retention',()=>{const m=projectMetrics({duration:100,actions:[call('a',10,1),call('b',90,1)],metrics_totals:{tools:800},agents:[]});assert.equal(m.toolRate,1/60);assert.equal(m.totals.tools,800);});
+test('preferences persist six unique slots and tolerate unavailable storage',()=>{assert.equal(readPreferences({getItem(){throw Error();}}).pins.length,6);assert.deepEqual(readPreferences({getItem:()=>JSON.stringify({pins:['tools','tools'],category:'Tools',expanded:true})}),{pins:['tools'],category:'Tools',expanded:true});});
+for(const n of [3,10,32])test(`${n} simultaneous agents with 32000 calls`,()=>{const agents=Array.from({length:n},(_,i)=>({id:String(i),status:'running'}));const actions=Array.from({length:32000},(_,i)=>({...call(String(i),i/10,1),agent:String(i%n)}));const m=projectMetrics({agents,actions,duration:3201});assert.equal(m.totals.tools,32000);assert.equal(m.agents.length,n);});

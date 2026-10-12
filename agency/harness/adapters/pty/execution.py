@@ -179,7 +179,10 @@ class PtyExecution:
         if self._failure:
             raise RuntimeError(self._failure)
         if self.handle.returncode is not None:
-            raise RuntimeError(f"{self.driver.name} process exited ({self.handle.returncode})")
+            lines, _, _, _ = self.handle.terminal_screen()
+            detail = "\n".join(line.rstrip() for line in lines if line.strip())[-2000:]
+            message = f"{self.driver.name} process exited ({self.handle.returncode})"
+            raise RuntimeError(f"{message}\n{detail}" if detail else message)
 
     def _wait_until(self, predicate, description, timeout=None):
         deadline = time.monotonic() + (self.INPUT_TIMEOUT if timeout is None else timeout)

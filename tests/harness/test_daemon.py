@@ -804,3 +804,56 @@ def test_host_syscall_policy_logging_failure_never_raises():
 
     assert policy.check(None, event) == (True, None, None, None)
     assert attempted.wait(timeout=5)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_cancel_route_reuses_request_scoped_control_and_preserves_force(force):
+    from fastapi.testclient import TestClient
+    from agency.harness.servers.harness_interaction_server import HarnessInteractionServer
+
+    called = []
+    server = HarnessInteractionServer(
+        "/tmp/unused-stop-test.sock",
+        lambda request: None,
+        control_handler=lambda action, **kwargs: called.append((action, kwargs)),
+    )
+    with TestClient(server.build_app()) as client:
+        assert (
+            client.post("/control/cancel", json={"request_id": "r", "force": force}).status_code
+            == 200
+        )
+        assert called == [("cancel", {"request_id": "r", "force": force})]
+        assert client.post("/control/cancel", json={"force": force}).status_code == 400
+        assert (
+            client.post("/control/cancel", json={"request_id": "r", "force": "yes"}).status_code
+            == 400
+        )
+        assert len(called) == 1
+
+
+@pytest.mark.parametrize("late_handle", [False, True])
+def test_graceful_cancel_can_escalate_and_never_targets_a_different_request(late_handle):
+    from types import SimpleNamespace
+
+    called = []
+    manager = HarnessManager.__new__(HarnessManager)
+    manager._control_lock = threading.Lock()
+    manager._current_request_id = "r"
+    manager._current_request_cancelled = False
+    manager._current_cancel_force = True
+    manager._agent_paused = True
+    handle = SimpleNamespace(
+        terminate=lambda: called.append("term"), kill=lambda: called.append("kill")
+    )
+    manager._current_control_handle = None if late_handle else handle
+    manager.control("cancel", request_id="other", force=True)
+    assert not called and not manager._current_request_cancelled
+    manager.control("cancel", request_id="r", force=False)
+    assert not manager._agent_paused
+    if late_handle:
+        manager._register_control_handle(handle)
+    assert called == ["term"]
+    manager.control("cancel", request_id="r", force=True)
+    assert called == ["term", "kill"]
+    manager.control("cancel", request_id="r", force=False)
+    assert called[-1] == "kill"

@@ -404,6 +404,9 @@ class agProxyPtraceHandle:
         with self._loop._lock:
             return bool(self._loop._held_pids & self._loop._known_pids)
 
+    def _control_snapshot(self) -> dict:
+        return self._loop._control_snapshot()
+
     def close(self) -> None:
         self.kill()
         try:
@@ -442,6 +445,10 @@ class agProxyPtraceHandle:
             self._loop.on_exit(callback)
         else:
             self._loop.on_exit(lambda pid, _code: callback(pid))
+
+    def terminate(self) -> None:
+        """Request graceful shutdown of this launch's tracked process tree."""
+        self._loop.terminate()
 
     def kill(self) -> None:
         self._loop.kill()

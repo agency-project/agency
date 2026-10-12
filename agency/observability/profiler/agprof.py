@@ -796,6 +796,11 @@ def enabled() -> bool:
     return _session is not None
 
 
+def active_output_dir() -> "Path | None":
+    """On-disk destination owned by the active session, if any."""
+    return _out_dir if enabled() else None
+
+
 def span(name: str, *, parent_context=None):
     """A timed, named interval in the current execution context. No-op
     unless a session is active; nesting produces parent/child spans, and
@@ -1904,6 +1909,8 @@ class _Sampler(threading.Thread):
 
     def _tick(self) -> None:
         t = time.perf_counter_ns()
+        sample_start = len(_samples)
+        sampled_at = time.time()
         self._tick_workload_cgroup(t)
         self._tick_processes(t)
         if self._nvml is not None:
@@ -1917,6 +1924,26 @@ class _Sampler(threading.Thread):
                     _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
                     self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
         self._tick_cgroups(t)
+        # Reuse the sampled values and buffered logger; no second sampler or poller.
+        logger = _profile_data_logger
+        if logger is not None:
+            values = {name: value for _, name, value in _samples[sample_start:]}
+            previous = getattr(self, "_live_previous", {})
+            for name, value in list(values.items()):
+                if name.endswith((":cpu_us", ":cpu_s")) and name in previous:
+                    before_t, before_value = previous[name]
+                    elapsed = (t - before_t) / 1e9
+                    if elapsed > 0 and value >= before_value:
+                        unit = 1e6 if name.endswith(":cpu_us") else 1
+                        values[name.rsplit(":", 1)[0] + ":cpu_pct"] = (
+                            (value - before_value) / unit / elapsed * 100
+                        )
+            self._live_previous = {name: (t, value) for name, value in values.items()}
+            try:
+                logger.record_event("resource_sample", {"values": values, "sampled_at": sampled_at})
+            except Exception:
+                # Observability must not stop the sampler or workload.
+                _health["sample_export_failures"] += 1
 
     def run(self) -> None:
         _remember_thread_label("agprof sampler", priority=90)
@@ -3382,20 +3409,24 @@ def _env_out_dir() -> str:
 
 
 @contextmanager
-def workload():
+def workload(*, out_dir=None):
     """Profile a workload boundary when environment profiling requests it.
 
     The context owns a session only for ``AGENCY_PROFILE_SCOPE=workload`` (the
     default) and only when no explicit session is already active. This keeps
     callers free of scope conditionals and prevents the context from stopping
-    a session it did not start. A failed start() degrades to running
+    a session it did not start. *out_dir* supplies a default destination for
+    callers with custom run directories; AGENCY_PROFILE_DIR takes precedence.
+    A failed start() degrades to running
     unprofiled rather than blocking the actual work.
     """
     owns_session = False
     prof = _profiler
     if _env_enabled() and profile_scope() == "workload" and not enabled():
         try:
-            prof = start(_env_out_dir())
+            prof = start(
+                _env_out_dir() if out_dir is None else os.environ.get("AGENCY_PROFILE_DIR", out_dir)
+            )
             owns_session = True
         except RuntimeError as exc:
             _agprof_print(

@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import copy
 import json
+import math
 import os
 import random
 import sqlite3
@@ -50,6 +51,8 @@ INDEX_INTERVAL = 1_000  # events between sample points in the timeline index
 
 _run_dir: Path = Path(".")
 _command_dir: Path = Path(".")
+_command_lock = threading.RLock()
+_command_ids: dict[tuple[str, str], str] = {}
 
 # Highest event id seen so far -- ids are zero-padded-sequence + uuid4 hex
 # strings (agDataLogger._next_id_locked), sortable as TEXT; "" sorts before
@@ -87,6 +90,164 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+
+def _queue_command(command):
+    """The dashboard and live profiler share the execution-process relay."""
+    _atomic_write_text(
+        _command_dir / f"{_time.time_ns():020d}-{_uuid.uuid4().hex}.json", json.dumps(command)
+    )
+
+
+def _execution_controls(source):
+    try:
+        available = _time.time() - (_command_dir / ".heartbeat").stat().st_mtime < 30
+    except OSError:
+        available = False
+    try:
+        session = json.loads((_command_dir / ".session").read_text())
+    except (OSError, ValueError):
+        session = {}
+    receipts = []
+    for path in sorted((_command_dir / "receipts").glob("*.json")):
+        try:
+            receipt = json.loads(path.read_text())
+            if receipt.get("relay_id") == session.get("relay_id"):
+                receipts.append(receipt)
+        except (OSError, ValueError):
+            pass
+    with source.lock:
+        return {
+            "available": available
+            and bool(session.get("relay_id"))
+            and source.model.finished_at is None,
+            "relay_id": session.get("relay_id"),
+            "execution": {
+                "id": source.model.run["id"],
+                "time_origin": source.model.run.get("time_origin"),
+            },
+            "capabilities": session.get("capabilities", {}),
+            "control_observations": session.get("control_observations", False) is True,
+            "receipts": sorted(receipts, key=lambda item: item.get("time", 0))[-200:],
+            "agents": [
+                agent["id"]
+                for agent in source.model.agents.values()
+                if agent.get("identity") == "execution_actor"
+                and agent.get("execution_state", agent["status"])
+                not in {"completed", "failed", "cancelled"}
+            ],
+        }
+
+
+def _trajectory_execution_command(source, message):
+    result = {"type": "execution_command_result", "id": message.get("id")}
+    controls = _execution_controls(source)
+    command = message.get("command")
+    if not isinstance(command, str) or (
+        message.get("agname") is not None and not isinstance(message["agname"], str)
+    ):
+        return {**result, "error": "Command and agent identifiers must be strings."}
+    if not controls["available"]:
+        return {**result, "error": "No active execution command bridge is available."}
+    if (
+        message.get("relay_id") != controls["relay_id"]
+        or message.get("execution") != controls["execution"]
+    ):
+        return {
+            **result,
+            "error": "Execution changed; reopen the current live controls before submitting.",
+        }
+    identifier = message.get("id")
+    if not isinstance(identifier, str) or not identifier or len(identifier) > 128:
+        return {**result, "error": "A nonblank command ID of at most 128 characters is required."}
+    if command not in {
+        "pause",
+        "resume",
+        "pause_all",
+        "resume_all",
+        "stop",
+        "kill",
+        "stop_all",
+        "kill_all",
+        "queue_message",
+        "redirect",
+        "run",
+    }:
+        return {**result, "error": "Unsupported execution command."}
+    capabilities = controls["capabilities"].get(message.get("agname"), {})
+    if (
+        command in {"pause", "resume", "stop", "kill"}
+        and message.get("agname") not in controls["agents"]
+    ):
+        return {**result, "error": "The selected agent is no longer active."}
+    if command in {"queue_message", "redirect", "run"} and not capabilities:
+        return {**result, "error": "The selected agent is unavailable to this execution process."}
+    if command in {"queue_message", "redirect"}:
+        content = message.get("message")
+        if not isinstance(content, str) or not content.strip() or len(content) > 32000:
+            return {**result, "error": "Message must contain 1–32000 characters."}
+        if command == "queue_message" and not capabilities.get("queue_message"):
+            return {**result, "error": "Retained-context messages are unsupported for this target."}
+        if command == "redirect" and message.get("invocation") not in capabilities.get(
+            "redirect", []
+        ):
+            return {**result, "error": "This target has no currently redirectable invocation."}
+    if command == "run":
+        if not isinstance(message.get("task"), str):
+            return {**result, "error": "Task identifier must be a string."}
+        if message.get("task") not in {task["id"] for task in capabilities.get("run", [])}:
+            return {**result, "error": "Task is not registered for this profiler session."}
+        if not isinstance(message.get("input"), dict) or len(json.dumps(message["input"])) > 32000:
+            return {
+                **result,
+                "error": "Task input must be a JSON object of at most 32000 characters.",
+            }
+    targets = list(controls["agents"]) if command.endswith("_all") else [message.get("agname")]
+    if "targets" in message and message["targets"] != targets:
+        return {
+            **result,
+            "error": "Agent scope changed; review the current targets before submitting.",
+        }
+    if not targets:
+        return {**result, "error": "No active agents are available."}
+    queued = {
+        "id": identifier,
+        "type": command,
+        "agname": message.get("agname"),
+        "targets": targets,
+        "relay_id": controls["relay_id"],
+        "execution": controls["execution"],
+    }
+    for field in ("message", "invocation", "task", "input"):
+        if field in message:
+            queued[field] = message[field]
+    signature = json.dumps(queued, sort_keys=True)
+    key = (controls["relay_id"], identifier)
+    try:
+        with _command_lock:
+            if key in _command_ids:
+                if _command_ids[key] != signature:
+                    return {
+                        **result,
+                        "error": "Command ID was already used for a different request.",
+                    }
+                return {
+                    **result,
+                    "queued": True,
+                    "state": "queued",
+                    "duplicate": True,
+                    "targets": targets,
+                }
+            if len(_command_ids) >= 2000:
+                return {
+                    **result,
+                    "error": "This server reached its command limit; no request was submitted.",
+                }
+            _queue_command(queued)
+            _command_ids[key] = signature
+    except OSError:
+        return {**result, "error": "Could not deliver the execution command."}
+    return {**result, "queued": True, "state": "queued", "targets": targets}
 
 
 def _db_path() -> Path:
@@ -810,11 +971,6 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
-app.mount(
-    "/perfetto",
-    StaticFiles(directory=str(_STATIC / "perfetto"), html=True, check_dir=False),
-    name="perfetto",
-)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
 
@@ -848,7 +1004,7 @@ async def investigator_page():
 async def investigator_runs():
     from .investigator import catalog
     from .investigator_demo import DEMO_ENTRIES
-    from .trajectory_scenarios import ENTRY, SCALE_ENTRY
+    from .trajectory_scenarios import ENTRY, SCALE_ENTRY, MULTI_AGENT_ENTRIES
 
     entries = await asyncio.to_thread(catalog, str(_profiler_dir()), int(_time.time() // 30))
     live = {
@@ -865,6 +1021,7 @@ async def investigator_runs():
         + [{k: v for k, v in e.items() if k != "path"} for e in entries]
         + DEMO_ENTRIES
         + [ENTRY, SCALE_ENTRY]
+        + MULTI_AGENT_ENTRIES
     }
 
 
@@ -877,7 +1034,12 @@ async def investigator_run(run_id: str):
         source = _trajectory_source()
         await asyncio.to_thread(source.refresh, force=True)
         return source.message()["run"]
-    if run_id in {"trajectory-scenarios", "trajectory-scale"}:
+    if run_id in {
+        "trajectory-scenarios",
+        "trajectory-scale",
+        "trajectory-agents-10",
+        "trajectory-agents-32",
+    }:
         return await asyncio.to_thread(_scenario_trajectory, run_id)
 
     if run_id in {entry["id"] for entry in DEMO_ENTRIES}:
@@ -916,15 +1078,31 @@ def _demo_trajectory(run_id):
 _replay_cache = OrderedDict()
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def _scenario_trajectory(run_id):
     from .trajectory import Trajectory
-    from .trajectory_scenarios import ENTRY, SCALE_ENTRY, events, scale_events
+    from .trajectory_scenarios import (
+        ENTRY,
+        SCALE_ENTRY,
+        MULTI_AGENT_ENTRIES,
+        events,
+        scale_events,
+        multi_agent_events,
+    )
 
-    entry = SCALE_ENTRY if run_id == SCALE_ENTRY["id"] else ENTRY
+    entry = next((entry for entry in MULTI_AGENT_ENTRIES if entry["id"] == run_id), None) or (
+        SCALE_ENTRY if run_id == SCALE_ENTRY["id"] else ENTRY
+    )
     model = Trajectory(run_id, entry["title"], mode="review", source="synthetic")
     model.run.update({key: entry[key] for key in ("model", "harness", "subtitle")})
-    for event in scale_events() if run_id == SCALE_ENTRY["id"] else events():
+    rows = (
+        multi_agent_events(entry["agent_count"], hierarchy=entry["agent_count"] == 10)
+        if "agent_count" in entry
+        else scale_events()
+        if run_id == SCALE_ENTRY["id"]
+        else events()
+    )
+    for event in rows:
         model.apply(event)
     return model.snapshot()
 
@@ -958,12 +1136,61 @@ async def trajectory_event(event_id: str):
         )
 
 
+@app.get("/api/trajectory/live/history")
+async def trajectory_history_page(
+    agent: str,
+    before_start: float | None = None,
+    before_id: str = "",
+    active: bool = False,
+    query: str = "",
+):
+    from .trajectory import trajectory_history
+
+    if before_start is not None and not math.isfinite(before_start):
+        return JSONResponse({"error": "History cursor must be finite."}, status_code=422)
+    source = _trajectory_source()
+    await asyncio.to_thread(source.refresh)
+    with source.lock:
+        return trajectory_history(
+            source.model.run,
+            agent,
+            before_start=before_start,
+            before_id=before_id,
+            active=active,
+            query=query,
+        )
+
+
 async def _trajectory_replay_data(run_id):
     from .trajectory import replay_events
     from .trajectory_scenarios import events, scale_events
 
+    if run_id == "live":
+        source = _trajectory_source()
+        await asyncio.to_thread(source.refresh)
+        with source.lock:
+            run = {
+                key: value
+                for key, value in source.model.run.items()
+                if key
+                in {
+                    "id",
+                    "title",
+                    "source",
+                    "duration",
+                    "model",
+                    "harness",
+                    "condition",
+                    "task",
+                    "format",
+                    "time_origin",
+                }
+            }
+            origin = source.model.origin or 0
+            rows = [{**event, "ts": max(0, event["ts"] - origin)} for event in source.events]
+        return run, sorted(rows, key=lambda event: (event["ts"], event["id"]))
     run = await investigator_run(run_id)
-    if isinstance(run, JSONResponse) or run_id == "live":
+    if isinstance(run, JSONResponse):
         raise ValueError("Select a saved execution for replay.")
     cached = _replay_cache.get(run_id)
     if cached is not None and cached[0] is run:
@@ -973,8 +1200,32 @@ async def _trajectory_replay_data(run_id):
         rows = events()
     elif run_id == "trajectory-scale":
         rows = scale_events()
+    elif run_id in {"trajectory-agents-10", "trajectory-agents-32"}:
+        from .trajectory_scenarios import multi_agent_events
+
+        count = 10 if run_id == "trajectory-agents-10" else 32
+        rows = multi_agent_events(count, hierarchy=count == 10)
     else:
-        rows = replay_events(run)
+        # Keep full recorded payloads in the evidence endpoint. The projected
+        # UI actions intentionally carry only bounded previews.
+        from .investigator import catalog, load_run
+        from .investigator_demo import DEMO_ENTRIES, demo_run
+
+        if run_id in {entry["id"] for entry in DEMO_ENTRIES}:
+            original = demo_run(run_id)
+            original["status"] = "completed"
+        else:
+            entries = await asyncio.to_thread(
+                catalog, str(_profiler_dir()), int(_time.time() // 30)
+            )
+            entry = next((item for item in entries if item["id"] == run_id), None)
+            original = run
+            if entry:
+                path = Path(entry["path"])
+                original = await asyncio.to_thread(
+                    load_run, str(path), path.stat().st_mtime, json.dumps(entry, sort_keys=True)
+                )
+        rows = replay_events(original)
     data = (run, rows)
     _replay_cache[run_id] = data
     if len(_replay_cache) > 4:
@@ -1005,10 +1256,14 @@ async def trajectory_stream(ws: WebSocket):
         while True:
             await asyncio.to_thread(source.refresh)
             message = source.message(cursor, epoch)
+            message["execution_controls"] = _execution_controls(source)
             await ws.send_json(message)
             cursor, epoch = message["cursor"], message["epoch"]
             try:
-                await asyncio.wait_for(ws.receive_json(), timeout=TAIL_POLL_INTERVAL)
+                command = await asyncio.wait_for(ws.receive_json(), timeout=TAIL_POLL_INTERVAL)
+                # Replay's plain 'pause' is never routed to the execution relay.
+                if command.get("type") == "execution_command":
+                    await ws.send_json(_trajectory_execution_command(source, command))
             except asyncio.TimeoutError:
                 pass
     except (WebSocketDisconnect, RuntimeError):
@@ -1020,74 +1275,119 @@ async def trajectory_stream(ws: WebSocket):
 async def _replay_stream(ws):
     from .trajectory import Trajectory
 
-    run, events = await _trajectory_replay_data(ws.query_params.get("run", "demo-baseline"))
-    model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
-    for key in ("model", "harness", "condition", "task", "format"):
-        if key in run:
-            model.run[key] = run[key]
-    model.run["coverage"]["replay"] = (
-        "Start/end boundaries reconstructed from saved spans; results appear only at their recorded end."
-    )
+    run_id = ws.query_params.get("run", "demo-baseline")
+    run, events = await _trajectory_replay_data(run_id)
     cursor = min(max(0, int(ws.query_params.get("cursor", "0"))), len(events))
-    for event in events[:cursor]:
-        model.apply(event)
     clock = events[cursor - 1]["ts"] if cursor else 0
+    if ws.query_params.get("clock") is not None:
+        selected_clock = float(ws.query_params["clock"])
+        clock = max(0, min(selected_clock, run["duration"])) if math.isfinite(selected_clock) else 0
+        cursor = sum(event["ts"] <= clock for event in events)
     playing, speed = False, 4.0
 
-    def replay_meta():
-        return {
+    def rebuild():
+        model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
+        for key in ("model", "harness", "condition", "task", "format", "time_origin"):
+            if key in run:
+                model.run[key] = run[key]
+        model.run["coverage"]["replay"] = (
+            "Canonical event prefix; saved spans use reconstructed boundaries."
+        )
+        for event in events[:cursor]:
+            model.apply(event)
+        return model
+
+    model = rebuild()
+    previous = _time.monotonic()
+    snapshot = True
+    while True:
+        model.tick(clock)
+        # Saved trace counters already share its relative clock. Canonical live
+        # counters enter through resource_sample events and incremental patches.
+        if run_id != "live":
+            model.run["counters"] = {
+                name: [point for point in points if point[0] <= clock]
+                for name, points in run.get("counters", {}).items()
+            }
+        meta = {
             "position": cursor,
             "total": len(events),
             "clock": clock,
+            "duration": max(run["duration"], events[-1]["ts"] if events else 0),
             "playing": playing,
             "finished": cursor == len(events),
             "speed": speed,
         }
-
-    await ws.send_json(
-        {"type": "snapshot", "run": model.snapshot(), "cursor": cursor, "replay": replay_meta()}
-    )
-    model.patch()
-    previous = _time.monotonic()
-    while True:
+        patch = model.patch()
+        if run_id != "live":
+            patch["meta"]["counters"] = model.run["counters"]
+        await ws.send_json(
+            {
+                "type": "snapshot" if snapshot else "updates",
+                **({"run": model.snapshot()} if snapshot else {"patches": [patch]}),
+                "cursor": cursor,
+                "replay": meta,
+            }
+        )
+        snapshot = False
         command = {}
         try:
             command = await asyncio.wait_for(ws.receive_json(), timeout=0.2)
         except asyncio.TimeoutError:
             pass
         now = _time.monotonic()
-        if command.get("type") == "play":
-            playing = True
-            speed = min(1000, max(0.1, float(command.get("speed", speed))))
-        elif command.get("type") == "pause":
+        kind = command.get("type")
+        if kind == "execution_command":
+            await ws.send_json(
+                {
+                    "type": "execution_command_result",
+                    "id": command.get("id"),
+                    "error": "Execution controls are unavailable during replay.",
+                }
+            )
+        if run_id == "live":
+            latest_run, latest_events = await _trajectory_replay_data(run_id)
+            # A late event must also be reflected in a historical prefix. Rebuild
+            # only on changed evidence; the selected clock never follows ingestion.
+            if len(latest_events) != len(events):
+                run, events = latest_run, latest_events
+                cursor = sum(event["ts"] <= clock for event in events)
+                model = rebuild()
+                snapshot = True
+            else:
+                run = latest_run
+        if kind == "seek":
+            target = float(command.get("clock", 0))
+            if not math.isfinite(target):
+                target = 0
+            clock = max(0, min(target, run["duration"]))
+            cursor = sum(event["ts"] <= clock for event in events)
             playing = False
-        elif command.get("type") == "step" and cursor < len(events):
+            model = rebuild()
+            snapshot = True
+        elif kind == "play":
+            playing = True
+            requested_speed = float(command.get("speed", speed))
+            speed = min(1000, max(0.1, requested_speed)) if math.isfinite(requested_speed) else 4
+        elif kind == "pause":
+            playing = False
+        elif kind == "step" and cursor < len(events):
+            playing = False
             clock = max(clock, events[cursor]["ts"])
             model.apply(events[cursor])
             cursor += 1
-        if playing:
-            clock = min(events[-1]["ts"], clock + (now - previous) * speed)
+        if playing and events:
+            clock = min(run["duration"], clock + (now - previous) * speed)
             for _ in range(100):
                 if cursor == len(events) or events[cursor]["ts"] > clock:
                     break
                 model.apply(events[cursor])
                 cursor += 1
-            # A bounded batch must not advance displayed time past evidence
-            # waiting in the next batch, or inflate unfinished call durations.
             if cursor < len(events):
                 clock = min(clock, events[cursor]["ts"])
         previous = now
-        model.tick(clock)
         if cursor == len(events):
             playing = False
-        await ws.send_json(
-            {
-                "type": "updates",
-                "patches": [model.patch()],
-                "cursor": cursor,
-                "replay": replay_meta(),
-            }
-        )
 
 
 @app.get("/api/investigator/runs/{run_id}/trace")
@@ -1105,7 +1405,6 @@ async def investigator_raw_trace(run_id: str):
 async def profiler_status():
     trace = _profile_trace_path()
     return {
-        "viewer_available": (_STATIC / "perfetto" / "index.html").is_file(),
         "trace_available": trace.is_file(),
     }
 
@@ -1226,18 +1525,44 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 msg = json.loads(data)
                 mtype = msg.get("type")
-                if mtype in ("pause", "resume", "pause_all", "resume_all"):
-                    cmd = {"type": mtype, "agname": msg.get("agname")}
-                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    _atomic_write_text(cmd_file, json.dumps(cmd))
+                if mtype == "execution_controls_request":
+                    source = _trajectory_source()
+                    await asyncio.to_thread(source.refresh)
+                    await ws.send_json(
+                        {
+                            "type": "execution_controls",
+                            "execution_controls": _execution_controls(source),
+                        }
+                    )
+                elif mtype in (
+                    "pause",
+                    "resume",
+                    "pause_all",
+                    "resume_all",
+                    "stop",
+                    "kill",
+                    "stop_all",
+                    "kill_all",
+                ):
+                    source = _trajectory_source()
+                    await asyncio.to_thread(source.refresh)
+                    # Dashboard controls now obtain the same execution fence
+                    # through an explicit read-only handshake.
+                    response = _trajectory_execution_command(
+                        source,
+                        {
+                            **msg,
+                            "command": mtype,
+                        },
+                    )
+                    await ws.send_json(response)
                 elif mtype in ("update_config", "update_config_all"):
                     cmd = {
                         "type": mtype,
                         "agname": msg.get("agname"),
                         "config": msg.get("config") or {},
                     }
-                    cmd_file = _command_dir / f"{_uuid.uuid4().hex}.json"
-                    _atomic_write_text(cmd_file, json.dumps(cmd))
+                    _queue_command(cmd)
             except Exception as _e:
                 # Reference the raw `data`, not `msg` -- json.loads(data) itself
                 # may be what raised, in which case `msg` was never assigned.
@@ -1311,28 +1636,18 @@ async def _tail_and_broadcast() -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    if __package__:
-        from .build_perfetto import ensure_viewer
-    else:
-        from build_perfetto import ensure_viewer
-
     parser = argparse.ArgumentParser(description="agwebui standalone server")
     parser.add_argument(
         "--run-dir", required=True, help="log_dir shared with the execution process's agents"
     )
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument(
-        "--no-perfetto",
-        action="store_true",
-        help="Start investigator without building the optional raw Perfetto viewer",
+        "--host", default="0.0.0.0", help="Bind address; use 127.0.0.1 for a local viewer"
     )
     parsed = parser.parse_args()
-
-    if not parsed.no_perfetto:
-        ensure_viewer()
 
     _run_dir = Path(parsed.run_dir)
     _command_dir = _run_dir / "ui_commands"
     _command_dir.mkdir(parents=True, exist_ok=True)
 
-    uvicorn.run(app, host="0.0.0.0", port=parsed.port, log_level="error")
+    uvicorn.run(app, host=parsed.host, port=parsed.port, log_level="error")
