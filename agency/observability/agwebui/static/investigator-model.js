@@ -82,6 +82,9 @@ export function readableExecutionTitle(run) {
 
 // Live events contain cumulative CPU/I/O counters; saved traces contain rates.
 // Keep their recorded scope rather than adding overlapping workload/PID totals.
+const gpuStates=['valid','no_new_samples','unsupported','collection_failure','stale','unavailable'];
+const gpuStateLabels={no_new_samples:'No new samples',unsupported:'Unsupported metric',collection_failure:'Collection failure',stale:'Stale measurement',unavailable:'Unavailable'};
+const decodeIdentity=value=>{try{return decodeURIComponent(value);}catch{return value;}};
 const systemMeasurementCache=new WeakMap(),latestMeasurementCache=new WeakMap();
 export function systemMeasurements(run,{latestOnly=false}={}) {
   const counters=run.counters||{},metrics=[];
@@ -89,13 +92,15 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
   // the projection between renders of the same recording/window.
   const future=Object.values(counters).some(v=>Array.isArray(v)&&v.at(-1)?.[0]>run.duration);
   const window=Number.isFinite(run.duration)?(latestOnly&&!future?'all':run.duration):'all';
-  const signature=JSON.stringify([window,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
+  const signature=JSON.stringify([window,Object.keys(counters).some(name=>/^gpu\d+:/.test(name))?run.duration:null,Object.entries(counters).map(([key,v])=>[key,Array.isArray(v)?v.length:0,Array.isArray(v)?v.at(-1):null])]);
   const cache=latestOnly?latestMeasurementCache:systemMeasurementCache;
   const cached=cache.get(run);
   if(cached?.counters===counters&&cached.signature===signature)return cached.metrics;
-  for(const [name,samples] of Object.entries(counters)) {
+  const names=new Set(Object.keys(counters).map(name=>/^gpu\d+:.*:state$/.test(name)?name.slice(0,-6):name));
+  for(const name of names) {
+    const samples=counters[name]||[];
     if(!Array.isArray(samples))continue;
-    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
+    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|process_mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
     if(!match)continue;
     const kind=match[1],prefix=name.slice(0,name.length-kind.length);
     const cpu=/^cpu/.test(kind),rawCPU=/^cpu_(us|s)$/.test(kind);
@@ -125,13 +130,24 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
         previous=point;
       }else points.push(point);
     }
-    if(!points.length)continue;
     const parts=name.split(':');
+    const gpu=/^gpu\d+:/.test(name);
+    const state=gpu?(counters[name+':state']||[]).findLast(usable):null;
+    if(!points.length&&!state)continue;
+    const last=points.at(-1);
+    let status=state?gpuStates[state[1]]||'unavailable':'valid';
+    if(gpu&&['valid','no_new_samples'].includes(status)&&last&&Number.isFinite(run.duration)&&run.duration-last[0]>10)status='stale';
+    if(!last&&status==='valid')status='unavailable';
+    const latest=status==='valid'?last:[state?.[0]??last?.[0]??0,null];
     const workload=/^workload(?:_total)?[: ]/.test(name),host=/^(host|system):/.test(name);
     const device=/^gpu\d+:/.test(name)&&parts.length===2;
     const process=/^(proc|process):/.test(name),sandbox=/^(cg|sandbox):/.test(name);
-    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:parts.length>2&&/^gpu\d+$/.test(parts[0])?`${parts[0]} · ${parts[1]}`:'Recorded scope';
-    metrics.push({name,label:/^gpu\d+:/.test(name)&&kind==='mem_mb'?'VRAM':label,unit,scope,aggregate:workload||host||device,points,latest:points.at(-1),derived:rawCPU||bytes});
+    const gpuProcess=gpu&&parts[1]==='proc'&&parts[3]==='sandbox';
+    const processMemory=gpu&&(parts[1]==='processes'&&kind==='mem_mb'||kind==='process_mem_mb');
+    const gpuScope=gpuProcess?`${parts[0]} · Process ${parts[2]}${parts[4]!=='~'?` · Sandbox ${decodeIdentity(parts[4])}`:''}`:gpu&&parts[1]==='sandbox'?`${parts[0]} · Sandbox ${decodeIdentity(parts[2])}`:gpu&&parts[1]==='processes'?`${parts[0]} · Compute processes`:parts.length>2&&gpu?`${parts[0]} · ${parts[1]}`:'Recorded scope';
+    const scope=workload?'Workload':host?'Host':device?parts[0]:process?`Process ${parts[1]}`:sandbox?`Sandbox ${parts[1]}`:gpuScope;
+    const metricLabel=processMemory?'Process VRAM':gpu&&kind==='mem_mb'?'VRAM':gpuProcess&&kind==='util_pct'?'Process SM activity':label;
+    metrics.push({name,label:metricLabel,unit,scope,aggregate:workload||host||device,points,latest,derived:rawCPU||bytes,status,statusLabel:gpuStateLabels[status]||'',processIdentity:gpuProcess?parts[2]:null,sandbox:gpuProcess&&parts[4]!=='~'?decodeIdentity(parts[4]):null});
   }
   cache.set(run,{counters,signature,metrics});
   return metrics;
@@ -163,7 +179,7 @@ export function executionMeasurements(run,{includeResources=true}={}) {
   const resourcesMeasured=includeResources?systemMeasurements(run,{latestOnly:true}):[];
   for(const label of ['CPU','RAM','GPU','VRAM']) {
     const metric=resourcesMeasured.find(m=>m.label===label&&m.aggregate)||resourcesMeasured.find(m=>m.label===label);
-    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s`]);
+    if(metric)secondary.push([label,metric.latest[1],metric.unit,`${metric.name} · ${metric.scope} · sample at ${metric.latest[0]}s${metric.statusLabel?` · ${metric.statusLabel}`:''}`]);
   }
   const usage=models.length?`Usage reported for ${input.length}/${models.length} input and ${output.length}/${models.length} output calls.`:'No model calls recorded.';
   const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';

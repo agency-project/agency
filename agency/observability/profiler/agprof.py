@@ -1584,8 +1584,13 @@ class _Sampler(threading.Thread):
         # Containers are sampled from the registry the sandbox backends fill
         # at container start (see container_started()) — no filesystem
         # discovery, no runtime naming assumptions.
-        self._pid_labels: "dict[int, str]" = {}  # pid -> label (container or comm)
-        self._proc_util_last: "dict[int, int]" = {}  # gpu idx -> last NVML sample ts
+        from .gpu import GPUCollector
+
+        def scopes():
+            with _cg_lock:
+                return dict(_cg_registry)
+
+        self._gpu_collector = GPUCollector(self._nvml, _samples, scopes)
 
     def _workload_pids(self) -> "dict[int, str]":
         """Return every PID in the workload cgroup tree and its cgroup path.
@@ -1710,74 +1715,6 @@ class _Sampler(threading.Thread):
         """Refresh workload membership and sample every PID still alive."""
         for pid, cgroup_dir in self._workload_pids().items():
             self._sample_process(t, pid, cgroup_dir)
-
-    def _pid_label(self, pid: int) -> str:
-        """Label for a GPU-using PID: the owning container's agname when the
-        PID's cgroup falls under a registered container dir (same registry the
-        CPU collector samples — runtime-agnostic), else the process comm name
-        (e.g. vLLM's server process)."""
-        label = self._pid_labels.get(pid)
-        if label is not None:
-            return label
-        label = f"pid{pid}"
-        cacheable = True
-        try:
-            cg = Path(f"/proc/{pid}/cgroup").read_text()
-            path = next((l.split("::", 1)[1] for l in cg.splitlines() if l.startswith("0::")), "")
-            full = "/sys/fs/cgroup" + path
-            with _cg_lock:
-                entries = list(_cg_registry.items())
-            for reg_label, reg_dir in entries:
-                if full == reg_dir or full.startswith(reg_dir + "/"):
-                    label = reg_label
-                    break
-            else:
-                label = Path(f"/proc/{pid}/comm").read_text().strip() or label
-        except Exception:
-            cacheable = False
-        # comm names may contain ':' (e.g. "VLLM::EngineCor") — keep series
-        # names parseable as gpu{i}:{label}:{metric}.
-        label = label.replace(":", "_")
-        if cacheable:
-            self._pid_labels[pid] = label
-        return label
-
-    def _tick_gpu_procs(
-        self, t: int, i: int, h, dev_util: float = 0.0, dev_power_w: float = 0.0
-    ) -> None:
-        """Per-PID GPU accounting for device *i*: VRAM per process (compute
-        procs list) and SM utilization per process (NVML's sample buffer since
-        the previous tick). This is what splits a device-wide curve into
-        per-agent/per-process series under concurrency — cgroups can't meter
-        GPUs, so this is the container-attribution path for the device.
-
-        Power has NO per-process accounting anywhere (board sensors measure
-        the whole card), so ``power_w_est`` is the device draw apportioned by
-        utilization share — an APPORTIONED ESTIMATE, never a measurement,
-        hence the ``_est`` suffix."""
-        with suppress(Exception):
-            for pr in self._nvml.nvmlDeviceGetComputeRunningProcesses(h):
-                if pr.usedGpuMemory:
-                    _samples.append(
-                        (t, f"gpu{i}:{self._pid_label(pr.pid)}:mem_mb", pr.usedGpuMemory / 2**20)
-                    )
-        with suppress(Exception):
-            last = self._proc_util_last.get(i, 0)
-            util_samples = self._nvml.nvmlDeviceGetProcessUtilization(h, last)
-            per_pid: "dict[int, list[int]]" = {}
-            newest = last
-            for s in util_samples:
-                if s.timeStamp > last:  # NVML may replay old samples
-                    per_pid.setdefault(s.pid, []).append(s.smUtil)
-                    newest = max(newest, s.timeStamp)
-            self._proc_util_last[i] = newest
-            for pid, utils in per_pid.items():
-                label = self._pid_label(pid)
-                pid_util = sum(utils) / len(utils)
-                _samples.append((t, f"gpu{i}:{label}:util_pct", pid_util))
-                if dev_power_w > 0 and pid_util > 0:
-                    share = min(1.0, pid_util / max(dev_util, 1.0))
-                    _samples.append((t, f"gpu{i}:{label}:power_w_est", dev_power_w * share))
 
     def _tick_cgroups(self, t: int) -> None:
         """Sample every REGISTERED container (see container_started()) plus the
@@ -1915,35 +1852,42 @@ class _Sampler(threading.Thread):
         self._tick_processes(t)
         if self._nvml is not None:
             for i, h in enumerate(self._handles):
-                with suppress(Exception):
-                    u = self._nvml.nvmlDeviceGetUtilizationRates(h)
-                    m = self._nvml.nvmlDeviceGetMemoryInfo(h)
-                    p = self._nvml.nvmlDeviceGetPowerUsage(h)
-                    _samples.append((t, f"gpu{i}:util_pct", float(u.gpu)))
-                    _samples.append((t, f"gpu{i}:mem_mb", m.used / 2**20))
-                    _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
-                    self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
+                self._gpu_collector.tick(t, i, h, sampled_at)
         self._tick_cgroups(t)
         # Reuse the sampled values and buffered logger; no second sampler or poller.
         logger = _profile_data_logger
         if logger is not None:
-            values = {name: value for _, name, value in _samples[sample_start:]}
+            # NVML process samples carry their original observation times.
+            # Emit one event per timestamp rather than collapsing a tick into
+            # one last-value dictionary and losing buffered process samples.
+            grouped = {}
+            for at, name, value in _samples[sample_start:]:
+                grouped.setdefault(at, {})[name] = value
             previous = getattr(self, "_live_previous", {})
-            for name, value in list(values.items()):
-                if name.endswith((":cpu_us", ":cpu_s")) and name in previous:
-                    before_t, before_value = previous[name]
-                    elapsed = (t - before_t) / 1e9
-                    if elapsed > 0 and value >= before_value:
-                        unit = 1e6 if name.endswith(":cpu_us") else 1
-                        values[name.rsplit(":", 1)[0] + ":cpu_pct"] = (
-                            (value - before_value) / unit / elapsed * 100
-                        )
-            self._live_previous = {name: (t, value) for name, value in values.items()}
-            try:
-                logger.record_event("resource_sample", {"values": values, "sampled_at": sampled_at})
-            except Exception:
-                # Observability must not stop the sampler or workload.
-                _health["sample_export_failures"] += 1
+            current = {}
+            for at, values in sorted(grouped.items()):
+                for name, value in list(values.items()):
+                    if name.endswith((":cpu_us", ":cpu_s")) and name in previous:
+                        before_t, before_value = previous[name]
+                        elapsed = (at - before_t) / 1e9
+                        if elapsed > 0 and value >= before_value:
+                            unit = 1e6 if name.endswith(":cpu_us") else 1
+                            values[name.rsplit(":", 1)[0] + ":cpu_pct"] = (
+                                (value - before_value) / unit / elapsed * 100
+                            )
+                    current[name] = (at, value)
+                try:
+                    logger.record_event(
+                        "resource_sample",
+                        {
+                            "values": values,
+                            "sampled_at": sampled_at + (at - t) / 1e9,
+                        },
+                    )
+                except Exception:
+                    # Observability must not stop the sampler or workload.
+                    _health["sample_export_failures"] += 1
+            self._live_previous = current
 
     def run(self) -> None:
         _remember_thread_label("agprof sampler", priority=90)
@@ -2354,6 +2298,8 @@ def _gauge_description(series: str) -> "tuple[str, str]":
     unit = {
         "util_pct": "percent",
         "mem_mb": "MB",
+        "process_mem_mb": "MB",
+        "state": "collection state",
         "power_w": "W",
         "power_w_est": "W",
         "rss_mb": "MB",
@@ -2363,10 +2309,13 @@ def _gauge_description(series: str) -> "tuple[str, str]":
         return f"sandbox {parts[1]} memory", unit
     if parts[0].startswith("gpu"):
         gpu = parts[0][3:]
-        owner = f" {parts[1]}" if len(parts) == 3 else ""
+        from urllib.parse import unquote
+
+        owner = " " + " / ".join(unquote(part) for part in parts[1:-1]) if len(parts) > 2 else ""
         metric = {
             "util_pct": "utilization",
             "mem_mb": "memory",
+            "process_mem_mb": "reported process memory",
             "power_w": "power",
             "power_w_est": "estimated power",
         }.get(suffix, suffix)
@@ -2604,7 +2553,17 @@ def _build_run_summary(
         )
 
     grouped: "dict[str, list[dict]]" = {}
+    gpu_collection_states = {}
     for observation in observations:
+        if observation["name"].startswith("gpu") and observation["name"].endswith(":state"):
+            name = observation["name"][:-6]
+            prior = gpu_collection_states.get(name)
+            if prior is None or observation["timestamp_ns"] >= prior["timestamp_ns"]:
+                gpu_collection_states[name] = {
+                    "timestamp_ns": observation["timestamp_ns"],
+                    "state": int(observation["value"]),
+                }
+            continue
         grouped.setdefault(observation["name"], []).append(observation)
     resource_rows = []
     for name, grouped_observations in sorted(grouped.items()):
@@ -2985,6 +2944,7 @@ def _build_run_summary(
         "workload_metrics": workload_metrics,
         "process_metrics": process_metrics,
         "gpu_metrics": gpu_metrics,
+        "gpu_collection_states": gpu_collection_states,
         "sandbox_metrics": sandbox_metrics,
         "sampling": {
             "configured_hz": sample_hz,

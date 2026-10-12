@@ -88,8 +88,8 @@ function renderSystemMetrics() {
     const [at,value]=metric.latest,start=Math.max(0,at-60),points=metric.points.filter(p=>p[0]>=start);
     const high=Math.max(1,...points.map(p=>p[1])),x=t=>2+(t-start)/(at-start||1)*116,y=v=>30-v/high*26;
     const line=points.map(p=>`${x(p[0])},${y(p[1])}`).join(' '),last=points.at(-1);
-    const note=`${metric.name} · ${metric.derived?'Rate calculated from counter deltas':'Recorded sample'} at ${formatTime(at)}${metric.label==='CPU'?' · 100% = one CPU core; multiple cores can exceed 100%':''}`;
-    return `<div class="system-metric" title="${esc(note)}"><div class="system-metric-value"><span>${esc(metric.label)}</span><strong>${count(value)} ${metric.unit}</strong></div><svg viewBox="0 0 120 34" role="img" aria-label="${esc(metric.scope+' '+metric.label)} · recent recorded samples"><polyline points="${line}" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="${x(last[0])}" cy="${y(last[1])}" r="2" fill="currentColor"/></svg><small>${esc(metric.scope)} · at ${formatTime(at)}</small></div>`;
+    const note=`${metric.name} · ${metric.statusLabel|| (metric.derived?'Rate calculated from counter deltas':'Recorded sample')} at ${formatTime(at)}${metric.label==='CPU'?' · 100% = one CPU core; multiple cores can exceed 100%':''}`;
+    return `<div class="system-metric" title="${esc(note)}"><div class="system-metric-value"><span>${esc(metric.label)}</span><strong>${value==null?'Unavailable':count(value)} ${metric.unit}</strong></div><svg viewBox="0 0 120 34" role="img" aria-label="${esc(metric.scope+' '+metric.label)} · recent recorded samples"><polyline points="${line}" fill="none" stroke="currentColor" stroke-width="1.5"/>${last?`<circle cx="${x(last[0])}" cy="${y(last[1])}" r="2" fill="currentColor"/>`:''}</svg><small>${esc(metric.scope)} · at ${formatTime(at)}</small></div>`;
   }).join('');
   panel.innerHTML=heading+(cards?`<div class="system-metrics-cards">${cards}</div>`:'<p class="system-metrics-empty">No usable system samples recorded yet. Profiling must be enabled to collect CPU, memory, I/O and available GPU counters.</p>');
 }
