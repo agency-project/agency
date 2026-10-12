@@ -1,5 +1,6 @@
 """agSandbox transactions: AgentEngine.execute() holds the sandbox for a whole run, while
-host tools called during that run execute on MCP worker threads and must still reach it."""
+host tools and policy hooks called during that run execute on server worker threads and must
+still reach it."""
 
 from __future__ import annotations
 
@@ -15,7 +16,10 @@ from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agtool import agtool
 from agency.configs.agconfig import agconfig as agconfig_cls
+from agency.agpolicy import agpolicy
+from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.engine.host_servers.host_mcp_server import HostMcpServer
+from agency.harness._syscall_event import agsyscallevent
 from agency.sandbox.agsandbox import agSandbox
 
 # Generous: a deadlock never finishes, so this only bounds how long a failure takes to report.
@@ -24,6 +28,7 @@ _WAIT_S = 5
 
 class _FakeBackend:
     def __init__(self):
+        self._gpu_count_requested = 0  # read by HostInteractionServer.check_syscall's GPU gate
         self.exec_threads: "list[str]" = []
         self.barrier: "threading.Barrier | None" = None
 
@@ -80,6 +85,58 @@ def test_host_tool_can_use_the_sandbox_while_the_engine_holds_it(sandbox):
     finally:
         sandbox.end_transaction()
     assert json.loads(results[0].content[0].text) == {"output": "ran echo hi"}
+
+
+def _interaction_server(sandbox, policy):
+    skill = agskill(name="s", prompt="p", policy=policy)
+    return HostInteractionServer(skill, data_logger=None, agname="a", sandbox=sandbox)
+
+
+def test_a_tool_hook_can_use_the_sandbox_while_the_engine_holds_it(sandbox):
+    """Policy hooks run on the interaction server's request thread, so they need the same
+    hand-off as host tools: one that inspects the sandbox used to deadlock."""
+    seen = []
+    server = _interaction_server(
+        sandbox,
+        agpolicy(tool_hooks={"Bash": lambda _input: seen.append(sandbox.exec("pwd")) or True}),
+    )
+    sandbox.begin_transaction()
+    try:
+        thread, results = _in_thread(lambda: server.check_tool("Bash", {}), "policy-worker")
+        assert not thread.is_alive(), "tool hook deadlocked on the engine's sandbox lock"
+    finally:
+        sandbox.end_transaction()
+    assert results == [(True, None)]
+    assert seen == [("ran pwd", 0)]
+
+
+def test_a_syscall_hook_can_use_the_sandbox_while_the_engine_holds_it(sandbox):
+    seen = []
+    server = _interaction_server(
+        sandbox,
+        agpolicy(
+            syscall_hooks={"execve": lambda _event: seen.append(sandbox.exec("git diff")) or True}
+        ),
+    )
+    event = agsyscallevent(
+        syscall="execve",
+        pid=1,
+        tid=1,
+        argv=["python", "w.py"],
+        envp=None,
+        path="/usr/bin/python",
+        timestamp=0.0,
+        tool_name=None,
+        tool_args=None,
+    )
+    sandbox.begin_transaction()
+    try:
+        thread, results = _in_thread(lambda: server.check_syscall(event), "policy-worker")
+        assert not thread.is_alive(), "syscall hook deadlocked on the engine's sandbox lock"
+    finally:
+        sandbox.end_transaction()
+    assert results[0][:2] == (True, None)
+    assert seen == [("ran git diff", 0)]
 
 
 def test_a_guest_does_not_wait_for_the_owner(sandbox):

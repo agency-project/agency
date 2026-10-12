@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -90,6 +91,9 @@ class _FakeSandbox:
         self._gpu_count_requested = gpu_count_requested
         self._gpu_ids = list(gpu_ids or [])
         self.acquire_calls = []
+
+    def join_transaction(self):
+        return nullcontext()
 
     def current_gpu_ids(self):
         if self._gpu_count_requested <= 0:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable
 
 from fastapi import FastAPI, Request
@@ -76,6 +77,13 @@ class HostInteractionServer:
         self._open_spans: "dict[str, object]" = {}
         self._profile_pid = -2 - agprof.next_index("remote-profile")
 
+    def _as_guest(self):
+        # A policy hook runs on this server's request thread while the engine's
+        # thread holds the sandbox for the whole run; joining lets the hook use
+        # it (see agSandbox.join_transaction), as HostMcpServer does for tools.
+        join = getattr(self._sandbox, "join_transaction", None)
+        return join() if join is not None else nullcontext()
+
     def check_tool(self, tool_name: str, tool_input: dict) -> "tuple[bool, str | None]":
         """Pure policy check -- does not acquire a reserved GPU."""
         if self._is_cancelled():
@@ -84,7 +92,8 @@ class HostInteractionServer:
         if hook is None:
             return not self._policy.default_to_deny, None
         try:
-            result = hook(tool_input)
+            with self._as_guest():
+                result = hook(tool_input)
         except Exception as exc:
             return False, f"hook raised: {exc}"
         return result if isinstance(result, tuple) else (result, None)
@@ -99,7 +108,8 @@ class HostInteractionServer:
             allowed, reason = not self._policy.default_to_deny, None
         else:
             try:
-                result = hook(syscall)
+                with self._as_guest():
+                    result = hook(syscall)
             except Exception as exc:
                 result = (False, f"hook raised: {exc}")
             allowed, reason = result if isinstance(result, tuple) else (result, None)
