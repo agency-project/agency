@@ -475,8 +475,39 @@ def normalize_trace(trace, entry, summary=None):
     actions = []
     intervals = []
     counters = defaultdict(list)
+    sandbox_owners = defaultdict(set)
+
+    def remember_owner(agent, sandbox):
+        if isinstance(agent, str) and agent and isinstance(sandbox, str) and sandbox:
+            sandbox_owners[sandbox].add(agent)
+
+    def presentation_owners(info):
+        # Versioned presentation paths contain explicit identities. Display
+        # labels and counter-name similarities are never ownership evidence.
+        if not isinstance(info, dict):
+            return
+        path = info.get("path", [])
+        if not isinstance(path, list):
+            return
+        ids = [
+            part[0] for part in path if isinstance(part, list) and part and isinstance(part[0], str)
+        ]
+        sandboxes = {part.removeprefix("sandbox:") for part in ids if part.startswith("sandbox:")}
+        if len(sandboxes) != 1:
+            return
+        sandbox = next(iter(sandboxes))
+        for part in ids:
+            if part.startswith("agent:"):
+                remember_owner(part.removeprefix("agent:"), sandbox)
+        shared = info.get("shared_with", [])
+        if isinstance(shared, list):
+            for agent in shared:
+                remember_owner(agent, sandbox)
+
     for span in spans:
         attrs = span.get("args") if isinstance(span.get("args"), dict) else {}
+        remember_owner(attrs.get("agency.agent_id"), attrs.get("agency.sandbox_id"))
+        presentation_owners(object_value(attrs.get("agency_presentation")) or {})
         agent = attrs.get("agency.agent_id") or "workflow"
         if agent not in agents:
             agents[agent] = {
@@ -594,13 +625,21 @@ def normalize_trace(trace, entry, summary=None):
             continue
         name = event.get("name", "")
         if name.startswith("agency-counter-v1:"):
-            info = object_value(name.removeprefix("agency-counter-v1:")) or {}
+            info = object_value(name.removeprefix("agency-counter-v1:"))
+            info = info if isinstance(info, dict) else {}
+            presentation_owners(info)
             name = info.get("label", name)
         for key, value in (event.get("args") or {}).items():
             if number(value) is not None:
                 counters[name if key == "value" else f"{name} {key}"].append(
                     [(event["ts"] - origin) / 1e6, value]
                 )
+    for agent, row in agents.items():
+        sandboxes = sorted(sandbox for sandbox, owners in sandbox_owners.items() if agent in owners)
+        if sandboxes:
+            row["sandboxes"] = sandboxes
+            if len(sandboxes) == 1:
+                row["sandbox"] = sandboxes[0]
     # Unknown gaps are explicit coverage gaps, never inferred CPU or idle work.
     for agent in agents:
         covered = sorted(
@@ -655,6 +694,7 @@ def normalize_trace(trace, entry, summary=None):
         **{k: v for k, v in entry.items() if k != "path"},
         "duration": max(duration, entry.get("duration", 0)),
         "agents": list(agents.values()),
+        "sandbox_owners": {sandbox: sorted(owners) for sandbox, owners in sandbox_owners.items()},
         "actions": actions,
         "episodes": episodes,
         "intervals": sorted(intervals, key=lambda i: i["start"]),

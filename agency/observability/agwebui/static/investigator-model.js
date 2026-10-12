@@ -185,3 +185,37 @@ export function executionMeasurements(run,{includeResources=true}={}) {
   const resources=samples.length?`${samples.length} sampled resource series; scope retained in details.`:'No system samples recorded.';
   return {primary,secondary,coverage:`${usage} ${resources}`};
 }
+
+// Container (cgroup) measurements of the sandboxes the engine recorded for
+// these agents: CPU is every process in the container, 100% = one core. A
+// sandbox also used by an agent outside *ids* is shared and is not attributed.
+// Host, workload, orchestrator and runtime-daemon series are never included.
+export function agentResources(run,ids,stale=10) {
+  const wanted=new Set(ids),owners=new Map();
+  const remember=(sandbox,id)=>{
+    if(typeof sandbox!=='string'||!sandbox||typeof id!=='string'||!id)return;
+    const agents=owners.get(sandbox)||[];
+    if(!agents.includes(id))agents.push(id);
+    owners.set(sandbox,agents);
+  };
+  for(const a of run.agents||[])for(const sandbox of new Set([a.sandbox,...(Array.isArray(a.sandboxes)?a.sandboxes:[])]))remember(sandbox,a.id);
+  // Saved presentation metadata can name a shared owner with no retained
+  // spans. Keep it in the ownership set instead of treating the box as sole-owned.
+  for(const [sandbox,agents] of Object.entries(run.sandbox_owners||{}))if(Array.isArray(agents))for(const id of agents)remember(sandbox,id);
+  const linked=[...owners].filter(([,agents])=>agents.some(id=>wanted.has(id)));
+  const own=linked.filter(([,agents])=>agents.every(id=>wanted.has(id))).map(([sandbox])=>sandbox);
+  const metrics=own.length?systemMeasurements(run,{latestOnly:true}):[];
+  const read=(label,prefixes)=>{
+    let value=0,sandboxes=0;
+    for(const sandbox of own) {
+      // cg:* is the live series; sandbox:* is the saved canonical series.
+      // Pick one latest observation, never add aliases of the same cgroup.
+      const metric=metrics.filter(m=>m.label===label&&prefixes.some(prefix=>m.name.startsWith(`${prefix}:${sandbox}:`))&&Number.isFinite(m.latest[1])).sort((a,b)=>b.latest[0]-a.latest[0])[0];
+      // A container that stopped reporting has no current utilization.
+      if(!metric||Number.isFinite(run.duration)&&run.duration-metric.latest[0]>stale)continue;
+      value+=metric.latest[1];sandboxes++;
+    }
+    return sandboxes?{value,sandboxes}:null;
+  };
+  return {cpu:read('CPU',['cg','sandbox']),memory:read('RAM',['sandbox']),sandboxes:own.length,shared:linked.length-own.length};
+}
