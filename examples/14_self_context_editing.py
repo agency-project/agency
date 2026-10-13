@@ -44,12 +44,18 @@ PRUNE_AFTER_USE = agskill(
         "list_context, find the tool result holding that output, and replace it with "
         "edit_context by a one-line note of what it was. Answer with the sum."
     ),
+    input_schema=agdata(request=agrawstring),
     output_schema=agdata(answer=agrawstring),
     add_host_mcp_tools=context_tools(),
 )
 
+# A skill run that continues an agent's conversation gets its input, not its skill
+# prompt (that only opens a new session), so the instructions travel in the input.
 STATE_FACTS = agdata(request="Alice has a blue car, Bob has a red car.")
-CORRECTION = agdata(request="Correction: Alice has a red car and Bob has a blue car.")
+CORRECTION = agdata(
+    request=f"Correction: Alice has a red car and Bob has a blue car. {CORRECT_CONTEXT.prompt}"
+)
+PRUNE = agdata(request=PRUNE_AFTER_USE.prompt)
 ASK_COLOR = agdata(request="What is the color of Alice's car?")
 
 
@@ -80,7 +86,7 @@ def main() -> None:
 
     # 2. Read bulky output, use it, then cut it from the context. The edit lasts only
     #    for this skill run, so afterwards the agent's history has the original back.
-    pruned = learner.run(PRUNE_AFTER_USE, agdata())
+    pruned = learner.run(PRUNE_AFTER_USE, PRUNE)
     pruned.wait(timeout=example_wait_timeout())
     print(f"Sum (bulky output pruned after use): {pruned.answer}")
     learner.context.resolve_prev_dependencies()
