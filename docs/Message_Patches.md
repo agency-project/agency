@@ -100,8 +100,8 @@ does both steps for the skill runs it reaches.
 `MessageStore.materialize(hashes, applied=None)` rebuilds messages: for each message
 hash it reads the record, and for each block hash it either uses the block from
 `message_block_lookup` or, if a patch matches it, the linked replacement blocks; the
-key of each patch used is added to the set `applied`, if given.
-`patch_keys_for(block_hashes)` says which patch matches each block. `agent.history` and `agcontext.get_resolved_transcript()`
+key of each patch used is added to the set `applied`, if given; `patch_keys_for(block_hashes)`
+says which patch matches each block. `agent.history` and `agcontext.get_resolved_transcript()`
 call it, so a rebuilt history always shows the patches; mutating the result changes
 nothing. `agent.history = ...` replaces `message_hash_list` with the hashes of the
 messages given. `agent.save()` writes `message_hash_list`, `message_structure_lookup`,
@@ -226,6 +226,10 @@ and without the `tool_schema` message (the tools of one conversation can change)
   in the skill run that produced it, so a patch keyed by the harness's flattened resend
   only starts matching the history from the next skill run.
 * A patch invalidates the provider's prompt cache once; after that the prompt is stable.
+* On Claude models with preserved thinking, a patch invalidates every signed thinking
+  block after the patched block. Every request that replays thinking to such a model
+  carries `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, so the API
+  drops those blocks instead of rejecting the request.
 * `patch_history` does not validate the result against the provider's rules.
 
 ## Tests
