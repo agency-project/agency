@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
     from ...agtool import agtool
+    from ...context_tools import ContextView
     from ...sandbox.agsandbox import agSandbox
 
 _current_data_logger = threading.local()
@@ -84,8 +85,12 @@ class HostMcpServer:
         *,
         is_cancelled: "Callable[[], bool] | None" = None,
         live_session: bool = False,
+        context_view: "ContextView | None" = None,
     ) -> None:
         self._live_session = live_session
+        # The skill run's own LLM context, for tools that ask for it
+        # (agency/context_tools.py).
+        self._context_view = context_view
         self._sandbox = sandbox
         self._skill = skill
         self._resource_pool = resource_pool
@@ -118,6 +123,7 @@ class HostMcpServer:
                 sandbox=self._sandbox,
                 resource_pool=self._resource_pool,
                 output_schema=self._skill.output_schema,
+                context_view=self._context_view,
                 **persistent,
             ).to_dict()
 
