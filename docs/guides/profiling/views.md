@@ -1,8 +1,9 @@
 # Profiler views and interpretation
 
 A working, read-only investigator at `/profiler`, alongside the existing live
-run dashboard. Six views share a run, selected agent,
-action/episode, inspector, event search, and time cursor. No frontend package
+run dashboard. Three views, in this order, share a run, selected
+action/episode, inspector, event search, and time cursor: **Execution
+Trajectory** (the default agent-column view), **Timeline**, and **Profiler**. No frontend package
 installation or build step is needed.
 
 ## Open it
@@ -17,12 +18,12 @@ continues to select an external profiler directory.
 
 The representative demo is available directly at
 <http://localhost:7860/profiler?run=demo-baseline&view=trajectory>.
-“Open research demo” also opens it from any view. The matching contention run
-is selected automatically in Compare runs. Numbers **1–6** switch views;
-**Escape** clears the selected event. Export run downloads the normalized data,
+“Open research demo” also opens it from any view. Numbers **1–3** switch views;
+**Escape** clears the selected event. Links to the removed views
+(`view=resources`, `context`, `agents`, `compare`) open the trajectory. Export run downloads the normalized data,
 including source labels.
 
-All six investigator views start without a viewer build. The embedded
+All investigator views start without a viewer build. The embedded
 Perfetto viewer has been removed; recorded Chrome traces remain available
 through the raw trace download endpoints. Native observer JSONL remains
 available in the investigator.
@@ -42,20 +43,13 @@ For incremental execution, replay, provenance, and verification details, see
   between Episode list and Agent overlay. The overlay places each agent's actions on a shared time axis, separates nested
   actions into tracks, and retains the same selection, inspector, agent/search
   filters, and time cursor. `layout=overlay` preserves the layout in shared URLs.
-- **Resources & waits:** common time axis with model/tool/queue/dependency/gap
-  lanes, CPU/memory samples, longest waits, and interval zoom. Selecting a wait
-  exposes its causal action while preserving the wait's selected interval.
-- **Context & information:** model-call navigation; source composition; added,
-  repeated, and dropped prompt blocks; content previews; supervisor/worker
-  information boundary in the demo.
-- **Multi-agent:** selectable agent transcript columns with expandable
-  activities, token/time summaries, concurrent work and sampled system counters
-  on a shared time axis, explicit parent relationships, recorded/synthetic
-  handoffs, and identical-command detection.
-- **Compare runs:** matching-task defaults; longest-common-subsequence alignment
-  of action categories; inserted/deleted actions, first divergence, reconvergence,
-  per-action duration changes, resource peaks, models/harnesses, referenced-path
-  differences, evaluator outcomes, and navigation into either execution.
+- **Timeline:** agent calls and measured system resources on a shared
+  wall-clock axis, with the same selection and time cursor.
+- **Profiler:** detailed Activity, LLM, Tools and Systems measurements.
+- **Removed views:** Resources & waits, Context & information, the tandem
+  trace board and Compare runs are no longer in the navigation. Their recorded
+  data (spans, prompt provenance, counters, relationships and the run catalog)
+  is still collected, served by the same endpoints and included in exports.
 - **Task progress:** obligations with evidence links and explicit unvalidated
   work; evaluator result separated from inferred tool completion.
 
