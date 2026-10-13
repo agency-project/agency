@@ -23,7 +23,8 @@ class agcontext:
                            ``message_block_lookup`` (block hash -> block
                            payload) and ``message_patch_lookup`` (original
                            block hash -> ordered hashes of the blocks that
-                           replace it); the lookups are kept across skill runs
+                           replace it), plus ``message_patch_origin`` (who
+                           made each patch); the lookups are kept across skill runs
     harness_sessions    : per-harness session continuity, e.g.
                            {"claude_code": {"session_id": ..., "blob_b64": ...}}
     retained_messages   : ordered user/system messages retained independently
@@ -110,6 +111,7 @@ class agcontext:
                 "message_block_lookup": dict(store.message_block_lookup),
                 "message_structure_lookup": dict(store.message_structure_lookup),
                 "message_patch_lookup": {k: list(v) for k, v in store.message_patch_lookup.items()},
+                "message_patch_origin": dict(store.message_patch_origin),
             }
 
     @classmethod
@@ -123,6 +125,7 @@ class agcontext:
                     dict(state.get("message_block_lookup") or {}),
                     dict(state.get("message_structure_lookup") or {}),
                     {k: list(v) for k, v in (state.get("message_patch_lookup") or {}).items()},
+                    dict(state.get("message_patch_origin") or {}),
                 ),
             }
         store = MessageStore()

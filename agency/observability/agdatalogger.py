@@ -276,10 +276,11 @@ class agDataLogger:
         `message_block_lookup` table (keyed by content hash), and `exchange_chain`
         lists the blocks of the prompt and of the response in order. A block of
         *harness_message_hashes* (what the harness sent) that is a key of the
-        store's `message_patch_lookup` was replaced in the prompt; the replacement is
-        kept in this database's `message_patch_lookup`, one row per replacement
-        block (a removed block is one row with a NULL `replacement_hash`), with the
-        blocks on both sides in `message_block_lookup`."""
+        store's `message_patch_lookup` matches (by hash, or position-free) was
+        replaced in the prompt; the replacement is kept in this database's
+        `message_patch_lookup`, one row per replacement block (a removed block is one
+        row with a NULL `replacement_hash`), with the blocks on both sides in
+        `message_block_lookup` and who made the patch in `origin`."""
         timestamp = time.time()
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
@@ -300,14 +301,21 @@ class agDataLogger:
                 ]
                 for messages in (prompt_messages, response_messages)
             )
-            matched = dict.fromkeys(
-                block_hash
-                for message_hash in harness_message_hashes
-                for block_hash in structure[message_hash].get("blocks") or ()
-                if block_hash in patches
+            matched = message_store.patch_keys_for(
+                dict.fromkeys(
+                    block_hash
+                    for message_hash in harness_message_hashes
+                    for block_hash in structure[message_hash].get("blocks") or ()
+                )
             )
             applied_patches = [
-                (key, blocks[key], [(h, blocks[h]) for h in patches[key]]) for key in matched
+                (
+                    block_hash,
+                    blocks[block_hash],
+                    [(h, blocks[h]) for h in patches[key]],
+                    message_store.patch_origin(key),
+                )
+                for block_hash, key in matched.items()
             ]
         with self._lock:
             self._stream_delta_rows = [
@@ -335,16 +343,16 @@ class agDataLogger:
                         (digest, json.dumps(record), call_label, timestamp)
                     )
                     self._per_exchange_message_rows.append((call_label, kind, seq, digest))
-            for original_hash, original_payload, replacement in applied_patches:
+            for original_hash, original_payload, replacement, origin in applied_patches:
                 self._block_rows.append(
                     (original_hash, json.dumps(original_payload), call_label, timestamp)
                 )
                 for digest, payload in replacement:
                     self._block_rows.append((digest, json.dumps(payload), call_label, timestamp))
                 if not replacement:
-                    self._patch_rows.append((call_label, original_hash, 0, None))
+                    self._patch_rows.append((call_label, original_hash, 0, None, origin))
                 for seq, (digest, _payload) in enumerate(replacement):
-                    self._patch_rows.append((call_label, original_hash, seq, digest))
+                    self._patch_rows.append((call_label, original_hash, seq, digest, origin))
             self._pending_count += 1
             self._flush_locked()
             if self._conn is not None:
@@ -583,7 +591,8 @@ class agDataLogger:
         # original block hash maps, in order, to the hashes of the blocks that
         # stood in for it (several rows = several replacement blocks; one row
         # with a NULL `replacement_hash` = the block was removed). Both sides
-        # are rows of `message_block_lookup`.
+        # are rows of `message_block_lookup`. `origin` is who made the patch
+        # ("operator" or "model").
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS message_patch_lookup (
@@ -591,10 +600,18 @@ class agDataLogger:
                 original_hash TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 replacement_hash TEXT,
+                origin TEXT NOT NULL DEFAULT 'operator',
                 PRIMARY KEY (call_label, original_hash, seq)
             )
             """
         )
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(message_patch_lookup)")}
+        if "origin" not in columns:
+            # A database written before patches had an origin.
+            self._conn.execute(
+                "ALTER TABLE message_patch_lookup "
+                "ADD COLUMN origin TEXT NOT NULL DEFAULT 'operator'"
+            )
         self._conn.commit()
 
     def _maybe_flush_locked(self) -> None:
@@ -695,7 +712,8 @@ class agDataLogger:
             if self._patch_rows:
                 self._conn.executemany(
                     "INSERT INTO message_patch_lookup "
-                    "(call_label, original_hash, seq, replacement_hash) VALUES (?, ?, ?, ?)",
+                    "(call_label, original_hash, seq, replacement_hash, origin) "
+                    "VALUES (?, ?, ?, ?, ?)",
                     self._patch_rows,
                 )
         self._event_rows.clear()
@@ -796,8 +814,9 @@ def reconstruct_llm_messages(
 
 def reconstruct_llm_patches(connection: "sqlite3.Connection", call_label: str) -> "list[dict]":
     """The persistent patches applied to one exchange's request, as
-    ``{"original": block, "replacement": [block, ...], "original_hash": ...}``
-    (blocks without their role; an empty replacement means the block was removed)."""
+    ``{"original": block, "replacement": [block, ...], "original_hash": ...,
+    "origin": "operator" | "model"}`` (blocks without their role; an empty
+    replacement means the block was removed)."""
     from ..llm.message_store import block_of
 
     def block(digest: str) -> dict:
@@ -807,15 +826,20 @@ def reconstruct_llm_patches(connection: "sqlite3.Connection", call_label: str) -
         return block_of(json.loads(payload))
 
     rows = connection.execute(
-        "SELECT original_hash, replacement_hash FROM message_patch_lookup "
+        "SELECT original_hash, replacement_hash, origin FROM message_patch_lookup "
         "WHERE call_label = ? ORDER BY rowid",
         (call_label,),
     ).fetchall()
     patches: "dict[str, dict]" = {}
-    for original_hash, replacement_hash in rows:
+    for original_hash, replacement_hash, origin in rows:
         entry = patches.setdefault(
             original_hash,
-            {"original_hash": original_hash, "original": block(original_hash), "replacement": []},
+            {
+                "original_hash": original_hash,
+                "original": block(original_hash),
+                "replacement": [],
+                "origin": origin,
+            },
         )
         if replacement_hash is not None:
             entry["replacement"].append(block(replacement_hash))
