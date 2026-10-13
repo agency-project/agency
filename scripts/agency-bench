@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Terminal-Bench 4.0 contention benchmark launcher. Run from anywhere.
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+exec "$repo/.venv/bin/python" -m benchmarks.terminalbench_contention "$@"
