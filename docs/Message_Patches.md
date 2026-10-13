@@ -43,9 +43,14 @@ A runnable walkthrough is `examples/13_context_manipulation.py`.
   all of them.
 
 Calling `patch_history` again with the same `old_block` replaces the earlier link.
-A patch matches the block exactly as the harness sends it, and replaces every
-identical block (a tool call or result is unique by id). Patches are not applied
+A patch matches the block as the harness sends it: by its hash, or failing that by
+its hash with `index` left out, so a block the harness inserts in front of it (a
+Claude Code `<system-reminder>`, say) does not break the match. It replaces every
+such block (a tool call or result is unique by id). Patches are not applied
 recursively.
+
+The model can make patches too, from inside a skill run, with the context tools:
+see [Context_Tools.md](Context_Tools.md).
 
 ## When a patch lands
 
@@ -80,8 +85,10 @@ A request that reached the host server before the patch was made is not patched.
   * `message_structure_lookup`: message hash to its record;
   * `message_block_lookup`: block hash to block payload;
   * `message_patch_lookup`: original block hash to the ordered hashes of the blocks
-    that replace it. Both sides are rows of `message_block_lookup`; the replacement
-    blocks are written there when the patch is added.
+    that replace it. Both sides are rows of `message_block_lookup`; the original and
+    the replacement blocks are written there when the patch is added.
+  * `message_patch_origin`: patch key to `"model"` for a patch the model made with
+    the context tools; a key it does not name was made by the operator.
 
 The store is written with `add_block(MessageBlock) -> hash`, `add_message(message) -> hash`
 and `add_messages(messages) -> hashes`; each stores a row once, however often it is called.
@@ -90,10 +97,11 @@ hashes of the replacement blocks, which must already be rows of `message_block_l
 (`add_block` stores a new one first; `old_hash` need not be a row yet). `patch_history`
 does both steps for the skill runs it reaches.
 
-`MessageStore.materialize(hashes)` rebuilds messages: for each message hash it reads
-the record, and for each block hash it either uses the block from
-`message_block_lookup` or, if the hash is a key in `message_patch_lookup`, the
-linked replacement blocks. `agent.history` and `agcontext.get_resolved_transcript()`
+`MessageStore.materialize(hashes, applied=None)` rebuilds messages: for each message
+hash it reads the record, and for each block hash it either uses the block from
+`message_block_lookup` or, if a patch matches it, the linked replacement blocks; the
+key of each patch used is added to the set `applied`, if given.
+`patch_keys_for(block_hashes)` says which patch matches each block. `agent.history` and `agcontext.get_resolved_transcript()`
 call it, so a rebuilt history always shows the patches; mutating the result changes
 nothing. `agent.history = ...` replaces `message_hash_list` with the hashes of the
 messages given. `agent.save()` writes `message_hash_list`, `message_structure_lookup`,
@@ -144,9 +152,11 @@ whose single block is `{"type": "error", "index": 0, "error": "<Type: message>"}
 1. A request arrives, already translated to agency format by the adapter.
    `LlmHandlerServer._stage_request` hashes its messages with `add_messages`:
    `harness_message_hashes`, what the harness sent.
-2. `materialize(harness_message_hashes)` rebuilds the messages with every block that is
-   a key in `message_patch_lookup` replaced. Those are the `patched_messages`; they
-   replace the request's messages and are hashed again as `patched_message_hashes`.
+2. `materialize(harness_message_hashes)` rebuilds the messages with every block a patch
+   matches replaced. Those are the `patched_messages`; they replace the request's
+   messages and are hashed again as `patched_message_hashes`. The keys of the patches
+   used are kept with the request (`LlmHandlerServer.latest_request()` returns them
+   for the harness's latest one).
 3. The patched messages go to the LLM backend. When the reply arrives,
    `_finalize_success` hashes it and hands `agDataLogger.record_llm_exchange` the
    `message_store` and the three hash lists (`harness_message_hashes`,
@@ -190,9 +200,11 @@ The collector keeps the same hashes in tables of the same names:
 * `per_exchange_messages`: the ordered message hashes of each exchange's prompt and
   reply;
 * `message_patch_lookup`: the patches an exchange's request went through, as rows
-  `(call_label, original_hash, seq, replacement_hash)`. One original hash links, in
-  `seq` order, to one or more replacement hashes; a removed block is a single row with
-  a NULL `replacement_hash`. Both ends are rows of `message_block_lookup`.
+  `(call_label, original_hash, seq, replacement_hash, origin)`. One original hash (the
+  block the harness actually sent) links, in `seq` order, to one or more replacement
+  hashes; a removed block is a single row with a NULL `replacement_hash`. Both ends
+  are rows of `message_block_lookup`. `origin` is `operator` or `model`; a database
+  from before it gains the column (as `operator`) when opened.
 
 `reconstruct_llm_messages(connection, call_label, kind)` rebuilds one request or reply
 exactly; `reconstruct_llm_patches(connection, call_label)` reads the patches back.
@@ -205,8 +217,11 @@ and without the `tool_schema` message (the tools of one conversation can change)
 
 ## Limits
 
-* A patch matches the block exactly as the harness sends it. If the harness rewrites
-  it (compaction, a changed tool result) the patch matches nothing, silently.
+* A patch matches the block as the harness sends it (up to its `index`). If the
+  harness rewrites it (compaction, a changed tool result) the patch matches nothing.
+  The SQLite record and `latest_request()["applied_patch_keys"]` show which patches
+  each request used; the context tools warn the model about its own edits that
+  stopped matching.
 * A block that arrived as the model's own reply is stored in its richer response shape
   in the skill run that produced it, so a patch keyed by the harness's flattened resend
   only starts matching the history from the next skill run.
