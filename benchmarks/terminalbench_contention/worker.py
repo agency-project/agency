@@ -344,6 +344,7 @@ def run(job: dict) -> int:
     signal.signal(signal.SIGINT, interrupted)
 
     actor = sandbox = None
+    pending = None
     container_cgroup = None
     host_cgroup = cgroup_of(os.getpid())
     profiler_started = False
@@ -486,8 +487,17 @@ def run(job: dict) -> int:
                 marks["stop_ns"] = time.monotonic_ns()
             return original_stop(*args, **kwargs)
 
+        def preserve_discarded_container(*args, **kwargs):
+            # Agency rolls back cancelled/failed skill transactions by removing
+            # their container. A benchmark must grade the filesystem left at
+            # the cap, so stop that same container and defer destructive cleanup
+            # until Harbor has collected it. destroy() below still removes it.
+            state["discard_container_preserved"] = True
+            return stop()
+
         try:
             sandbox.commit, sandbox.stop = commit, stop
+            sandbox.rm_container = preserve_discarded_container
             state["lifecycle_hooks"] = True
         except AttributeError:
             state["lifecycle_hooks"] = False
@@ -584,6 +594,16 @@ def run(job: dict) -> int:
             if actor is not None and state["status"] not in ("completed",):
                 try:
                     actor.stop()
+                    if pending is not None:
+                        # Cancellation is asynchronous. Wait for the engine to
+                        # finish its stopped-container discard before collection
+                        # can resume that container, including background work.
+                        try:
+                            pending.wait(timeout=10)
+                        except TimeoutError:
+                            actor.stop(force=True)
+                            pending.wait(timeout=10)
+                        state["cancellation_resolved"] = True
                 except Exception as exc:
                     state["stop_error"] = safe(exc)[-500:]
             if profiler_started:

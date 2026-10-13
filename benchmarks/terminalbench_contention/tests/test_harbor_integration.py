@@ -232,3 +232,36 @@ def test_end_to_end_smoke_with_a_local_mock_model():
     # 8. complete artifacts
     for name in ("config.json", "metadata.json", "summary.json", "run.json"):
         assert (run_dir / name).is_file()
+
+
+@pytest.mark.skipif(
+    os.environ.get("AGENCY_TB_E2E") != "1",
+    reason="set AGENCY_TB_E2E=1 to run the real-container timeout test",
+)
+def test_timeout_preserves_partial_files_for_collection_and_grading():
+    """Cancel the real harness while its tool runs; grade its retained filesystem."""
+    name = f"pytest-timeout-preservation-{os.getpid()}"
+    result = subprocess.run(
+        [str(REPOSITORY / "scripts" / "agency-bench"), "smoke",
+         "--agents", "1", "--tasks", "1", "--task", SMALL, "--name", name,
+         # exec_command may yield while sleep remains in the background. Keep
+         # the next scripted model response pending past the cap as well.
+         "--task-seconds", "25", "--latency", "8", "--command",
+         "echo partial-at-cap > /logs/artifacts/agency-smoke.txt; sleep 120"],
+        capture_output=True, text=True, timeout=800,
+    )
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-2000:]
+    run_dir = sorted((ROOT / "validation" / "smoke-tests" / name).glob("attempt-*"))[-1]
+    summary = read_json(run_dir / "summary.json")
+    [task] = summary["tasks"]
+    agent = run_dir / "agents" / task["directory"]
+    assert task["status"] == "timeout" and task["censored"]
+    assert read_json(agent / "task.json")["discard_container_preserved"]
+    assert read_json(agent / "task.json")["cancellation_resolved"]
+    assert task["collection_ok"] and task["verdict"]["ok"]
+    artifact = (run_dir / "grading" / "source" / task["directory"] /
+                "artifacts" / "logs" / "artifacts" / "agency-smoke.txt")
+    assert artifact.read_text().strip() == "partial-at-cap"
+    assert summary["ledger_ok"] and summary["isolation"]["leaked_containers"] == []
+    assert summary["counts"]["graded"] == 1
+    assert summary["counts"]["grading_failures"] == 0

@@ -63,6 +63,8 @@ pending task launches. Conditions differ in nothing else.
   default 1800 s) from the moment the agent is released. A task at the cap is
   stopped, marked `censored` and still graded. Tasks never released before a
   run ended are `not_started`. Nothing is dropped from the results.
+  The benchmark retains a cancelled or failed skill's container until artifact
+  collection, overriding Agency's normal transaction discard for that container.
   Terminal-Bench's own task timeout is 28 800 s; the shorter uniform cap is a
   deliberate, recorded deviation (see Limitations).
 
