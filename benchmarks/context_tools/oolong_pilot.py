@@ -240,13 +240,14 @@ def make_config(args, log_dir: Path) -> agconfig:
     )
 
 
-def run_one(args, row: dict, arm: str) -> dict:
-    name = f"{arm}_{row['id']}"
+def run_one(args, row: dict, arm: str, repeat: int = 0) -> dict:
+    name = f"{arm}_{row['id']}" + (f"_r{repeat}" if args.repeats > 1 else "")
     log_dir = args.out / "logs"
     cfg = make_config(args, log_dir)
     record = {
         "arm": arm,
         "id": row["id"],
+        "repeat": repeat,
         "context_len": row["context_len"],
         "dataset": row["dataset"],
         "task": row["task"],
@@ -329,6 +330,7 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=4, help="questions (each runs once per arm)")
     parser.add_argument("--offset", type=int, default=0, help="skip this many shuffled questions")
     parser.add_argument("--ids", default="", help="comma-separated question ids (overrides --n)")
+    parser.add_argument("--repeats", type=int, default=1, help="runs per question and arm")
     parser.add_argument("--arms", default="A,B,C")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="claude-sonnet-5-5")
@@ -350,14 +352,19 @@ def main() -> None:
         random.Random(args.seed).shuffle(rows)
         rows = rows[args.offset : args.offset + args.n]
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    jobs = [(row, arm) for row in rows for arm in arms]
-    print(f"{len(jobs)} runs: {len(rows)} questions x arms {arms}, budget {args.context_limit}")
+    jobs = [(row, arm, k) for k in range(args.repeats) for row in rows for arm in arms]
+    print(
+        f"{len(jobs)} runs: {len(rows)} questions x arms {arms} x {args.repeats} repeats, "
+        f"budget {args.context_limit}"
+    )
 
     results_path = args.out / "results.jsonl"
     lock = threading.Lock()
     records: "list[dict]" = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(run_one, args, row, arm): (row["id"], arm) for row, arm in jobs}
+        futures = {
+            pool.submit(run_one, args, row, arm, k): (row["id"], arm, k) for row, arm, k in jobs
+        }
         for future in concurrent.futures.as_completed(futures):
             record = future.result()
             with lock:
@@ -365,7 +372,7 @@ def main() -> None:
                 with results_path.open("a") as f:
                     f.write(json.dumps(record, default=str) + "\n")
             print(
-                f"[{len(records)}/{len(jobs)}] {record['arm']} q{record['id']} "
+                f"[{len(records)}/{len(jobs)}] {record['arm']} q{record['id']} r{record['repeat']} "
                 f"score={record['score']:.2f} rel_err={record.get('relative_error')} cost=${record.get('cost_usd', 0):.3f} "
                 f"edits={record['tool_calls'].get('edit_context', 0)} "
                 f"compactions={record['compactions']} {record.get('error', '')[:120]}",
