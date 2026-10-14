@@ -28,7 +28,7 @@ def _reset_warn_once(monkeypatch):
     monkeypatch.setattr(sys.modules["agency.llm.agllm"], "_WARNED_ONCE", set())
 
 
-LLM_COMPACT_CONFIG ={"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
+LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}
 
 
 def test_build_llm_kwargs_includes_reasoning_effort():

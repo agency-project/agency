@@ -88,14 +88,14 @@ def _container_socket_path(host_path: Path) -> str:
 
 
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
-    """Every field, via safe_snapshot() -- not a hand-picked subset."""
+    """Forward adapter and ptrace settings plus the daemon's sandbox controls."""
     if agconfig is None:
         return {}
     # The daemon needs harness/ptrace knobs, not host credentials or live
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
     config = {
-        "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
+        "harness_adapter": agconfig.harness_adapter.safe_snapshot(),
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),
             "file_access": agconfig.ptrace.file_access,

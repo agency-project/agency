@@ -32,7 +32,9 @@ def test_example_imports(path: Path) -> None:
 
 
 def test_tutorial_is_numbered_and_documented() -> None:
-    assert [path.name[:2] for path in LESSONS] == [f"{number:02d}" for number in range(1, 11)]
+    assert [path.name[:2] for path in LESSONS] == [
+        f"{number:02d}" for number in range(1, len(LESSONS) + 1)
+    ]
     readme = (EXAMPLES_DIR / "README.md").read_text()
     for lesson in LESSONS:
         assert lesson.name in readme

@@ -125,6 +125,7 @@ class LLMClient:
             usage: "dict | None" = None
             finish_reason = None
             received_chunk = False
+            stream_error = None
             try:
                 with self._client.stream("POST", "/v1/chat/completions", json=kwargs) as resp:
                     if resp.status_code == 503:
@@ -216,16 +217,18 @@ class LLMClient:
 
                 if stream_error is not None:
                     last_error = f"dispatch failed: {stream_error.get('message', stream_error)}"
-                    assembled = content_parts or reasoning_parts or tool_calls_raw
+                    assembled = (
+                        content_parts or reasoning_parts or signature_parts or tool_calls_raw
+                    )
                     if (
                         stream_error.get("transient")
                         and not assembled
-                        and attempt < _DISPATCH_MAX_RETRIES - 1
+                        and attempt < self.max_attempts - 1
                     ):
                         with profile_span(self, f"llm:retry_backoff[{attempt}]"):
                             time.sleep(_retry_backoff_s(attempt))
                         continue
-                    return {"error": last_error}
+                    return self._dispatch_error(last_error, attempt + 1, internal_kind)
 
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
                 if reasoning_parts:

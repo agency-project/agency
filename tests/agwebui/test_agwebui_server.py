@@ -320,7 +320,8 @@ def test_index_returns_html(server):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert b"Agency Web UI" in resp.content
+    assert "<title>Agency · Execution profiler</title>".encode() in resp.content
+    assert b'src="/static/investigator.js"' in resp.content
 
 
 def test_static_css_served(server):

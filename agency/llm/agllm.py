@@ -456,6 +456,13 @@ class agllm:
         # its exact role name) may keep it; anything after becomes a `user`
         # message at its original position.
         _SYSTEM_CLASS_ROLES = {"system", "developer"}
+        from .openai_responses import ENCRYPTED_REASONING_TAG
+
+        def is_responses_reasoning(block):
+            return block["type"] == "thinking" and (block.get("signature") or "").startswith(
+                ENCRYPTED_REASONING_TAG
+            )
+
         wire_messages: list[dict] = []
         conversation_started = False
         system_class_used = False
@@ -466,7 +473,7 @@ class agllm:
             if not is_system_class:
                 conversation_started = True
             if role == "assistant":
-                if any(b["type"] == "thinking" and b.get("signature") for b in blocks):
+                if any(is_responses_reasoning(b) for b in blocks):
                     # Chat Completions has no slot for a previous turn's
                     # reasoning item, so it cannot be replayed on this wire
                     # format. Say so instead of dropping it unseen.
@@ -498,7 +505,11 @@ class agllm:
                 }
                 if tool_calls:
                     wire_msg["tool_calls"] = tool_calls
-                reasoning_text = "".join(b["text"] for b in blocks if b["type"] == "thinking")
+                reasoning_text = "".join(
+                    b["text"]
+                    for b in blocks
+                    if b["type"] == "thinking" and not is_responses_reasoning(b)
+                )
                 if reasoning_text:
                     wire_msg["reasoning_content"] = reasoning_text
                 # Resend extended-thinking/other unknown blocks verbatim too.
@@ -509,7 +520,13 @@ class agllm:
                             break
                 # LiteLLM's replay shape for signed (Anthropic/Bedrock) thinking; overrides
                 # any raw streamed thinking_blocks fragments resent just above.
-                signed = [b for b in blocks if b["type"] == "thinking" and b.get("signature")]
+                signed = [
+                    b
+                    for b in blocks
+                    if b["type"] == "thinking"
+                    and b.get("signature")
+                    and not is_responses_reasoning(b)
+                ]
                 if signed:
                     wire_msg["thinking_blocks"] = [
                         {"type": "thinking", "thinking": b["text"], "signature": b["signature"]}

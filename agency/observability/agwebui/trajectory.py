@@ -142,7 +142,9 @@ def returned_preview(value):
 
 class Trajectory:
     def __init__(self, run_id, title, *, mode="live", source="recorded", defer_causal_graph=None):
-        self.defer_causal_graph = mode == "live" if defer_causal_graph is None else defer_causal_graph
+        self.defer_causal_graph = (
+            mode == "live" if defer_causal_graph is None else defer_causal_graph
+        )
         self.run = {
             "id": run_id,
             "title": title,
@@ -1514,7 +1516,8 @@ class LiveSource:
         # final patch is sent via a current snapshot rather than retained.
         while self.journal and (
             self.journal_bytes + size > self.journal_byte_limit
-            or self.journal.maxlen is not None and len(self.journal) >= self.journal.maxlen
+            or self.journal.maxlen is not None
+            and len(self.journal) >= self.journal.maxlen
         ):
             revision, _ = self.journal.popleft()
             self.journal_bytes -= self._journal_sizes.pop(revision)
@@ -1529,10 +1532,7 @@ class LiveSource:
                 epoch != self.epoch
                 or not after
                 or after > self.revision
-                or (
-                    after < self.revision
-                    and (not self.journal or after < self.journal[0][0] - 1)
-                )
+                or (after < self.revision and (not self.journal or after < self.journal[0][0] - 1))
             ):
                 return {
                     "type": "snapshot",

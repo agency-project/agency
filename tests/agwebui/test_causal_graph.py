@@ -311,10 +311,15 @@ def test_full_sqlite_evidence_survives_preview_limits(tmp_path):
     assert len(model["context"]["blocks"]) == 80
     assert len(model["causal_evidence"]["prompt"]) == 91
     assert source.model.snapshot()["causal_graph"]["state"] == "pending"
-    source.model.apply({
-        "id": "done", "ts": 10, "actor": "workflow", "type": "done",
-        "payload": {"status": "completed"},
-    })
+    source.model.apply(
+        {
+            "id": "done",
+            "ts": 10,
+            "actor": "workflow",
+            "type": "done",
+            "payload": {"status": "completed"},
+        }
+    )
     assert any(e["kind"] == "tool_result" for e in source.model.snapshot()["causal_graph"]["edges"])
 
 
@@ -332,25 +337,40 @@ def test_live_graph_waits_for_final_boundary_and_builds_once(monkeypatch, status
     monkeypatch.setattr(causal_graph, "build_graph", build)
     model = Trajectory("live", "live")
     for index in range(40):
-        model.apply({
-            "id": str(index), "ts": index, "actor": "a", "type": "tool_call",
-            "payload": {"call_id": str(index), "tool": "read"},
-        })
+        model.apply(
+            {
+                "id": str(index),
+                "ts": index,
+                "actor": "a",
+                "type": "tool_call",
+                "payload": {"call_id": str(index), "tool": "read"},
+            }
+        )
         model.tick(index + 1)
         patch = model.patch()
         assert not patch["meta"].get("causal_graph", {}).get("nodes")
         assert model.snapshot()["causal_graph"]["state"] == "pending"
     assert calls == []
-    model.apply({
-        "id": "callback-return", "ts": 41, "actor": "workflow", "type": "workload_completed",
-        "payload": {"status": status},
-    })
+    model.apply(
+        {
+            "id": "callback-return",
+            "ts": 41,
+            "actor": "workflow",
+            "type": "workload_completed",
+            "payload": {"status": status},
+        }
+    )
     assert model.snapshot()["causal_graph"]["state"] == "pending"
     assert calls == []
-    model.apply({
-        "id": "done", "ts": 42, "actor": "workflow", "type": "done",
-        "payload": {"status": status},
-    })
+    model.apply(
+        {
+            "id": "done",
+            "ts": 42,
+            "actor": "workflow",
+            "type": "done",
+            "payload": {"status": status},
+        }
+    )
     patch = model.patch()
     assert patch["meta"]["causal_graph"]["nodes"]
     assert calls == [40]

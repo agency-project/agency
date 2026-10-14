@@ -511,7 +511,7 @@ class CodexAdapter(HarnessAdapter):
                 # This adapter already buffers through `done`; see
                 # start_streaming_response for why the first frame comes first.
                 return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             try:
                 payload = self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes

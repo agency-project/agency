@@ -666,7 +666,9 @@ class LlmHandlerServer:
                                         "ts": time.time(),
                                     }
                                 )
-                            self._finalize_success(call_label, request, result["message"])
+                            self._finalize_success(
+                                call_label, request, result["message"], internal_kind=internal_kind
+                            )
                             finalized = True
                             return result
                         _annotate(

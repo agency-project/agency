@@ -448,10 +448,8 @@ def test_agency_to_harness_text_only():
     assert out["usage"]["input_tokens"] == 5
     assert out["usage"]["output_tokens"] == 3
     assert out["usage"]["total_tokens"] == 8
-    # The source dict's own fields survive alongside the Responses-API
-    # aliases -- not narrowed away, see _forward_usage_to_responses.
-    assert out["usage"]["prompt_tokens"] == 5
-    assert out["usage"]["completion_tokens"] == 3
+    assert "prompt_tokens" not in out["usage"]
+    assert "completion_tokens" not in out["usage"]
 
 
 def test_agency_to_harness_tool_use():

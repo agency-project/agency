@@ -76,9 +76,14 @@ def test_syscalls_are_recorded_but_do_not_fill_trajectory_history(tmp_path):
     first = trajectory_history(run, "worker", active=True, limit=1)
     assert first["actions"][0]["call_id"] == "real-tool"
     assert first["has_more"]
-    second = trajectory_history(run, "worker", active=True, limit=1,
-                                before_start=first["actions"][0]["start"],
-                                before_id=first["actions"][0]["id"])
+    second = trajectory_history(
+        run,
+        "worker",
+        active=True,
+        limit=1,
+        before_start=first["actions"][0]["start"],
+        before_id=first["actions"][0]["id"],
+    )
     assert second["actions"][0]["call_id"] == "open"
     assert not second["has_more"]
     assert not trajectory_history(run, "worker", active=True, query="sendto")["actions"]
@@ -411,8 +416,14 @@ def test_live_websocket_delivers_critical_path_only_after_completion(tmp_path, m
                 if frame["type"] == "snapshot":
                     graph = frame["run"]["causal_graph"]
                 else:
-                    graph = next((p["meta"]["causal_graph"] for p in frame["patches"]
-                                  if "causal_graph" in p["meta"]), {})
+                    graph = next(
+                        (
+                            p["meta"]["causal_graph"]
+                            for p in frame["patches"]
+                            if "causal_graph" in p["meta"]
+                        ),
+                        {},
+                    )
                 if graph.get("nodes"):
                     break
             else:

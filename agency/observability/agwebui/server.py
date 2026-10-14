@@ -1371,10 +1371,12 @@ async def _replay_stream(ws):
 
     def rebuild():
         model = Trajectory(
-            run["id"], run["title"], mode="replay", source=run["source"],
-            defer_causal_graph=run_id == "live" and run.get("status") not in {
-                "completed", "failed", "cancelled"
-            },
+            run["id"],
+            run["title"],
+            mode="replay",
+            source=run["source"],
+            defer_causal_graph=run_id == "live"
+            and run.get("status") not in {"completed", "failed", "cancelled"},
         )
         for key in ("model", "harness", "condition", "task", "format", "time_origin"):
             if key in run:

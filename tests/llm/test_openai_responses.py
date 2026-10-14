@@ -835,7 +835,8 @@ def test_dropping_another_providers_reasoning_state_is_said_out_loud(capsys):
     assert "cannot be replayed on /v1/responses" in capsys.readouterr().out
 
 
-def test_chat_completions_backend_says_when_it_cannot_send_reasoning_state(capsys):
+@pytest.mark.parametrize("reasoning_text", ["", "summary"])
+def test_chat_completions_backend_says_when_it_cannot_send_reasoning_state(capsys, reasoning_text):
     from agency.llm.agllm import _WARNED_ONCE
 
     _WARNED_ONCE.discard(("chat_drops_reasoning_state", "openai"))
@@ -846,7 +847,12 @@ def test_chat_completions_backend_says_when_it_cannot_send_reasoning_state(capsy
         {
             "role": "assistant",
             "blocks": [
-                {"type": "thinking", "index": 0, "text": "", "signature": _tagged("rsn_1")},
+                {
+                    "type": "thinking",
+                    "index": 0,
+                    "text": reasoning_text,
+                    "signature": _tagged("rsn_1"),
+                },
                 {"type": "text", "index": 1, "text": "ok"},
             ],
         }

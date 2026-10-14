@@ -293,19 +293,22 @@ def test_daemon_log_is_preclaimed_host_side_before_container_can_write_it(monkey
     assert oct(log_path.stat().st_mode)[-3:] == "666"
 
 
-def test_daemon_config_forwards_every_harness_adapter_ptrace_sandbox_field():
-    """Every field reaches the daemon -- no hand-picked subset."""
+def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials():
+    """Adapter settings and the daemon's sandbox controls survive JSON transport."""
     config = agconfig(
-        harnessadapterconfig(binary_path="/bin/claude", stream_keepalive_s=7.5),
+        harnessadapterconfig(
+            binary_path="/bin/claude", stream_keepalive_s=7.5, allow_subagents=True
+        ),
         llmconfig(api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
-    result = launcher._daemon_config(config)
+    result = json.loads(json.dumps(launcher._daemon_config(config)))
     assert result["harness_adapter"]["binary_path"] == "/bin/claude"
     assert result["harness_adapter"]["stream_keepalive_s"] == 7.5
     assert result["sandbox"]["harness_python_path"] is None
-    assert result["ptrace"]["syscalls"] == agconfig().ptrace.syscalls
+    assert result["harness_adapter"]["allow_subagents"] is True
+    assert result["ptrace"]["syscalls"] == list(config.ptrace.syscalls)
     # llmconfig isn't one of the three namespaces this function forwards at
     # all -- its secret never has a chance to leak through here.
     assert "llm" not in result

@@ -278,6 +278,7 @@ class TestSignedThinking:
                 ],
             ),
         ]
+        chunks.append(_ev(usage=None, choices=[_ev(delta=_SdkObj(), finish_reason="stop")]))
         items = list(_OpenAICompatibleBackend(_cfg())._format_stream_to_agency(iter(chunks)))
         thinking = [i for i in items if i.get("block_type") == "thinking"]
         assert [(i["index"], i.get("text"), i.get("signature")) for i in thinking] == [

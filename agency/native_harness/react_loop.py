@@ -11,7 +11,8 @@ This loop carries no invocation-lifecycle state of its own: cancellation
 propagates the same way it does for every other harness -- a denied tool
 call (`bridge.check_tool_policy`) or a denied/errored model dispatch
 (`llm.dispatch`), both mediated by the same host-side admission checks any
-external harness goes through. There is no separate "checkpoint" concept."""
+external harness goes through. Optional progress snapshots are written only
+after all tool results in a turn have been appended."""
 
 from __future__ import annotations
 
@@ -90,6 +91,7 @@ def run_react_loop(
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
+    on_checkpoint: "Callable[[list], None] | None" = None,
     annotation_arm: str = "baseline",
     observer=None,
     toolset: "tuple[list[dict], dict] | None" = None,
