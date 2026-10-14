@@ -1,1 +1,0 @@
-"""Controlled checkpoint-size benchmark."""
