@@ -88,6 +88,7 @@ def _container_socket_path(host_path: Path) -> str:
 
 
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
+    """Every field, via safe_snapshot() -- not a hand-picked subset."""
     if agconfig is None:
         return {}
     # The daemon needs harness/ptrace knobs, not host credentials or live
@@ -264,7 +265,7 @@ def ensure_harness_daemon(
     harness: str,
     *,
     agconfig: "agconfig_cls | None" = None,
-    timeout_s: float = 120.0,
+    timeout_s: float = 300.0,
     progress_source: "HostInteractionServer | None" = None,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox.

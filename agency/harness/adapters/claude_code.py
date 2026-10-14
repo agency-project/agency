@@ -6,6 +6,7 @@ policy-aware runtime, and owns native PTY input and completion.
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import re
@@ -17,7 +18,7 @@ from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -27,6 +28,24 @@ def claude_code_available() -> bool:
 
 
 _DEFAULT_TIMEOUT_S = 300
+_KEEPALIVE_FRAME = 'event: ping\ndata: {"type": "ping"}\n\n'
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_frame(exc: BaseException) -> str:
+    message, status, _transient = upstream_error(exc)
+    error = {"type": _ANTHROPIC_ERROR_TYPES.get(status, "api_error"), "message": message}
+    return f"event: error\ndata: {json.dumps({'type': 'error', 'error': error})}\n\n"
+
 
 # --autocompact only accepts this range (per `claude --help`); a model with a
 # real window outside it can't be told via this flag at all, so Claude Code
@@ -258,6 +277,26 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _forward_usage_to_anthropic(
+    usage: "dict | None", *, output_tokens: "int | None" = None
+) -> dict:
+    """Full copy, plus Anthropic's own field names layered on top."""
+    usage = dict(usage or {})
+    usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    usage["output_tokens"] = (
+        output_tokens
+        if output_tokens is not None
+        else usage.get("completion_tokens", usage.get("output_tokens", 0))
+    )
+    usage["cache_read_input_tokens"] = usage.get(
+        "cache_read_tokens", usage.get("cache_read_input_tokens", 0)
+    )
+    usage["cache_creation_input_tokens"] = usage.get(
+        "cache_write_tokens", usage.get("cache_creation_input_tokens", 0)
+    )
+    return usage
+
+
 class ClaudeDriver(PtyDriver):
     """Claude Code: Agency-assigned turn identity, hook-driven completion.
 
@@ -418,11 +457,15 @@ class ClaudeDriver(PtyDriver):
         return True
 
     def _record_usage(self, blob, event):
+        """Sums every numeric usage field the CLI's rows carry, not just
+        input_tokens/output_tokens."""
         self._snapshot = blob
-        usage = {"input_tokens": 0, "output_tokens": 0}
+        usage: "dict[str, int]" = {"input_tokens": 0, "output_tokens": 0}
         for row in self._rows(blob[self._attempt_offset :]):
-            for key in usage:
-                usage[key] += row.get("message", {}).get("usage", {}).get(key, 0)
+            row_usage = row.get("message", {}).get("usage") or {}
+            for key, value in row_usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
         event.update(usage)
 
     def snapshot(self):
@@ -606,12 +649,19 @@ class ClaudeCodeAdapter(HarnessAdapter):
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
                 frames = stream_response(
-                    router, token, agency_context, model, self._format_agency_stream_to_harness
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=_anthropic_error_frame,
                 )
                 # Only the finalized message is published; see
                 # start_streaming_response for why the first frame comes first.
                 return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
         @app.post("/v1/messages/count_tokens")
@@ -755,7 +805,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 )
             elif b["type"].startswith(_ANTHROPIC_TYPE_PREFIX):
                 content_blocks.append(_unknown_block_to_anthropic(b))
-        usage = agency_response.get("usage") or {}
         return {
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
@@ -764,10 +813,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "model": model,
             "stop_reason": _stop_reason_to_anthropic(agency_response.get("stop_reason")),
             "stop_sequence": None,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-            },
+            "usage": _forward_usage_to_anthropic(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -799,10 +845,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                     "model": model,
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": final_usage.get("prompt_tokens", 0),
-                        "output_tokens": 0,
-                    },
+                    "usage": _forward_usage_to_anthropic(final_usage, output_tokens=0),
                 },
             },
         )
@@ -904,7 +947,6 @@ class ClaudeCodeAdapter(HarnessAdapter):
                         },
                     )
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-            usage = item.get("usage") or {}
             yield _sse(
                 "message_delta",
                 {
@@ -913,7 +955,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                         "stop_reason": _stop_reason_to_anthropic(item.get("stop_reason")),
                         "stop_sequence": None,
                     },
-                    "usage": {"output_tokens": usage.get("completion_tokens", 0)},
+                    "usage": _forward_usage_to_anthropic(item.get("usage")),
                 },
             )
             yield _sse("message_stop", {"type": "message_stop"})

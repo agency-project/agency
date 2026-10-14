@@ -1081,13 +1081,16 @@ class TestFormatContextBackendToAgency:
     def test_usage_and_stop_reason_extracted(self):
         raw = _ev(content=[], usage=_ev(input_tokens=10, output_tokens=5), stop_reason="end_turn")
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["usage"] == {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-        }
+        usage = result["usage"]
+        assert usage["prompt_tokens"] == 10
+        assert usage["completion_tokens"] == 5
+        assert usage["total_tokens"] == 15
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+        # The SDK's own raw fields survive alongside the renamed aliases --
+        # not narrowed away, see _serialize_anthropic_usage's docstring.
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
         assert result["stop_reason"] == "end_turn"
 
     def test_unrecognized_content_block_preserved_as_unknown(self):
@@ -1139,13 +1142,16 @@ class TestFormatStreamToAgency:
         assert [i["text"] for i in text_items] == ["Hello", ", world"]
         usage_item = items[-1]
         assert usage_item["type"] == "usage"
-        assert usage_item["usage"] == {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-        }
+        usage = usage_item["usage"]
+        assert usage["prompt_tokens"] == 10
+        assert usage["completion_tokens"] == 5
+        assert usage["total_tokens"] == 15
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+        # Both message_start's and message_delta's own raw fields survive
+        # the merge, not just the renamed aliases.
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
         assert usage_item["stop_reason"] == "end_turn"
 
     def test_citations_delta_emitted_for_text_block(self):

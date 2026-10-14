@@ -49,6 +49,16 @@ def test_render_attempt_prompt_keeps_output_instruction_when_resuming():
     assert daemon._render_attempt_prompt(request) == "user turn\n\noutput instruction"
 
 
+def test_render_attempt_prompt_includes_output_instruction_on_a_fresh_session():
+    request = HarnessAttemptRequest(
+        prompt=PromptPayload("system prompt", "user turn", "output instruction"),
+        harness="fake",
+    )
+    assert (
+        daemon._render_attempt_prompt(request) == "system prompt\n\nuser turn\n\noutput instruction"
+    )
+
+
 class _FakePingClient:
     """Records every POST made through it in the shared `posted` list --
     stands in for httpx.Client so _ping_daemon_lifecycle's tests don't need

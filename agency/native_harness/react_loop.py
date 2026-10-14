@@ -19,7 +19,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from . import tools
 from .profiling import profile_run, span as profile_span
@@ -278,6 +278,13 @@ def run_react_loop(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )
+            # Only after every tool result is in: a resume must never start from a
+            # dangling tool_use, so a crash mid-turn reverts to the previous turn.
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint(messages)
+                except Exception:  # noqa: S110 - best-effort, same as _write_progress
+                    pass
     return ReactLoopResult(
         status="error",
         message=f"exceeded max_steps={max_steps} without a final answer",
