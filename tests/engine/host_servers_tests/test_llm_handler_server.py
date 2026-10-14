@@ -1267,7 +1267,12 @@ def test_controlled_paths_preserve_logger_call_labels_and_finalization():
     assert logger.events == [
         (
             "agent_state",
-            {"state": "waiting_llm", "request_id": "test-request", "model": "recording"},
+            {
+                "state": "waiting_llm",
+                "request_id": "test-request",
+                "model": "recording",
+                "causal_evidence": server._request_evidence(backend.requests[0][1]),
+            },
             handle.call_label,
             True,
         )
@@ -1282,7 +1287,8 @@ def test_malformed_nonstream_result_finalizes_the_logger_call_label():
             self.requests.append(("nonstream", copy.deepcopy(request)))
             return {"usage": None, "message": {"role": "assistant", "blocks": []}}
 
-    server = _controlled_server(MalformedBackend())
+    backend = MalformedBackend()
+    server = _controlled_server(backend)
 
     with pytest.raises(KeyError, match="stop_reason"):
         server.dispatch({"messages": _completed_tool_history()})
@@ -1292,7 +1298,7 @@ def test_malformed_nonstream_result_finalizes_the_logger_call_label():
         (
             logger.events[0][2],
             "llm_stream_error",
-            [],
+            server._prompt_chain(backend.requests[0][1]),
             _marker_chain({"error": "KeyError: 'stop_reason'"}),
         )
     ]
@@ -1904,7 +1910,12 @@ def test_stream_http_disconnect_before_first_item_joins_producer():
 
     logger = server._data_logger
     assert logger.finalized == [
-        (logger.events[0][2], "llm_stream_cancelled", [], _marker_chain({"cancelled": True}))
+        (
+            logger.events[0][2],
+            "llm_stream_cancelled",
+            server._prompt_chain(backend.requests[0][1]),
+            _marker_chain({"cancelled": True}),
+        )
     ]
     assert all(
         handle._thread is None or not handle._thread.is_alive() for handle in server._handles

@@ -38,6 +38,8 @@ EVENT_TYPES = (
     "ui_intervention",
     "tool_call",
     "tool_result",
+    "syscall_call",
+    "syscall_result",
     "skill_start",
     "skill_call",
     "skill_error",
@@ -165,6 +167,7 @@ class Trajectory:
         self.origin = None if mode == "live" else 0
         self.seen = set()
         self.actions = {}
+        self._graph_revision = 0
         self.episodes = {}
         self.agents = {}
         self.current = {}
@@ -306,11 +309,20 @@ class Trajectory:
         self.dirty["episodes"].add(episode["id"])
 
     def _call(self, event, kind, key, *, ending=False):
+        self._graph_revision += 1
         actor, payload, timestamp = event["actor"], event["payload"], event["ts"]
         action_id = payload.get("action_id") or f"{actor}:{key}"
         action = self.actions.get(action_id)
         if action is None:
-            arguments = payload.get("arguments") or {}
+            arguments = payload.get("arguments") or (
+                {
+                    k: payload[k]
+                    for k in ("pid", "path", "argv", "program", "address", "port")
+                    if payload.get(k) is not None
+                }
+                if kind == "syscall"
+                else {}
+            )
             command = (
                 arguments.get("command", text(arguments))
                 if isinstance(arguments, dict)
@@ -320,7 +332,7 @@ class Trajectory:
             declared = annotation.get("raw", {}) if annotation.get("status") == "valid" else {}
             declared = declared if isinstance(declared, dict) else {}
             intent = payload.get("intent") or declared.get("purpose") or ""
-            name = payload.get("tool") or payload.get("name") or kind
+            name = payload.get("tool") or payload.get("name") or payload.get("syscall") or kind
             category = payload.get("kind") or (
                 classify(f"tool:{name}", command) if kind == "tool" else kind
             )
@@ -408,6 +420,8 @@ class Trajectory:
                     if isinstance(item, str) and item
                 )
             )
+        if payload.get("causal_evidence") is not None:
+            action["causal_evidence"] = payload["causal_evidence"]
         if not ending:
             missing_start = action["missing_start"]
             action["missing_start"] = False
@@ -479,6 +493,11 @@ class Trajectory:
             self.running.discard(action_id)
         action["metadata"] = {
             **action["metadata"],
+            **(
+                {k: payload[k] for k in ("pid", "program", "path", "return_value") if k in payload}
+                if kind == "syscall"
+                else {}
+            ),
             **payload.get("metadata", {}),
             "event_ids": action["event_ids"],
             "call_id": action["call_id"],
@@ -643,6 +662,7 @@ class Trajectory:
                     [event["id"]],
                 )
             self.finished_at = event["ts"]
+            self._graph_revision += 1
             if self.running:
                 self._signal(
                     "unfinished",
@@ -746,8 +766,20 @@ class Trajectory:
                     agent["sandbox"] = payload["sandbox"]
                 if payload.get("state") == "waiting_llm" and event.get("call_label"):
                     self._call(event, "model", f"model:{event['call_label']}")
-            elif kind in {"tool_call", "tool_result", "model_result"}:
-                call_kind = "model" if kind == "model_result" else "tool"
+            elif kind in {
+                "tool_call",
+                "tool_result",
+                "model_result",
+                "syscall_call",
+                "syscall_result",
+            }:
+                call_kind = (
+                    "model"
+                    if kind == "model_result"
+                    else "syscall"
+                    if kind.startswith("syscall_")
+                    else "tool"
+                )
                 key = payload.get("call_id") or event.get("call_label") or event["id"]
                 if call_kind == "model":
                     key = f"model:{key}"
@@ -970,8 +1002,25 @@ class Trajectory:
         self.run["metrics_totals"] = self.metrics_counters.update(calls)
         self.run["metrics_by_agent"] = self.metrics_counters.by_agent
 
+    def _causal_graph(self):
+        from .causal_graph import build_graph
+
+        signature = self._graph_revision
+        if signature != getattr(self, "_graph_signature", None):
+            self.run["causal_graph"] = build_graph(self.run)
+            self._graph_signature = signature
+        for node in self.run["causal_graph"]["nodes"]:
+            if node["phase"] == "open":
+                node["time"] = self.run["duration"]
+        self.run["causal_graph"]["summary"]["execution_duration"] = (
+            self.run["execution_wall_time"]
+            if self.run["execution_started_at"] is not None
+            else self.run["duration"]
+        )
+
     def patch(self):
         self._metrics()
+        self._causal_graph()
         maps = {
             "actions": self.actions,
             "episodes": self.episodes,
@@ -1006,6 +1055,9 @@ class Trajectory:
             )
             if key in self.run
         }
+        if self._graph_signature != getattr(self, "_published_graph_signature", None):
+            patch["meta"]["causal_graph"] = copy.deepcopy(self.run["causal_graph"])
+            self._published_graph_signature = self._graph_signature
         patch["counter_samples"] = self.counter_updates
         self.counter_updates = {}
         for ids in self.dirty.values():
@@ -1014,6 +1066,7 @@ class Trajectory:
 
     def snapshot(self):
         self._metrics()
+        self._causal_graph()
         self.run["signals"] = list(self.signals.values())
         return copy.deepcopy(self.run)
 
@@ -1249,6 +1302,8 @@ class LiveSource:
 
     @staticmethod
     def _exchange(con, label, kind, *, full=False):
+        from .causal_graph import exchange_evidence
+
         chains = {"prompt": [], "response": []}
         for chain_kind, raw in con.execute(
             "SELECT c.kind,b.payload FROM exchange_chain c JOIN blocks b ON b.hash=c.hash WHERE c.call_label=? ORDER BY c.kind,c.seq",
@@ -1296,6 +1351,7 @@ class LiveSource:
         return {
             "model": recorded_model if isinstance(recorded_model, str) else None,
             "model_response": model_response,
+            "causal_evidence": exchange_evidence(chains["prompt"], chains["response"]),
             "output_truncated": response_truncated,
             "result": "\n".join(visible),
             "error": markers.get("error"),
@@ -1460,6 +1516,7 @@ def replay_events(run):
             "model": action.get("model"),
             "model_id": action.get("model_id"),
             "model_tool_call_id": action.get("model_tool_call_id"),
+            "causal_evidence": action.get("causal_evidence"),
             "metadata": {
                 key: value
                 for key, value in action.get("metadata", {}).items()
@@ -1476,6 +1533,8 @@ def replay_events(run):
         }
         model = action["kind"] == "model"
         start = {**common, "state": "waiting_llm"} if model else common
+        if model and action.get("causal_evidence"):
+            start["causal_evidence"] = {**action["causal_evidence"], "response": []}
         events.append(
             {
                 "id": f"replay/start/{action['id']}",
@@ -1546,4 +1605,7 @@ def historical_projection(run):
     # Existing attribution, resources, evaluator evidence and context stay intact.
     for key in ("actions", "episodes", "signals", "mode", "status"):
         run[key] = projected[key]
+    from .causal_graph import build_graph
+
+    run["causal_graph"] = build_graph(run)
     return run

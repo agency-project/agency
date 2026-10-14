@@ -165,6 +165,7 @@ class HostInteractionServer:
                     metadata={
                         **self._profile_attributes,
                         "call_id": call_id,
+                        "model_tool_call_id": attributes.get("model_tool_call_id"),
                         "timing": "hook_boundary",
                         "provenance": "host_observed",
                         **(
@@ -334,7 +335,11 @@ class HostInteractionServer:
         return {"ok": rejected == 0, "rejected": rejected}
 
     def admit_tool_call(
-        self, tool_name: str, tool_input: dict, annotation: dict | None = None
+        self,
+        tool_name: str,
+        tool_input: dict,
+        annotation: dict | None = None,
+        model_tool_call_id: str | None = None,
     ) -> dict:
         """Admission + telemetry entry point for a tool call."""
         allowed, reason = self.check_tool(tool_name, tool_input)
@@ -345,6 +350,10 @@ class HostInteractionServer:
             except GpuWaitCancelled:
                 allowed, reason = False, "agent invocation cancelled"
         gpu_ids = sandbox.current_gpu_ids() if sandbox is not None else None
+        identity = model_tool_call_id or (
+            annotation.get("model_tool_call_id") if isinstance(annotation, dict) else None
+        )
+        identity = identity if isinstance(identity, str) and identity else None
         call_id = self._record_admission(
             "tool",
             tool_name,
@@ -352,6 +361,7 @@ class HostInteractionServer:
                 "tool": tool_name,
                 "arguments": tool_input,
                 "gpu_ids": gpu_ids,
+                **({"model_tool_call_id": identity} if identity else {}),
                 **({"annotation": annotation} if isinstance(annotation, dict) else {}),
             },
             allowed,
@@ -514,7 +524,10 @@ class HostInteractionServer:
         def _check_tool(request: dict, http_request: Request) -> JSONResponse:
             return JSONResponse(
                 http_request.app.state.interaction_server.admit_tool_call(
-                    request["tool_name"], request["tool_input"], request.get("annotation")
+                    request["tool_name"],
+                    request["tool_input"],
+                    request.get("annotation"),
+                    request.get("model_tool_call_id"),
                 )
             )
 

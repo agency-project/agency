@@ -108,7 +108,7 @@ function page(replay=false,view=null) {
     var lastWindowEnd;
     globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
-      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,renderAgentColumnControls};
+      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},setCausal:viewer=>{causalViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,renderAgentColumnControls};
   `,context);
   const agentButton=(kind,id='a')=>{
     const attribute=`data-execution-${kind}`,html=context.ui.agentExecutionControls(id);
@@ -1208,4 +1208,15 @@ test('copy takes the complete recorded payload in either view and reports the ou
     p.flush();assert.equal(button.textContent,'Copy');
   }
   assert.equal(p.copied.length,2);
+});
+
+
+test('Critical Path uses the frozen snapshot for scrolling and resize while ingestion continues',()=>{
+  const p=page();let displayed,held;
+  const viewer={update:run=>{displayed=run;},setFrozen:value=>{held=value;}};
+  p.ui.setCausal(viewer);p.ui.pauseDisplay();
+  assert.equal(displayed,p.ui.state.run);assert.equal(held,true);
+  const clock=displayed.duration;p.append();
+  assert.equal(displayed.duration,clock);
+  assert.equal(p.ui.state.liveRun.duration,clock+1);
 });

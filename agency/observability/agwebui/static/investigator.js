@@ -3,6 +3,7 @@ import {agentRoster, reconcilePinnedAgents, pinAgent} from './agent-roster.js';
 import {requestControlConfirmation, refreshControlConfirmation} from './control-confirmation.js';
 import {eventCard, eventRelationships, eventMeasurements, payloadWindow, payloadValue, prettyJson, highlightJson} from './event-details.js';
 import {ExecutionTimeline} from './execution-timeline.js';
+import {CausalGraph, causalSummary} from './causal-graph.js';
 import {matchesAction, packActionTracks, groupCallStack, executionIdentity, executionMeasurements, readableExecutionTitle, systemMeasurements, agentTokens, agentResources} from './investigator-model.js';
 import {executionControlState, mergeTrajectory, mergeTrajectorySnapshot, boundTrajectory, TrajectoryStream} from './trajectory-stream.js';
 
@@ -14,11 +15,13 @@ const colors = {search:'#70b4ed', read:'#89c7da', edit:'#72d6b1', test:'#9fbb84'
 // Primary views in navigation order; the agent-column trajectory is the default.
 const views = [['trajectory','Execution Trajectory'], ['timeline','Timeline'], ['profiler','Profiler']];
 const params = new URLSearchParams(location.search);
-const profilerCategories={activity:'Activity',llm:'LLM',tools:'Tools',systems:'Systems'};
+const profilerCategories={activity:'Activity',llm:'LLM',tools:'Tools',systems:'Systems',critical:'Critical Path'};
 const requestedView=params.get('view');
 const initialProfiler=profilerCategories[params.get('profiler')]?params.get('profiler'):profilerCategories[requestedView]?requestedView:'activity';
 const state = {profilerCategory:initialProfiler,catalog:[], run:null, view:profilerCategories[requestedView]?'profiler':views.some(v=>v[0]===requestedView)?requestedView:'trajectory', trajectoryLayout:params.get('layout')==='overlay'?'overlay':'episodes', agent:'', query:'', cursor:0, selected:null, inspectorOpen:false, expanded:new Set(), loading:false};
 let timelineViewer=null;
+let causalViewer=null;
+let causalNavigation={scale:null,left:0,top:0,lock:false};
 let timelineNavigation={scale:null,left:0,top:0,lock:false};
 const fullPayloads=new WeakMap();
 let commandSequence=0;
@@ -319,6 +322,7 @@ async function loadRun(id, selected=null, replay=false, start={}) {
   pendingTrajectoryChanges.clear();pendingResync=false;
   const generation = ++loadGeneration;
   clearExecutionPending();state.lastExecutionCommand=null;state.executionReceiptTargets=[];state.executionControls=null;state.executionMessage='';state.measurementMessage='';state.executionOutcomes=[];if(state.interaction){state.interaction.invalid='Execution changed. Reopen interaction for the intended agent.';renderInteractionStatus();}
+  causalNavigation={scale:null,left:0,top:0,lock:false};
   timelineNavigation={scale:null,left:0,top:0,lock:false};openToolDetails.clear();payloadFormats.clear();trajectoryColumns.clear();columnReading.clear();clearNotice(state.pendingNew);setMetricScope(null);
   state.stream?.close();state.stream=null;state.replay=replay;state.replayState=null;
   state.follow=true;state.unread.clear();state.windowEnd=null;
@@ -443,8 +447,10 @@ function render() {
   $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
   renderRunChrome();
   timelineViewer?.destroy();timelineViewer=null;
+  causalViewer?.destroy();causalViewer=null;
   setContent(({profiler:detailedProfilerView,timeline:timelineView,trajectory:trajectoryView})[state.view]());
   if(state.view==='timeline'){if(state.displayPaused)timelineNavigation.lock=false;timelineViewer=new ExecutionTimeline($('execution-timeline'),timelineNavigation,id=>selectAction(id),()=>holdHistory());timelineViewer.update(run,visibleActions(run),state.agent,state.replayState?.duration);timelineViewer.setSelection?.(state.selected?.execution===executionIdentity(run)?state.selected.id:null);timelineViewer.scroll.scrollLeft=timelineNavigation.left;timelineViewer.scroll.scrollTop=timelineNavigation.top||0;timelineViewer.setFrozen(state.displayPaused);}
+  if(state.view==='profiler'&&state.profilerCategory==='critical')mountCausalGraph();
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes'){reconcileActivities(true);$('agent-roster').open=state.rosterOpen;for(const el of content.querySelectorAll('[data-roster-parent]'))el.open=state.rosterExpanded.includes(el.dataset.rosterParent);}
   for(const [selector,left,top] of heldScroll){const region=content.querySelector(selector);if(region){region.scrollLeft=left;region.scrollTop=top;}}
   content.dataset.run=run.id;content.dataset.view=state.view;
@@ -529,6 +535,7 @@ function pauseDisplay() {
   state.displayPaused=true;clearNotice(state.displayChanges);clearNotice(state.pendingNew);
   // Timeline scrolling and resize paints must also read the held snapshot.
   timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
+  causalViewer?.update(state.run);causalViewer?.setFrozen(true);
   renderSession();
 }
 function resumeDisplay() {
@@ -748,12 +755,13 @@ function updateTrajectory(changed,resynced=false) {
       if(focused)$('content').querySelector(`[data-action="${CSS.escape(focused)}"]`)?.focus({preventScroll:true});
     }
   }
-  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
+  if(state.view==='profiler'&&state.profilerCategory==='critical'){causalViewer?.update(state.run);const summary=$('causal-summary');if(summary)summary.innerHTML=causalSummary(state.run.causal_graph);}
+  else if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='timeline')timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);
   const target=executionState().target;
   const controlSignature=`${target?.id}:${target?.status}:${target?.control_ts}`;
   const controlChanged=controlSignature!==state.inspectorControlSignature;
-  if(controlChanged||!state.selected||changed.includes(state.selected?.id)){
+  if(controlChanged||!state.selected||state.selected.type.startsWith('causal-')||changed.includes(state.selected?.id)){
     if($('inspector').contains(document.activeElement)){state.inspectorDirty=true;const note=$('inspector').querySelector('.inspector-update');if(note)note.textContent='Selected evidence updated. Details refresh when you leave the inspector.';}
     else renderInspector(true);
   }
@@ -779,7 +787,8 @@ function addAgentColumn(id) {
   if(!pinned.changed){$('agent-column-limit').textContent=pinned.reason;return;}
   state.columnsCustomized=true;state.agentColumns=pinned.ids;state.activeColumn=id;
   state.agent='';
-  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
+  if(state.view==='profiler'&&state.profilerCategory==='critical'){causalViewer?.update(state.run);const summary=$('causal-summary');if(summary)summary.innerHTML=causalSummary(state.run.causal_graph);}
+  else if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   renderCallStack();
   scrollAgentColumn(id);
 }
@@ -787,7 +796,8 @@ function addAgentColumn(id) {
 function removeAgentColumn(id) {
   if(!state.agentColumns.includes(id))return;
   state.columnsCustomized=true;state.agentColumns=state.agentColumns.filter(agent=>agent!==id);if(state.agent===id)state.agent='';
-  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
+  if(state.view==='profiler'&&state.profilerCategory==='critical'){causalViewer?.update(state.run);const summary=$('causal-summary');if(summary)summary.innerHTML=causalSummary(state.run.causal_graph);}
+  else if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   renderCallStack();
 }
 
@@ -847,7 +857,7 @@ function readingState(agent) {
 function readingPins() {
   const pins=[];
   if(state.selected){
-    pins.push(state.selected.id);
+    pins.push(state.selected.id);if(state.selected.action_id)pins.push(state.selected.action_id);
     if(state.selected.type==='episode')pins.push(...(state.run?.episodes.find(e=>e.id===state.selected.id)?.actions||[]));
     if(state.selected.type==='interval'){const interval=state.run?.intervals.find(i=>i.id===state.selected.id);if(interval?.action)pins.push(interval.action);}
   }
@@ -1320,7 +1330,23 @@ function renderInspector(preserveEvidence=false) {
   const map=actionMap(run);
   let content='';
   const selection=state.selected;
-  if(selection.type==='action') {
+  if(selection.type==='causal-node'||selection.type==='causal-edge') {
+    const graph=run.causal_graph;
+    const item=(selection.type==='causal-node'?graph?.nodes:graph?.edges)?.find(n=>n.id===selection.id);
+    if(!item)content='<p>Selected graph evidence is unavailable in this prefix.</p>';
+    else if(selection.type==='causal-node') {
+      const op=graph.operations.find(o=>o.id===item.operation);
+      content=`${pill(item.band)}<h2>${esc(item.label)} · ${esc(item.phase)}</h2>${field('Agent',item.agent)}${field('Timestamp on trace',formatTime(item.time))}${field('Wall-clock timestamp',Number.isFinite(run.time_origin)?new Date((run.time_origin+item.time)*1000).toISOString():'Relative recording clock')}${field('Timing evidence',item.timing)}${field('Measured duration',op.duration==null?'Unknown':formatTime(op.duration))}${field('Request ID',item.request_id||'Unavailable')}${field('Exchange ID',op.exchange_id||'Unavailable')}${field('Model tool ID',item.tool_id||'Unavailable')}${field('Slack in observed chain',item.slack==null?'Unknown':formatTime(item.slack))}<p class="notice">Slack uses observed dependency timing; missing dependencies may hide constraints.</p>`;
+      if(op.action_id&&map.has(op.action_id))content+=`<button class="jump" data-action="${esc(op.action_id)}">Inspect call and profiling metrics →</button>`;
+      content+=`<div class="detail-label">Incoming / outgoing dependency evidence</div>`+graph.edges.filter(e=>e.source===item.id||e.target===item.id).map(e=>`<p>${esc(e.kind)} · ${esc(e.confidence)} · ${esc(e.evidence)}</p>`).join('');
+      content+=`<pre>${esc(JSON.stringify(op.metrics,null,2))}</pre>`;
+      if(op.metrics.event_ids?.length)content+=op.metrics.event_ids.slice(-5).map(id=>`<button class="jump" data-raw-event="${esc(id)}">Source evidence · ${esc(id)} →</button>`).join('');
+    } else {
+      const left=graph.nodes.find(n=>n.id===item.source),right=graph.nodes.find(n=>n.id===item.target);
+      content=`${field('From',left?`${left.label} · ${left.phase} · ${formatTime(left.time)}`:item.source)}${field('To',right?`${right.label} · ${right.phase} · ${formatTime(right.time)}`:item.target)}${field('Request IDs',[left?.request_id,right?.request_id].filter(Boolean).join(' → ')||'Unavailable')}${field('Tool IDs',[left?.tool_id,right?.tool_id].filter(Boolean).join(' → ')||'Unavailable')}${pill(item.confidence)}<h2>${esc(item.kind)}</h2>${field('Source',item.source)}${field('Target',item.target)}${field('Dependency evidence',item.evidence)}${field('Blocking',item.blocking?'Verified dependency':'Not included in path calculation')}${field('Measured weight',formatTime(item.weight))}${field('Wait before consumption',formatTime(item.wait))}${field('Unexplained elapsed gap',formatTime(item.gap))}${field('On recorded critical path',item.critical?'Yes':'No')}`;
+    }
+    content+=`<details><summary>Missing observations and gaps</summary>${graph.coverage.unknown.slice(0,50).map(g=>`<p>${esc(g.operation)}: ${esc(g.reason)}</p>`).join('')}</details>`;
+  } else if(selection.type==='action') {
     const a=map.get(selection.id);
     if(!a) content='<p>Selection is no longer available.</p>';
     else {
@@ -1373,7 +1399,14 @@ function selectAction(id) {
   render();
 }
 
-function detailedProfilerView(){return `<nav class="prof-tabs prof-detail-tabs" role="tablist" aria-label="Detailed profiler categories">${Object.entries(profilerCategories).map(([key,label])=>`<button role="tab" aria-selected="${state.profilerCategory===key}" data-profiler-category="${key}">${label}</button>`).join('')}</nav><section role="tabpanel" aria-label="${profilerCategories[state.profilerCategory]} profiler">${profilerView(state.run,profilerCategories[state.profilerCategory])}</section>`;}
+function detailedProfilerView(){return `<nav class="prof-tabs prof-detail-tabs" role="tablist" aria-label="Detailed profiler categories">${Object.entries(profilerCategories).map(([key,label])=>`<button role="tab" aria-selected="${state.profilerCategory===key}" data-profiler-category="${key}">${label}</button>`).join('')}</nav><section role="tabpanel" aria-label="${profilerCategories[state.profilerCategory]} profiler">${state.profilerCategory==='critical'?heading('Critical Path','Explore recorded execution dependencies on a shared wall-clock axis.')+'<div id="causal-summary">'+causalSummary(state.run.causal_graph)+'</div><div id="causal-graph" class="panel"></div>':profilerView(state.run,profilerCategories[state.profilerCategory])}</section>`;}
+function mountCausalGraph(){
+  causalViewer=new CausalGraph($('causal-graph'),causalNavigation,selection=>{
+    holdSelection();const node=state.run.causal_graph.nodes.find(n=>n.id===selection.id);setSelection({...selection,action_id:node?.action_id});causalNavigation.selected=selection.id;
+    renderInspector();causalViewer.setSelection(selection.id);
+  },()=>holdHistory());
+  causalViewer.update(state.run);causalViewer.setSelection(state.selected?.id);causalViewer.setFrozen(state.displayPaused);
+}
 document.addEventListener('click',event=>{const tab=event.target.closest('[data-profiler-category]');if(tab)setView(tab.dataset.profilerCategory);});
 
 function setView(view) {
@@ -1450,7 +1483,8 @@ function followLatest() {
   if(state.run)state.cursor=state.replayState?.clock??state.run.duration;
   renderRunChrome();
   if(state.view==='trajectory'&&state.trajectoryLayout==='episodes')reconcileActivities();
-  if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
+  if(state.view==='profiler'&&state.profilerCategory==='critical'){causalViewer?.update(state.run);const summary=$('causal-summary');if(summary)summary.innerHTML=causalSummary(state.run.causal_graph);}
+  else if(state.view==='profiler'&&!$('content').contains(document.activeElement))$('content').innerHTML=detailedProfilerView();
   if(state.view==='timeline'){timelineViewer?.update(state.run,visibleActions(state.run),state.agent,state.replayState?.duration);timelineViewer?.latest();}
 }
 

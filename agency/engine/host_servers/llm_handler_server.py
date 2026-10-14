@@ -504,6 +504,7 @@ class LlmHandlerServer:
             type="agent_state",
             payload={
                 "state": "waiting_llm",
+                "causal_evidence": self._request_evidence(request),
                 "request_id": self._request_id,
                 "model": self.resolve_model(),
             },
@@ -515,12 +516,12 @@ class LlmHandlerServer:
 
         def finalize_error(error: BaseException) -> None:
             nonlocal finalized
-            self._finalize_terminal(call_label, kind="error", error=error)
+            self._finalize_terminal(call_label, kind="error", request=request, error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
-            self._finalize_terminal(call_label, kind="cancelled")
+            self._finalize_terminal(call_label, kind="cancelled", request=request)
             finalized = True
 
         def complete_failure(error: BaseException) -> None:
@@ -708,6 +709,7 @@ class LlmHandlerServer:
             type="agent_state",
             payload={
                 "state": "waiting_llm",
+                "causal_evidence": self._request_evidence(request),
                 "request_id": self._request_id,
                 "model": self.resolve_model(),
             },
@@ -741,9 +743,9 @@ class LlmHandlerServer:
                     self._handles.remove(handle)
             handle._thread = None
             if was_cancelled:
-                self._finalize_terminal(call_label, kind="cancelled")
+                self._finalize_terminal(call_label, kind="cancelled", request=request)
                 raise _RequestAborted from error
-            self._finalize_terminal(call_label, kind="error", error=error)
+            self._finalize_terminal(call_label, kind="error", request=request, error=error)
             raise
 
     def stop(self) -> None:
@@ -967,11 +969,10 @@ class LlmHandlerServer:
         call_label: "str | None",
         *,
         kind: str,
+        request: "dict | None" = None,
         error: "BaseException | None" = None,
     ) -> None:
-        """Record this exchange's non-success outcome. No prompt is
-        captured here (matching prior behavior) -- only a single synthetic
-        marker block on the response chain."""
+        """Retain the attempted prompt even when a request fails or is cancelled."""
         agname = getattr(self._data_logger, "_default_name", None)
         if kind == "cancelled":
             marker = {"cancelled": True}
@@ -982,11 +983,16 @@ class LlmHandlerServer:
         self._data_logger.record_llm_exchange(
             call_label,
             exchange_type=f"llm_stream_{kind}",
-            prompt_chain=[],
+            prompt_chain=self._prompt_chain(request) if request else [],
             response_chain=[(_payload_hash(marker), marker)],
             term_message=f"[{agname}] LLM    ✗  {suffix}",
             print_to_terminal=False,
         )
+
+    def _request_evidence(self, request: dict) -> dict:
+        from ...observability.agwebui.causal_graph import exchange_evidence
+
+        return exchange_evidence([b for _, b in self._prompt_chain(request)], [])
 
     def _prompt_chain(self, request: dict) -> "list[tuple[str, dict]]":
         """This exchange's *complete* prompt, as an ordered list of
@@ -1060,14 +1066,14 @@ class LlmHandlerServer:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_terminal(handle.call_label, kind="error", error=error)
+            self._finalize_terminal(handle.call_label, kind="error", request=request, error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_terminal(handle.call_label, kind="cancelled")
+            self._finalize_terminal(handle.call_label, kind="cancelled", request=request)
             finalized = True
 
         def finalize_success(response_message: dict) -> None:

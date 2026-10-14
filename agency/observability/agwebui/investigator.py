@@ -561,6 +561,8 @@ def normalize_trace(trace, entry, summary=None):
         captured_response = (
             visible_model_response(attrs.get("llm.response")) if kind == "model" else None
         )
+        from .causal_graph import messages_evidence
+
         action = {
             "id": attrs.get("span_id") or attrs.get("agency.span_id") or f"action-{len(actions)}",
             "agent": agent,
@@ -578,6 +580,9 @@ def normalize_trace(trace, entry, summary=None):
             "context": context,
             "model": attrs.get("model"),
             "model_response": captured_response,
+            "causal_evidence": messages_evidence(attrs.get("llm.messages"), captured_response)
+            if kind == "model"
+            else None,
             "tool_call_ids": response_tool_ids(captured_response),
             "model_tool_call_id": attrs.get("model_tool_call_id"),
             "model_id": attrs.get("model_id"),
@@ -724,7 +729,11 @@ def load_run(path: str, modified: float, entry_json: str):
     entry = json.loads(entry_json)
     if entry.get("format") == "native_events":
         return normalize_native_events(trace_path, entry)
-    return normalize_trace(json.loads(trace_path.read_text()), entry, summary)
+    from .causal_graph import enrich_saved_evidence
+
+    return enrich_saved_evidence(
+        normalize_trace(json.loads(trace_path.read_text()), entry, summary), trace_path
+    )
 
 
 def normalize_native_events(path, entry):
