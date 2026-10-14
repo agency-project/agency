@@ -230,13 +230,15 @@ class agwebui:
         port: int = 7860,
         linger: bool = True,
         ui_tasks: dict | None = None,
+        host: str = "0.0.0.0",
         **kwargs,
     ) -> None:
         """Run *fn(\\*args, \\*\\*kwargs)* with the web UI active.
 
         Starts the server subprocess first, waits for it to be ready, then
         calls *fn* in the current thread.  Blocks until *fn* completes and
-        (if *linger=True*) until the user presses Ctrl+C.
+        (if *linger=True*) until the user presses Ctrl+C. *host* is the
+        server's bind address; pass ``"127.0.0.1"`` for a local-only viewer.
 
         Wraps the call in ``agutil.sigterm_as_exit()`` -- see its docstring
         for why a plain `kill <pid>` needs that at all (short version: with
@@ -293,6 +295,8 @@ class agwebui:
                 str(run_dir),
                 "--port",
                 str(port),
+                "--host",
+                host,
             ],
             stdout=server_log,
             stderr=server_log,

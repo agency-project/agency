@@ -182,8 +182,12 @@ class agDataLogger:
         term_message: "str | None" = None,
         print_to_terminal: bool = True,
         flush: bool = False,
+        timestamp: "float | None" = None,
     ) -> None:
-        timestamp = time.time()
+        # A reporter that learns of an event after the fact (e.g. a batched
+        # telemetry export carrying its own measured time) passes that time
+        # here. Row ids still follow arrival order.
+        timestamp = time.time() if timestamp is None else timestamp
         payload_json = json.dumps(payload)
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
@@ -258,12 +262,13 @@ class agDataLogger:
         object: "str | None" = None,
         term_message: "str | None" = None,
         print_to_terminal: bool = True,
+        timestamp: "float | None" = None,
     ) -> None:
         """Atomically clear every `stream_deltas` row for *call_label* (both
         already-flushed and still-pending), store each distinct block
         exactly once in the agent-global `blocks` table (keyed by content
-        hash)."""
-        timestamp = time.time()
+        hash). *timestamp* is as for record_event()."""
+        timestamp = time.time() if timestamp is None else timestamp
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None and print_to_terminal:

@@ -12,6 +12,29 @@ from collections import OrderedDict
 from pathlib import Path
 
 
+# Controllable processes that are not Agency agents, e.g. a standalone
+# interactive Claude Code session (agency/sessions/claude_code.py). Each needs
+# only pause(), resume() and stop(force=...); they accept no queued messages,
+# redirects or tasks, since a human drives them through their own terminal.
+_standalone_targets: "dict[str, object]" = {}
+_standalone_lock = threading.Lock()
+
+
+def register_standalone_target(name: str, target) -> None:
+    with _standalone_lock:
+        _standalone_targets[name] = target
+
+
+def unregister_standalone_target(name: str) -> None:
+    with _standalone_lock:
+        _standalone_targets.pop(name, None)
+
+
+def _standalone_snapshot() -> "dict[str, object]":
+    with _standalone_lock:
+        return dict(_standalone_targets)
+
+
 def command_key(identifier: str) -> str:
     return hashlib.sha256(identifier.encode()).hexdigest()
 
@@ -76,6 +99,8 @@ class ProfilerRelay:
                 "redirect": redirect,
                 "run": task_specs,
             }
+        for name in _standalone_snapshot():
+            capabilities[name] = {"queue_message": False, "redirect": [], "run": []}
         atomic_json(
             self.directory / ".session",
             {
@@ -326,6 +351,7 @@ class ProfilerRelay:
             return receipt
         targets = command.get("targets") or []
         by_name = {str(target.agname): target for target in agent.all()}
+        by_name.update(_standalone_snapshot())
         for name in targets:
             self._record_event(receipt, command, name, "requested")
             result = {"agname": name, "state": "failed"}
