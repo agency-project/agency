@@ -2,7 +2,7 @@
 
 The execution profiler (`/profiler`) has one Profiler navigation tab containing Activity, LLM, Tools and Systems
 category views, plus **Critical Path** for
-[observed dependency chains](architecture/observability.md#profiler-critical-path).
+[observed dependency chains](architecture/observability.md#critical-path).
 Trajectory and other execution views have a six-slot summary
 and a collapsible category panel; the detailed Profiler tab hides this repeated
 summary. Category, expansion

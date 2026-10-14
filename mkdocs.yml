@@ -14,6 +14,7 @@ nav:
   - Guides:
       - Configuration and providers: guides/configuration.md
       - Profiling and viewing runs: guides/profiling.md
+      - Live metrics and profiler views: live-metrics.md
       - Host setup: guides/host-setup.md
       - Checkpoints: guides/checkpoints.md
       - Development: guides/development.md

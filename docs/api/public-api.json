@@ -526,6 +526,7 @@
         "summary_table"
       ],
       "excluded_members": {
+        "active_output_dir": "Runtime telemetry helper used to locate the active profiling session's output directory; not an application profiling entry point.",
         "container_cgroup_parent": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
         "container_started": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
         "container_stopped": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
@@ -747,6 +748,18 @@
       "API_ERROR_EXCS": {
         "object": "agency.llm.agllm.API_ERROR_EXCS",
         "rationale": "Backend/engine/adapter extension protocol. Applications select implementations through namespaced configuration and Agent; diagnostic examples may use these internals directly."
+      },
+      "ProviderResponseError": {
+        "object": "agency.llm.agllm.ProviderResponseError",
+        "rationale": "Backend response validation exception handled by the engine and harness adapters; application failures are exposed through agerror."
+      },
+      "StreamInterruptedError": {
+        "object": "agency.llm.agllm.StreamInterruptedError",
+        "rationale": "Backend response validation exception handled by the engine and harness adapters; application failures are exposed through agerror."
+      },
+      "UnusableResponseError": {
+        "object": "agency.llm.agllm.UnusableResponseError",
+        "rationale": "Backend response validation exception handled by the engine and harness adapters; application failures are exposed through agerror."
       }
     },
     "agency.engine": {

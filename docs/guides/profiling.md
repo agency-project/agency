@@ -41,7 +41,7 @@ The three navigation views are **Execution Trajectory**, **Timeline**, and
 **Profiler**. Profiler contains Activity, LLM, Tools, Systems, and Critical Path
 categories. Missing measurements stay unavailable. See
 [live metrics](../live-metrics.md) for metric scopes and measurement boundaries,
-[Critical Path](../architecture/observability.md#profiler-critical-path) for
+[Critical Path](../architecture/observability.md#critical-path) for
 observed dependencies, and [live trajectory](profiling/live-trajectory.md) for
 replay, history, and execution controls.
 

@@ -47,7 +47,7 @@ For incremental execution, replay, provenance, and verification details, see
 - **Timeline:** agent calls and measured system resources on a shared
   wall-clock axis, with the same selection and time cursor.
 - **Profiler:** Activity, LLM, Tools and Systems measurements, plus
-  [Critical Path](../../architecture/observability.md#profiler-critical-path)
+  [Critical Path](../../architecture/observability.md#critical-path)
   for observed dependencies and explicitly qualified gaps.
 - **Removed views:** Resources & waits, Context & information, the tandem
   trace board and Compare runs are no longer in the navigation. Their recorded

@@ -18,7 +18,6 @@ As AI agents execute longer workflows, invoke tools, and run concurrently, under
 **Agency 0.1** is an open-source platform for observing, debugging, profiling, and controlling agent execution. It connects model requests, tool calls, and system-level activity in one environment, so you can investigate a run while it happens and analyze what happened afterward.
 
 <!-- TODO(release): Replace with an actual product recording. -->
-![Agency live execution overview — demo GIF placeholder](docs/assets/agency-overview.gif)
 
 ## What you can do with Agency
 
@@ -29,7 +28,6 @@ Follow agent execution as it happens. Inspect model requests, tool calls, tool o
 The same view provides a historical execution record when a run finishes.
 
 <!-- TODO(release): Record multiple agents executing, inspecting an invocation, and exercising a supported control. -->
-![Live Trajectory demo GIF placeholder](docs/assets/agency-live-trajectory.gif)
 
 ### Critical Path Profiler — find what determines completion time
 
@@ -38,7 +36,6 @@ See how work and dependencies unfold on a shared wall-clock axis, with separate 
 Critical-path analysis is primarily a **post-run** workflow: use Live Trajectory while agents are running, then examine the recorded execution to understand its bottlenecks.
 
 <!-- TODO(release): Show agent lanes, dependencies, critical path, and time-axis zoom. -->
-![Critical Path Profiler demo GIF placeholder](docs/assets/agency-critical-path.gif)
 
 ### Detailed Profiler — investigate where time and resources go
 
@@ -47,7 +44,6 @@ Drill into recorded evidence across **LLM requests, tool calls, and systems**: d
 Agency distinguishes recorded measurements from interpretations. Missing metrics are shown as unavailable rather than estimated.
 
 <!-- TODO(release): Show LLM, tool, and systems profiling views. -->
-![Detailed Profiler demo GIF placeholder](docs/assets/agency-detailed-profiler.gif)
 
 ### Compare Runs — understand what changed
 
@@ -56,7 +52,6 @@ Compare completed runs side by side: execution trajectories, model and tool acti
 Comparisons use **historical run data only**. Agency does not invent missing data or assign an unsupported cause to a difference.
 
 <!-- TODO(release): Show selection of two historical runs and trajectory/metrics comparison. -->
-![Compare Runs demo GIF placeholder](docs/assets/agency-compare-runs.gif)
 
 ## Underneath your agent stack
 
