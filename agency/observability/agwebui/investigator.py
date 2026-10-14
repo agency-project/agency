@@ -476,6 +476,12 @@ def normalize_trace(trace, entry, summary=None):
     intervals = []
     counters = defaultdict(list)
     sandbox_owners = defaultdict(set)
+    # Saved collector metadata identifies process generations. Do not merge
+    # identically labelled RSS/CPU counters from independent Chrome PID tracks.
+    process_by_pid = defaultdict(list)
+    for process in (summary or {}).get("process_metrics", []):
+        if isinstance(process, dict) and process.get("identity") and process.get("pid") is not None:
+            process_by_pid[process["pid"]].append(process)
 
     def remember_owner(agent, sandbox):
         if isinstance(agent, str) and agent and isinstance(sandbox, str) and sandbox:
@@ -571,6 +577,7 @@ def normalize_trace(trace, entry, summary=None):
             "intent": intent,
             "start": start,
             "duration": elapsed,
+            "missing_end": number(span.get("dur")) is None or span.get("dur", 0) < 0,
             "outcome": outcome,
             "command": command if name.startswith("tool:") else "",
             "arguments": attrs.get("tool.arguments") if name.startswith("tool:") else None,
@@ -629,11 +636,36 @@ def normalize_trace(trace, entry, summary=None):
         if not isinstance(event, dict) or event.get("ph") != "C" or number(event.get("ts")) is None:
             continue
         name = event.get("name", "")
+        info = {}
         if name.startswith("agency-counter-v1:"):
             info = object_value(name.removeprefix("agency-counter-v1:"))
             info = info if isinstance(info, dict) else {}
             presentation_owners(info)
             name = info.get("label", name)
+        if name in {"rss_mb", "vms_mb", "cpu_percent", "io_read_mb_s", "io_write_mb_s"}:
+            path = info.get("path", [])
+            identities = (
+                {
+                    part[0].removeprefix("process:")
+                    for part in path
+                    if isinstance(part, list)
+                    and part
+                    and isinstance(part[0], str)
+                    and part[0].startswith("process:")
+                }
+                if isinstance(path, list)
+                else set()
+            )
+            candidates = process_by_pid.get(event.get("pid"), [])
+            identity = next(iter(identities)) if len(identities) == 1 else None
+            if identity is None and len(candidates) == 1:
+                identity = candidates[0]["identity"]
+            if identity is None and info.get("version") == 1 and event.get("pid") is not None:
+                # The sampler allocates a fresh Chrome PID track on PID reuse.
+                # Keep its trace identity when OS generation metadata is absent.
+                identity = f"trace-{event['pid']}"
+            if identity:
+                name = f"process:{identity}:{name}"
         for key, value in (event.get("args") or {}).items():
             if number(value) is not None:
                 counters[name if key == "value" else f"{name} {key}"].append(

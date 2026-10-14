@@ -73,7 +73,7 @@ export function actionState(action) {
   const status=action.request_state||action.outcome||'unknown';
   const type=modelCall(action)?'Request':controlCall(action)?'Control':action.kind==='syscall'?'System call':['queue','dependency','setup'].includes(action.kind)?'Operation':'Tool';
   const states={running:['◷',`${type} running`,'running'],success:['✓',`${type} completed`,'success'],completed:['✓',`${type} completed`,'success'],failed:['!',`${type} failed`,'failed'],failure:['!',`${type} failed`,'failed'],cancelled:['■',`${type} cancelled`,'cancelled'],incomplete:['?',`${type} incomplete`,'unknown'],queued:['◷',controlCall(action)?'Context queued':'Request queued','queue'],context_committed:['↳','Retained context committed · model consumption unknown','success'],submitted:['↳','Invocation submitted · completion unconfirmed','queue'],blocked:['◷','Request blocked','queue'],requested:['◷','Requested · not acknowledged','queue'],accepted:['↳','Accepted · application unconfirmed','queue'],observed:['✓','Local outcome observed','success'],applied:['✓','Application recorded','success'],delivered:['↳','Input delivered · response unconfirmed','success'],partial:['!','Partial outcome','failed'],unknown:['?','Outcome unknown','unknown']};
-  const [icon,label,semantic]=states[status]||['?',`${type} state: ${status}`,'unknown'];
+  const [icon,label,semantic]=states[status]||(['pending','waiting'].includes(status)?['◷',`${type} ${status}`,'queue']:['?',`${type} state: ${status}`,'unknown']);
   return {status,icon,label,semantic};
 }
 
@@ -133,6 +133,36 @@ export function eventCard(action,run={}) {
   const formatted=prettyJson(primary);
   const type=modelCall(action)?'model':controlCall(action)?'control':action.kind==='syscall'?'syscall':['queue','dependency','setup'].includes(action.kind)?'operation':'tool';
   return {primary:clipped(formatted??primary,360),json:formatted!=null,type,typeLabel:{model:'Model',control:'Control',operation:'Operation',tool:'Tool',syscall:'System call'}[type],secondary,state,elapsed,elapsedText:elapsed==null?'Elapsed unavailable':`${state.status==='running'?'Elapsed':'Wall interval'} ${time(elapsed)}`,preview,previewLabel,usage,modelSource,scope:modelCall(action)?'model request':controlCall(action)?'human intervention':action.kind==='syscall'?'system call':'tool call'};
+}
+
+// Cheap, deterministic presentation only. Compound shell commands retain their
+// recorded text rather than suggesting that one operation describes the whole.
+export function activitySummary(action,card=eventCard(action)) {
+  const compact=value=>clipped(String(value).replace(/\s+/g,' ').trim(),120);
+  if(card.type==='model')return {text:compact(card.primary),technical:false};
+  if(meaningful(action.intent))return {text:compact(action.intent),technical:false};
+  const command=toolCommand(action).trim();
+  if(!/[;&|\n]/.test(command)){
+    for(const [pattern,summary] of [
+      [/^(?:\S*\/)?pytest(?:\s|$)|^(?:\S*\/)?python[\d.]*\s+-m\s+pytest(?:\s|$)/,'Run tests'],
+      [/^git\s+diff(?:\s|$)/,'Inspect changes'],
+      [/^git\s+status(?:\s|$)/,'Check working tree'],
+      [/^git\s+log(?:\s|$)/,'Review commit history'],
+      [/^curl\s+(?:-I|--head)(?:\s|$)/,'Inspect response headers'],
+      [/^(?:rg|grep)\s/,'Search files'],
+    ])if(pattern.test(command))return {text:summary,technical:false};
+  }
+  const args=parsed(action.arguments),path=args&&typeof args==='object'&&(args.path||args.file_path);
+  if(typeof path==='string'&&/^(?:read|write|edit)(?:[_ -]?file)?$/i.test(card.secondary))
+    return {text:compact(path),technical:true};
+  return {text:compact(card.json?'Arguments available in details':command),technical:card.type!=='control'};
+}
+
+export function activityClock(action,run={}) {
+  if(action.missing_start||String(action.source||'').includes('timestamp_missing')||!finite(action.start))return null;
+  const origin=finite(run.time_origin)?run.time_origin:0;
+  const executionStart=finite(run.execution_started_at)?Math.max(0,run.execution_started_at-origin):null;
+  return {trace:action.start,execution:executionStart==null?null:action.start-executionStart};
 }
 
 export function renderEventCard(action,run={}) {

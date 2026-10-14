@@ -1,11 +1,11 @@
-.control-confirmation {box-sizing:border-box;width:min(520px,calc(100vw - 40px));max-height:calc(100vh - 60px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:22px;font:13px/1.6 var(--sans,system-ui,sans-serif)}
+.control-confirmation {box-sizing:border-box;width:min(520px,calc(100vw - 40px));max-height:calc(100vh - 60px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:22px;font:var(--font-weight-regular) var(--font-size-ui)/var(--line-height-ui) var(--sans,system-ui,sans-serif);font-variant-numeric:tabular-nums}
 .control-confirmation::backdrop {background:var(--overlay)}
-.control-confirmation h2 {font-size:18px;margin:0 0 10px}
+.control-confirmation h2 {font-size:var(--font-size-heading);margin:0 0 10px}
 .confirmation-execution,.confirmation-targets {overflow-wrap:anywhere;white-space:pre-wrap}
 .confirmation-targets {max-height:180px;overflow:auto;padding-left:22px}
 .confirmation-status {color:var(--amber)}
 .confirmation-actions {display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
-.confirmation-actions button {font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:7px 12px;cursor:pointer}
+.confirmation-actions button {font:inherit;font-variant-numeric:tabular-nums;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:7px 12px;cursor:pointer}
 .confirmation-actions [data-confirm-submit] {border-color:var(--red);color:var(--red);background:var(--danger-bg)}
 .confirmation-actions button:disabled {opacity:.45;cursor:default}
 .confirmation-actions button:focus-visible,.confirmation-targets:focus-visible {outline:2px solid var(--blue);outline-offset:3px}

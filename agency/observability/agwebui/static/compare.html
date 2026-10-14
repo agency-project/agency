@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
+<title>Agency · Compare Runs</title>
+<link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/investigator.css"><link rel="stylesheet" href="/static/compare.css">
+</head>
+<body class="profiler-workspace compare-workspace">
+<div id="workspace">
+<aside class="sidebar"><a class="brand" href="/profiler"><span class="brand-mark">a</span><span>agency<span class="brand-caption">Execution profiler</span></span></a><div class="side-caption">Views</div><nav class="compare-main-nav" aria-label="Workspace views"><a href="/profiler?view=trajectory">Execution Trajectory</a><a href="/profiler?view=profiler">Profiler</a><a href="/profiler?view=critical">Critical Path</a><a href="/compare" class="active" aria-current="page">Compare Runs</a></nav><div class="side-bottom"><span>Historical recordings only</span></div></aside>
+<div class="workspace-main"><header class="topbar"><h1>Compare Runs</h1><div class="top-actions"><button id="refresh">↻ Refresh catalog</button><button id="swap" disabled>Swap A ⇄ B</button></div></header>
+<section class="compare-selection" aria-label="Select historical runs"><div><label for="run-a">Run A — Baseline</label><select id="run-a"><option value="">Select a historical run</option></select><div id="meta-a" class="compare-run-meta"></div></div><div><label for="run-b">Run B — Comparison</label><select id="run-b"><option value="">Select a historical run</option></select><div id="meta-b" class="compare-run-meta"></div></div></section>
+<nav id="compare-views" class="compare-tabs" aria-label="Comparison views"></nav>
+<main id="compare-content" tabindex="-1"><p class="loading-state">Reading historical run catalog…</p></main>
+<aside id="compare-inspector" class="compare-inspector" aria-label="Recorded operation details" hidden></aside>
+<footer class="statusbar"><span id="compare-status" role="status" aria-live="polite">Loading…</span><span>Recorded values · B − A · no judgments</span></footer>
+</div></div><script type="module" src="/static/compare.js"></script>
+</body></html>

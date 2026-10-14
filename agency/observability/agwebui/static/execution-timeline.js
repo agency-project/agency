@@ -90,7 +90,7 @@ export class ExecutionTimeline {
     let axis=this.canvas.querySelector('.execution-time-axis');
     if(!axis){axis=document.createElement('div');axis.className='execution-time-axis';this.canvas.append(axis);}
     const step=10**Math.floor(Math.log10(100/scale)),tickStep=[1,2,5,10].map(n=>n*step).find(n=>n*scale>=80)||step*10;
-    let ticks='<span class="timeline-track-label">WALL-CLOCK TIME</span>';
+    let ticks='<span class="timeline-track-label">Wall-clock time</span>';
     for(let t=Math.ceil(from/tickStep)*tickStep;t<=Math.min(to,this.extent);t+=tickStep)ticks+=`<span class="timeline-tick" style="left:${left+t*scale}px">${seconds(t)}</span>`;
     const markers=measurementMarkers(run,this.extent);
     for(const marker of markers)ticks+=`<span class="timeline-measure-flag ${marker.kind}" style="left:${left+marker.at*scale}px" title="${escape(marker.label)}">${escape(marker.label)}</span>`;

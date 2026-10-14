@@ -423,7 +423,7 @@ function colorizeTermMessage(termMessage, color, ts) {
   if (!m || !color) {
     return tsPrefix + ansiToHtml(termMessage);
   }
-  const tag = `<span style="color:var(--text-secondary);font-weight:bold">${esc(m[1])}</span>`;
+  const tag = `<span style="color:var(--text-secondary);font-weight:var(--font-weight-medium)">${esc(m[1])}</span>`;
   return tsPrefix + tag + ansiToHtml(m[2]);
 }
 
@@ -780,7 +780,7 @@ function buildHistoryHtml(agname) {
             argsText = esc(b.arguments || '');
           }
           frags.push(
-            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(b.name || '?')} ▶</span>\n` +
+            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ Tool ${esc(b.name || '?')} ▶</span>\n` +
             `<span class="body-tool">${argsText}</span></div>`
           );
         } else if (b.type === 'metadata' && state.fullLogsEnabled) {
@@ -802,7 +802,7 @@ function buildHistoryHtml(agname) {
         if (b.type === 'tool_result') {
           const name = toolNamesByCallId.get(b.tool_call_id) || '?';
           frags.push(
-            `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(name)} ✓</span>\n` +
+            `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ Tool ${esc(name)} ✓</span>\n` +
             `<span class="body-tool">${esc(b.text || '')}</span></div>`
           );
         }

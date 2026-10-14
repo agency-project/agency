@@ -64,8 +64,8 @@ or test fixtures. When replacing documentation, preserve the prior page under
 
 Benchmarks remain under `benchmarks/`; their READMEs describe their own setup
 and measurement requirements. See [development notes](docs/guides/development.md)
-and the [Stage 1 verification record](docs/archive/documentation-refactor.md) for
-current documentation follow-ups.
+and the [earlier verification records](docs/archive/documentation-refactor.md) for
+historical documentation follow-ups; recheck those findings against current source.
 
 ## Documentation
 

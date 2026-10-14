@@ -993,6 +993,11 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
+# Compare has a read-only router and shares the historical investigator store.
+from .compare import create_router as _compare_router
+
+app.include_router(_compare_router(_profiler_dir))
+
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
@@ -1008,7 +1013,7 @@ async def _no_cache_static(request, call_next):
 
 @app.get("/")
 async def index():
-    return FileResponse(_STATIC / "index.html")
+    return FileResponse(_STATIC / "investigator.html")
 
 
 def _profile_trace_path() -> Path:
@@ -1220,7 +1225,7 @@ async def _trajectory_replay_data(run_id):
         await asyncio.to_thread(source.refresh)
         with source.lock:
             run = {
-                key: value
+                key: dict(value) if key == "measurement" else value
                 for key, value in source.model.run.items()
                 if key
                 in {
@@ -1235,6 +1240,8 @@ async def _trajectory_replay_data(run_id):
                     "task",
                     "format",
                     "time_origin",
+                    "execution_started_at",
+                    "measurement",
                 }
             }
             origin = source.model.origin or 0
@@ -1355,6 +1362,7 @@ async def _replay_stream(ws):
     # A client that seeks out of a live view, or reconnects, resumes as it was.
     playing = ws.query_params.get("play") == "1"
     speed = _replay_speed(ws.query_params.get("speed"), 1.0)
+    seek_id = int(ws.query_params["seek_id"]) if "seek_id" in ws.query_params else None
 
     def exhausted():
         # A running execution keeps producing evidence: its playback idles
@@ -1397,11 +1405,31 @@ async def _replay_stream(ws):
                 name: [point for point in points if point[0] <= clock]
                 for name, points in run.get("counters", {}).items()
             }
+        duration = max(run["duration"], events[-1]["ts"] if events else 0)
+        started = run.get("execution_started_at")
+        measurement = run.get("measurement") or {}
+        end_offset = measurement.get("end_offset")
+        wall_end = (
+            min(duration, end_offset)
+            if end_offset is not None and not measurement.get("held")
+            else duration
+        )
+        wall_start = (
+            min(wall_end, max(0, started - (run.get("time_origin") or 0)))
+            if started is not None
+            else 0
+        )
         meta = {
             "position": cursor,
             "total": len(events),
             "clock": clock,
-            "duration": max(run["duration"], events[-1]["ts"] if events else 0),
+            "duration": duration,
+            "wall_clock": {
+                "start": wall_start,
+                "end": wall_end,
+                "pending": "execution_started_at" in run and started is None,
+            },
+            "seek_id": seek_id,
             "playing": playing,
             "finished": exhausted(),
             "speed": speed,
@@ -1455,6 +1483,7 @@ async def _replay_stream(ws):
             else:
                 run = latest_run
         if kind == "seek":
+            seek_id = command.get("seek_id")
             target = float(command.get("clock", 0))
             if not math.isfinite(target):
                 target = 0
