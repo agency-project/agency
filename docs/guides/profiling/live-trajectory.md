@@ -53,8 +53,15 @@ Server startup requires no viewer download or frontend build.
 
 ## Pause and inspect live execution
 
-The session bar separates **Freeze view** / **Unfreeze view** from
-**Pause Agents** / **Resume Agents**. Freeze view holds event cards, details,
+The time cursor carries **Freeze view** / **Unfreeze view** with **Jump to
+live** beside it, separate from **Pause Agents** / **Resume Agents**, which
+sit with the other agent controls and the session actions directly under the
+Execution Trajectory heading. The cursor is a
+playback scrubber: it spans the measured wall clock from the first agent
+execution to its end and advances with it second for second. Releasing it at
+an earlier instant keeps playing from there at 1×; if the view is frozen it
+stays frozen there until you unfreeze. Dragging it to the end, or **Jump to
+live**, rejoins the running execution. Freeze view holds event cards, details,
 timeline spans, and metrics while backend ingestion continues. Connection and
 authoritative agent controls remain live, and the frozen-view label reminds you
 that agents may still be running. Counts distinguish newly buffered calls from
@@ -231,7 +238,8 @@ binding is unchanged.
 ## Replay and investigation
 
 Select a live or saved execution, then **Replay recorded events**. Replay starts
-paused; use **Next event**, **Play replay**, speed, or **Restart replay**.
+frozen at the beginning; use **Unfreeze view** on the time cursor to play at the
+selected speed (1× by default), **Next event**, or **Restart replay**.
 `mode=replay` is preserved in the URL. Actual saved spans supply start/end
 boundaries, and results, usage, context, and final metadata arrive only at the
 recorded end. Reconstructed boundaries are identified as such in raw detail.
@@ -239,7 +247,7 @@ Replay exhaustion is separate from a recorded final execution status.
 Replay pause controls playback only; saved/replay runs never expose live
 execution controls. Scrubbing the time cursor rebuilds the canonical event prefix,
 including paused/resumed agent state and resource samples. Live replay continues
-reading new evidence while its selected clock stays fixed. Reconnect preserves
+reading new evidence; its clock moves only while playing and holds while frozen. Reconnect preserves
 the selected time, including positions between sparse events.
 
 The **Timeline** tab follows Trajectory. Agent rows and sampled resource tracks
@@ -301,7 +309,7 @@ browser projection retains 2,000 recent completed calls, 200 in-flight calls,
 up to 500 reading/inspection pins, and 2,000 samples per resource series. Coverage
 text identifies the window; live export and recorded review retain complete
 source evidence. Reconnect snapshots and incremental delivery merge by stable
-identity. Moving the time cursor holds the shared overview; **Jump to live**
+identity. Moving the time cursor plays the recording from that instant; **Jump to live**
 returns all reading windows to live.
 
 ## What the evidence establishes

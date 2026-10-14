@@ -1,4 +1,6 @@
 from __future__ import annotations
+import contextvars
+from contextlib import contextmanager, suppress
 from typing import Generator
 import httpx
 import openai  # noqa: F401 — unused directly; tests patch agency.agllm.openai.OpenAI
@@ -40,6 +42,112 @@ _VLLM_EXTRA_GEN_FIELDS = frozenset(
         "guided_regex",
     }
 )
+
+
+_METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
+
+# Response headers that identify one upstream call, kept so an unusable
+# response can be looked up in the gateway's and the provider's own logs.
+# None of these is a credential.
+_RESPONSE_ID_HEADERS = (
+    "x-request-id",
+    "x-litellm-call-id",
+    "llm_provider-x-amzn-requestid",
+    "x-litellm-attempted-retries",
+)
+
+
+class UnusableResponseError(RuntimeError):
+    """The provider answered, but with nothing an agent can act on.
+
+    An HTTP 200 is not a completed turn: the body can be empty, cut off, or
+    carry a provider error in a shape the SDK does not raise for. ``reason``
+    names which, ``retryable`` says whether asking again can help (a model
+    call has no side effect until its response is delivered, so a retry is
+    always safe; it is only pointless for a request the provider rejects),
+    and ``details`` keeps whatever identifies the upstream call.
+
+    ``transient`` and ``status_code`` are what LlmHandlerServer copies into
+    the error item a harness adapter turns into an HTTP response.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int = 502,
+        details: "dict | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retryable = retryable
+        self.transient = retryable
+        self.status_code = status_code
+        self.details = dict(details or {})
+
+
+class StreamInterruptedError(UnusableResponseError):
+    """A stream ended without the event that marks a finished response."""
+
+    def __init__(self, message: str, *, details: "dict | None" = None) -> None:
+        super().__init__("stream_interrupted", message, details=details)
+
+
+class ProviderResponseError(UnusableResponseError):
+    """The provider reported a failure inside a successful HTTP response."""
+
+    # Failures of the request itself: asking again returns the same answer.
+    _REQUEST_ERROR_CODES = frozenset(
+        {
+            "invalid_prompt",
+            "invalid_request_error",
+            "context_length_exceeded",
+            "content_filter",
+            "content_policy_violation",
+            "validation_error",
+            "unsupported_value",
+        }
+    )
+    # Quota failures are transient, but the caller must back off rather than
+    # immediately ask again -- so they are never retried in place.
+    _RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "insufficient_quota", "throttling"})
+
+    def __init__(self, message: str, *, code: "str | None" = None, details=None) -> None:
+        code = str(code) if code else None
+        request_error = code in self._REQUEST_ERROR_CODES
+        rate_limited = code in self._RATE_LIMIT_CODES
+        super().__init__(
+            "rate_limited" if rate_limited else "provider_error",
+            message,
+            retryable=not (request_error or rate_limited),
+            status_code=400 if request_error else (429 if rate_limited else 502),
+            details={**(details or {}), "code": code},
+        )
+        self.transient = not request_error
+
+
+# Which attempt of one harness request the current backend call is. Set by
+# LlmHandlerServer around each call so that instrumentation wrapped around a
+# backend (the benchmark's API telemetry) can tell a first attempt from a
+# retry, and why it was retried, without the backend API carrying it.
+_DISPATCH_ATTEMPT: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "agency_llm_dispatch_attempt", default=None
+)
+
+
+@contextmanager
+def dispatch_attempt(**fields):
+    token = _DISPATCH_ATTEMPT.set(dict(fields))
+    try:
+        yield
+    finally:
+        _DISPATCH_ATTEMPT.reset(token)
+
+
+def current_dispatch_attempt() -> "dict | None":
+    return _DISPATCH_ATTEMPT.get()
 
 
 _WARNED_ONCE: "set[tuple]" = set()
@@ -252,12 +360,58 @@ class agllm:
     def dispatch_stream(self, request: dict, on_client=None) -> "Generator[dict, None, None]":
         backend_request = self._format_context_agency_to_backend(request)
         raw_stream, client = self._call_backend_stream(backend_request, on_client)
+        response_ids = self._response_ids(raw_stream)
+        # Carried as a metadata fragment so an empty or unusable response is
+        # still traceable upstream. Emitted with the first real item (not
+        # when headers arrive) so time-to-first-item keeps its meaning, and
+        # before it so the last metadata fragment stays the one with usage.
+        ids_item = (
+            {
+                "type": "block_delta",
+                "index": _METADATA_BLOCK_INDEX,
+                "block_type": "metadata",
+                "data": {"response_ids": response_ids},
+            }
+            if response_ids
+            else None
+        )
         try:
-            yield from self._format_stream_to_agency(raw_stream)
+            try:
+                for item in self._format_stream_to_agency(raw_stream):
+                    if ids_item is not None:
+                        yield ids_item
+                        ids_item = None
+                    yield item
+            except Exception as error:
+                if response_ids and not getattr(error, "response_ids", None):
+                    with suppress(Exception):  # an exception type that rejects attributes
+                        error.response_ids = response_ids
+                raise
+            if ids_item is not None:
+                yield ids_item
         finally:
             close = getattr(client, "close", None)
             if close:
                 close()
+
+    def _response_ids(self, raw_result) -> dict:
+        """Identifiers of the upstream call behind *raw_result* (an SDK
+        stream), for tracing an unusable response in the provider's logs.
+        {} for a backend that exposes none."""
+        return {}
+
+    def output_token_cap(self) -> int:
+        """The output-token limit this backend sends with every request."""
+        llm = self.agconfig.llm
+        return int(llm.max_completion_tokens or llm.max_tokens or llm.default_max_tokens)
+
+    def with_output_token_cap(self, tokens: int) -> "agllm":
+        """A backend identical to this one except for its output-token limit.
+        Used to re-ask after a response was cut off at the limit."""
+        config = self.agconfig.clone()
+        config.llm.max_completion_tokens = int(tokens)
+        config.llm.max_tokens = None
+        return agllm.for_config(config)
 
     def _call_backend_stream(self, backend_request: dict, on_client=None):
         raise NotImplementedError
@@ -307,6 +461,17 @@ class agllm:
             if not is_system_class:
                 conversation_started = True
             if role == "assistant":
+                if any(b["type"] == "thinking" and b.get("signature") for b in blocks):
+                    # Chat Completions has no slot for a previous turn's
+                    # reasoning item, so it cannot be replayed on this wire
+                    # format. Say so instead of dropping it unseen.
+                    _warn_once(
+                        ("chat_drops_reasoning_state", self.agconfig.llm.provider),
+                        "this conversation carries reasoning state from earlier turns, "
+                        "which the Chat Completions wire format cannot send back -- the "
+                        "model will not see its previous reasoning. Use "
+                        "provider='openai_responses' to preserve it.",
+                    )
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 tool_calls = [
                     {

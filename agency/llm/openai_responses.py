@@ -17,7 +17,8 @@ as a reasoning input item next turn.
 
 from __future__ import annotations
 
-from .openai import _OpenAICompatibleBackend
+from .agllm import ProviderResponseError, StreamInterruptedError, _warn_once
+from .openai import _OpenAICompatibleBackend, _detail
 
 _RESPONSES_TYPE_PREFIX = "openai_responses_"
 _METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
@@ -92,7 +93,20 @@ def _assistant_blocks_to_items(blocks: "list[dict]") -> "list[dict]":
     items = []
     for block in blocks:
         if block["type"] == "text" and block["text"]:
-            items.append({"role": "assistant", "content": block["text"]})
+            if block.get("phase"):
+                # The model labels its own messages ("commentary" before a
+                # tool call, "final_answer" at the end) and reads the label
+                # back to tell them apart; it only fits the item form.
+                items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": block["phase"],
+                        "content": [{"type": "output_text", "text": block["text"]}],
+                    }
+                )
+            else:
+                items.append({"role": "assistant", "content": block["text"]})
         elif block["type"] == "thinking":
             # Only this backend's own reasoning is replayed. Anything else --
             # another provider's signature, or a vLLM reasoning_content trace
@@ -100,6 +114,13 @@ def _assistant_blocks_to_items(blocks: "list[dict]") -> "list[dict]":
             # dropped; the conversation's text and tool calls are kept.
             if (block.get("signature") or "").startswith(ENCRYPTED_REASONING_TAG):
                 items.append(_thinking_block_to_reasoning_item(block))
+            elif block.get("signature"):
+                _warn_once(
+                    ("responses_drops_foreign_reasoning",),
+                    "dropping a reasoning block that carries another provider's opaque "
+                    "state: it cannot be replayed on /v1/responses, so the model will not "
+                    "see that turn's reasoning.",
+                )
         elif block["type"] == "tool_use":
             items.append(
                 {
@@ -198,7 +219,10 @@ def _message_item_to_blocks(item: dict, first_index: int) -> "list[dict]":
     for part in item.get("content") or []:
         index = first_index + len(blocks)
         if part.get("type") == "output_text":
-            blocks.append({"type": "text", "index": index, "text": part.get("text", "")})
+            block = {"type": "text", "index": index, "text": part.get("text", "")}
+            if item.get("phase"):
+                block["phase"] = item["phase"]
+            blocks.append(block)
         else:
             # e.g. a "refusal" part -- kept, like the Chat Completions
             # backend keeps its refusal field, rather than dropped.
@@ -267,11 +291,39 @@ def _serialize_responses_usage(usage) -> "dict | None":
         return None
     prompt_tokens = getattr(usage, "input_tokens", 0) or 0
     completion_tokens = getattr(usage, "output_tokens", 0) or 0
-    return {
+    serialized = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
     }
+    # cached_tokens is a subset of prompt_tokens (the OpenAI convention the
+    # Bedrock surface follows); cache_write_tokens is the part of the
+    # uncached remainder that was written to the cache.
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    for key, value in (
+        ("cached_tokens", _detail(input_details, "cached_tokens")),
+        ("cache_write_tokens", _detail(input_details, "cache_write_tokens")),
+        ("reasoning_tokens", _detail(output_details, "reasoning_tokens")),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool):
+            serialized[key] = value
+    return serialized
+
+
+def _response_failure(response) -> ProviderResponseError:
+    """A response the provider itself marked failed (status "failed", or an
+    "error" stream event). The code and message are the provider's own."""
+    error = getattr(response, "error", None)
+    code = _detail(error, "code") if error is not None else None
+    message = (_detail(error, "message") if error is not None else None) or str(
+        error if error is not None else "no error detail"
+    )
+    return ProviderResponseError(
+        f"provider reported a failed response: {message}",
+        code=code,
+        details={"response_id": getattr(response, "id", None)},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +375,16 @@ def _finished_item_deltas(item, output_index: int, indexes: _StreamBlockIndexes)
     if item_type == "message":
         for content_index, part in enumerate(data.get("content") or []):
             if part.get("type") == "output_text":
-                continue  # already streamed through response.output_text.delta
+                # The text already streamed through response.output_text.delta;
+                # only the item knows its phase.
+                if data.get("phase"):
+                    yield {
+                        "type": "block_delta",
+                        "index": indexes.of(output_index, "text"),
+                        "block_type": "text",
+                        "phase": data["phase"],
+                    }
+                continue
             yield {
                 "type": "block_delta",
                 "index": indexes.of(output_index, "part", content_index),
@@ -366,8 +427,13 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
             # encrypted_content and can't be replayed under store=False.
             include=["reasoning.encrypted_content"],
         )
+        reasoning = {}
         if llm.reasoning_effort is not None:
-            kwargs["reasoning"] = {"effort": llm.reasoning_effort}
+            reasoning["effort"] = llm.reasoning_effort
+        if llm.reasoning_summary is not None:
+            reasoning["summary"] = llm.reasoning_summary
+        if reasoning:
+            kwargs["reasoning"] = reasoning
         if llm.temperature is not None:
             kwargs["temperature"] = llm.temperature
         if llm.top_p is not None:
@@ -392,6 +458,8 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
             client.close()
 
     def _format_context_backend_to_agency(self, raw_result) -> dict:
+        if getattr(raw_result, "status", None) == "failed":
+            raise _response_failure(raw_result)
         blocks = _output_items_to_blocks(getattr(raw_result, "output", None))
         usage = _serialize_responses_usage(getattr(raw_result, "usage", None))
         stop_reason = _stop_reason(raw_result)
@@ -414,12 +482,19 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
         client = self.make_client(self._client_timeout())
         if on_client is not None:
             on_client(client)
-        raw_stream = client.responses.create(**backend_request, stream=True)
+        try:
+            raw_stream = client.responses.create(**backend_request, stream=True)
+        except BaseException:
+            client.close()
+            raise
         return raw_stream, client
 
     def _format_stream_to_agency(self, raw_stream):
         indexes = _StreamBlockIndexes()
+        events = 0
+        terminated = False
         for event in raw_stream:
+            events += 1
             event_type = getattr(event, "type", None)
             if event_type == "response.output_text.delta":
                 yield {
@@ -448,12 +523,23 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
             elif event_type == "response.output_item.done":
                 yield from _finished_item_deltas(event.item, event.output_index, indexes)
             elif event_type in ("response.completed", "response.incomplete"):
+                terminated = True
                 yield from self._final_deltas(event.response)
             elif event_type == "response.failed":
-                error = getattr(event.response, "error", None)
-                raise RuntimeError(f"OpenAI response failed: {getattr(error, 'message', error)}")
+                raise _response_failure(event.response)
             elif event_type == "error":
-                raise RuntimeError(f"OpenAI stream error: {getattr(event, 'message', event)}")
+                raise ProviderResponseError(
+                    f"provider stream error: {getattr(event, 'message', None) or event}",
+                    code=getattr(event, "code", None),
+                )
+        if not terminated and self.agconfig.llm.strict_stream_termination:
+            # No response.completed / response.incomplete: the stream was cut.
+            # Items already seen (a reasoning item, half a function call) are
+            # a fragment of a response, never a finished turn.
+            raise StreamInterruptedError(
+                f"responses stream ended without a terminal event after {events} event(s)",
+                details={"events": events},
+            )
 
     @staticmethod
     def _final_deltas(response):

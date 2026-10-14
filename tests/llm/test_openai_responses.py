@@ -612,3 +612,287 @@ def test_openai_encrypted_reasoning_never_becomes_anthropic_signature():
         if block.get("type") == "tool_result"
     ]
     assert tool_results == ["toolu_1", "call_2"]
+
+
+# ---------------------------------------------------------------------------
+# Responses that are not a finished turn, and state that must survive a turn.
+#
+# Shapes are those recorded from GPT-6.1 Sol through LiteLLM 1.104.1 to
+# Bedrock's /openai/v1/responses (analysis/sol_integration/data).
+# ---------------------------------------------------------------------------
+
+from agency.llm.agllm import ProviderResponseError, StreamInterruptedError  # noqa: E402
+
+CUT_ARGUMENTS = '{"cmd":"cat <<\'EOF\' > notes.txt\\n1. Linux scheduling determines which'
+
+
+def test_stream_that_ends_without_a_terminal_event_is_interrupted():
+    events = [
+        _ev("response.created", response=_response([], status="in_progress")),
+        _ev("response.output_text.delta", output_index=0, content_index=0, delta="par"),
+    ]
+    with pytest.raises(StreamInterruptedError, match="without a terminal event after 2"):
+        list(_backend()._format_stream_to_agency(iter(events)))
+    with pytest.raises(StreamInterruptedError, match="after 0 event"):
+        list(_backend()._format_stream_to_agency(iter([])))
+
+
+def test_interrupted_stream_check_can_be_turned_off():
+    events = [_ev("response.output_text.delta", output_index=0, content_index=0, delta="par")]
+    deltas = list(_backend(strict_stream_termination=False)._format_stream_to_agency(iter(events)))
+    assert [d["text"] for d in deltas] == ["par"]
+
+
+def test_truncated_function_call_arrives_as_a_tool_call_with_stop_reason_length():
+    """Bedrock sends output_item.done for the cut-off call and only then
+    response.incomplete. The backend must carry both facts: the fragment
+    (so it is on record) and the stop reason (so nothing runs it)."""
+    call = _SdkObj(
+        type="function_call",
+        id="fc_1",
+        call_id="call_cut",
+        name="exec_command",
+        arguments=CUT_ARGUMENTS,
+        status="incomplete",
+    )
+    events = [
+        _ev("response.output_item.added", output_index=0, item=call),
+        _ev("response.function_call_arguments.delta", output_index=0, delta=CUT_ARGUMENTS),
+        _ev("response.output_item.done", output_index=0, item=call),
+        _ev(
+            "response.incomplete",
+            response=_response(
+                [call],
+                status="incomplete",
+                incomplete_reason="max_output_tokens",
+                usage=_usage(101, 64),
+            ),
+        ),
+    ]
+    deltas = list(_backend()._format_stream_to_agency(iter(events)))
+    tool = next(d for d in deltas if d.get("block_type") == "tool_use")
+    assert (tool["id"], tool["arguments"]) == ("call_cut", CUT_ARGUMENTS)
+    assert deltas[-1]["stop_reason"] == "length"
+    assert deltas[-1]["usage"]["completion_tokens"] == 64
+
+
+@pytest.mark.parametrize(
+    "code,retryable,transient,status",
+    [
+        ("server_error", True, True, 502),
+        (None, True, True, 502),
+        ("validation_error", False, False, 400),
+        ("context_length_exceeded", False, False, 400),
+        ("rate_limit_exceeded", False, True, 429),
+    ],
+)
+def test_failed_response_keeps_the_providers_code_and_says_whether_to_ask_again(
+    code, retryable, transient, status
+):
+    failed = SimpleNamespace(id="resp_1", error=SimpleNamespace(code=code, message="boom"))
+    with pytest.raises(ProviderResponseError, match="boom") as raised:
+        list(_backend()._format_stream_to_agency(iter([_ev("response.failed", response=failed)])))
+    error = raised.value
+    assert (error.retryable, error.transient, error.status_code) == (retryable, transient, status)
+    assert error.details["code"] == code and error.details["response_id"] == "resp_1"
+
+
+def test_non_streaming_failed_response_raises_instead_of_returning_an_empty_turn():
+    failed = _SdkObj(
+        status="failed",
+        output=[],
+        usage=None,
+        id="resp_2",
+        error=_SdkObj(code="server_error", message="upstream fell over"),
+    )
+    with pytest.raises(ProviderResponseError, match="upstream fell over"):
+        _backend()._format_context_backend_to_agency(failed)
+
+
+def test_usage_reports_cached_cache_write_and_reasoning_tokens():
+    usage = _SdkObj(
+        input_tokens=2344,
+        output_tokens=50,
+        total_tokens=2394,
+        input_tokens_details=_SdkObj(cached_tokens=2342, cache_write_tokens=0),
+        output_tokens_details=_SdkObj(reasoning_tokens=45),
+    )
+    result = _backend()._format_context_backend_to_agency(_response([], usage=usage))
+    assert result["usage"] == {
+        "prompt_tokens": 2344,
+        "completion_tokens": 50,
+        "total_tokens": 2394,
+        "cached_tokens": 2342,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 45,
+    }
+
+
+def test_usage_without_details_gains_no_invented_zeroes():
+    result = _backend()._format_context_backend_to_agency(_response([], usage=_usage(10, 5)))
+    assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
+
+def test_message_phase_survives_response_and_replay():
+    message = _message_item(_output_text("Checking."))
+    message.phase = "commentary"
+    blocks = _backend()._format_context_backend_to_agency(_response([message]))["message"]["blocks"]
+    assert blocks[0] == {"type": "text", "index": 0, "text": "Checking.", "phase": "commentary"}
+
+    events = [
+        _ev("response.output_text.delta", output_index=0, content_index=0, delta="Checking."),
+        _ev("response.output_item.done", output_index=0, item=message),
+        _ev("response.completed", response=_response([message])),
+    ]
+    deltas = list(_backend()._format_stream_to_agency(iter(events)))
+    assert {
+        "type": "block_delta",
+        "index": 0,
+        "block_type": "text",
+        "phase": "commentary",
+    } in deltas
+
+    request = _backend()._format_context_agency_to_backend(
+        {"messages": [{"role": "assistant", "blocks": [blocks[0]]}]}
+    )
+    assert request["input"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Checking."}],
+        }
+    ]
+
+
+def test_reasoning_then_message_then_tool_call_replay_in_the_models_own_order():
+    """A reasoning item is only valid directly before what it led to, and its
+    encrypted content is sent back without an id (a mismatched id is a 400)."""
+    history = [
+        _text_msg("user", "how many cores?"),
+        {
+            "role": "assistant",
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "", "signature": _tagged("rsn_1")},
+                {"type": "text", "index": 1, "text": "Checking.", "phase": "commentary"},
+                {
+                    "type": "tool_use",
+                    "index": 2,
+                    "id": "call_abc",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"nproc"}',
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "blocks": [
+                {"type": "tool_result", "index": 0, "tool_call_id": "call_abc", "text": "6\n"}
+            ],
+        },
+    ]
+    items = _backend()._format_context_agency_to_backend({"messages": history})["input"]
+    assert [item.get("type", "message") for item in items] == [
+        "message",
+        "reasoning",
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+    assert items[1] == {"type": "reasoning", "summary": [], "encrypted_content": "rsn_1"}
+    assert items[3]["call_id"] == items[4]["call_id"] == "call_abc"
+    assert items[4]["output"] == "6\n"
+
+
+def test_reasoning_effort_and_summary_are_sent_as_configured_for_the_model():
+    request = _backend(model="gpt-6.1-sol", reasoning_effort="medium")
+    assert request._format_context_agency_to_backend({"messages": []})["reasoning"] == {
+        "effort": "medium"
+    }
+    request = _backend(model="gpt-6.1-sol", reasoning_effort="medium", reasoning_summary="auto")
+    assert request._format_context_agency_to_backend({"messages": []})["reasoning"] == {
+        "effort": "medium",
+        "summary": "auto",
+    }
+    assert "reasoning" not in _backend()._format_context_agency_to_backend({"messages": []})
+
+
+def test_dropping_another_providers_reasoning_state_is_said_out_loud(capsys):
+    from agency.llm.agllm import _WARNED_ONCE
+
+    _WARNED_ONCE.discard(("responses_drops_foreign_reasoning",))
+    history = [
+        {
+            "role": "assistant",
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "", "signature": "anthropic-base64=="},
+                {"type": "text", "index": 1, "text": "ok"},
+            ],
+        }
+    ]
+    items = _backend()._format_context_agency_to_backend({"messages": history})["input"]
+    assert items == [{"role": "assistant", "content": "ok"}]
+    assert "cannot be replayed on /v1/responses" in capsys.readouterr().out
+
+
+def test_chat_completions_backend_says_when_it_cannot_send_reasoning_state(capsys):
+    from agency.llm.agllm import _WARNED_ONCE
+
+    _WARNED_ONCE.discard(("chat_drops_reasoning_state", "openai"))
+    backend = agllm.for_config(
+        agconfig(llmconfig(provider="openai", base_url="http://x/v1", model="gpt-6-luna"))
+    )
+    history = [
+        {
+            "role": "assistant",
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "", "signature": _tagged("rsn_1")},
+                {"type": "text", "index": 1, "text": "ok"},
+            ],
+        }
+    ]
+    wire = backend.build_kwargs(history)["messages"]
+    assert wire == [{"role": "assistant", "content": "ok"}]
+    assert "provider='openai_responses'" in capsys.readouterr().out
+
+
+def test_stream_carries_upstream_call_ids_and_attaches_them_to_a_failure():
+    class Stream:
+        response = SimpleNamespace(
+            headers={
+                "x-litellm-call-id": "call-7",
+                "llm_provider-x-amzn-requestid": "amzn-1",
+                "authorization": "Bearer secret",
+                "x-litellm-key-spend": "17.0",
+            }
+        )
+
+        def __init__(self, events):
+            self._events = events
+
+        def __iter__(self):
+            return iter(self._events)
+
+    message = _message_item(_output_text("hi"))
+    good = [
+        _ev("response.output_text.delta", output_index=0, content_index=0, delta="hi"),
+        _ev("response.completed", response=_response([message])),
+    ]
+    backend = _backend()
+    client = SimpleNamespace(close=lambda: None)
+    backend._call_backend_stream = lambda request, on_client=None: (Stream(good), client)
+    items = list(backend.dispatch_stream({"messages": []}))
+    ids = {"x-litellm-call-id": "call-7", "llm_provider-x-amzn-requestid": "amzn-1"}
+    # First item, so the last metadata fragment is still the one with usage.
+    assert items[0]["block_type"] == "metadata" and items[0]["data"] == {"response_ids": ids}
+    assert "secret" not in repr(items)
+
+    backend._call_backend_stream = lambda request, on_client=None: (Stream(good[:1]), client)
+    with pytest.raises(StreamInterruptedError) as raised:
+        list(backend.dispatch_stream({"messages": []}))
+    assert raised.value.response_ids == ids
+
+    backend._call_backend_stream = lambda request, on_client=None: (Stream([]), client)
+    with pytest.raises(StreamInterruptedError) as raised:
+        list(backend.dispatch_stream({"messages": []}))
+    assert raised.value.response_ids == ids
