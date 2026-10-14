@@ -142,6 +142,7 @@ class CodexSession(CliSession):
                 started_at,
                 headers_at,
                 model=attributes.get("model"),
+                actor=self._known_subagent(attributes.get("conversation.id")),
                 error=str(error or f"HTTP {int(status)}"),
                 details={"attempt": number(attributes.get("attempt"))},
             )
@@ -160,6 +161,8 @@ class CodexSession(CliSession):
             at if started_at is None else started_at,
             at,
             model=attributes.get("model"),
+            # A Codex subagent's conversation id is its agent_id.
+            actor=self._known_subagent(attributes.get("conversation.id")),
             input_tokens=attributes.get("input_token_count"),
             output_tokens=attributes.get("output_token_count"),
             error=f"Codex reported {kind}" if failed else None,

@@ -1314,7 +1314,16 @@ class LiveSource:
             # captured identity / usage timing, never the opaque native body.
             "metadata": {
                 key: metadata[key]
-                for key in ("request_id", "skill", "stop_reason", "ttft_ms", "new_prompt_tokens")
+                for key in (
+                    "request_id",
+                    "skill",
+                    "stop_reason",
+                    "ttft_ms",
+                    "new_prompt_tokens",
+                    # How a self-reported request was assigned to an agent
+                    # (agency/sessions): evidence, not content.
+                    "attribution",
+                )
                 if metadata.get(key) is not None
             },
             "context": {

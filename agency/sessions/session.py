@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -40,6 +41,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +84,43 @@ _UNREPORTED_TOOL_GRACE_S = 5.0
 _STOP_GRACE_S = 5.0
 
 
+# A subagent's run is over in one of these states; Agency's controls then
+# drop it, as they drop a finished agent.
+_FINISHED_STATES = {"completed", "cancelled", "agent_exit"}
+
+
+class _Actor:
+    """One trajectory column: the CLI's main agent or a subagent it spawned.
+
+    Each has its own logger and telemetry server, as each Agency agent does,
+    so the trajectory shows a subagent as its own agent with a recorded
+    parent rather than folding its calls into the parent's column."""
+
+    def __init__(self, name: str, logger, host) -> None:
+        self.name = name
+        self.logger = logger
+        self.host = host
+        self.state = "agent_idle"
+        self.subagent_type: "str | None" = None
+        self.started_at = time.time()
+        self.stopped_at: "float | None" = None
+
+
+class _SubagentControls:
+    """Relay target for a subagent. It runs inside its parent CLI's process,
+    so there is nothing of its own to pause or stop."""
+
+    def __init__(self, parent: str) -> None:
+        self.parent = parent
+
+    def _refuse(self, *_args, **_kwargs) -> None:
+        raise ValueError(
+            f"This subagent runs inside {self.parent}'s process; pause or stop {self.parent}."
+        )
+
+    pause = resume = stop = _refuse
+
+
 class CliSession:
     # Set by each CLI's subclass.
     agent_name = ""  # actor name in the trajectory and relay
@@ -116,9 +155,14 @@ class CliSession:
         self.ended = threading.Event()
         self._spawn_lock = threading.Lock()
         self._telemetry_lock = threading.Lock()
-        self._pending_tools: "dict[str, str]" = {}  # CLI tool-call id -> Agency call_id
-        self._waiting_for_input = False
-        self._state = "agent_idle"
+        # CLI tool-call id -> (the column that made the call, Agency call_id)
+        self._pending_tools: "dict[str, tuple[_Actor, str]]" = {}
+        self._waiting_for_input: "set[str]" = set()
+        self._main: "_Actor | None" = None
+        self._subagents: "dict[str, _Actor]" = {}  # the CLI's agent_id -> column
+        self._subagents_lock = threading.Lock()
+        # Labels of spawn calls still waiting for their SubagentStart, in order.
+        self._spawn_labels: "deque[str]" = deque()
         self._paused = False
         self._server = None
         self._server_thread = None
@@ -161,47 +205,19 @@ class CliSession:
 
     def start(self, global_logger=None) -> None:
         """*global_logger* defaults to the orchestrator's run-wide logger."""
-        from ..agpolicy import agpolicy
-        from ..configs.agconfig import agconfig, dataloggerconfig
-        from ..engine.host_servers.host_interaction_server import HostInteractionServer
-        from ..observability.agdatalogger import agDataLogger
         from ..observability.agwebui.relay import register_standalone_target
         from ..observability.profiler import agprof
         from ..orchestrator import get_orchestrator
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._global_logger = global_logger or get_orchestrator().data_logger
-        agent_db = self.run_dir / f"{self.agent_name}_data.sqlite3"
-        self._agent_logger = agDataLogger(
-            agconfig(dataloggerconfig(db_path=str(agent_db))),
-            default_name=self.agent_name,
-            default_object="agent",
-        )
-        self._agent_logger.start()
-        # Only HostInteractionServer's telemetry is used: its policy allows
-        # everything, and its admission answer is never returned to the CLI.
-        self._host = HostInteractionServer(
-            SimpleNamespace(policy=agpolicy()),
-            self._agent_logger,
+        self._main = self._open_actor(
             self.agent_name,
-            profile_attributes={
-                "harness": self.harness,
-                "agency.interactive_session_id": self.session_id,
-            },
+            f"{self.agent_name}_data.sqlite3",
+            {"cwd": str(self.cwd), "interactive_session_id": self.session_id},
         )
-        self._agent_logger.record_event(
-            "agent_created",
-            {
-                "agname": self.agent_name,
-                "harness": self.harness,
-                "cwd": str(self.cwd),
-                "interactive_session_id": self.session_id,
-            },
-            term_message=f"[{self.agent_name}] CREATED interactive {self.label} session",
-            print_to_terminal=False,
-            flush=True,
-        )
-        self._register(model=None)
+        self._agent_logger = self._main.logger
+        self._host = self._main.host
         self._set_state("agent_idle")
         agprof.register_engine(self.harness, **self.engine_coverage)
         self._start_server()
@@ -223,6 +239,8 @@ class CliSession:
         from ..observability.agwebui.relay import unregister_standalone_target
 
         unregister_standalone_target(self.agent_name)
+        for actor in self._subagent_actors():
+            unregister_standalone_target(actor.name)
         terminal = self.terminal
         if terminal is not None and not terminal.exited.is_set():
             self._kill_tree()
@@ -237,29 +255,119 @@ class CliSession:
         if self._server is not None:
             self._server.should_exit = True
             self._server_thread.join(timeout=5)
-        if self._host is not None:
-            self._host.finalize_profile()
-        if self._agent_logger is not None:
-            self._agent_logger.flush()
-            self._agent_logger.stop()
+        for actor in [*self._subagent_actors(), self._main]:
+            if actor is None:
+                continue
+            actor.host.finalize_profile()
+            actor.logger.flush()
+            actor.logger.stop()
         self.ended.set()
 
-    def _register(self, model: "str | None") -> None:
+    def _open_actor(self, name: str, db_name: str, created: dict, parent=None) -> _Actor:
+        """A new column: its own logger and telemetry server, registered with
+        the run (and with its parent, for a subagent)."""
+        from ..agpolicy import agpolicy
+        from ..configs.agconfig import agconfig, dataloggerconfig
+        from ..engine.host_servers.host_interaction_server import HostInteractionServer
+        from ..observability.agdatalogger import agDataLogger
+
+        logger = agDataLogger(
+            agconfig(dataloggerconfig(db_path=str(self.run_dir / db_name))),
+            default_name=name,
+            default_object="agent",
+        )
+        logger.start()
+        attributes = {"harness": self.harness, "agency.interactive_session_id": self.session_id}
+        if parent is not None:
+            attributes["agency.parent_agent_id"] = parent
+        # Only HostInteractionServer's telemetry is used: its policy allows
+        # everything, and its admission answer is never returned to the CLI.
+        host = HostInteractionServer(
+            SimpleNamespace(policy=agpolicy()), logger, name, profile_attributes=attributes
+        )
+        actor = _Actor(name, logger, host)
+        logger.record_event(
+            "agent_created",
+            {
+                "agname": name,
+                "harness": self.harness,
+                **({"parent_agname": parent} if parent else {}),
+                **created,
+            },
+            term_message=f"[{name}] CREATED interactive {self.label} "
+            + ("subagent" if parent else "session"),
+            print_to_terminal=False,
+            flush=True,
+        )
+        self._register(actor, parent=parent)
+        return actor
+
+    def _register(self, actor: _Actor, model: "str | None" = None, parent=None) -> None:
         payload = {
-            "db_path": str(Path(self._agent_logger.db_path).resolve()),
+            "db_path": str(Path(actor.logger.db_path).resolve()),
             "team": None,
             "harness": self.harness,
         }
+        if parent:
+            payload["parent_agname"] = parent
         if model:
             payload["llm_config"] = {"model": model}
         self._global_logger.record_event(
             "agent_registered",
             payload,
-            name=self.agent_name,
+            name=actor.name,
             object="agent",
             update_latest_snapshot=True,
             flush=True,
         )
+
+    def _subagent_actors(self) -> "list[_Actor]":
+        with self._subagents_lock:
+            return list(self._subagents.values())
+
+    def _subagent(self, agent_id: str, agent_type: "str | None") -> _Actor:
+        """The column of the CLI's subagent *agent_id*, opened on first sight.
+
+        Normally that is its SubagentStart hook, but a tool hook from inside
+        the subagent may arrive first."""
+        from ..observability.agwebui.relay import register_standalone_target
+
+        with self._subagents_lock:
+            actor = self._subagents.get(agent_id)
+            if actor is not None:
+                return actor
+            label = self._spawn_labels.popleft() if self._spawn_labels else None
+            name = f"{self.agent_name}/{agent_type or 'subagent'}-{agent_id[-8:]}"
+            actor = self._open_actor(
+                name,
+                f"{self.agent_name}_subagent_{re.sub(r'[^A-Za-z0-9_-]', '_', agent_id)}"
+                "_data.sqlite3",
+                {"subagent_id": agent_id, "subagent_type": agent_type},
+                parent=self.agent_name,
+            )
+            actor.subagent_type = agent_type
+            self._subagents[agent_id] = actor
+        self._main.logger.record_event(
+            "delegation",
+            {"to": name, "task": label or agent_type or "subagent", "subagent_id": agent_id},
+            flush=True,
+        )
+        register_standalone_target(name, _SubagentControls(self.agent_name))
+        self._set_state("running_harness", actor)
+        return actor
+
+    def _actor_for(self, payload: dict) -> _Actor:
+        """Hooks fired inside a subagent carry its agent_id; others are the
+        main agent's."""
+        agent_id = payload.get("agent_id")
+        if not agent_id:
+            return self._main
+        return self._subagent(str(agent_id), payload.get("agent_type"))
+
+    def _known_subagent(self, agent_id) -> _Actor:
+        """A subagent already seen through hooks, else the main agent."""
+        with self._subagents_lock:
+            return self._subagents.get(agent_id) or self._main
 
     def _write_private_json(self, name: str, value: dict) -> None:
         path = self.run_dir / name
@@ -324,6 +432,7 @@ class CliSession:
             print_to_terminal=False,
             flush=True,
         )
+        self._finish_subagents("cancelled")
         # Whatever the session left running (a dev server started with `&`)
         # belongs to it and ends with it.
         self._kill_tree()
@@ -353,7 +462,7 @@ class CliSession:
         except RuntimeError as exc:
             print(f"[agency] WARNING: profiler cannot sample the session scope: {exc}")
         # The trajectory links an agent to its resource series by this label.
-        self._set_state(self._state, sandbox=self.scope_unit)
+        self._set_state(self._main.state, sandbox=self.scope_unit)
 
     def _finish_scope(self) -> None:
         from ..observability.profiler import agprof
@@ -425,37 +534,65 @@ class CliSession:
 
     # -- Telemetry -------------------------------------------------------------
 
-    def _set_state(self, state: str, **extra) -> None:
-        self._state = state
-        self._agent_logger.record_event(
+    def _set_state(self, state: str, actor: "_Actor | None" = None, **extra) -> None:
+        actor = actor or self._main
+        actor.state = state
+        actor.logger.record_event(
             "agent_state", {"state": state, **extra}, update_latest_snapshot=True, flush=True
         )
 
-    def _await_input(self, message: str) -> None:
+    def _await_input(self, message: str, actor: _Actor) -> None:
         with self._telemetry_lock:
-            self._waiting_for_input = True
-        self._agent_logger.record_event(
+            self._waiting_for_input.add(actor.name)
+        actor.logger.record_event(
             "input_required", {"message": message}, update_latest_snapshot=True, flush=True
         )
-        self._set_state("waiting_input")
+        self._set_state("waiting_input", actor)
 
-    def _input_resolved(self) -> None:
-        with self._telemetry_lock:
-            if not self._waiting_for_input:
-                return
-            self._waiting_for_input = False
-        self._agent_logger.record_event("input_resolved", {}, flush=True)
+    def _input_resolved(self, actor: "_Actor | None" = None) -> None:
+        """Close *actor*'s pending input request, or every one when None."""
+        actors = [actor] if actor is not None else [self._main, *self._subagent_actors()]
+        for candidate in actors:
+            with self._telemetry_lock:
+                if candidate.name not in self._waiting_for_input:
+                    continue
+                self._waiting_for_input.discard(candidate.name)
+            candidate.logger.record_event("input_resolved", {}, flush=True)
+
+    def _finish_subagents(self, state: str) -> None:
+        for actor in self._subagent_actors():
+            if actor.state not in _FINISHED_STATES:
+                actor.stopped_at = time.time()
+                self._input_resolved(actor)
+                self._set_state(state, actor)
+
+    def _subagent_running_at(self, agent_type, at: float) -> "_Actor | None":
+        """The one subagent of *agent_type* that was running at *at*, if
+        exactly one was. For telemetry that names a subagent's type but not
+        which subagent; a second candidate makes the answer unknowable."""
+        # Hook arrival and the CLI's own clock reading differ slightly.
+        slack = 1.0
+        candidates = [
+            actor
+            for actor in self._subagent_actors()
+            if actor.subagent_type == agent_type
+            and actor.started_at - slack <= at
+            and (actor.stopped_at is None or at <= actor.stopped_at + slack)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     def handle_hook(self, payload: dict) -> None:
         """Claude Code and Codex share these hook names and field names; an
         event one CLI never sends is simply never matched."""
         event = payload.get("hook_event_name")
+        actor = self._actor_for(payload)
         if event == "SessionStart":
-            self._register(model=payload.get("model"))
-            self._set_state("agent_idle")
+            if actor is self._main:
+                self._register(self._main, model=payload.get("model"))
+                self._set_state("agent_idle")
         elif event == "UserPromptSubmit":
-            self._input_resolved()
-            self._agent_logger.record_event(
+            self._input_resolved(actor)
+            actor.logger.record_event(
                 "user_prompt",
                 {
                     "prompt": str(payload.get("prompt", ""))[:_MAX_RESULT_CHARS],
@@ -463,11 +600,13 @@ class CliSession:
                 },
                 flush=True,
             )
-            self._set_state("running_harness")
+            self._set_state("running_harness", actor)
         elif event == "PreToolUse":
-            self._tool_started(payload)
+            self._tool_started(actor, payload)
         elif event == "PermissionRequest":
-            self._await_input(f"{self.label} asks permission to use {payload.get('tool_name')}")
+            self._await_input(
+                f"{self.label} asks permission to use {payload.get('tool_name')}", actor
+            )
         elif event == "PostToolUse":
             self._tool_finished(
                 payload.get("tool_use_id"),
@@ -484,32 +623,39 @@ class CliSession:
         elif event == "Notification":
             kind = payload.get("notification_type")
             if kind == "permission_prompt":
-                self._await_input(str(payload.get("message") or f"{self.label} needs permission"))
+                self._await_input(
+                    str(payload.get("message") or f"{self.label} needs permission"), actor
+                )
             elif kind == "idle_prompt":
                 self._input_resolved()
                 self._set_state("agent_idle")
-        elif event in {"SubagentStart", "SubagentStop"}:
-            self._agent_logger.record_event(
-                "subagent_started" if event == "SubagentStart" else "subagent_stopped",
-                {"agent_id": payload.get("agent_id"), "agent_type": payload.get("agent_type")},
-                flush=True,
-            )
+        elif event == "SubagentStart":
+            pass  # _actor_for() above opened its column
+        elif event == "SubagentStop" and actor is not self._main:
+            actor.stopped_at = time.time()
+            self._input_resolved(actor)
+            self._set_state("completed", actor)
         elif event == "Interrupt":
             # The user interrupted the turn; anything still running is over.
             for tool_use_id in self._pending_tool_ids():
                 self._tool_finished(tool_use_id, error="Interrupted by the user")
             self._input_resolved()
+            self._finish_subagents("cancelled")
             self._set_state("agent_idle")
+        elif event in {"Stop", "StopFailure"} and actor is not self._main:
+            # A subagent's own turn ended; SubagentStop marks it finished.
+            self._input_resolved(actor)
+            self._set_state("agent_idle", actor)
         elif event in {"Stop", "StopFailure"}:
             self._input_resolved()
             if event == "StopFailure":
-                self._agent_logger.record_event(
+                self._main.logger.record_event(
                     "turn_failed", {"error": payload.get("error")}, flush=True
                 )
             self._set_state("agent_idle")
             self._expire_unreported_tools()
         elif event == "SessionEnd":
-            self._agent_logger.record_event(
+            self._main.logger.record_event(
                 "session_ended", {"reason": payload.get("reason")}, flush=True
             )
 
@@ -517,31 +663,33 @@ class CliSession:
         with self._telemetry_lock:
             return list(self._pending_tools)
 
-    def _tool_started(self, payload: dict) -> None:
+    def _tool_started(self, actor: _Actor, payload: dict) -> None:
         tool_use_id = payload.get("tool_use_id")
+        tool_name = str(payload.get("tool_name") or "unknown")
         tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {"input": tool_input}
+        if _spawns_subagent(tool_name):
+            # Its SubagentStart names only the subagent's type; the parent's
+            # spawn call is where the task it was given is described.
+            with self._subagents_lock:
+                self._spawn_labels.append(_spawn_label(tool_input))
         # The tool-call id is the model's own id for this call, which the
         # trajectory uses to link a tool to the model response requesting it.
-        annotation = {"model_tool_call_id": tool_use_id}
-        # Tools run inside a subagent carry its identity; keep it with the call.
-        for key in ("agent_id", "agent_type"):
-            if payload.get(key):
-                annotation[key] = payload[key]
-        admission = self._host.admit_tool_call(
-            str(payload.get("tool_name") or "unknown"),
-            tool_input if isinstance(tool_input, dict) else {"input": tool_input},
-            annotation,
+        admission = actor.host.admit_tool_call(
+            tool_name, tool_input, {"model_tool_call_id": tool_use_id}
         )
         if tool_use_id:
             with self._telemetry_lock:
-                self._pending_tools[tool_use_id] = admission["call_id"]
+                self._pending_tools[tool_use_id] = (actor, admission["call_id"])
 
     def _tool_finished(self, tool_use_id, *, result=None, error=None, duration_ms=None) -> bool:
         """Close a pending call; False when none was pending for this id."""
         with self._telemetry_lock:
-            call_id = self._pending_tools.pop(tool_use_id, None) if tool_use_id else None
-        if call_id is None:
+            pending = self._pending_tools.pop(tool_use_id, None) if tool_use_id else None
+        if pending is None:
             return False
+        actor, call_id = pending
         encoded = json.dumps(result, default=str)
         if len(encoded) > _MAX_RESULT_CHARS:
             result = {"_truncated_json": encoded[:_MAX_RESULT_CHARS] + "…[truncated]"}
@@ -552,10 +700,10 @@ class CliSession:
             # that the PreToolUse boundary includes.
             duration_ns = max(0, int(duration_ms * 1_000_000))
             timing = {"duration_ns": duration_ns, "started_wall_ns": time.time_ns() - duration_ns}
-        self._host.complete_tool_call(call_id, result, error, **timing)
-        self._input_resolved()
-        if self._state != "agent_idle":
-            self._set_state("running_harness")
+        actor.host.complete_tool_call(call_id, result, error, **timing)
+        self._input_resolved(actor)
+        if actor.state != "agent_idle" and actor.state not in _FINISHED_STATES:
+            self._set_state("running_harness", actor)
         return True
 
     def _expire_unreported_tools(self) -> None:
@@ -578,6 +726,7 @@ class CliSession:
         ended_at: float,
         *,
         model,
+        actor: "_Actor | None" = None,
         input_tokens=None,
         output_tokens=None,
         request_id=None,
@@ -586,6 +735,7 @@ class CliSession:
     ) -> None:
         """One completed model request, placed where it actually ran. The
         CLIs report a request only after it ends, so this is always late."""
+        actor = actor or self._main
         call_label = uuid.uuid4().hex[:12]
         metadata = {
             "type": "metadata",
@@ -603,23 +753,23 @@ class CliSession:
             marker = {"error": error}
             response.append((_block_hash(marker), marker))
         # A backdated start must not overwrite the agent's live state.
-        self._agent_logger.record_event(
+        actor.logger.record_event(
             "agent_state",
             {"state": "waiting_llm", "model": model, "request_id": request_id},
             call_label=call_label,
             timestamp=started_at,
             flush=True,
         )
-        self._agent_logger.record_llm_exchange(
+        actor.logger.record_llm_exchange(
             call_label,
             exchange_type="llm_stream_error" if error is not None else "llm_block",
             prompt_chain=[],
             response_chain=response,
-            term_message=f"[{self.agent_name}] LLM    {'✗' if error else '✓'}  {model}",
+            term_message=f"[{actor.name}] LLM    {'✗' if error else '✓'}  {model}",
             print_to_terminal=False,
             timestamp=ended_at,
         )
-        self._host.record_span(
+        actor.host.record_span(
             f"llm:{model}",
             started_at,
             ended_at,
@@ -765,6 +915,19 @@ class CliSession:
                 raise RuntimeError(f"{self.label} session endpoint did not start")
             time.sleep(0.01)
         self.port = server.servers[0].sockets[0].getsockname()[1]
+
+
+def _spawns_subagent(tool_name: str) -> bool:
+    """Claude Code's Agent (formerly Task) tool; Codex's collaboration.spawn_agent."""
+    return tool_name in {"Agent", "Task"} or tool_name.endswith("spawn_agent")
+
+
+def _spawn_label(tool_input: dict) -> str:
+    for key in ("description", "task_name", "subagent_type", "agent_type"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:200]
+    return "subagent"
 
 
 def _dimension(value, fallback: int) -> int:

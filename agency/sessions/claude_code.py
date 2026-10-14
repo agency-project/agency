@@ -142,10 +142,21 @@ class ClaudeCodeSession(CliSession):
             number(attributes.get(key)) or 0
             for key in ("input_tokens", "cache_read_tokens", "cache_creation_tokens")
         )
+        # A subagent's requests carry its type (`agent.name`) but no id, and
+        # may arrive after its SubagentStop; see _subagent_running_at().
+        subagent_type = attributes.get("agent.name")
+        actor = self._subagent_running_at(subagent_type, ended_at) if subagent_type else None
+        attribution = {}
+        if subagent_type:
+            attribution["attribution"] = (
+                "subagent_type_and_time" if actor else "subagent_ambiguous_kept_on_parent"
+            )
+            attribution["subagent_type"] = subagent_type
         self._record_model_request(
             ended_at - (duration_ms or 0) / 1000,
             ended_at,
             model=attributes.get("model"),
+            actor=actor,
             input_tokens=input_tokens,
             output_tokens=attributes.get("output_tokens"),
             request_id=attributes.get("request_id"),
@@ -154,6 +165,7 @@ class ClaudeCodeSession(CliSession):
                 "duration_ms": duration_ms,
                 "cost_usd": number(attributes.get("cost_usd")),
                 "query_source": attributes.get("query_source"),
+                **attribution,
             },
         )
 
