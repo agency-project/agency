@@ -23,7 +23,10 @@ def main() -> None:
     )
     task = agskill(
         name="code_and_test",
-        prompt="Complete the request in /workspace. Run the code, then summarize the result.",
+        prompt=(
+            "Complete the request in /workspace. Run the code, then summarize the result."
+            "\nAfter submitting all output fields, finish with a short confirmation."
+        ),
         input_schema=agdata(request=str),
         output_schema=agdata(summary=str),
     )
@@ -31,7 +34,7 @@ def main() -> None:
     result = worker.run(
         task,
         agdata(
-            request="Write sum_even(numbers) in Python and run assertions for empty and mixed lists."
+            request="Write sum_even(numbers) in Python and print its output for empty and mixed lists."
         ),
     )
     result.wait()

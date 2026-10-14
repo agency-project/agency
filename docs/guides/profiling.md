@@ -37,13 +37,25 @@ display to the latest activity. Running calls stay above completed history.
 Use **Add agent** to inspect agents side by side, or **Agent overlay** for a
 shared time axis.
 
-The three navigation views are **Execution Trajectory**, **Timeline**, and
-**Profiler**. Profiler contains Activity, LLM, Tools, Systems, and Critical Path
-categories. Missing measurements stay unavailable. See
+Navigation provides **Execution Trajectory**, **Profiler**, **Critical Path**,
+and **Compare runs**. Profiler contains Activity, LLM, Tools, and Systems
+categories; Critical Path opens the dedicated historical view. Missing
+measurements stay unavailable. See
 [live metrics](../live-metrics.md) for metric scopes and measurement boundaries,
-[Critical Path](../architecture/observability.md#critical-path) for
+[Critical Path](profiling/critical-path.md) for
 observed dependencies, and [live trajectory](profiling/live-trajectory.md) for
 replay, history, and execution controls.
+
+## Historical Critical Path Profiler
+
+Open `/critical-path`, or choose **Critical Path** in the navigation, to analyze
+saved executions on a shared agent timeline. The view loads compact backend
+analysis and provides dependency inspection, agent focus, process expansion,
+zoom/pan, and links to detailed recorded evidence. It reports measured path
+coverage and unexplained intervals explicitly. Recorded files under
+`agency_runs/`, `artifacts/`, `runs/`, and the configured profiler directory are
+available in its catalog. See the [profiler guide](profiling/critical-path.md)
+for correlation rules and known limitations.
 
 <a id="raw-trace-viewer"></a>
 

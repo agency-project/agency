@@ -998,6 +998,10 @@ from .compare import create_router as _compare_router
 
 app.include_router(_compare_router(_profiler_dir))
 
+from .critical_path_api import router as _critical_path_router
+
+app.include_router(_critical_path_router(_profiler_dir))
+
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
@@ -1006,7 +1010,7 @@ async def _no_cache_static(request, call_next):
     file, since a plain refresh can silently keep serving stale JS/CSS with
     no visible sign anything is wrong."""
     response = await call_next(request)
-    if request.url.path in ("/", "/profiler") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/profiler", "/critical-path") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -1023,6 +1027,11 @@ def _profile_trace_path() -> Path:
 @app.get("/profiler")
 async def investigator_page():
     return FileResponse(_STATIC / "investigator.html")
+
+
+@app.get("/critical-path")
+async def critical_path_page():
+    return FileResponse(_STATIC / "critical-path.html")
 
 
 @app.get("/api/investigator/runs")

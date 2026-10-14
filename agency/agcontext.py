@@ -106,12 +106,19 @@ class agcontext:
     def copy(self) -> "agcontext":
         """Return a deep copy of the resolved context (blocks if pending)."""
         self.resolve_prev_dependencies()
-        return agcontext(
+        result = agcontext(
             recent_transcript=copy.deepcopy(self.recent_transcript),
             harness_sessions=copy.deepcopy(self.harness_sessions),
             retained_messages=copy.deepcopy(self.retained_messages),
             harness_message_cursors=copy.deepcopy(self.harness_message_cursors),
         )
+        # Execution evidence is host-local metadata, never conversation data
+        # or checkpoint state. Keeping it through copies records dependencies
+        # on a completed context without retaining scheduler requests.
+        for key in ("_execution_id", "_execution_agent_id"):
+            if key in self.__dict__:
+                setattr(result, key, self.__dict__[key])
+        return result
 
     def __repr__(self) -> str:
         pending = " (pending)" if self._future is not None else ""

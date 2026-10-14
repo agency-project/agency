@@ -86,10 +86,10 @@ def catalog(profile_dir: str, bucket: int = 0):
                 )
     configured = Path(profile_dir) / "agprof.trace.json"
     paths = [configured] if configured.is_file() else []
-    for base in (ROOT / "agency_runs", ROOT / "artifacts"):
+    for base in (ROOT / "agency_runs", ROOT / "artifacts", ROOT / "runs"):
         if base.exists():
             paths.extend(sorted(base.rglob("agprof.trace.json")))
-    seen = set()
+    seen = {entry["id"] for entry in entries}
     for path in paths:
         key = run_key(path)
         if key in seen:
@@ -99,10 +99,14 @@ def catalog(profile_dir: str, bucket: int = 0):
         summary_path = path.parent / "summary.json"
         if summary_path.exists():
             try:
-                summary = json.loads(summary_path.read_text())
+                value = json.loads(summary_path.read_text())
+                summary = value if isinstance(value, dict) else {}
             except (OSError, ValueError):
                 pass  # A partially written summary does not hide a usable trace.
-        engines = summary.get("coverage", {}).get("engines", {})
+        coverage = summary.get("coverage", {})
+        coverage = coverage if isinstance(coverage, dict) else {}
+        engines = coverage.get("engines", {})
+        engines = engines if isinstance(engines, dict) else {}
         entries.append(
             {
                 "id": key,
@@ -110,9 +114,9 @@ def catalog(profile_dir: str, bucket: int = 0):
                 "subtitle": str(path.parent.relative_to(ROOT))
                 if path.is_relative_to(ROOT)
                 else "Configured profiler directory",
-                "source": "recorded",
+                "source": "synthetic" if summary.get("data_source") == "mock" else "recorded",
                 "path": str(path),
-                "duration": (summary.get("duration_ms") or 0) / 1000,
+                "duration": (number(summary.get("duration_ms")) or 0) / 1000,
                 "model": recorded_model(str(path), path.stat().st_mtime),
                 "harness": ", ".join(engines) or "unknown",
             }

@@ -133,7 +133,7 @@ def critical_path(nodes, edges):
     }
 
 
-def build_graph(run):
+def build_graph(run, *, max_unmeasured_tools=None):
     actions = sorted(run.get("actions", []), key=lambda a: (a.get("start", 0), a["id"]))
     nodes, edges, operations, unknown = {}, {}, {}, []
     totals = dict.fromkeys(("LLM", "Tool", "System"), 0.0)
@@ -321,6 +321,8 @@ def build_graph(run):
     by_lineage = defaultdict(list)
     failed_prompts = defaultdict(list)
     models = [a for a in actions if a["kind"] == "model"]
+    omitted_tool_identities = 0
+    identity_limit = len(actions) + max_unmeasured_tools if max_unmeasured_tools is not None else None
     for a in models:
         evidence = a.get("causal_evidence") or {}
         refs = evidence.get("response") or []
@@ -335,6 +337,9 @@ def build_graph(run):
             if ref.get("hash"):
                 by_hash[(a["agent"], ref["hash"])].append((a, index))
             if ref.get("type") not in {"tool_use", "function_call"} or not ref.get("tool_id"):
+                continue
+            if identity_limit is not None and len(issued) >= identity_limit:
+                omitted_tool_identities += 1
                 continue
             key = f"issued:{a['id']}:{index}:{ref['tool_id']}"
             item = {"id": key, "issuer": a, "ref": ref, "host": None, "consumer": None}
@@ -471,12 +476,19 @@ def build_graph(run):
             )
 
     aliases = {}
+    omitted_unmeasured_tools = 0
+    unmeasured_tools = 0
     for key, item in issued.items():
         origin = operations[item["issuer"]["id"]]
         host, consumer = item["host"], item["consumer"]
         if host:
             op = operations[host["id"]]
         else:
+            if max_unmeasured_tools is not None and unmeasured_tools >= max_unmeasured_tools:
+                aliases[key] = None
+                omitted_unmeasured_tools += 1
+                continue
+            unmeasured_tools += 1
             at = nodes[origin["end_node"]]["time"] if origin.get("end_node") else None
             op = operation(
                 key,
@@ -508,7 +520,12 @@ def build_graph(run):
             )
 
     for source, target, kind, blocking, evidence in dependencies:
-        left, right = operations[aliases.get(source, source)], operations[target]
+        resolved = aliases.get(source, source)
+        if resolved is None:
+            resolved = issued[source]["issuer"]["id"]
+            kind = "unmeasured_tool_result" if blocking else "history"
+            evidence += "; unmeasured tool projection omitted by size limit"
+        left, right = operations[resolved], operations[target]
         if left.get("end_node") and right.get("start_node"):
             edge(
                 left["end_node"],
@@ -518,6 +535,8 @@ def build_graph(run):
                 confidence="verified" if blocking else "provenance",
                 blocking=blocking,
             )
+    if omitted_unmeasured_tools or omitted_tool_identities:
+        unknown.append({"reason": f"Projection size limit omitted {omitted_unmeasured_tools} unmeasured tool spans and {omitted_tool_identities} tool issuance identities"})
     # A successful execve proves execution of a process image, not its birth,
     # lifetime, exit status or syscall-to-tool ownership. Preserve the syscall
     # and project a separate process observation with unknown lifecycle bounds.
@@ -743,6 +762,8 @@ def build_graph(run):
             "measured_operations": sum(o["duration"] is not None for o in operations.values()),
             "total_operations": len(operations),
             "native_process_attribution": False,
+            "omitted_unmeasured_tools": omitted_unmeasured_tools,
+            "omitted_tool_identities": omitted_tool_identities,
             "verified_edges": sum(e["confidence"] == "verified" for e in edge_list),
             "inferred_edges": sum(e["confidence"] == "inferred" for e in edge_list),
             "explanation": "Partial recorded dependency path. Unexplained waits are marked; unobserved work and cross-agent dependencies remain unknown. System-wide critical path is not established.",

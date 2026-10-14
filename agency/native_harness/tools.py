@@ -25,6 +25,8 @@ import time
 import uuid
 from typing import Generator
 
+from .profiling import run_process
+
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
 _WEBFETCH_DEFAULT_TIMEOUT = 30
@@ -536,7 +538,7 @@ def _run_bash_tool(arguments_json: str) -> str:
     except (TypeError, ValueError):
         timeout = _BASH_TIMEOUT_S
     try:
-        proc = subprocess.run(
+        proc = run_process(
             ["bash", "-c", command],
             capture_output=True,
             timeout=timeout,
@@ -645,7 +647,7 @@ def _run_glob_tool(arguments_json: str) -> str:
                     if len(files) > GLOB_LIMIT:
                         break
             return json.dumps(parse_glob_output("\n".join(files)))
-        proc = subprocess.run(
+        proc = run_process(
             ["bash", "-c", glob_command(pattern, path)],
             capture_output=True,
             timeout=30,
@@ -714,7 +716,7 @@ def _run_grep_tool(arguments_json: str) -> str:
                     "truncated": truncated,
                 }
             )
-        proc = subprocess.run(
+        proc = run_process(
             ["bash", "-c", grep_command(pattern, path, include)],
             capture_output=True,
             timeout=30,

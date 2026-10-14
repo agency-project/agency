@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from . import tools
-from .profiling import profile_run, span as profile_span
+from .profiling import profile_run, span as profile_span, tool_execution
 from .compaction import maybe_compact
 from .annotations import augment_schemas, extract, instruction, event_id, redact
 
@@ -203,6 +203,8 @@ def run_react_loop(
                     )
                 prepared_calls.append((tc, fn_name, fn_args, correlation, annotation))
 
+            tool_batch_id = event_id()
+            preceding_tool_call_id = preceding_model_tool_call_id = None
             for tc, fn_name, fn_args, correlation, annotation in prepared_calls:
                 handler = dispatch_table.get(fn_name)
                 call_id = None
@@ -214,7 +216,19 @@ def run_react_loop(
                         fn_name,
                         _parse_tool_input(fn_args),
                         annotation=redact(
-                            {**annotation, "model_tool_call_id": tc["id"]},
+                            {
+                                **annotation,
+                                "model_tool_call_id": tc["id"],
+                                "tool_batch_id": tool_batch_id,
+                                **(
+                                    {
+                                        "preceding_tool_call_id": preceding_tool_call_id,
+                                        "preceding_model_tool_call_id": preceding_model_tool_call_id,
+                                    }
+                                    if preceding_tool_call_id is not None
+                                    else {}
+                                ),
+                            },
                             (getattr(bridge, "token", None),),
                         ),
                     )
@@ -234,7 +248,8 @@ def run_react_loop(
                         tool_started_ns = time.perf_counter_ns()
                         tool_started_wall_ns = time.time_ns()
                         try:
-                            result_content = handler(fn_args)
+                            with tool_execution(bridge, call_id, tc["id"]):
+                                result_content = handler(fn_args)
                         except Exception as exc:
                             result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
@@ -277,6 +292,8 @@ def run_react_loop(
                         )
                     else:
                         bridge.complete_tool_policy(call_id, result_content)
+                    if tool_duration_ns is not None and isinstance(call_id, str):
+                        preceding_tool_call_id, preceding_model_tool_call_id = call_id, tc["id"]
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )

@@ -412,6 +412,16 @@ class LlmHandlerServer:
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
         self._request_id = request_id
+        from ...observability.profiler import agprof
+
+        self._profile_attributes = {
+            **agprof.current_execution_attributes(),
+            **(
+                {"request_id": request_id, "agency.run_id": request_id}
+                if request_id is not None
+                else {}
+            ),
+        }
         self._skill_name = skill_name
 
         self.change_config(agconfig)
@@ -586,6 +596,7 @@ class LlmHandlerServer:
                 ) as attempt_span:
                     _annotate(
                         attempt_span,
+                        **self._profile_attributes,
                         model=backend.model,
                         provider=type(backend).__name__,
                         call_label=call_label,
@@ -1181,6 +1192,7 @@ class LlmHandlerServer:
             ) as attempt_span:
                 _annotate(
                     attempt_span,
+                    **self._profile_attributes,
                     model=backend.model,
                     provider=type(backend).__name__,
                     call_label=handle.call_label,

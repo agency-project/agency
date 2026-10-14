@@ -482,7 +482,7 @@ function updateUrl() {
 }
 
 function executionNavigation() {
-  return views.map(([id,label],index)=>`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">${index+1}</span>${label}</button>`).join('') + '<a href="/compare" class="compare-nav-link"><span class="view-number">4</span>Compare Runs</a>';
+  return views.map(([id,label],index)=>id==='critical'?`<a href="/critical-path?run=${encodeURIComponent(state.run?.id||'')}" class="compare-nav-link"><span class="view-number">${index+1}</span>Critical Path Profiler</a>`:`<button data-view="${id}" class="${state.view===id?'active':''}" aria-current="${state.view===id?'page':'false'}"><span class="view-number">${index+1}</span>${label}</button>`).join('') + '<a href="/compare" class="compare-nav-link"><span class="view-number">4</span>Compare Runs</a>';
 }
 
 function render() {

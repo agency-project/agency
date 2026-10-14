@@ -166,6 +166,15 @@ class HostInteractionServer:
                         **self._profile_attributes,
                         "call_id": call_id,
                         "model_tool_call_id": attributes.get("model_tool_call_id"),
+                        **{
+                            key: attributes[key]
+                            for key in (
+                                "tool_batch_id",
+                                "preceding_tool_call_id",
+                                "preceding_model_tool_call_id",
+                            )
+                            if attributes.get(key) is not None
+                        },
                         "timing": "hook_boundary",
                         "provenance": "host_observed",
                         **(
@@ -354,6 +363,13 @@ class HostInteractionServer:
             annotation.get("model_tool_call_id") if isinstance(annotation, dict) else None
         )
         identity = identity if isinstance(identity, str) and identity else None
+        serial_evidence = {
+            key: annotation[key]
+            for key in ("tool_batch_id", "preceding_tool_call_id", "preceding_model_tool_call_id")
+            if isinstance(annotation, dict)
+            and isinstance(annotation.get(key), str)
+            and 0 < len(annotation[key]) <= 256
+        }
         call_id = self._record_admission(
             "tool",
             tool_name,
@@ -362,6 +378,7 @@ class HostInteractionServer:
                 "arguments": tool_input,
                 "gpu_ids": gpu_ids,
                 **({"model_tool_call_id": identity} if identity else {}),
+                **serial_evidence,
                 **({"annotation": annotation} if isinstance(annotation, dict) else {}),
             },
             allowed,

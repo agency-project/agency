@@ -85,6 +85,7 @@ _span_stack: "ContextVar[tuple[_TimedSpan, ...]]" = ContextVar("agprof_span_stac
 _execution_context: ContextVar[dict] = ContextVar("agprof_execution_context", default={})
 _OWNERSHIP_KEYS = (
     "agency.agent_id",
+    "agency.run_id",
     "agency.sandbox_id",
     "agency.component",
     "agency.execution_side",
@@ -924,6 +925,23 @@ def current_span_attributes() -> dict:
     return dict(_span_stack.get()[-1]._metadata)
 
 
+def current_execution_attributes() -> dict:
+    """Copy execution ownership for evidence emitted by a synchronization API."""
+    return _capture_execution_context() if _session is not None else {}
+
+
+def current_span_id() -> str | None:
+    """Stable identity of the current semantic span, without retaining its handle."""
+    if _session is None or not _span_stack.get():
+        return None
+    return f"{_span_stack.get()[-1]._span.get_span_context().span_id:016x}"
+
+
+def session_identity() -> str | None:
+    """Scope retained correlation identities to one profiler recording."""
+    return _profile_session_id if _session is not None else None
+
+
 def sandbox_identity(sandbox) -> "str | None":
     """Return an explicit sandbox name, or no identity for custom adapters."""
     identity = getattr(sandbox, "_agname", None)
@@ -1640,6 +1658,7 @@ class _Sampler(threading.Thread):
             fields = stat[close + 2 :].split()
             cpu_s = (int(fields[11]) + int(fields[12])) / self._clock_ticks
             start_ticks = int(fields[19])
+            parent_pid = int(fields[1])
             vms_mb = int(fields[20]) / 2**20
             rss_mb = int(fields[21]) * self._page_mb
         except (OSError, ValueError, IndexError):
@@ -1665,6 +1684,7 @@ class _Sampler(threading.Thread):
                 "identity": identity,
                 "pid": pid,
                 "start_ticks": start_ticks,
+                "ppid": parent_pid,
                 "comm": comm,
                 "cmdline": cmdline,
                 "argv": argv,
@@ -1676,11 +1696,26 @@ class _Sampler(threading.Thread):
                 "last_seen_ns": t,
             }
             try:
+                parent_stat = (self._proc_root / str(parent_pid) / "stat").read_bytes()
+                parent_fields = parent_stat[parent_stat.rfind(b") ") + 2 :].split()
+                parent_ticks = int(parent_fields[19])
+                if parent_ticks <= start_ticks:
+                    info["parent_identity"] = f"{parent_pid}-{parent_ticks}"
+            except (OSError, ValueError, IndexError):
+                # An exited or hidden parent is unknown, never a PID-only join.
+                pass
+            try:
                 info["pid_namespace"] = os.readlink(process_dir / "ns/pid")
                 status = (process_dir / "status").read_text()
                 nspid = next(line for line in status.splitlines() if line.startswith("NSpid:"))
                 info["namespace_pid"] = int(nspid.split()[-1])
-            except (OSError, ValueError, StopIteration):
+                # Separate /proc reads can straddle exit and PID reuse. Do not
+                # attach a new namespace to the preceding generation's stat.
+                verified_stat = (process_dir / "stat").read_bytes()
+                verified_ticks = int(verified_stat[verified_stat.rfind(b") ") + 2 :].split()[19])
+                if verified_ticks != start_ticks:
+                    info["pid_namespace"] = info["namespace_pid"] = None
+            except (OSError, ValueError, StopIteration, IndexError):
                 # Keep resource samples when namespace identity is unavailable.
                 info["pid_namespace"] = None
                 info["namespace_pid"] = None
@@ -1699,6 +1734,12 @@ class _Sampler(threading.Thread):
         _samples.append((t, prefix + "cpu_s", cpu_s))
         _samples.append((t, prefix + "rss_mb", rss_mb))
         _samples.append((t, prefix + "vms_mb", vms_mb))
+        try:
+            schedstat = (process_dir / "schedstat").read_text().split()
+            _samples.append((t, prefix + "runqueue_s", int(schedstat[1]) / 1e9))
+        except (OSError, ValueError, IndexError):
+            # Run-queue delay is optional; missing measurements are not zero.
+            pass
         try:
             io_fields = {}
             with (process_dir / "io").open("rb") as f:
@@ -2315,7 +2356,7 @@ def _resource_observations(samples, *, process_info=None) -> list[dict]:
         identity = parts[1] if scope == "proc" and len(parts) == 3 else None
         process = process_info.get(identity) if identity is not None else None
         cumulative_scope = scope in ("cg", "workload", "proc")
-        if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
+        if kind in ("cpu_us", "cpu_s", "runqueue_s") or kind in _BYTE_KINDS:
             if not cumulative_scope:
                 continue
             prior = prev.get(series)
@@ -2327,7 +2368,16 @@ def _resource_observations(samples, *, process_info=None) -> list[dict]:
                 continue
             dt_s = (t - prior[0]) / 1e9
             label = series.split(":")[1]
-            if kind in ("cpu_us", "cpu_s"):
+            if kind == "runqueue_s":
+                measured = 100.0 * delta / dt_s
+                unit = "percent"
+                total_value, total_unit = delta, "run-queue seconds"
+                name = f"process:{identity}:runqueue_wait_pct"
+                display_name = (
+                    f"{process['display_name'] if process else identity} main thread run-queue wait"
+                )
+                trace_name = "runqueue_wait_percent"
+            elif kind in ("cpu_us", "cpu_s"):
                 cpu_s = delta * (1e-6 if kind == "cpu_us" else 1.0)
                 measured = 100.0 * cpu_s / dt_s
                 unit = "percent"
@@ -2956,6 +3006,7 @@ def _build_run_summary(
         vms = resource_by_name.get(prefix + "vms_mb")
         read = resource_by_name.get(prefix + "io_read_mb_s")
         write = resource_by_name.get(prefix + "io_write_mb_s")
+        runqueue = resource_by_name.get(prefix + "runqueue_wait_pct")
         process_metrics.append(
             {
                 "identity": identity,
@@ -2968,6 +3019,16 @@ def _build_run_summary(
                 "start_ticks": info.get("start_ticks"),
                 "namespace_pid": info.get("namespace_pid"),
                 "pid_namespace": info.get("pid_namespace"),
+                "ppid": info.get("ppid"),
+                "parent_identity": info.get("parent_identity"),
+                "first_seen_ns": info.get("first_seen_ns"),
+                "last_seen_ns": info.get("last_seen_ns"),
+                "first_seen_ms": (info["first_seen_ns"] - started_ns) / 1e6
+                if info.get("first_seen_ns") is not None and started_ns is not None
+                else None,
+                "last_seen_ms": (info["last_seen_ns"] - started_ns) / 1e6
+                if info.get("last_seen_ns") is not None and started_ns is not None
+                else None,
                 "cpu_average_percent": cpu["mean"] if cpu else None,
                 "cpu_peak_percent": cpu["max"] if cpu else None,
                 "cpu_time_seconds": cpu.get("total") if cpu else None,
@@ -2977,6 +3038,7 @@ def _build_run_summary(
                 "vms_peak_mb": vms["max"] if vms else None,
                 "io_read_mb": read.get("total") if read else None,
                 "io_write_mb": write.get("total") if write else None,
+                "main_thread_runqueue_seconds": runqueue.get("total") if runqueue else None,
                 "samples": max(
                     (metric["samples"] for metric in (cpu, rss, vms, read, write) if metric),
                     default=0,
