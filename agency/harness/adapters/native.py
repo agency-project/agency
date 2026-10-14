@@ -193,6 +193,20 @@ class NativeAdapter(HarnessAdapter):
                 argv += ["--elide-large", str(ha.elide_large)]
             if ha.cache_keepalive_s:
                 argv += ["--cache-keepalive-s", str(ha.cache_keepalive_s)]
+            if ha.library_suggest:
+                argv.append("--library-suggest")
+            if ha.system_stats_explained:
+                argv.append("--system-stats-explained")
+            elif ha.system_stats:
+                argv.append("--system-stats")
+            if ha.system_prompt:
+                argv += ["--system", ha.system_prompt]
+            if ha.fork_steps:
+                argv += ["--fork-tool", "--fork-steps", str(ha.fork_steps)]
+                if ha.fork_force_at:
+                    argv += ["--fork-force-at", str(ha.fork_force_at)]
+                if ha.fork_force_on_fail:
+                    argv.append("--fork-force-on-fail")
             if ha.elide_selector and ha.supervisor_model:
                 argv += ["--selector-model", ha.supervisor_model,
                          "--selector-llm-base-url", f"{runtime.harness_base_url}/supervisor"]

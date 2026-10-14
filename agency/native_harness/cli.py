@@ -41,7 +41,7 @@ from .mcp_client import McpToolset
 from .react_loop import run_react_loop
 from . import session as session_store
 from . import react_loop
-from . import tools
+from . import fork, libsuggest, tools
 
 _DEFAULT_SESSION_DIR = os.path.join(os.path.expanduser("~"), ".native_harness", "sessions")
 _DEFAULT_OFFLOAD_DIR = "./long_tool_call_outputs"
@@ -138,6 +138,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="While tools run, re-send the last request with max 1 output token once this many seconds "
         "have passed since the cache was last used (0 = off).",
     )
+    p.add_argument("--system-stats", action="store_true", help="Append host load and pressure to bash results.")
+    p.add_argument("--system-stats-explained", action="store_true",
+                   help="Like --system-stats, with each number explained and advice on how load affects results.")
+    p.add_argument("--fork-tool", action="store_true", help="Offer the fork tool (parallel exploration branches).")
+    p.add_argument("--fork-steps", type=int, default=30, help="Step limit per fork branch.")
+    p.add_argument("--library-suggest", action="store_true",
+                   help="Suggest related /library scripts at task start and when the agent re-creates one.")
+    p.add_argument("--fork-force-on-fail", action="store_true",
+                   help="Make the agent fork right after its first failed test run following an edit.")
+    p.add_argument("--fork-force-at", type=int, default=0,
+                   help="At this step, if the agent has not forked yet, make it call fork (0 = never).")
     p.add_argument("--selector-model", default=None, help="Model that picks lines of elided outputs to show in full.")
     p.add_argument("--selector-llm-base-url", default=None)
     p.add_argument(
@@ -184,6 +195,9 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.elide_large:
         tools.enable_show_elided()
     react_loop.CACHE_KEEPALIVE_S = args.cache_keepalive_s
+    tools.SYSTEM_STATS = args.system_stats or args.system_stats_explained
+    tools.SYSTEM_STATS_EXPLAINED = args.system_stats_explained
+    libsuggest.ENABLED = args.library_suggest
 
     llm_base_url, llm_api_key = _resolve_llm_endpoint(args)
     llm = LLMClient(llm_base_url, llm_api_key)
@@ -199,6 +213,12 @@ def main(argv: "list[str] | None" = None) -> int:
         else None
     )
     context_limit = bridge.context_limit() if bridge is not None else None
+    if args.fork_tool:
+        fork.ENABLED = True
+        fork.LLM_FACTORY = lambda: LLMClient(llm_base_url, llm_api_key)
+        fork.MODEL, fork.BRIDGE, fork.OFFLOAD_DIR, fork.BRANCH_STEPS = args.model, bridge, args.offload_dir, args.fork_steps
+        fork.FORCE_AT_STEP = args.fork_force_at
+        fork.FORCE_ON_FAIL = args.fork_force_on_fail
 
     mcp_config = json.loads(args.mcp_config) if args.mcp_config else None
     mcp = McpToolset(mcp_config) if mcp_config else None

@@ -244,6 +244,7 @@ class TracerLoop:
         self._pending_syscall_exit: "dict[int, tuple]" = {}
         self._options_applied: "set[int]" = set()
         self._returncode: "int | None" = None
+        self.tracer_error: "BaseException | None" = None
         self._finished = threading.Event()
         # ``launch()`` must not return while the root process is still only
         # the forked Python image.  In particular, an immediately-ending
@@ -344,7 +345,14 @@ class TracerLoop:
                 started.set()
                 return
             started.set()
-            self._run()
+            try:
+                self._run()
+            except BaseException as exc:  # noqa: BLE001
+                # A dead tracer leaves its tracees stopped and join() waiting forever: end the run instead.
+                self.tracer_error = exc
+                report_failure("agproxy_ptrace", "tracer thread died; killing the traced process tree", exc)
+                self._kill_after_tracer_death()
+                raise
 
         self._thread = threading.Thread(target=run_with_fork, name="agproxy_ptrace", daemon=True)
         self._thread.start()
@@ -730,7 +738,15 @@ class TracerLoop:
                 unknown = got_pid not in self._known_pids
             if unknown:
                 self._remember_spawn(got_pid, is_process=None)
-            self._dispatch(got_pid, status)
+            try:
+                self._dispatch(got_pid, status)
+            except pt.PtraceError as exc:
+                if exc.errno != errno.ESRCH:
+                    raise
+                # The tracee vanished (e.g. SIGKILLed) between its stop and our ptrace call on it;
+                # its exit status arrives on a later waitpid like any other exit.
+                with self._lock:
+                    self._pending_syscall_exit.pop(got_pid, None)
 
         self._finished.set()
 
@@ -1093,6 +1109,32 @@ class TracerLoop:
         if self._stdin_writer is not None:
             self._stdin_writer.join()
         return self._returncode
+
+    def _kill_after_tracer_death(self) -> None:
+        with self._lock:
+            pids = set(self._known_pids)
+            if self._returncode is None:
+                self._returncode = -signal.SIGKILL
+        # Children forked after the tracer's last stop were never registered; find them through /proc.
+        parents = {}
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                try:
+                    with open(f"/proc/{entry}/stat") as f:
+                        parents[int(entry)] = int(f.read().rsplit(")", 1)[1].split()[1])
+                except (OSError, IndexError, ValueError):
+                    continue
+        grew = True
+        while grew:
+            more = {child for child, parent in parents.items() if parent in pids} - pids
+            pids |= more
+            grew = bool(more)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self._finished.set()
 
     def kill(self) -> None:
         if self._checkpoint_detached:

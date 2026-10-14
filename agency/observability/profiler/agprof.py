@@ -92,6 +92,8 @@ _OWNERSHIP_KEYS = (
 
 # Sampler timeline + GPU lease intervals (see _Sampler / gpu_lease_*).
 _samples: "list[tuple[int, str, float]]" = []  # (t_mono_ns, series, value)
+_samples_persisted = 0  # prefix of _samples already written through the data logger
+_wall_minus_perf_ns: "int | None" = None
 _process_info: "dict[str, dict]" = {}  # pid-start_ticks identity -> trace/display metadata
 _profile_root_pid: "int | None" = None
 _thread_labels: "dict[tuple[int, int], tuple[int, str]]" = {}
@@ -1551,6 +1553,37 @@ def _process_display_name(pid: int, comm: str, argv: list[str], sandbox: "str | 
     return f"{role} (PID {pid})"
 
 
+def _persist_samples() -> None:
+    """Write samples taken since the last call through the profiler's data logger."""
+    global _samples_persisted
+    logger, session, offset = _profile_data_logger, _profile_session_id, _wall_minus_perf_ns
+    end = len(_samples)
+    if logger is None or session is None or offset is None or end <= _samples_persisted:
+        return
+    rows = [
+        ((t + offset) / 1e9, t, series, value, session)
+        for t, series, value in _samples[_samples_persisted:end]
+    ]
+    _samples_persisted = end
+    try:
+        logger.record_samples(rows)
+    except Exception as exc:  # swallow-ok: counted in _health['sample_export_failures']
+        _health["sample_export_failures"] += 1
+        _agprof_print(f"[agprof] WARNING: datalogger sample export failed: {exc}")
+
+
+def _persist_process(info: dict) -> None:
+    logger, session = _profile_data_logger, _profile_session_id
+    if logger is None or session is None:
+        return
+    try:
+        logger.record_event(
+            "profile_process", {**info, "profile_session_id": session}, print_to_terminal=False
+        )
+    except Exception:  # swallow-ok: counted in _health['sample_export_failures']
+        _health["sample_export_failures"] += 1
+
+
 class _Sampler(threading.Thread):
     """Background poller for per-PID, workload-cgroup, and GPU metrics."""
 
@@ -1673,6 +1706,7 @@ class _Sampler(threading.Thread):
                 info["pid_namespace"] = None
                 info["namespace_pid"] = None
             _process_info[identity] = info
+            _persist_process(info)
         else:
             info["last_seen_ns"] = t
             if info["sandbox"] is None:
@@ -1799,6 +1833,8 @@ class _Sampler(threading.Thread):
                 _samples.append((t, f"sandbox:{label}:mem_mb", int(f.read()) / 2**20))
         except Exception:  # swallow-ok: cgroup vanished (container stopped)
             return  # cgroup vanished (container stopped/hibernated) — skip all
+        for resource in ("cpu", "memory", "io"):
+            self._sample_pressure(t, f"cg:{label}", f"{cdir}/{resource}.pressure", resource)
         # Disk IO, tier 1: the cgroup's own io.stat (exact; present under
         # rootful docker and io-delegated rootless slices).
         io_done = False
@@ -1902,8 +1938,37 @@ class _Sampler(threading.Thread):
             # is preferable to turning a completed benchmark into a failure.
             return
 
+    def _sample_pressure(self, t: int, scope: str, path, resource: str) -> None:
+        """PSI avg10: percent of the last 10 s in which tasks stalled on *resource*."""
+        with suppress(OSError, ValueError, IndexError):
+            for line in Path(path).read_text().splitlines():
+                fields = line.split()
+                _samples.append(
+                    (t, f"{scope}:psi_{resource}_{fields[0]}", float(fields[1].split("=")[1]))
+                )
+
+    def _tick_host(self, t: int) -> None:
+        """Host-wide load and pressure, i.e. what every other tenant of the machine is doing."""
+        with suppress(OSError, ValueError, IndexError):
+            load = (self._proc_root / "loadavg").read_text().split()
+            _samples.append((t, "host:load1", float(load[0])))
+            _samples.append((t, "host:procs_running", float(load[3].split("/")[0])))
+        with suppress(OSError, ValueError, IndexError):
+            jiffies = [int(x) for x in (self._proc_root / "stat").read_text().split("\n", 1)[0].split()[1:]]
+            us = 1e6 / self._clock_ticks
+            _samples.append((t, "host:cpu_us", (sum(jiffies[:3]) + sum(jiffies[5:8])) * us))
+            _samples.append((t, "host:iowait_us", jiffies[4] * us))
+        with suppress(OSError, ValueError, IndexError):
+            for line in (self._proc_root / "meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    _samples.append((t, "host:mem_available_mb", int(line.split()[1]) / 1024))
+                    break
+        for resource in ("cpu", "memory", "io"):
+            self._sample_pressure(t, "host", self._proc_root / "pressure" / resource, resource)
+
     def _tick(self) -> None:
         t = time.perf_counter_ns()
+        self._tick_host(t)
         self._tick_workload_cgroup(t)
         self._tick_processes(t)
         if self._nvml is not None:
@@ -1917,6 +1982,7 @@ class _Sampler(threading.Thread):
                     _samples.append((t, f"gpu{i}:power_w", p / 1000.0))
                     self._tick_gpu_procs(t, i, h, float(u.gpu), p / 1000.0)
         self._tick_cgroups(t)
+        _persist_samples()
 
     def run(self) -> None:
         _remember_thread_label("agprof sampler", priority=90)
@@ -1972,7 +2038,7 @@ def start(
     global _sampler
     global _session_started_ns, _session_sample_hz, _session_sample_gpu
     global _profile_session_id, _profile_data_logger, _last_profile_records
-    global _profile_root_pid, _auto_dropped
+    global _profile_root_pid, _auto_dropped, _samples_persisted, _wall_minus_perf_ns
     auto_settings = (
         _make_auto_settings(
             include=auto_include,
@@ -2045,6 +2111,13 @@ def start(
         with _open_spans_lock:
             _open_spans.clear()
         _samples.clear()
+        _samples_persisted = 0
+        _wall_minus_perf_ns = time.time_ns() - time.perf_counter_ns()
+        profile_data_logger.record_event(
+            "profile_host",
+            {"profile_session_id": profile_session_id, "cpus": os.cpu_count(), "pid": os.getpid()},
+            print_to_terminal=False,
+        )
         _process_info.clear()
         _thread_labels.clear()
         _profile_root_pid = os.getpid()
@@ -2109,6 +2182,7 @@ def stop():
         _session_started_ns = None
     if sampler is not None:
         sampler.halt()
+    _persist_samples()
     auto_settings = copy.deepcopy(_auto_settings)
     auto_events = _disable_auto_functions() if _auto_tool_in_use else list(_auto_records)
     t_end = time.perf_counter_ns()
@@ -2125,6 +2199,12 @@ def stop():
     prof.stop()
     records = _load_profile_records(profile_session_id)
     _last_profile_records = list(records)
+    persisted_samples = []
+    if profile_data_logger is not None and profile_session_id is not None:
+        try:
+            persisted_samples = profile_data_logger.read_samples(profile_session_id)
+        except Exception as exc:
+            _agprof_print(f"[agprof] WARNING: datalogger sample read failed: {exc}")
     if profile_data_logger is not None:
         try:
             profile_data_logger.stop()
@@ -2132,7 +2212,7 @@ def stop():
             _agprof_print(f"[agprof] WARNING: profiler datalogger shutdown failed: {exc}")
     _profile_session_id = None
     _profile_data_logger = None
-    samples = list(_samples)
+    samples = persisted_samples or list(_samples)
     leases = list(_leases)
     interrupted_spans = list(_interrupted_spans)
     process_info = copy.deepcopy(_process_info)
@@ -2227,7 +2307,27 @@ def _resource_observations(samples, *, process_info=None) -> list[dict]:
         kind = parts[-1]
         identity = parts[1] if scope == "proc" and len(parts) == 3 else None
         process = process_info.get(identity) if identity is not None else None
-        cumulative_scope = scope in ("cg", "workload", "proc")
+        cumulative_scope = scope in ("cg", "workload", "proc", "host")
+        if scope == "host" and kind in ("cpu_us", "iowait_us"):
+            prior = prev.get(series)
+            prev[series] = (t, value)
+            if prior is None or t <= prior[0] or value < prior[1]:
+                continue
+            what = "CPU" if kind == "cpu_us" else "iowait"
+            observations.append(
+                {
+                    "timestamp_ns": t,
+                    "name": f"host:{kind[:-3]}_pct",
+                    "display_name": f"host {what} (100 = one core)",
+                    "trace_name": f"host {what} %",
+                    "unit": "percent",
+                    "value": 100.0 * (value - prior[1]) * 1e-6 / ((t - prior[0]) / 1e9),
+                    "interval_total": (value - prior[1]) * 1e-6,
+                    "total_unit": "CPU seconds",
+                    "interval_start_ns": prior[0],
+                }
+            )
+            continue
         if kind in ("cpu_us", "cpu_s") or kind in _BYTE_KINDS:
             if not cumulative_scope:
                 continue
@@ -2332,6 +2432,11 @@ def _gauge_description(series: str) -> "tuple[str, str]":
         "rss_mb": "MB",
     }.get(suffix, "value")
     parts = series.split(":")
+    if suffix.startswith("psi_"):
+        owner = parts[0] if len(parts) == 2 else f"sandbox {parts[1]}"
+        return f"{owner} {suffix.replace('_', ' ')} (avg10)", "percent"
+    if parts[0] == "host":
+        return f"host {suffix}", "MB" if suffix.endswith("_mb") else "value"
     if parts[0] == "sandbox" and suffix == "mem_mb":
         return f"sandbox {parts[1]} memory", unit
     if parts[0].startswith("gpu"):
@@ -3381,6 +3486,17 @@ def _env_out_dir() -> str:
     return os.environ.get("AGENCY_PROFILE_DIR", default)
 
 
+def _env_start_kwargs() -> dict:
+    """AGENCY_PROFILE_SAMPLE_HZ sets the sampler rate; AGENCY_PROFILE_AUTO=0 turns off
+    automatic function intervals (sys.monitoring), leaving spans and resource samples."""
+    kwargs = {}
+    if os.environ.get("AGENCY_PROFILE_SAMPLE_HZ"):
+        kwargs["sample_hz"] = float(os.environ["AGENCY_PROFILE_SAMPLE_HZ"])
+    if os.environ.get("AGENCY_PROFILE_AUTO", "").strip().lower() in ("0", "false"):
+        kwargs["auto_functions"] = False
+    return kwargs
+
+
 @contextmanager
 def workload():
     """Profile a workload boundary when environment profiling requests it.
@@ -3395,7 +3511,7 @@ def workload():
     prof = _profiler
     if _env_enabled() and profile_scope() == "workload" and not enabled():
         try:
-            prof = start(_env_out_dir())
+            prof = start(_env_out_dir(), **_env_start_kwargs())
             owns_session = True
         except RuntimeError as exc:
             _agprof_print(
@@ -3415,7 +3531,7 @@ def _maybe_autostart() -> None:
     global _process_shutdown_started
     with _process_shutdown_lock:
         _process_shutdown_started = False
-    start(_env_out_dir())
+    start(_env_out_dir(), **_env_start_kwargs())
     _install_process_profile_signal_handlers()
     atexit.register(_shutdown_process_profile)
 

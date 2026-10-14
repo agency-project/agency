@@ -32,14 +32,26 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 
 import httpx
 from .profiling import span as profile_span
 
-_DISPATCH_MAX_RETRIES = 4
-_DISPATCH_BASE_BACKOFF_S = 0.5
-_DISPATCH_MAX_BACKOFF_S = 8.0
+_DISPATCH_MAX_RETRIES = 6
+_DISPATCH_BASE_BACKOFF_S = 1.0
+_DISPATCH_MAX_BACKOFF_S = 30.0
+# Gateway/proxy failures that carry no model output: Cloudflare 520-524, bad gateway, and the host bridge's own
+# 500 for a dropped upstream stream (marked "transient").
+_RETRY_STATUSES = {502, 503, 504, 520, 521, 522, 523, 524}
+
+
+_TRANSIENT_TEXT = re.compile(r"Error code: 5\d\d|peer closed connection|incomplete chunked read|Internal Server Error")
+
+
+def _is_transient(status: int, body: str) -> bool:
+    return status in _RETRY_STATUSES or (
+        status == 500 and ('"transient":true' in body.replace(" ", "") or bool(_TRANSIENT_TEXT.search(body))))
 
 
 def _retry_backoff_s(attempt: int) -> float:
@@ -63,6 +75,7 @@ class LLMClient:
         *,
         internal_kind: "str | None" = None,
         max_tokens: "int | None" = None,
+        tool_choice: "dict | str | None" = None,
     ) -> dict:
         """Returns `{"message": {...}, "usage": {...} | None}` on success,
         `{"error": "..."}` on failure (exhausted retries or a non-retryable
@@ -70,6 +83,8 @@ class LLMClient:
         kwargs = {"model": model, "messages": messages, "stream": True}
         if tools:
             kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
         if internal_kind is not None:
             kwargs["agency_internal_kind"] = internal_kind
         if max_tokens is not None:
@@ -85,8 +100,7 @@ class LLMClient:
             stream_error: "dict | None" = None
             try:
                 with self._client.stream("POST", "/v1/chat/completions", json=kwargs) as resp:
-                    if resp.status_code == 503:
-                        resp.read()
+                    if resp.status_code != 200 and _is_transient(resp.status_code, resp.read().decode(errors="replace")):
                         last_error = f"dispatch failed: {resp.status_code} {resp.text}"
                         if attempt < _DISPATCH_MAX_RETRIES - 1:
                             with profile_span(self, f"llm:retry_backoff[{attempt}]"):
@@ -141,7 +155,7 @@ class LLMClient:
                     last_error = f"dispatch failed: {stream_error.get('message', stream_error)}"
                     assembled = content_parts or reasoning_parts or tool_calls_raw
                     if (
-                        stream_error.get("transient")
+                        (stream_error.get("transient") or _TRANSIENT_TEXT.search(str(stream_error.get("message", ""))))
                         and not assembled
                         and attempt < _DISPATCH_MAX_RETRIES - 1
                     ):
@@ -159,7 +173,7 @@ class LLMClient:
                     message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
                 return {"message": message, "usage": usage}
 
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ReadError) as e:
                 last_error = f"llm endpoint unreachable: {e}"
                 if attempt < _DISPATCH_MAX_RETRIES - 1:
                     with profile_span(self, f"llm:retry_backoff[{attempt}]"):

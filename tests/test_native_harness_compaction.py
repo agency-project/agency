@@ -80,3 +80,28 @@ def test_assemble_compacted_messages_injects_summary_and_keeps_tail():
     assert result[1] == task_input[0]
     assert "the summary" in result[2]["content"]
     assert result[-1] == tail[0]
+
+
+def test_prompt_budget_leaves_room_for_the_requested_output():
+    # 230k prompt + 32k output overflowed a 262k vLLM context (10-12); the budget must trigger before that.
+    assert compaction.prompt_budget(262000) == 222000
+    assert compaction.should_compact(230001, 262000)
+    assert compaction.prompt_budget(40000) == 30000
+
+
+def test_maybe_compact_uses_the_servers_token_count_when_the_estimate_is_low():
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def dispatch(self, model, messages, *a, **kw):
+            self.calls += 1
+            return {"message": {"role": "assistant", "content": "summary"}}
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+    for i in range(12):
+        msgs += [{"role": "assistant", "content": f"a{i}", "tool_calls": []}, {"role": "tool", "content": "x" * 40}]
+    llm = LLM()
+    out, _ = compaction.maybe_compact(msgs, 262000, llm, "m", None)
+    assert llm.calls == 0 and out is msgs
+    out, summary = compaction.maybe_compact(msgs, 262000, llm, "m", None, known_tokens=240000)
+    assert llm.calls == 1 and summary == "summary"

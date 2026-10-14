@@ -56,6 +56,7 @@ _BARE_THREAD_ALLOWLIST = {
     # General background I/O and UI maintenance.
     ("agency/utils/agutil.py", "_iter_batched"): (1, "stream iterator drainer"),
     ("agency/native_harness/react_loop.py", "_start_keepalive"): (1, "prompt-cache keep-alive during tool calls"),
+    ("agency/native_harness/fork.py", "make_tool.fork"): (1, "fork tool: one thread per exploration branch"),
     (
         "agency/observability/agwebui/__init__.py",
         "agwebui.run",

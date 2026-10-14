@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 
 CHARS_PER_TOKEN = 4
 COMPACT_THRESHOLD = 0.9  # Fraction of context_limit that triggers compaction.
+# The gateway asks for this many output tokens on every call (agconfig.llm.default_max_tokens), and the server
+# rejects prompt + output above the context limit, so the prompt budget must leave room for it.
+OUTPUT_RESERVE = 32000 + 8000
 TAIL_FRACTION = 0.25
 TAIL_MIN_TOKENS = 2_000
 TAIL_MAX_TOKENS = 8_000
@@ -90,8 +93,13 @@ def estimate_messages_tokens(messages: "list[dict]") -> int:
     return sum(estimate_tokens(m) for m in messages)
 
 
+def prompt_budget(context_limit: int) -> int:
+    reserve = min(OUTPUT_RESERVE, context_limit // 4)  # small-context models cannot spare 40k
+    return min(int(context_limit * COMPACT_THRESHOLD), context_limit - reserve)
+
+
 def should_compact(prompt_tokens: int, context_limit: int) -> bool:
-    return prompt_tokens >= int(context_limit * COMPACT_THRESHOLD)
+    return prompt_tokens >= prompt_budget(context_limit)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +113,7 @@ def should_compact(prompt_tokens: int, context_limit: int) -> bool:
 def tail_start(conv: "list[dict]", context_limit: int, tail_turns: int = DEFAULT_TAIL_TURNS) -> int:
     if not conv:
         return 0
-    usable = int(context_limit * COMPACT_THRESHOLD)
+    usable = prompt_budget(context_limit)
     tail_budget = max(TAIL_MIN_TOKENS, min(TAIL_MAX_TOKENS, int(usable * TAIL_FRACTION)))
     turns_kept = 0
     tokens_kept = 0
@@ -247,6 +255,7 @@ def maybe_compact(
     llm: "LLMClient",
     model: str,
     previous_summary: "str | None",
+    known_tokens: "int | None" = None,
 ) -> "tuple[list, str | None]":
     """Compact `messages` if they're near `context_limit`. Returns
     `(messages, previous_summary)` -- both unchanged if compaction doesn't
@@ -256,7 +265,9 @@ def maybe_compact(
     just one step later than agllm.py's own compact()-raises behavior)."""
     if context_limit is None:
         return messages, previous_summary
-    token_count = estimate_messages_tokens(messages)
+    # known_tokens: the server's count for the last call plus an estimate of what was added since; the
+    # character estimate alone can fall well short of the real count.
+    token_count = max(estimate_messages_tokens(messages), known_tokens or 0)
     if not should_compact(token_count, context_limit):
         return messages, previous_summary
     sys_msg, task_input, head, tail = split_for_compaction(messages, context_limit)

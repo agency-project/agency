@@ -352,6 +352,20 @@ class harnessadapterconfig(confignamespace):
     cache_keepalive_s: int = 0
     # Native: supervisor_model picks the lines of an elided output shown in full (T45).
     elide_selector: bool = False
+    # Native: host load and pressure appended to every bash result.
+    system_stats: bool = False
+    # Native: system_stats with each number explained and advice on how load affects results.
+    system_stats_explained: bool = False
+    # Native: system prompt for a fresh session ("" = none, the default).
+    system_prompt: str = ""
+    # Native: offer the fork tool (parallel exploration branches) with this many steps per branch (0 = off).
+    fork_steps: int = 0
+    # Native: with fork_steps, the step at which the harness makes the agent call fork if it has not (0 = never).
+    fork_force_at: int = 0
+    # Native: with fork_steps, make the agent fork right after its first failed test run following an edit.
+    fork_force_on_fail: bool = False
+    # Native: the harness suggests related /library scripts at task start and when the agent re-creates one.
+    library_suggest: bool = False
 
     _SENSITIVE_FIELDS: ClassVar[frozenset] = frozenset({"supervisor_api_key"})
 
@@ -385,7 +399,8 @@ class hostserverconfig(confignamespace):
 
     uds_path: "str | None" = None
     startup_timeout_s: float = 10.0
-    shutdown_timeout_s: float = 10.0
+    # A sandbox throttled by its CPU quota (H1x load) closes its connections slowly; 10 s killed 4 runs (10-13).
+    shutdown_timeout_s: float = 60.0
 
 
 @dataclass(slots=True, init=False)

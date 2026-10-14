@@ -23,9 +23,9 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from . import tools
+from . import fork, libsuggest, tools
 from .profiling import profile_run, span as profile_span
-from .compaction import maybe_compact
+from .compaction import estimate_messages_tokens, maybe_compact
 
 # Set by cli.py: tool names left out of the tool list (T41), and whether a run ends as soon as
 # submit_output reports every output field in, without a closing turn (T39).
@@ -123,16 +123,41 @@ def run_react_loop(
 
     if DROP_TOOLS:
         tool_schemas = [t for t in tool_schemas if t["function"]["name"] not in DROP_TOOLS]
+    if fork.ENABLED:
+        dispatch_table["fork"] = fork.make_tool(dispatch_table)
+        tool_schemas.append(tools._tool_schema("fork", fork.DESCRIPTION, fork.PARAMS))
+    if libsuggest.ENABLED:
+        for name in ("write", "bash"):
+            if name in dispatch_table:
+                dispatch_table[name] = libsuggest.with_note(name, dispatch_table[name])
+        if not any(m.get("role") == "assistant" for m in messages):
+            note = libsuggest.start_note(libsuggest.task_text(messages))
+            if note:
+                messages.append({"role": "user", "content": note})
 
+    forked = edited = fork_due = False
+    served_tokens, served_upto = 0, None  # last call's prompt + completion tokens, and len(messages) right after it
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
+            known = (served_tokens + estimate_messages_tokens(messages[served_upto:])) if served_upto else None
+            n_before = len(messages)
             messages, previous_summary = maybe_compact(
-                messages, context_limit, llm, model, previous_summary
+                messages, context_limit, llm, model, previous_summary, known_tokens=known
             )
+            if len(messages) != n_before:
+                served_tokens, served_upto = 0, None
 
+            tool_choice = None
+            if fork.ENABLED and not forked and (fork_due or (fork.FORCE_AT_STEP and step == fork.FORCE_AT_STEP)):
+                messages.append({"role": "user", "content": fork.FIX_NOTE if fork_due else fork.FORCE_NOTE})
+                tool_choice = {"type": "function", "function": {"name": "fork"}}
+                fork_due = False
             sent = list(messages)
             cache_used_at = time.monotonic()
-            resp = llm.dispatch(model, messages, tool_schemas or None)
+            if tool_choice is None:
+                resp = llm.dispatch(model, messages, tool_schemas or None)
+            else:
+                resp = llm.dispatch(model, messages, tool_schemas or None, tool_choice=tool_choice)
             if "error" in resp:
                 return ReactLoopResult(
                     status="error", message=str(resp["error"]), turn_count=step + 1
@@ -144,7 +169,10 @@ def run_react_loop(
 
             message = resp["message"]
             tool_calls = message.get("tool_calls") or []
+            forked = forked or any((c.get("function") or {}).get("name") == "fork" for c in tool_calls)
             messages.append(message)
+            served_tokens = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
+            served_upto = len(messages)
             if not tool_calls:
                 return ReactLoopResult(
                     status="done",
@@ -159,12 +187,16 @@ def run_react_loop(
             )
 
             tools.elide.note_context(sent, message)
+            fork.CONTEXT = sent
             keepalive = _start_keepalive(llm, model, sent, tool_schemas, cache_used_at)
             try:
                 _run_tool_calls(tool_calls, dispatch_table, bridge, offload_dir, messages)
             finally:
                 if keepalive is not None:
                     keepalive.set()
+            if fork.ENABLED and fork.FORCE_ON_FAIL and not forked:
+                edited = edited or any((c.get("function") or {}).get("name") in ("edit", "write") for c in tool_calls)
+                fork_due = edited and fork.failed_check(tool_calls, messages[-len(tool_calls):])
             # Only after every tool result is in: a resume must never start from a
             # dangling tool_use, so a crash mid-turn reverts to the previous turn.
             if on_checkpoint is not None:
@@ -189,6 +221,34 @@ def run_react_loop(
         message=f"exceeded max_steps={max_steps} without a final answer",
         turn_count=max_steps,
     )
+
+
+def run_branch_loop(messages: list, model: str, llm, dispatch_table: dict, *, bridge=None, max_steps: int = 30,
+                    offload_dir: str = "./long_tool_call_outputs") -> ReactLoopResult:
+    """A fork branch: the plain tool loop over dispatch_table, no compaction, keep-alive or nested fork."""
+    messages = list(messages)
+    schemas = [s for name, s in tools.BUILTIN_TOOL_SCHEMAS.items() if name in dispatch_table and name not in DROP_TOOLS]
+    tin = tout = 0
+    for step in range(max_steps):
+        resp = llm.dispatch(model, messages, schemas or None)
+        if "error" in resp:
+            return ReactLoopResult(status="error", message=str(resp["error"]), turn_count=step + 1)
+        usage = resp.get("usage") or {}
+        tin += usage.get("prompt_tokens", 0) or 0
+        tout += usage.get("completion_tokens", 0) or 0
+        message = resp["message"]
+        messages.append(message)
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return ReactLoopResult(status="done", messages=messages, final_text=message.get("content") or "",
+                                   total_input_tokens=tin, total_output_tokens=tout, turn_count=step + 1)
+        _run_tool_calls(tool_calls, dispatch_table, bridge, offload_dir, messages)
+    messages.append({"role": "user", "content": "[fork] Step limit reached. Reply now with your report; no more tool calls."})
+    resp = llm.dispatch(model, messages, None)
+    text = (resp.get("message") or {}).get("content") or "" if "error" not in resp else ""
+    return ReactLoopResult(status="done" if text else "error", messages=messages, final_text=text,
+                           message="step limit reached", total_input_tokens=tin, total_output_tokens=tout,
+                           turn_count=max_steps)
 
 
 def _run_tool_calls(tool_calls: list, dispatch_table: dict, bridge, offload_dir: str, messages: list) -> None:

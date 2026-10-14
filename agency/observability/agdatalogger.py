@@ -53,6 +53,7 @@ class agDataLogger:
         self._block_rows: list[tuple] = []
         self._exchange_rows: list[tuple] = []
         self._exchange_chain_rows: list[tuple] = []
+        self._sample_rows: list[tuple] = []
         self._pending_count = 0
         self._last_flush_ts = 0.0
 
@@ -170,6 +171,39 @@ class agDataLogger:
                 )
             )
         return records
+
+    def record_samples(self, rows: "list[tuple]", *, call_label: "str | None" = None) -> None:
+        """Resource samples: (timestamp, perf_ns, series, value, profile_session_id) tuples."""
+        if not rows:
+            return
+        with self._lock:
+            self._sample_rows.extend(
+                (ts, perf_ns, series, value, session, self._default_name, call_label)
+                for ts, perf_ns, series, value, session in rows
+            )
+            self._pending_count += len(rows)
+            self._maybe_flush_locked()
+
+    def read_samples(self, profile_session_id: str) -> "list[tuple[int, str, float]]":
+        """(perf_ns, series, value) for one profiling session, in sampling order."""
+        with self._lock:
+            self._flush_locked()
+            connection = self._conn
+            owns_connection = connection is None
+            if owns_connection:
+                if self.agconfig.data_logger.db_path == ":memory:":
+                    return []
+                connection = sqlite3.connect(self.agconfig.data_logger.db_path, timeout=30)
+            try:
+                rows = connection.execute(
+                    "SELECT perf_ns, series, value FROM samples WHERE profile_session_id = ? "
+                    "ORDER BY id",
+                    (profile_session_id,),
+                ).fetchall()
+            finally:
+                if owns_connection:
+                    connection.close()
+        return [(int(t), series, float(value)) for t, series, value in rows]
 
     def record_event(
         self,
@@ -534,6 +568,24 @@ class agDataLogger:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_exchange_chain_label ON exchange_chain(call_label)"
         )
+        # Resource samples (host load, pressure, per-sandbox and per-process usage) from
+        # the profiler's sampler; cumulative series are counters, the rest gauges.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                perf_ns INTEGER NOT NULL,
+                series TEXT NOT NULL,
+                value REAL NOT NULL,
+                profile_session_id TEXT,
+                name TEXT,
+                call_label TEXT
+            )
+            """
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(timestamp)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_samples_series ON samples(series)")
         self._conn.commit()
 
     def _maybe_flush_locked(self) -> None:
@@ -556,6 +608,7 @@ class agDataLogger:
             and not self._block_rows
             and not self._exchange_rows
             and not self._exchange_chain_rows
+            and not self._sample_rows
         ):
             self._last_flush_ts = time.time()
             return
@@ -623,6 +676,12 @@ class agDataLogger:
                     "INSERT INTO exchange_chain (call_label, kind, seq, hash) VALUES (?, ?, ?, ?)",
                     self._exchange_chain_rows,
                 )
+            if self._sample_rows:
+                self._conn.executemany(
+                    "INSERT INTO samples (timestamp, perf_ns, series, value, profile_session_id, "
+                    "name, call_label) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    self._sample_rows,
+                )
         self._event_rows.clear()
         self._span_rows.clear()
         self._latest_value_rows.clear()
@@ -631,6 +690,7 @@ class agDataLogger:
         self._block_rows.clear()
         self._exchange_rows.clear()
         self._exchange_chain_rows.clear()
+        self._sample_rows.clear()
         self._pending_count = 0
         self._last_flush_ts = time.time()
 

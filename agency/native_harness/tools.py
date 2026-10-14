@@ -19,10 +19,11 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from typing import Generator
 
-from . import elide
+from . import elide, sysstats
 from .canonicalize import canonicalize_run, is_test_command, summarize_tests, compact_code_read, compact_tables, is_code_read_command, is_run_command
 
 _BASH_TIMEOUT_S = 120
@@ -40,6 +41,9 @@ _TOOL_OUTPUT_OFFLOAD_CHARS = 40_000
 CANONICALIZE_RUN_OUTPUT = False
 COMPACT_TABLES = False
 COMPACT_TESTS = False
+# Append host load / pressure as seen from the sandbox to every bash result.
+SYSTEM_STATS = False
+SYSTEM_STATS_EXPLAINED = False
 # Set by cli.py from --compact-code-reads.
 COMPACT_CODE_READS = False
 
@@ -543,6 +547,22 @@ def _parse_tool_args(arguments_json: str) -> dict:
 
 
 def _run_bash_tool(arguments_json: str) -> str:
+    if not SYSTEM_STATS:
+        return _run_bash_command(arguments_json)
+    started = time.monotonic()
+    result = _run_bash_command(arguments_json)
+    elapsed = time.monotonic() - started
+    note = sysstats.explained_footer(elapsed) if SYSTEM_STATS_EXPLAINED else sysstats.footer(elapsed)
+    try:
+        d = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    key = "output" if "output" in d else "error"
+    d[key] = f"{d.get(key) or ''}\n{note}"
+    return json.dumps(d)
+
+
+def _run_bash_command(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     command = args.get("command", "") if isinstance(args, dict) else ""
     workdir = args.get("workdir") or None

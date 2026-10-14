@@ -1655,3 +1655,70 @@ def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, 
         if agprof._sampler is not None and not agprof._sampler.is_alive():
             agprof._sampler = None
         agprof.stop()
+
+
+def test_host_sampler_reads_load_cpu_memory_and_pressure(tmp_path, monkeypatch):
+    proc_root = tmp_path / "proc"
+    (proc_root / "pressure").mkdir(parents=True)
+    (proc_root / "loadavg").write_text("12.50 10.00 8.00 9/1200 4242\n")
+    (proc_root / "stat").write_text("cpu  100 0 50 1000 20 5 5 0 0 0\ncpu0 1 1 1 1 1 1 1 1 1 1\n")
+    (proc_root / "meminfo").write_text("MemTotal: 32000000 kB\nMemAvailable: 2048000 kB\n")
+    (proc_root / "pressure" / "cpu").write_text(
+        "some avg10=37.50 avg60=20.00 avg300=5.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    )
+    sampler = object.__new__(agprof._Sampler)
+    sampler._proc_root = proc_root
+    sampler._clock_ticks = 100
+    monkeypatch.setattr(agprof, "_samples", [])
+
+    sampler._tick_host(7)
+
+    assert agprof._samples == [
+        (7, "host:load1", 12.5),
+        (7, "host:procs_running", 9.0),
+        (7, "host:cpu_us", 1_600_000.0),
+        (7, "host:iowait_us", 200_000.0),
+        (7, "host:mem_available_mb", 2000.0),
+        (7, "host:psi_cpu_some", 37.5),
+        (7, "host:psi_cpu_full", 0.0),
+    ]
+
+
+def test_host_cpu_counter_becomes_percent_observation():
+    observations = agprof._resource_observations(
+        [(0, "host:cpu_us", 0.0), (1_000_000_000, "host:cpu_us", 4_000_000.0),
+         (1_000_000_000, "host:psi_io_some", 12.0)],
+        process_info={},
+    )
+
+    cpu = next(o for o in observations if o["name"] == "host:cpu_pct")
+    assert cpu["value"] == pytest.approx(400.0)
+    psi = next(o for o in observations if o["name"] == "host:psi_io_some")
+    assert psi["unit"] == "percent"
+
+
+def test_sampler_samples_persist_to_data_logger_and_feed_stop(monkeypatch, tmp_path):
+    pytest.importorskip("opentelemetry.sdk.trace")
+    monkeypatch.setattr(agprof, "_require_linux", lambda: None)
+    agprof.start(tmp_path, sample_hz=0, sample_gpu=False)
+    session_id = agprof._profile_session_id
+    agprof._samples.append((time.perf_counter_ns(), "host:load1", 3.0))
+    agprof._persist_samples()
+    agprof._persist_samples()
+    agprof.stop()
+
+    with sqlite3.connect(tmp_path / "profile_data.sqlite3") as db:
+        rows = db.execute("SELECT series, value, profile_session_id, timestamp FROM samples").fetchall()
+        host = db.execute("SELECT payload FROM events WHERE type = 'profile_host'").fetchone()
+    assert [(r[0], r[1], r[2]) for r in rows] == [("host:load1", 3.0, session_id)]
+    assert abs(rows[0][3] - time.time()) < 60
+    assert json.loads(host[0])["cpus"] >= 1
+
+
+def test_env_start_kwargs_reads_sample_rate_and_auto_switch(monkeypatch):
+    monkeypatch.setenv("AGENCY_PROFILE_SAMPLE_HZ", "2")
+    monkeypatch.setenv("AGENCY_PROFILE_AUTO", "0")
+    assert agprof._env_start_kwargs() == {"sample_hz": 2.0, "auto_functions": False}
+    monkeypatch.delenv("AGENCY_PROFILE_SAMPLE_HZ")
+    monkeypatch.delenv("AGENCY_PROFILE_AUTO")
+    assert agprof._env_start_kwargs() == {}
