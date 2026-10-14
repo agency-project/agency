@@ -1362,7 +1362,12 @@ async def _replay_stream(ws):
         return cursor == len(events) and (run_id != "live" or run.get("status") != "running")
 
     def rebuild():
-        model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
+        model = Trajectory(
+            run["id"], run["title"], mode="replay", source=run["source"],
+            defer_causal_graph=run_id == "live" and run.get("status") not in {
+                "completed", "failed", "cancelled"
+            },
+        )
         for key in ("model", "harness", "condition", "task", "format", "time_origin"):
             if key in run:
                 model.run[key] = run[key]
@@ -1386,6 +1391,8 @@ async def _replay_stream(ws):
         # Saved trace counters already share its relative clock. Canonical live
         # counters enter through resource_sample events and incremental patches.
         if run_id != "live":
+            if run.get("clock"):
+                model.run["clock"] = run["clock"]
             model.run["counters"] = {
                 name: [point for point in points if point[0] <= clock]
                 for name, points in run.get("counters", {}).items()

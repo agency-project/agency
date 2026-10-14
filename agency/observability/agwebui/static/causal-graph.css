@@ -1,3 +1,92 @@
-.causal-summary {display:flex;gap:24px;flex-wrap:wrap;padding:16px;margin:12px 0}.causal-summary small {display:block;color:var(--muted,#879aad)}.causal-summary strong {display:block;font-size:20px;margin-top:6px}.causal-summary p {width:100%;color:#a8b9cb;margin:0;font-size:12px}
-.causal-controls {display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:12px;font-size:12px}.causal-controls label {display:flex;gap:6px;align-items:center}.causal-controls span {color:#9bafc3}.causal-graph .execution-timeline-scroll {height:560px;max-height:65vh;min-height:240px}.causal-graph svg text {fill:#99acc0;font-size:11px;pointer-events:none}.causal-band {fill:#121b25;stroke:#273646;opacity:.7}.causal-agent {font-weight:bold;fill:#d7e2ed!important}.causal-edge path {fill:none;stroke:#879aad;stroke-width:1.6}.causal-edge .causal-hit {stroke:transparent;stroke-width:14;pointer-events:stroke}.causal-edge.provenance path:not(.causal-hit) {stroke-dasharray:2 5;opacity:.55}.causal-edge.inferred path:not(.causal-hit),.causal-edge.unknown path:not(.causal-hit) {stroke-dasharray:7 5;opacity:.65}.causal-edge.critical path:not(.causal-hit) {stroke:#edba72;stroke-width:3}.causal-edge.selected path:not(.causal-hit),.causal-edge:focus path:not(.causal-hit) {stroke:#fff;stroke-width:3}.causal-node {cursor:pointer}.causal-node circle,.causal-node path {fill:#79b9ed;stroke:#142434;stroke-width:1.5}.causal-node.llm circle,.causal-node.llm path {fill:#c0a4ed}.causal-node.system circle,.causal-node.system path {fill:#75c8b0}.causal-node.critical circle,.causal-node.critical path {fill:#edba72}.causal-node.unknown circle,.causal-node.unknown path {fill:#1d2a38;stroke:#92a4b8;stroke-dasharray:2 2}.causal-node.selected circle,.causal-node.selected path,.causal-node:focus circle,.causal-node:focus path {stroke:#fff;stroke-width:3}.causal-node:hover text {fill:#fff}.causal-edge {cursor:pointer}.causal-tick {fill:#dbe7f1!important}
-.causal-edge.has-gap path:not(.causal-hit) {stroke-dasharray:7 5}
+.causal-summary {display:flex;gap:24px;flex-wrap:wrap;padding:16px;margin:12px 0}
+.causal-summary small {display:block;color:var(--muted)}
+.causal-summary strong {display:block;font-size:20px;margin-top:6px}
+.causal-summary p {width:100%;color:var(--text-secondary);margin:0;font-size:12px}
+.causal-controls {display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px;font-size:12px}
+.causal-controls label {display:flex;gap:6px;align-items:center}
+.causal-controls span {color:var(--text-secondary)}
+.causal-legend,[data-system-activity] {flex-basis:100%}
+.causal-graph .execution-timeline-scroll {height:480px;max-height:60vh;min-height:260px;background:var(--bg);touch-action:none;cursor:grab}
+.causal-graph svg text {fill:var(--text);font-size:12px;pointer-events:none}
+.causal-node {cursor:pointer;outline:none}
+.causal-node .causal-shape {fill:var(--tool-bg);stroke:var(--control-border);stroke-width:2}
+.causal-node.llm .causal-shape {fill:var(--model-bg);stroke:var(--model-color)}
+.causal-node.tool .causal-shape {fill:var(--tool-bg);stroke:var(--tool-color)}
+.causal-node.process .causal-shape {fill:var(--success-bg);stroke:var(--teal)}
+.causal-node.critical .causal-shape {stroke:var(--amber);stroke-width:4}
+.causal-node.selected .causal-shape,.causal-node:focus .causal-shape {outline:2px solid var(--blue);outline-offset:4px;stroke-width:3}
+.causal-label {font-weight:600}
+.causal-duration {font-weight:700;font-size:15px!important}
+.causal-time,.causal-actor {fill:var(--text-secondary)!important;font-size:10px!important}
+.causal-node [data-expand] rect {fill:var(--panel2);stroke:var(--control-border);stroke-width:1}
+.causal-node [data-expand]:hover rect,.causal-node [data-expand]:focus rect {stroke:var(--text)}
+.causal-edge {cursor:pointer;outline:none}
+.causal-edge path {fill:none;stroke:var(--text-secondary);stroke-width:1.7}
+.causal-edge .causal-hit {stroke:transparent;stroke-width:16;pointer-events:stroke}
+.causal-edge.provenance path:not(.causal-hit) {stroke-dasharray:2 5;opacity:.65}
+.causal-edge.inferred path:not(.causal-hit),.causal-edge.unknown path:not(.causal-hit) {stroke-dasharray:7 5}
+.causal-edge.critical path:not(.causal-hit) {stroke:var(--amber);stroke-width:3.8}
+.causal-edge.selected path:not(.causal-hit),.causal-edge:focus path:not(.causal-hit) {stroke:var(--blue);stroke-width:4}
+.causal-node.dimmed {opacity:.8}.causal-edge.dimmed {opacity:.7}
+.causal-node.selected,.causal-node:focus,.causal-node:hover,.causal-edge.selected,.causal-edge:focus {opacity:1}
+.causal-anchor,.causal-end {fill:var(--text);stroke:var(--bg);stroke-width:1}
+.causal-interval {stroke:var(--control-border);stroke-width:3;opacity:.7}
+.causal-interval.ongoing {stroke-dasharray:4 3}
+.causal-ruler rect {fill:var(--bg);stroke:none}.causal-ruler line {stroke:var(--control-border)}.causal-ruler text {fill:var(--text)!important;font-size:11px!important}
+.causal-ruler {pointer-events:none}.causal-gap {fill:var(--amber)!important;font-size:11px!important;paint-order:stroke;stroke:var(--bg);stroke-width:3px}
+.causal-graph .execution-timeline-scroll.dragging {cursor:grabbing}
+.causal-edge path {vector-effect:non-scaling-stroke}
+
+.causal-interval.causal-group-span,.causal-interval.bounds {stroke-dasharray:2 4;opacity:.45}
+
+/* Agent lanes: one camera, sticky-left headers, compact resource charts. */
+.causal-graph {position:relative}
+.causal-graph .execution-timeline-scroll {position:relative;max-height:none;height:auto}
+.causal-agent-filter {position:relative}
+.causal-agent-filter summary {cursor:pointer;padding:4px 8px;border:1px solid var(--line);border-radius:4px;list-style:none}
+.causal-agent-menu {position:absolute;z-index:5;top:100%;left:0;margin-top:4px;min-width:240px;max-height:320px;overflow:auto;padding:8px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;box-shadow:var(--popup-shadow)}
+.causal-agent-menu label {display:flex;gap:6px;padding:2px 0;white-space:nowrap}
+.causal-agent-menu > div:first-child {display:flex;gap:6px;margin-bottom:6px}
+.lane-overlay {position:absolute;top:0;left:0;pointer-events:none;z-index:2}
+.lane-header {position:absolute;left:0;height:34px;display:flex;align-items:center;gap:12px;padding:0 10px;background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;pointer-events:auto}
+.lane-header.host {background:var(--panel);border-top:2px solid var(--control-border)}
+.lane-header strong {color:var(--text);font-size:13px;overflow:hidden;text-overflow:ellipsis;max-width:40%}
+.lane-header button {font-size:11px;padding:2px 8px;pointer-events:auto}
+.lane-header .lane-caret {width:24px;padding:2px 0;border:none;background:none;color:var(--text);font-size:11px}
+.lane-status {padding:1px 8px;border-radius:9px;background:var(--panel2);color:var(--text-secondary)}
+.lane-status.running,.lane-status.running-tool {background:var(--success-bg);color:var(--teal)}
+.lane-status.failed {background:var(--danger-bg);color:var(--red)}
+.lane-path {color:var(--amber)}
+.lane-muted,.lane-scope {color:var(--muted)}
+.lane-chart-label {position:absolute;left:6px;display:flex;flex-direction:column;justify-content:center;padding:0 8px;background:var(--bg);border-right:1px solid var(--line);font-size:11px;line-height:1.15;color:var(--text-secondary);min-width:118px;pointer-events:auto}
+.lane-chart-label small {color:var(--muted);font-size:10px}
+.lane-note {position:absolute;left:10px;font-size:11px;color:var(--muted);font-style:italic;white-space:nowrap}
+.lane-band {fill:var(--bg)}.lane-band.host {fill:var(--bg)}
+.time-grid line {stroke:var(--line);stroke-width:1}
+.lane-chart .chart-bg {fill:var(--panel2)}
+.lane-chart .chart-area {stroke:none;opacity:.2}
+.lane-chart .chart-line {fill:none;stroke-width:1.2;opacity:.85;vector-effect:non-scaling-stroke}
+.lane-chart.cpu .chart-line {stroke:var(--chart-cpu)}.lane-chart.cpu .chart-area {fill:var(--chart-cpu)}
+.lane-chart.memory .chart-line {stroke:var(--chart-memory)}.lane-chart.memory .chart-area {fill:var(--chart-memory)}
+.lane-chart.pressure .chart-line {stroke:var(--chart-pressure)}.lane-chart.pressure .chart-area {fill:var(--chart-pressure)}
+.lane-chart.disk .chart-line {stroke:var(--chart-disk)}.lane-chart.disk .chart-area {fill:var(--chart-disk)}
+.lane-chart.net .chart-line {stroke:var(--chart-network)}.lane-chart.net .chart-area {fill:var(--chart-network)}
+.lane-chart.time .chart-line {stroke:var(--chart-cpu);stroke-dasharray:3 2}.lane-chart.time .chart-area {fill:none}
+.time-cursor {position:absolute;top:0;width:0;border-left:1px solid var(--cursor-color);pointer-events:none;z-index:3}
+.time-cursor-tip {position:absolute;z-index:6;max-width:420px;padding:8px 10px;background:var(--bg);border:1px solid var(--control-border);border-radius:6px;font-size:11px;line-height:1.45;color:var(--text);pointer-events:none;box-shadow:var(--popup-shadow)}
+.time-cursor-tip .tip-time {font-weight:700;font-size:12px;margin-bottom:2px}
+.time-cursor-tip .tip-focus {padding:2px 0 4px;border-bottom:1px solid var(--line);margin-bottom:4px}
+.time-cursor-tip .active {color:var(--text);background:var(--selection-bg)}
+
+/* Model, tool, and process shapes retain their labels and distinct geometry. */
+.lane-status.waiting,.lane-status.waiting-on-llm,.lane-status.waiting-on-tool,
+.lane-status.waiting-on-dependency,.lane-status.queued,.lane-status.paused,.lane-status.blocked {background:var(--warning-bg);color:var(--amber)}
+.lane-status.completed,.lane-status.finished,.lane-status.idle,.lane-status.inactive {background:var(--neutral-bg);color:var(--muted)}
+.lane-status.running::before,.lane-status.running-tool::before {content:'● ';font-size:8px}
+.lane-chart .chart-line {opacity:1;stroke-width:1.5}
+.causal-node .causal-shape {fill:var(--tool-bg);stroke:var(--tool-border)}
+.causal-node.llm .causal-shape {fill:var(--model-bg);stroke:var(--model-color)}
+.causal-node.process .causal-shape {fill:var(--neutral-bg);stroke:var(--tool-color)}
+.causal-node.critical .causal-shape {stroke:var(--amber);stroke-width:4}
+.causal-node.selected .causal-shape,.causal-node:focus .causal-shape {outline:2px solid var(--blue);outline-offset:4px}
+.causal-agent-filter summary {border-color:var(--control-border)}

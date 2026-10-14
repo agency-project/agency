@@ -187,7 +187,12 @@ def build_graph(run):
             "id": key,
             "agent": agent,
             "band": band,
+            "kind": action.get("kind") if action else "tool",
             "label": label,
+            "model": action.get("model") if action else None,
+            "command_preview": str(action.get("command") or action.get("arguments") or "")[:240]
+            if action
+            else "",
             "action_id": action.get("id") if action else None,
             "request_id": action.get("request_id") if action else None,
             "tool_id": tool_id,
@@ -211,6 +216,16 @@ def build_graph(run):
                 "program",
                 "path",
                 "return_value",
+                "ppid",
+                "executable_path",
+                "command_line",
+                "argv",
+                "rss_mb",
+                "memory_mb",
+                "io_read_bytes",
+                "io_write_bytes",
+                "cpu_time_s",
+                "exit_status",
             ):
                 value = action.get("metadata", {}).get(metric)
                 if value is not None:
@@ -503,15 +518,85 @@ def build_graph(run):
                 confidence="verified" if blocking else "provenance",
                 blocking=blocking,
             )
-    # Explicit process ownership is provenance only. Parentage is never blocking.
+    # A successful execve proves execution of a process image, not its birth,
+    # lifetime, exit status or syscall-to-tool ownership. Preserve the syscall
+    # and project a separate process observation with unknown lifecycle bounds.
+    processes = []
     for a in actions:
-        owner = a.get("metadata", {}).get("tool_action_id")
-        if owner in operations and a["kind"] == "process":
-            left, right = operations[owner], operations[a["id"]]
-            if left.get("start_node") and right.get("start_node"):
+        metadata = a.get("metadata", {})
+        if a["kind"] == "process":
+            processes.append((a, operations[a["id"]]))
+        elif (
+            a["kind"] == "syscall"
+            and a["name"] == "execve"
+            and metadata.get("return_value") == 0
+            and metadata.get("pid") is not None
+            and metadata.get("path")
+        ):
+            observed = a.get("end_ts")
+            if finite(observed) and finite(run.get("time_origin")):
+                observed -= run["time_origin"]
+            elif finite(a.get("start")) and not a.get("missing_start"):
+                observed = a["start"]
+            else:
+                observed = None
+            image = {**a, "kind": "process", "outcome": "execution_observed"}
+            op = operation(
+                f"process:{a['id']}",
+                a["agent"],
+                "System",
+                metadata["path"].rsplit("/", 1)[-1],
+                observed,
+                None,
+                action=image,
+                measured=False,
+            )
+            op["duration"] = None
+            op["metrics"].pop("return_value", None)
+            for metric in ("cpu_ms", "cpu_pct", "runqueue_ms", "blocked_ms", "cpu_time_s"):
+                op["metrics"].pop(metric, None)
+            op["metrics"]["execution_observation"] = "Successful execve; lifecycle not recorded"
+            try:
+                arguments = json.loads(a.get("arguments", "{}"))
+                if isinstance(arguments, dict) and arguments.get("argv") is not None:
+                    op["metrics"]["argv"] = arguments["argv"]
+            except (ValueError, TypeError):
+                pass
+            if op.get("start_node"):
+                nodes[op["start_node"]]["timing"] = "execve_observation"
+                nodes[op["start_node"]]["phase"] = "observation"
+            processes.append((a, op))
+    process_actions = {a["id"]: op for a, op in processes}
+    process_pids = defaultdict(list)
+    for a, op in processes:
+        pid = op["metrics"].get("pid")
+        if pid is not None:
+            process_pids[(a["agent"], pid)].append(op)
+    for a, op in processes:
+        metadata = a.get("metadata", {})
+        parent = process_actions.get(metadata.get("parent_process_action_id"))
+        evidence = "Explicit parent_process_action_id"
+        if parent is None and metadata.get("ppid") is not None:
+            candidates = process_pids[(a["agent"], metadata["ppid"])]
+            if len(candidates) == 1:
+                parent = candidates[0]
+                evidence = "Captured PPID and unique process identity in the same actor scope"
+        if parent and parent.get("start_node") and op.get("start_node"):
+            edge(
+                parent["start_node"],
+                op["start_node"],
+                "process_parent",
+                evidence,
+                confidence="provenance",
+                blocking=False,
+            )
+        owner = metadata.get("tool_action_id")
+        if owner in operations:
+            left = operations[owner]
+            if left.get("start_node") and op.get("start_node"):
                 edge(
                     left["start_node"],
-                    right["start_node"],
+                    op["start_node"],
                     "process_owner",
                     "Explicit tool_action_id",
                     confidence="provenance",
@@ -539,6 +624,55 @@ def build_graph(run):
             e["weight"] = e["gap"]
             e["segment_confidence"] = "unexplained_wait" if e["gap"] else "verified"
     path = critical_path(node_list, edge_list)
+    # A presentation path omits instrumentation vertices, without contracting
+    # them or inventing dependencies between their neighbours. Keep the full
+    # analysis available to the system profiler and evidence inspector.
+    operation_nodes = [
+        n
+        for n in node_list
+        if operations[n["operation"]]["band"] in {"LLM", "Tool"}
+        or operations[n["operation"]]["kind"] == "process"
+    ]
+    operation_ids = {n["id"] for n in operation_nodes}
+    operation_edges = [
+        e for e in edge_list if e["source"] in operation_ids and e["target"] in operation_ids
+    ]
+    operation_path = critical_path(operation_nodes, operation_edges)
+    operation_path_edges = set(operation_path["edge_ids"])
+    operation_path["measured_work"] = sum(
+        e["weight"]
+        for e in operation_edges
+        if e["id"] in operation_path_edges and e["kind"] == "duration"
+    )
+    operation_path["unexplained_wait"] = sum(
+        e["gap"]
+        for e in operation_edges
+        if e["id"] in operation_path_edges and e["kind"] != "duration"
+    )
+    # Each agent's chain is computed over its own operations only. Recorded
+    # dependencies are scoped to one agent, so a cross-agent edge is evidence
+    # we do not interpret; the multi-agent critical path stays unavailable.
+    owner = {n["id"]: n["agent"] for n in operation_nodes}
+    by_agent = defaultdict(list)
+    for n in operation_nodes:
+        by_agent[n["agent"]].append(n)
+    agent_paths = {}
+    for agent, members in by_agent.items():
+        local = [
+            e
+            for e in operation_edges
+            if owner[e["source"]] == agent and owner[e["target"]] == agent
+        ]
+        chain = critical_path(members, local)
+        chosen = set(chain["edge_ids"])
+        chain["measured_work"] = sum(
+            e["weight"] for e in local if e["id"] in chosen and e["kind"] == "duration"
+        )
+        chain["unexplained_wait"] = sum(
+            e["gap"] for e in local if e["id"] in chosen and e["kind"] != "duration"
+        )
+        agent_paths[agent] = chain
+    cross_agent = sum(owner[e["source"]] != owner[e["target"]] for e in operation_edges)
     path_edges = set(path["edge_ids"])
     path["measured_work"] = sum(
         e["weight"] for e in edge_list if e["id"] in path_edges and e["kind"] == "duration"
@@ -582,6 +716,14 @@ def build_graph(run):
         "edges": edge_list,
         "operations": list(operations.values()),
         "critical_path": path,
+        "operation_critical_path": operation_path,
+        "agent_critical_paths": agent_paths,
+        "system_critical_path": {
+            "available": False,
+            "reason": "Cross-agent logical dependencies are not captured; each agent's "
+            "known chain is shown separately and none of them is the system-wide path.",
+            "cross_agent_edges": cross_agent,
+        },
         "joins": [{"node": k, "dependencies": v} for k, v in incoming.items() if len(v) > 1],
         "summary": {
             "execution_duration": run.get("execution_wall_time", clock)

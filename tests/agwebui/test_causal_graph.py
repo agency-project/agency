@@ -310,7 +310,80 @@ def test_full_sqlite_evidence_survives_preview_limits(tmp_path):
     model = source.model.actions["a:model:m2"]
     assert len(model["context"]["blocks"]) == 80
     assert len(model["causal_evidence"]["prompt"]) == 91
+    assert source.model.snapshot()["causal_graph"]["state"] == "pending"
+    source.model.apply({
+        "id": "done", "ts": 10, "actor": "workflow", "type": "done",
+        "payload": {"status": "completed"},
+    })
     assert any(e["kind"] == "tool_result" for e in source.model.snapshot()["causal_graph"]["edges"])
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "unknown"])
+def test_live_graph_waits_for_final_boundary_and_builds_once(monkeypatch, status):
+    from agency.observability.agwebui import causal_graph
+
+    original = causal_graph.build_graph
+    calls = []
+
+    def build(run):
+        calls.append(len(run["actions"]))
+        return original(run)
+
+    monkeypatch.setattr(causal_graph, "build_graph", build)
+    model = Trajectory("live", "live")
+    for index in range(40):
+        model.apply({
+            "id": str(index), "ts": index, "actor": "a", "type": "tool_call",
+            "payload": {"call_id": str(index), "tool": "read"},
+        })
+        model.tick(index + 1)
+        patch = model.patch()
+        assert not patch["meta"].get("causal_graph", {}).get("nodes")
+        assert model.snapshot()["causal_graph"]["state"] == "pending"
+    assert calls == []
+    model.apply({
+        "id": "callback-return", "ts": 41, "actor": "workflow", "type": "workload_completed",
+        "payload": {"status": status},
+    })
+    assert model.snapshot()["causal_graph"]["state"] == "pending"
+    assert calls == []
+    model.apply({
+        "id": "done", "ts": 42, "actor": "workflow", "type": "done",
+        "payload": {"status": status},
+    })
+    patch = model.patch()
+    assert patch["meta"]["causal_graph"]["nodes"]
+    assert calls == [40]
+    for tick in range(43, 50):
+        model.tick(tick)
+        assert "causal_graph" not in model.patch()["meta"]
+        assert model.snapshot()["causal_graph"]["nodes"]
+    assert calls == [40]
+
+
+def test_completed_live_graph_waits_for_backlog_and_preserves_saved_replay(monkeypatch):
+    from agency.observability.agwebui import causal_graph
+
+    original = causal_graph.build_graph
+    calls = []
+
+    def build(run):
+        calls.append(run["id"])
+        return original(run)
+
+    monkeypatch.setattr(causal_graph, "build_graph", build)
+    live = Trajectory("live", "live")
+    live.apply({"id": "done", "ts": 10, "type": "done", "actor": "a", "payload": {}})
+    live.run["coverage"]["catching_up"] = True
+    assert live.snapshot()["causal_graph"]["state"] == "pending"
+    assert not calls
+    live.run["coverage"]["catching_up"] = False
+    assert "critical_path" in live.snapshot()["causal_graph"]
+    replay = Trajectory("saved", "saved", mode="replay")
+    assert "critical_path" in replay.snapshot()["causal_graph"]
+    ongoing_replay = Trajectory("live", "live", mode="replay", defer_causal_graph=True)
+    assert ongoing_replay.snapshot()["causal_graph"]["state"] == "pending"
+    assert calls == ["live", "saved"]
 
 
 def test_recorded_example_and_replay_api_have_graph(tmp_path, monkeypatch):
@@ -462,3 +535,111 @@ def test_observed_completion_with_missing_start_remains_inspectable():
     assert [(n["id"], n["time"]) for n in graph["nodes"]] == [("t:end", 5)]
     assert graph["operations"][0]["duration"] is None
     assert graph["critical_path"]["duration"] == 0
+
+
+def test_operation_path_excludes_syscalls_without_fabricating_bridges():
+    run = parallel()
+    run["actions"].append(action("syscall", 0, 900, "syscall"))
+    graph = build_graph(run)
+    assert graph["critical_path"]["duration"] == 900
+    assert graph["operation_critical_path"]["duration"] == 11
+    assert graph["operation_critical_path"]["measured_work"] == 11
+    assert all(not n.startswith("syscall:") for n in graph["operation_critical_path"]["node_ids"])
+    assert next(o for o in graph["operations"] if o["id"] == "syscall")["kind"] == "syscall"
+    assert (
+        graph["operation_critical_path"]["edge_ids"]
+        == build_graph(parallel())["critical_path"]["edge_ids"]
+    )
+
+
+def test_successful_execve_is_process_evidence_not_syscall_duration_or_exit():
+    a = action(
+        "exec",
+        3,
+        0.002,
+        "syscall",
+        metadata={"pid": 42, "path": "/usr/bin/python", "return_value": 0},
+    )
+    a["name"] = "execve"
+    a["arguments"] = json.dumps({"argv": ["python", "build.py"]})
+    graph = build_graph(trace(a))
+    process = next(o for o in graph["operations"] if o["kind"] == "process")
+    assert process["label"] == "python"
+    assert process["duration"] is None
+    assert "end_node" not in process
+    assert process["metrics"]["pid"] == 42
+    assert process["metrics"]["argv"] == ["python", "build.py"]
+    assert "return_value" not in process["metrics"]
+    assert "exit_status" not in process["metrics"]
+    assert graph["nodes"][-1]["timing"] == "execve_observation"
+    assert not any(e["kind"] == "process_owner" for e in graph["edges"])
+    assert any(o["kind"] == "syscall" for o in graph["operations"])
+    a["metadata"]["return_value"] = -2
+    assert not any(o["kind"] == "process" for o in build_graph(trace(a))["operations"])
+
+
+def test_explicit_process_ancestry_and_ownership_are_nonblocking():
+    tool = action("tool", 0, 5, "tool")
+    parent = action("parent", 1, 4, "process", metadata={"pid": 10, "tool_action_id": "tool"})
+    child = action(
+        "child", 2, 1, "process", metadata={"pid": 11, "ppid": 10, "cpu_ms": 30, "rss_mb": 2}
+    )
+    graph = build_graph(trace(tool, parent, child))
+    relationships = [e for e in graph["edges"] if e["kind"].startswith("process_")]
+    assert {e["kind"] for e in relationships} == {"process_owner", "process_parent"}
+    assert all(e["confidence"] == "provenance" and not e["blocking"] for e in relationships)
+    assert all(not e["critical"] for e in relationships)
+    assert graph["operation_critical_path"]["duration"] == 5
+    duplicate_pid = action("reused-parent", 8, 1, "process", metadata={"pid": 10})
+    graph = build_graph(trace(tool, parent, child, duplicate_pid))
+    assert not any(e["kind"] == "process_parent" for e in graph["edges"])
+
+
+def test_operation_path_ignores_unconnected_startup_bookkeeping():
+    run = parallel()
+    run["actions"].append(action("setup", 0, 200, "setup"))
+    graph = build_graph(run)
+    assert graph["critical_path"]["duration"] == 200
+    assert graph["operation_critical_path"]["duration"] == 11
+
+
+def _agent_chain(agent, offset, tool_seconds):
+    first = action(f"{agent}-m1", offset, 1, agent=agent, response=[use(f"{agent}-t")])
+    tool = action(
+        f"{agent}-t",
+        offset + 1,
+        tool_seconds,
+        "tool",
+        agent=agent,
+        model_id=f"{agent}-m1",
+        model_tool_call_id=f"{agent}-t",
+    )
+    last = action(
+        f"{agent}-m2",
+        offset + 1 + tool_seconds,
+        1,
+        agent=agent,
+        prompt=[use(f"{agent}-t"), result(f"{agent}-t")],
+        response=[text("done")],
+    )
+    return [first, tool, last]
+
+
+def test_each_agent_gets_its_own_known_chain_and_no_system_path_is_claimed():
+    graph = build_graph(trace(*_agent_chain("a", 0, 10), *_agent_chain("b", 0.5, 2)))
+    paths = graph["agent_critical_paths"]
+    assert set(paths) == {"a", "b"}
+    owner = {n["id"]: n["agent"] for n in graph["nodes"]}
+    for agent, chain in paths.items():
+        assert chain["node_ids"] and all(owner[node] == agent for node in chain["node_ids"])
+        assert chain["measured_work"] == pytest.approx(
+            chain["duration"] - chain["unexplained_wait"]
+        )
+    assert paths["a"]["duration"] == pytest.approx(12)
+    assert paths["b"]["duration"] == pytest.approx(4)
+    # The global longest chain alone would leave agent b without a path.
+    assert set(graph["operation_critical_path"]["node_ids"]) <= {
+        n for n in owner if owner[n] == "a"
+    }
+    system = graph["system_critical_path"]
+    assert system["available"] is False and system["cross_agent_edges"] == 0

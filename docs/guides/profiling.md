@@ -30,15 +30,20 @@ to your browser machine. A port already in use prevents `agwebui.run()` from sta
 
 ## Live execution profiler
 
-Open `/profiler?run=live&view=trajectory` and keep **Following latest** enabled
-for incoming calls and results. Running calls stay at the top of each selected
-agent column; completed calls move into history. Use **Add agent** to inspect
-agents side by side, or **Agent overlay** for a shared time axis.
+Open `/profiler?run=live&view=trajectory`. Each selected agent column follows
+incoming calls and results until you scroll into its history; **Live in this
+column** resumes following that column, and **Jump to live** returns the whole
+display to the latest activity. Running calls stay above completed history.
+Use **Add agent** to inspect agents side by side, or **Agent overlay** for a
+shared time axis.
 
-The **Multi-agent** view combines agent transcripts, token/time summaries,
-concurrent work, and recorded system counters. Missing measurements stay
-unavailable. See [live trajectory](profiling/live-trajectory.md) for replay
-and history controls.
+The three navigation views are **Execution Trajectory**, **Timeline**, and
+**Profiler**. Profiler contains Activity, LLM, Tools, Systems, and Critical Path
+categories. Missing measurements stay unavailable. See
+[live metrics](../live-metrics.md) for metric scopes and measurement boundaries,
+[Critical Path](../architecture/observability.md#profiler-critical-path) for
+observed dependencies, and [live trajectory](profiling/live-trajectory.md) for
+replay, history, and execution controls.
 
 <a id="raw-trace-viewer"></a>
 

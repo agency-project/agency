@@ -23,8 +23,8 @@ class ExecutionCounters:
     def update(self, actions):
         for action in actions:
             model = action["kind"] == "model"
-            # Queue/wait/lifecycle intervals are not tool invocations.
-            if action["kind"] in ("queue", "dependency", "unknown", "setup"):
+            # Kernel telemetry and queue/wait/lifecycle intervals are not tools.
+            if action["kind"] in ("queue", "dependency", "unknown", "setup", "syscall"):
                 continue
             values = {key: 0 for key in self.totals}
             values["models" if model else "tools"] = 1

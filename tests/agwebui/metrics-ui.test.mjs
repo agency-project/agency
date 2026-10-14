@@ -289,3 +289,9 @@ test('system cards keep entire-system meaning while agent sandbox cards follow t
   assert.match(none,/CPU · agent sandboxes<\/small><strong>Unavailable/);assert.match(none,/No sandbox recorded for these agents/);
   setMetricScope(null);press([],{metricCategory:'Activity'});
 });
+
+test('Systems profiler aggregates syscall instrumentation without turning it into tool calls',()=>{
+  const html=profilerView({...run,actions:[...(run.actions||[]),{id:'syscall',agent:'a',kind:'syscall',name:'futex',start:1,duration:2,outcome:'success',metadata:{}}]},'Systems');
+  assert.match(html,/Syscall instrumentation · aggregated/);assert.match(html,/futex/);
+  assert.match(html,/1 events · 1 without recorded ownership/);assert.match(html,/may overlap/);
+});

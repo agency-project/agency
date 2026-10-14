@@ -1,5 +1,13 @@
 # Profiler UX implementation map
 
+> **Historical audit snapshot (2026-10-10).** The capability matrix, blockers,
+> control protocol, and verification results below describe the cited checkout.
+> Subsequent implementation added live message/task controls, execution fencing,
+> correlated receipts, bounded history, resource attribution, and Critical Path;
+> this audit is preserved for design context. Use [current views](views.md),
+> [live controls and replay](live-trajectory.md), and
+> [observability architecture](../../architecture/observability.md) for current behavior.
+
 Audit: 2026-10-10, `eric/episode-traces` at `fd6033c`. Scope: functional UX
 before visual design. Agency is a live debugger: **See. Understand. Control.**
 The flagship remains per-agent trajectories, current activity above newest-first

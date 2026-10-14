@@ -1,7 +1,9 @@
 # Live metrics and profiler views
 
 The execution profiler (`/profiler`) has one Profiler navigation tab containing Activity, LLM, Tools and Systems
-category views. Trajectory and other execution views have a six-slot summary
+category views, plus **Critical Path** for
+[observed dependency chains](architecture/observability.md#profiler-critical-path).
+Trajectory and other execution views have a six-slot summary
 and a collapsible category panel; the detailed Profiler tab hides this repeated
 summary. Category, expansion
 and pins are saved in local storage (`agency.metrics.v1`). Diamond controls
@@ -67,7 +69,8 @@ are substituted. Restart counts and complete agent lifecycle concurrency are
 not available; call concurrency is measured from observed intervals.
 
 Remaining scope: activity gaps cover observed call boundaries, not every possible
-agent event. The profiler does not infer dependencies. Detailed system series
+agent event. Activity metrics do not establish causal dependencies; the separate
+Critical Path graph qualifies its recorded and inferred relationships. Detailed system series
 cover the displayed execution range; selecting an individual metric does not
 yet zoom to a narrower sample range. The global agent/search controls belong to
 trajectory navigation; profiler tables have their own explicit filter. Statistical
@@ -166,7 +169,13 @@ is matched with its recorded measurement; other saved traces show their trace
 duration as before. Rates, percentiles and the trace duration are unchanged by
 the measurement boundary.
 
-## Existing three-agent SWE-bench launcher
+## Local three-agent SWE-bench launcher
+
+This section records a prepared local workflow. `swebench_three_agents.py`, its
+`runs/` inputs, images, and pinned binary are local artifacts and are not shipped
+in a clean checkout. Preserve these instructions for reproducing that setup;
+for a checked-in launcher, start with [example 12](../examples/12_swebench_live.py)
+and its `--help`, which also requires separately prepared task data and an image.
 
 From `/home/eric/Documents/Codex/agency`, with provider credentials already
 exported:

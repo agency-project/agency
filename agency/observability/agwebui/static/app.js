@@ -37,9 +37,13 @@ const state = {
 // ANSI → HTML
 // ---------------------------------------------------------------------------
 
+// Standard ANSI colors follow the readable UI palette. Explicit xterm-256
+// payload colors below remain faithful to captured terminal output.
 const ANSI16 = [
-  '#000','#a00','#0a0','#880','#00a','#a0a','#0aa','#aaa',
-  '#555','#f55','#5f5','#ff5','#55f','#f5f','#5ff','#fff',
+  'var(--muted)','var(--red)','var(--teal)','var(--amber)',
+  'var(--blue)','var(--blue)','var(--blue)','var(--text-secondary)',
+  'var(--muted)','var(--red)','var(--teal)','var(--amber)',
+  'var(--blue)','var(--blue)','var(--blue)','var(--text)',
 ];
 
 function xterm256(n) {
@@ -74,7 +78,7 @@ function ansiToHtml(text) {
       const css = [
         color && `color:${color}`,
         bold  && 'font-weight:bold',
-        dim   && 'opacity:0.5',
+        dim   && 'color:var(--muted)',
       ].filter(Boolean).join(';');
       out.push(css ? `<span style="${css}">${esc}</span>` : esc);
     }
@@ -367,7 +371,7 @@ function updateInteractionTitle() {
     return;
   }
 
-  const ag      = state.agents.get(agname) || { color: '#d4d4d4' };
+  const ag      = state.agents.get(agname) || { color: 'var(--text-secondary)' };
   const usage   = state.tokenUsage.get(agname);
   const metaTxt = agentMetaText(ag);
   const metaHtml = metaTxt ? `<span class="meta-badge">${esc(metaTxt)}</span>` : '';
@@ -375,7 +379,7 @@ function updateInteractionTitle() {
     ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite)}</span>`
     : '';
   $interactionTitle.innerHTML =
-    `<span style="color:${ag.color || '#d4d4d4'}">${esc(agname)}</span>  [${idx + 1}/${n}]  ← →` +
+    `<span style="color:var(--text-secondary)">${esc(agname)}</span>  [${idx + 1}/${n}]  ← →` +
     `<span class="badge-group">${metaHtml}${tokHtml}</span>`;
   $navLabel.textContent = `${idx + 1} / ${n}`;
 }
@@ -407,7 +411,7 @@ function appendLog(line) {
 
 // agterm-style colorization: term_message lines are plain text of the form
 // "[agname] rest of the message" -- color just the agent tag, matching the
-// old terminal-based agui's per-agent-colored `[agname]` prefix, and leave
+// terminal agent prefix. Use a neutral identity color in the web UI and leave
 // the rest to ansiToHtml (term_message never contains ANSI codes, but this
 // keeps escaping consistent with every other log line). Every event carries
 // its own `ts` (see server.py's _build_envelope), so a short HH:MM:SS
@@ -419,7 +423,7 @@ function colorizeTermMessage(termMessage, color, ts) {
   if (!m || !color) {
     return tsPrefix + ansiToHtml(termMessage);
   }
-  const tag = `<span style="color:${color};font-weight:bold">${esc(m[1])}</span>`;
+  const tag = `<span style="color:var(--text-secondary);font-weight:bold">${esc(m[1])}</span>`;
   return tsPrefix + tag + ansiToHtml(m[2]);
 }
 
@@ -599,7 +603,7 @@ function renderAgentList() {
     }
 
     const indent = tname ? 12 : 0;
-    const ag = state.agents.get(agname) || { color: '#d4d4d4', state: 'inactive', skill: null, tool: null };
+    const ag = state.agents.get(agname) || { color: 'var(--text-secondary)', state: 'inactive', skill: null, tool: null };
     const isFocused = agname === focused;
     frags.push(renderAgentEntry(agname, ag, indent, isFocused));
   }
@@ -637,7 +641,7 @@ function updateAgentActionsBar() {
 }
 
 function renderAgentEntry(agname, ag, indent, isFocused) {
-  const color = ag.color || '#d4d4d4';
+  const color = 'var(--text-secondary)';
   const focusedClass = isFocused ? ' focused' : '';
   const { state: st, skill, tool } = ag;
   let dot, statusHtml;
@@ -645,6 +649,15 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   if (st === 'finished') {
     dot = `<span class="dot-finished">✓</span>`;
     statusHtml = `<span class="status-finished">finished</span>`;
+  } else if (st === 'failed' || st === 'error') {
+    dot = `<span class="dot-failed">!</span>`;
+    statusHtml = `<span class="status-failed">${esc(st)}</span>`;
+  } else if (st === 'cancelled' || st === 'destroyed') {
+    dot = `<span class="dot-inactive">■</span>`;
+    statusHtml = `<span class="dim">${esc(st)}</span>`;
+  } else if (['queued', 'blocked_on_dependency', 'blocked_on_resource', 'blocked', 'waiting'].includes(st)) {
+    dot = `<span class="dot-waiting">◷</span>`;
+    statusHtml = `<span class="status-waiting">${esc(st.replaceAll('_', ' '))}</span>`;
   } else if (st === 'paused') {
     dot = `<span class="dot-paused">⏸</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-paused">paused</span>`;
@@ -652,19 +665,19 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
   } else if (st === 'llm') {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-waiting">◷</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-llm">LLM Wait</span>`;
   } else if (st === 'tool') {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-running">●</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-tool">${esc(tool || 'tool')}</span>`;
   } else if (st === 'proc_wait') {
-    dot = `<span style="color:${color}">●</span>`;
-    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="dim">Shell Wait</span>`;
+    dot = `<span class="dot-waiting">◷</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-waiting">Shell Wait</span>`;
   } else if (st === 'human') {
-    dot = `<span style="color:${color}">●</span> <span class="status-human">?</span>`;
+    dot = `<span class="dot-waiting">◷</span> <span class="status-human">?</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-human">Input Pending</span>`;
   } else {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-running">●</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')} - running</span>`;
   }
 
@@ -968,9 +981,9 @@ function renderSidePanels() {
     els.panel.style.flex = `0 0 ${width}px`;
     els.panel.style.width = `${width}px`;
 
-    const ag = state.agents.get(agname) || { color: '#d4d4d4' };
+    const ag = state.agents.get(agname) || { color: 'var(--text-secondary)' };
     els.agnameEl.textContent = agname;
-    els.agnameEl.style.color = ag.color || '#d4d4d4';
+    els.agnameEl.style.color = 'var(--text-secondary)';
     els.metaEl.textContent = agentMetaText(ag);
     const usage = state.tokenUsage.get(agname);
     els.tokenEl.textContent = usage ? fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite) : '';
@@ -1044,7 +1057,7 @@ function handleEvent(ev) {
     case 'agent_registered':
       if (!state.agents.has(ev.agname)) {
         state.agents.set(ev.agname, {
-          color: ev.color || '#d4d4d4',
+          color: ev.color || 'var(--text-secondary)',
           state: 'inactive', skill: null, tool: null, config: {},
         });
         state.agentOrder.push(ev.agname);
@@ -1066,7 +1079,7 @@ function handleEvent(ev) {
       break;
 
     case 'agent_config': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4', state: 'inactive', skill: null, tool: null };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)', state: 'inactive', skill: null, tool: null };
       state.agents.set(ev.agname, { ...existing, config: ev.config || {} });
       if (!state.agentOrder.includes(ev.agname)) state.agentOrder.push(ev.agname);
       break;
@@ -1080,7 +1093,7 @@ function handleEvent(ev) {
     case 'request_failed':
     case 'request_cancelled':
     case 'request_destroyed': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)' };
       const stateMap = {
         request_submitted: 'queued',
         request_blocked: 'blocked_on_dependency',
@@ -1103,10 +1116,10 @@ function handleEvent(ev) {
     }
 
     case 'agent_state': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)' };
       state.agents.set(ev.agname, {
         ...existing,
-        color: ev.color || existing.color || '#d4d4d4',
+        color: ev.color || existing.color || 'var(--text-secondary)',
         state: normalizeAgentState(ev.state),
         skill: ev.skill,
         tool:  ev.tool,
@@ -1230,7 +1243,7 @@ async function loadAgentDetail(agname) {
     agentDetailSignatures.set(agname, signature);
 
     state.histories.set(agname, newMessages);
-    const existing = state.agents.get(agname) || { color: '#d4d4d4' };
+    const existing = state.agents.get(agname) || { color: 'var(--text-secondary)' };
     state.agents.set(agname, {
       ...existing,
       state: normalizeAgentState(agentState.state) || existing.state || 'inactive',

@@ -40,6 +40,7 @@ export function pinAgent(run, pinnedIds, id, {limit = MAX_AGENT_COLUMNS} = {}) {
 export function longRunningCalls(run, {agent = '', clock = run?.duration, threshold = 30} = {}) {
   if (!Number.isFinite(clock)) return [];
   return (run?.actions || []).filter(action => action.outcome === 'running'
+    && action.kind !== 'syscall'
     && (!agent || action.agent === agent)
     && Number.isFinite(action.start) && !action.missing_start
     && !String(action.source || '').includes('timestamp_missing')
@@ -54,6 +55,7 @@ export function agentRoster(run, {pinnedIds = [], query = '', status = '', longR
   const agents = rosterAgents(run), known = new Set(agents.map(agent => agent.id));
   const pinned = new Set(pinnedIds), calls = new Map(), longCalls = new Map();
   for (const action of run?.actions || []) {
+    if (action.kind === 'syscall') continue;
     if (!calls.has(action.agent)) calls.set(action.agent, []);
     calls.get(action.agent).push(action);
   }

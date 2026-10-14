@@ -4,6 +4,14 @@ import {test} from 'node:test';
 const source=await readFile(new URL('../../agency/observability/agwebui/static/event-details.js',import.meta.url),'utf8');
 const {eventCard,actionState,eventRelationships,eventMeasurements,payloadValue,payloadWindow,renderPayloadWindow,renderEventCard}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
+test('system telemetry inspection never labels syscalls as model tool calls',()=>{
+  const card=eventCard({kind:'syscall',name:'execve',outcome:'success',duration:.01});
+  assert.equal(card.type,'syscall');
+  assert.equal(card.typeLabel,'System call');
+  assert.equal(card.scope,'system call');
+  assert.equal(card.state.label,'System call completed');
+});
+
 test('tool cards promote commands and specific recorded failure without changing agent health',()=>{
   const agent={id:'a',status:'running'};
   const action={id:'t',agent:'a',kind:'test',name:'Bash',arguments:'{"command":"pytest tests/test_scheduler.py -q"}',command:'{"command":"pytest tests/test_scheduler.py -q"}',result:'{"exit_code":1,"stdout":"initialization\\nFAILED tests/test_scheduler.py::test_queue - AssertionError"}',outcome:'failed',duration:1.2};

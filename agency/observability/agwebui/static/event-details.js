@@ -71,7 +71,7 @@ export function highlightJson(value) {
 
 export function actionState(action) {
   const status=action.request_state||action.outcome||'unknown';
-  const type=modelCall(action)?'Request':controlCall(action)?'Control':['queue','dependency','setup'].includes(action.kind)?'Operation':'Tool';
+  const type=modelCall(action)?'Request':controlCall(action)?'Control':action.kind==='syscall'?'System call':['queue','dependency','setup'].includes(action.kind)?'Operation':'Tool';
   const states={running:['◷',`${type} running`,'running'],success:['✓',`${type} completed`,'success'],completed:['✓',`${type} completed`,'success'],failed:['!',`${type} failed`,'failed'],failure:['!',`${type} failed`,'failed'],cancelled:['■',`${type} cancelled`,'cancelled'],incomplete:['?',`${type} incomplete`,'unknown'],queued:['◷',controlCall(action)?'Context queued':'Request queued','queue'],context_committed:['↳','Retained context committed · model consumption unknown','success'],submitted:['↳','Invocation submitted · completion unconfirmed','queue'],blocked:['◷','Request blocked','queue'],requested:['◷','Requested · not acknowledged','queue'],accepted:['↳','Accepted · application unconfirmed','queue'],observed:['✓','Local outcome observed','success'],applied:['✓','Application recorded','success'],delivered:['↳','Input delivered · response unconfirmed','success'],partial:['!','Partial outcome','failed'],unknown:['?','Outcome unknown','unknown']};
   const [icon,label,semantic]=states[status]||['?',`${type} state: ${status}`,'unknown'];
   return {status,icon,label,semantic};
@@ -131,8 +131,8 @@ export function eventCard(action,run={}) {
   }
   // A command or argument set recorded as JSON is shown formatted, like every other payload.
   const formatted=prettyJson(primary);
-  const type=modelCall(action)?'model':controlCall(action)?'control':['queue','dependency','setup'].includes(action.kind)?'operation':'tool';
-  return {primary:clipped(formatted??primary,360),json:formatted!=null,type,typeLabel:{model:'Model',control:'Control',operation:'Operation',tool:'Tool'}[type],secondary,state,elapsed,elapsedText:elapsed==null?'Elapsed unavailable':`${state.status==='running'?'Elapsed':'Wall interval'} ${time(elapsed)}`,preview,previewLabel,usage,modelSource,scope:modelCall(action)?'model request':controlCall(action)?'human intervention':'tool call'};
+  const type=modelCall(action)?'model':controlCall(action)?'control':action.kind==='syscall'?'syscall':['queue','dependency','setup'].includes(action.kind)?'operation':'tool';
+  return {primary:clipped(formatted??primary,360),json:formatted!=null,type,typeLabel:{model:'Model',control:'Control',operation:'Operation',tool:'Tool',syscall:'System call'}[type],secondary,state,elapsed,elapsedText:elapsed==null?'Elapsed unavailable':`${state.status==='running'?'Elapsed':'Wall interval'} ${time(elapsed)}`,preview,previewLabel,usage,modelSource,scope:modelCall(action)?'model request':controlCall(action)?'human intervention':action.kind==='syscall'?'system call':'tool call'};
 }
 
 export function renderEventCard(action,run={}) {

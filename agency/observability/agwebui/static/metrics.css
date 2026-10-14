@@ -1,10 +1,10 @@
 #metrics{display:block;width:100%;border:0;overflow:visible;background:none}
 .prof-summary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr)) auto;gap:8px;align-items:stretch}
-.prof-metric{position:relative;box-sizing:border-box;min-width:0;padding:9px 12px;border:1px solid var(--line,#293542);border-radius:5px;background:var(--panel,#111a24);display:flex;flex-direction:column;gap:5px}
+.prof-metric{position:relative;box-sizing:border-box;min-width:0;padding:9px 12px;border:1px solid var(--line);border-radius:5px;background:var(--panel);display:flex;flex-direction:column;gap:5px}
 .prof-value{display:block;text-align:left;width:100%;padding:0;background:none;border:0;white-space:normal}
-.prof-value small{display:block;text-transform:uppercase;font-size:10px;letter-spacing:.05em;color:var(--muted,#91a0b0);padding-right:12px;overflow-wrap:anywhere}
+.prof-value small{display:block;text-transform:uppercase;font-size:10px;letter-spacing:.05em;color:var(--muted);padding-right:12px;overflow-wrap:anywhere}
 .prof-value strong{display:block;font:500 16px monospace;margin-top:4px;overflow-wrap:anywhere}
-.prof-note{display:block;font-size:10px;color:var(--muted,#91a0b0);line-height:1.4;margin-top:4px;overflow-wrap:anywhere}
+.prof-note{display:block;font-size:10px;color:var(--muted);line-height:1.4;margin-top:4px;overflow-wrap:anywhere}
 .prof-summary .prof-metric{height:94px}
 .prof-summary .prof-value strong{font-size:14px}
 .prof-summary .prof-note{display:none}
@@ -14,19 +14,19 @@
 .prof-cards .prof-metric{min-height:94px}
 .prof-expanded{padding:10px 0}
 .prof-tabs{display:flex;gap:5px;flex-wrap:wrap}
-.prof-tabs [aria-selected=true]{border-color:#83c5d5;color:#83c5d5}
+.prof-tabs [aria-selected=true]{border-color:var(--blue);color:var(--blue)}
 .prof-expanded .prof-tabs button:last-child{margin-left:auto}
-.prof-detail-tabs{margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid var(--line,#293542)}
+.prof-detail-tabs{margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid var(--line)}
 .prof-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.prof-chart{min-width:0;margin:8px 0;padding:12px;border:1px solid var(--line,#293542);border-radius:5px;color:#91b8cc}
+.prof-chart{min-width:0;margin:8px 0;padding:12px;border:1px solid var(--line);border-radius:5px;color:var(--blue)}
 .prof-chart svg{display:block;width:100%;height:auto;min-height:190px;overflow:visible}
-.prof-chart svg text{fill:var(--muted,#91a0b0);font:12px sans-serif}
-.prof-grid{stroke:var(--line,#293542);stroke-width:1;stroke-dasharray:3 4}
-.prof-axis{stroke:var(--muted,#91a0b0);stroke-width:1}
+.prof-chart svg text{fill:var(--muted);font:12px sans-serif}
+.prof-grid{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
+.prof-axis{stroke:var(--muted);stroke-width:1}
 .prof-chart figcaption{font-size:12px;font-weight:600;margin-bottom:8px}
-.prof-chart-description{font-size:11px;color:var(--muted,#91a0b0);line-height:1.5;margin:6px 0 0}
+.prof-chart-description{font-size:11px;color:var(--muted);line-height:1.5;margin:6px 0 0}
 .prof-table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;margin:12px 0}
-.prof-table td,.prof-table th{text-align:left;border-bottom:1px solid #293542;padding:7px;overflow-wrap:anywhere}
+.prof-table td,.prof-table th{text-align:left;border-bottom:1px solid var(--line);padding:7px;overflow-wrap:anywhere}
 .prof-table button{text-align:left;max-width:100%;overflow-wrap:anywhere}
 .prof-table-controls{display:flex;gap:12px;align-items:center;margin-top:15px}
 .prof-table-controls input{margin-left:8px}
@@ -37,62 +37,68 @@
 .prof-summary-slots{display:contents}
 .prof-expanded .prof-metric{height:150px;min-height:0}
 .prof-expanded .prof-note{flex:1;min-height:0;overflow:auto}
-.metric-pin-picker{width:min(420px,calc(100vw - 40px));max-height:80dvh;overflow:auto;padding:22px;background:var(--panel,#111a24);color:var(--text,#e5edf5);border:1px solid var(--line,#293542);border-radius:10px;box-shadow:0 16px 50px #0008}
-.metric-pin-picker::backdrop{background:#0008}
+.metric-pin-picker{width:min(420px,calc(100vw - 40px));max-height:80dvh;overflow:auto;padding:22px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;box-shadow:var(--popup-shadow)}
+.metric-pin-picker::backdrop{background:var(--overlay)}
 .metric-pin-picker h2{font-size:18px;margin:0 0 10px}
-.metric-pin-picker p{font-size:12px;color:var(--muted,#91a0b0)}
+.metric-pin-picker p{font-size:12px;color:var(--muted)}
 .metric-pin-slots{display:grid;gap:8px;margin:16px 0}
 .metric-pin-slots button{text-align:left;padding:10px 12px}
 
 /* Wall-clock measurement menu: reversible, measurement-only, never an agent control. */
-.measure-menu{position:absolute;right:22px;top:2px;font-size:11px;color:var(--muted,#91a0b0)}
+.measure-menu{position:absolute;right:22px;top:2px;font-size:11px;color:var(--muted)}
 .measure-menu[hidden]{display:none}
 .measure-menu summary{cursor:pointer;list-style:none;padding:0 5px;border-radius:4px;line-height:16px}
 .measure-menu summary::-webkit-details-marker{display:none}
-.measure-menu summary:hover,.measure-menu[open] summary{color:var(--text,#e5edf5);background:var(--line,#293542)}
-.measure-menu>div{position:absolute;z-index:10;left:0;top:calc(100% + 4px);width:230px;max-width:calc(100vw - 40px);padding:12px;background:var(--panel,#111a24);border:1px solid var(--line,#293542);border-radius:5px;box-shadow:0 8px 20px #0006;display:grid;gap:8px}
+.measure-menu summary:hover,.measure-menu[open] summary{color:var(--text);background:var(--line)}
+.measure-menu>div{position:absolute;z-index:10;left:0;top:calc(100% + 4px);width:230px;max-width:calc(100vw - 40px);padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:5px;box-shadow:var(--popup-shadow);display:grid;gap:8px}
 .measure-menu p{margin:0;line-height:1.4}
 .measure-menu button{text-align:left}
 .measure-menu [hidden]{display:none}
 .measure-end-at{display:flex;align-items:center;gap:5px}
 .measure-end-at input{width:70px;min-width:0}
-.measure-status{color:var(--text,#e5edf5)}
+.measure-status{color:var(--text)}
 .measure-message:empty{display:none}
-.measure-message{color:#e8a65c}
+.measure-message{color:var(--amber)}
 .prof-metric[data-metric-card="wall"] .prof-value small{padding-right:34px}
 /* Open toward the page centre whichever column the card is pinned in. */
 .prof-summary .prof-metric:nth-child(n+4) .measure-menu>div{left:auto;right:0}
 @media(max-width:1100px){.prof-summary .prof-metric:nth-child(n+4) .measure-menu>div{left:0;right:auto}.prof-summary .prof-metric:nth-child(3n) .measure-menu>div{left:auto;right:0}}
 @media(max-width:650px){.prof-summary .prof-metric:nth-child(3n) .measure-menu>div{left:0;right:auto}.prof-summary .prof-metric:nth-child(2n) .measure-menu>div{left:auto;right:0}}
-.timeline-measure-line{position:absolute;top:0;bottom:0;width:0;z-index:2;pointer-events:none;border-left:2px solid #83c5d5}
-.timeline-measure-line.manual{border-left-color:#e8a65c}
-.timeline-measure-line.superseded{border-left:1px dashed var(--muted,#91a0b0)}
-.timeline-measure-flag{position:absolute;top:24px;transform:translateX(-100%);font:9px var(--mono,monospace);white-space:nowrap;padding:0 4px;border-right:2px solid #83c5d5;color:#83c5d5}
-.timeline-measure-flag.manual{border-right-color:#e8a65c;color:#e8a65c}
-.timeline-measure-flag.superseded{border-right:1px dashed var(--muted,#91a0b0);color:var(--muted,#91a0b0);top:2px}
+.timeline-measure-line{position:absolute;top:0;bottom:0;width:0;z-index:2;pointer-events:none;border-left:2px solid var(--blue)}
+.timeline-measure-line.manual{border-left-color:var(--amber)}
+.timeline-measure-line.superseded{border-left:1px dashed var(--muted)}
+.timeline-measure-flag{position:absolute;top:24px;transform:translateX(-100%);font:9px var(--mono,monospace);white-space:nowrap;padding:0 4px;border-right:2px solid var(--blue);color:var(--blue)}
+.timeline-measure-flag.manual{border-right-color:var(--amber);color:var(--amber)}
+.timeline-measure-flag.superseded{border-right:1px dashed var(--muted);color:var(--muted);top:2px}
 
 /* Agent scope selector: one compact multi-select beside the summary cards. */
 .prof-summary-actions{display:flex;flex-direction:column;gap:6px;min-width:0;width:132px}
 .prof-summary-actions>button{flex:1}
 .metric-scope{position:relative;font-size:11px}
-.metric-scope summary{cursor:pointer;list-style:none;padding:5px 8px;border:1px solid var(--line,#293542);border-radius:5px;background:var(--panel,#111a24)}
+.metric-scope summary{cursor:pointer;list-style:none;padding:5px 8px;border:1px solid var(--line);border-radius:5px;background:var(--panel)}
 .metric-scope summary::-webkit-details-marker{display:none}
-.metric-scope summary small{display:block;text-transform:uppercase;font-size:9px;letter-spacing:.05em;color:var(--muted,#91a0b0)}
+.metric-scope summary small{display:block;text-transform:uppercase;font-size:9px;letter-spacing:.05em;color:var(--muted)}
 .metric-scope-label{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.metric-scope-label::after{content:" ▾";color:var(--muted,#91a0b0)}
-.metric-scope[data-scoped=true] summary{border-color:#83c5d5}
-.metric-scope[data-scoped=true] .metric-scope-label{color:#83c5d5}
-.metric-scope-menu{position:absolute;z-index:11;right:0;top:calc(100% + 4px);width:240px;max-width:calc(100vw - 40px);max-height:min(320px,60dvh);overflow:auto;padding:8px;background:var(--panel,#111a24);border:1px solid var(--line,#293542);border-radius:5px;box-shadow:0 8px 20px #0006}
+.metric-scope-label::after{content:" ▾";color:var(--muted)}
+.metric-scope[data-scoped=true] summary{border-color:var(--blue)}
+.metric-scope[data-scoped=true] .metric-scope-label{color:var(--blue)}
+.metric-scope-menu{position:absolute;z-index:11;right:0;top:calc(100% + 4px);width:240px;max-width:calc(100vw - 40px);max-height:min(320px,60dvh);overflow:auto;padding:8px;background:var(--panel);border:1px solid var(--line);border-radius:5px;box-shadow:var(--popup-shadow)}
 .metric-scope-menu label{display:flex;align-items:center;gap:7px;padding:4px 2px;cursor:pointer;min-width:0}
 .metric-scope-menu label span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.metric-scope-menu label small{color:var(--muted,#91a0b0);white-space:nowrap}
-.metric-scope-agents{border-top:1px solid var(--line,#293542);margin-top:4px;padding-top:4px}
-.metric-scope-menu p{margin:6px 2px 0;font-size:10px;line-height:1.4;color:var(--muted,#91a0b0)}
+.metric-scope-menu label small{color:var(--muted);white-space:nowrap}
+.metric-scope-agents{border-top:1px solid var(--line);margin-top:4px;padding-top:4px}
+.metric-scope-menu p{margin:6px 2px 0;font-size:10px;line-height:1.4;color:var(--muted)}
 /* No agents selected: a deliberate empty state in place of the cards, sized like them so the page does not jump. */
-.prof-scope-empty{grid-column:1/-2;box-sizing:border-box;min-height:94px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:10px 14px;border:1px dashed var(--line,#293542);border-radius:5px;font-size:12px;color:var(--muted,#91a0b0)}
-.prof-scope-empty strong{color:var(--text,#e5edf5);font-weight:600}
+.prof-scope-empty{grid-column:1/-2;box-sizing:border-box;min-height:94px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:10px 14px;border:1px dashed var(--line);border-radius:5px;font-size:12px;color:var(--muted)}
+.prof-scope-empty strong{color:var(--text);font-weight:600}
 .prof-scope-empty span{flex:1;min-width:200px;line-height:1.45}
-.prof-scope-empty-note{grid-column:1/-1;margin:0;font-size:12px;color:var(--muted,#91a0b0)}
+.prof-scope-empty-note{grid-column:1/-1;margin:0;font-size:12px;color:var(--muted)}
 /* Cards that keep their execution-wide meaning while an agent scope is active. */
 .prof-metric[data-unscoped=true]{border-style:dashed}
 @media(max-width:650px){.prof-scope-empty{grid-column:1/-1}.prof-summary-actions{width:auto;grid-column:1/-1;flex-direction:row}.metric-scope{flex:1}.metric-scope-menu{left:0;right:auto}}
+
+.prof-tabs [aria-selected=true],.metric-scope[data-scoped=true] summary {background:var(--selection-bg);border-color:var(--blue)}
+.prof-value:hover {background:transparent}
+.prof-table th {color:var(--text-secondary)}
+.prof-table tbody tr:hover {background:var(--panel2)}
+.metric-scope summary {border-color:var(--control-border)}

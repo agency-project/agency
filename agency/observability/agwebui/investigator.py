@@ -705,6 +705,14 @@ def normalize_trace(trace, entry, summary=None):
         "intervals": sorted(intervals, key=lambda i: i["start"]),
         "edges": edges,
         "counters": {key: reduce_samples(values) for key, values in counters.items()},
+        # agprof stamps spans and resource samples with one perf_counter_ns
+        # clock, so both share this run-relative axis without alignment.
+        "clock": {
+            "events": "agprof perf_counter_ns",
+            "resources": "agprof perf_counter_ns",
+            "shared": True,
+            "origin": "first recorded span",
+        },
         "obligations": obligations(actions, entry.get("resolved")),
         "summary": summary or {},
         "coverage": {

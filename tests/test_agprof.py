@@ -1700,3 +1700,80 @@ def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, 
         if agprof._sampler is not None and not agprof._sampler.is_alive():
             agprof._sampler = None
         agprof.stop()
+
+
+def _pressure(path, some_us, full_us=0):
+    path.write_text(
+        f"some avg10=0.00 avg60=0.00 avg300=0.00 total={some_us}\n"
+        f"full avg10=0.00 avg60=0.00 avg300=0.00 total={full_us}\n"
+    )
+
+
+def test_host_sampler_records_normalized_cpu_memory_and_interval_psi(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    (proc / "pressure").mkdir(parents=True)
+    sampler = object.__new__(agprof._Sampler)
+    sampler._proc_root = proc
+    monkeypatch.setattr(agprof, "_samples", [])
+
+    def write(user, idle, cpu_us, io_us):
+        (proc / "stat").write_text(f"cpu  {user} 0 0 {idle} 0 0 0 0 0 0\ncpu0 1 0 0 1\n")
+        (proc / "meminfo").write_text("MemTotal: 16777216 kB\nMemAvailable: 12582912 kB\n")
+        _pressure(proc / "pressure" / "cpu", cpu_us, 999)
+        _pressure(proc / "pressure" / "memory", 0)
+        _pressure(proc / "pressure" / "io", io_us, io_us // 2)
+
+    write(100, 900, 1_000_000, 0)
+    sampler._tick_host(1_000_000_000)
+    # The first tick has no interval: no fabricated rates.
+    names = {name for _t, name, _v in agprof._samples}
+    assert "host:cpu_util_pct" not in names and "host:cpu_psi_some_pct" not in names
+    assert (1_000_000_000, "host:mem_used_mb", 4096.0) in agprof._samples
+    agprof._samples.clear()
+
+    write(400, 1600, 1_250_000, 500_000)  # 300 busy of 1000 ticks; 0.25s / 0.5s stalled
+    sampler._tick_host(3_000_000_000)
+    values = {name: value for _t, name, value in agprof._samples}
+    assert values["host:cpu_util_pct"] == pytest.approx(30.0)
+    assert values["host:cpu_psi_some_pct"] == pytest.approx(12.5)
+    assert values["host:io_psi_some_pct"] == pytest.approx(25.0)
+    assert values["host:io_psi_full_pct"] == pytest.approx(12.5)
+    assert values["host:memory_psi_some_pct"] == 0.0
+    # System-wide "full" CPU pressure is undefined and omitted.
+    assert "host:cpu_psi_full_pct" not in values
+
+
+def test_sandbox_pressure_is_read_from_its_own_cgroup_only(tmp_path, monkeypatch):
+    cgroup = tmp_path / "sandbox"
+    cgroup.mkdir()
+    (cgroup / "cpu.stat").write_text("usage_usec 10\n")
+    (cgroup / "memory.current").write_text(str(2**20))
+    sampler = object.__new__(agprof._Sampler)
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(sampler, "_tick_io_net", lambda *a, **k: None)
+    _pressure(cgroup / "cpu.pressure", 0)
+    sampler._sample_container(1_000_000_000, "sb", str(cgroup))
+    _pressure(cgroup / "cpu.pressure", 100_000)
+    sampler._sample_container(2_000_000_000, "sb", str(cgroup))
+    values = {name: value for _t, name, value in agprof._samples}
+    assert values["sandbox:sb:cpu_psi_some_pct"] == pytest.approx(10.0)
+    # A kernel without PSI files simply produces no pressure series.
+    assert not any(name.startswith("sandbox:sb:io_psi") for name in values)
+    assert not any(name.startswith("host:") for name in values)
+
+
+def test_host_and_pressure_series_keep_their_units_in_saved_observations():
+    observations = agprof._resource_observations(
+        [
+            (1, "host:cpu_util_pct", 30.0),
+            (1, "host:mem_used_mb", 4096.0),
+            (1, "sandbox:sb:memory_psi_some_pct", 2.0),
+        ],
+        process_info={},
+    )
+    units = {o["name"]: o["unit"] for o in observations}
+    assert units == {
+        "host:cpu_util_pct": "percent of all host CPUs",
+        "host:mem_used_mb": "MB",
+        "sandbox:sb:memory_psi_some_pct": "percent of wall time stalled",
+    }

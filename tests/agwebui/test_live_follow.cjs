@@ -79,7 +79,7 @@ function page(replay=false,view=null) {
       sendExecution(command,extra){sent.push({type:'execution_command',command,...extra});return true;}
       sendReplay(type,extra){sent.push({type,...extra});return true;}
     },
-    matchesAction:()=>true,
+    matchesAction:()=>true,causalSummary:()=>'<p>Causal summary</p>',
     // The summary module is not loaded here; its scope contract is this small.
     metricScope:()=>metricScope,setMetricScope:ids=>{metricScope=ids==null?null:new Set(ids);},renderMetricsSummary:()=>{summaryRenders++;},
     navigator:{clipboard:{writeText:async text=>{if(clipboardFails)throw Error('denied');copied.push(text);}}},
@@ -106,7 +106,7 @@ function page(replay=false,view=null) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
+    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,criticalPathView,detailedProfilerView,profilerCategories,
       windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
       paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},setCausal:viewer=>{causalViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,renderAgentColumnControls};
   `,context);
@@ -168,8 +168,10 @@ test('first-use prompt is removed when agent columns become available',()=>{
   assert.equal(stack.querySelectorAll('[data-agent-column]').length,1);
 });
 test('explicit alternative execution views remain selected on entry',()=>{
-  assert.equal(page(false,'timeline').ui.state.view,'timeline');
+  assert.equal(page(false,'timeline').ui.state.view,'critical');
   assert.equal(page(false,'profiler').ui.state.view,'profiler');
+  assert.equal(page(false,'critical').ui.state.view,'critical');
+  assert.equal(page(false,'profiler&profiler=critical').ui.state.view,'critical');
   // Links to the removed views open the trajectory instead of failing.
   for(const removed of ['context','resources','agents','compare'])assert.equal(page(false,removed).ui.state.view,'trajectory');
 });
@@ -1097,14 +1099,14 @@ test('selecting a column header scopes the dashboard to that agent without chang
   assert.equal(p.feed('a').children.some(card=>card.dataset.callCard==='new-call'||card.dataset.callGroup==='new-call'),true);
 });
 
-// UI reorganisation: three views, relocated controls, readable payloads, typed cards.
+// UI navigation order, relocated controls, readable payloads, typed cards.
 const pageSource=()=>fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
-test('navigation is Execution Trajectory, Timeline, Profiler and the removed views are gone',()=>{
+test('navigation keeps three views and redirects the retired Timeline to Critical Path',()=>{
   const p=page();
-  assert.equal(JSON.stringify(p.ui.views),JSON.stringify([['trajectory','Execution Trajectory'],['timeline','Timeline'],['profiler','Profiler']]));
+  assert.equal(JSON.stringify(p.ui.views),JSON.stringify([['trajectory','Execution Trajectory'],['profiler','Profiler'],['critical','Critical Path']]));
   assert.equal(p.ui.state.view,'trajectory');
   const selection=(p.ui.selectAction('old'),p.ui.state.selected),run=p.ui.state.run;
-  for(const view of ['timeline','profiler','trajectory']){p.ui.setView(view);assert.equal(p.ui.state.view,view);assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selection);}
+  for(const view of ['profiler','critical','trajectory']){p.ui.setView(view);assert.equal(p.ui.state.view,view);assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selection);}
   // Profiler categories still deep-link into the Profiler view.
   p.ui.setView('llm');assert.equal(p.ui.state.view,'profiler');assert.equal(p.ui.state.profilerCategory,'llm');
   for(const removed of ['agents','compare','context','resources']){p.ui.setView(removed);assert.equal(p.ui.state.view,'profiler');}
@@ -1219,4 +1221,35 @@ test('Critical Path uses the frozen snapshot for scrolling and resize while inge
   const clock=displayed.duration;p.append();
   assert.equal(displayed.duration,clock);
   assert.equal(p.ui.state.liveRun.duration,clock+1);
+});
+
+
+test('Critical Path is separate from profiler categories and updates its mounted graph',()=>{
+  const p=page(false,'critical');let updates=0,displayed;
+  p.ui.setCausal({update:run=>{updates++;displayed=run;}});
+  p.append();
+  assert.ok(updates>0);assert.equal(displayed,p.ui.state.run);
+  assert.equal(JSON.stringify(Object.keys(p.ui.profilerCategories)),JSON.stringify(['activity','llm','tools','systems']));
+  p.ui.renderMetricsDashboard();assert.equal(p.node('summary-strip').hidden,true);
+});
+
+test('unified operation inspector shows both boundaries, nonblocking provenance and only explicit system attribution',()=>{
+  const p=page(false,'critical'),run=p.ui.state.run;
+  run.causal_graph={operations:[{id:'operation',action_id:'old',agent:'a',kind:'tool',label:'Captured tool',start_node:'start',end_node:'end',duration:2,outcome:'success',metrics:{cpu_ms:15}}],nodes:[{id:'start',operation:'operation',time:1,timing:'observed'},{id:'end',operation:'operation',time:3,timing:'observed'},{id:'process',operation:'child',label:'Recorded process',time:1}],edges:[{id:'owner',source:'start',target:'process',kind:'process_owner',confidence:'provenance',blocking:false,evidence:'Explicit tool_action_id'}],critical_path:{slack:{start:0}},coverage:{unknown:[],gaps:[]}};
+  run.actions.push({id:'syscall',kind:'syscall',name:'read',duration:.1,outcome:'success',metadata:{tool_action_id:'old'}});
+  p.ui.setSelection({type:'causal-operation',id:'operation',action_id:'old'});p.ui.renderInspector();
+  const html=p.node('inspector').innerHTML;
+  assert.match(html,/Captured tool/);assert.match(html,/Start on trace/);assert.match(html,/End on trace/);
+  assert.match(html,/nonblocking relationship/);assert.match(html,/Explicitly attributed syscall events/);assert.match(html,/cpu_ms/);
+  assert.ok(p.ui.readingPins().includes('old'));
+  run.actions.at(-1).metadata={pid:123};p.ui.renderInspector();
+  assert.match(p.node('inspector').innerHTML,/No syscall ownership was recorded/);
+});
+
+test('process observations expose captured PID/argv but never turn syscall latency into runtime or slack',()=>{
+ const p=page(false,'critical'),run=p.ui.state.run;
+ run.causal_graph={operations:[{id:'process',kind:'process',band:'System',label:'python',agent:'a',duration:null,outcome:'execution_observed',start_node:'observed',metrics:{pid:42,path:'/usr/bin/python',argv:['python','build.py'],execution_observation:'Successful execve; lifecycle not recorded'}}],nodes:[{id:'observed',operation:'process',time:1,timing:'execve_observation'}],edges:[],operation_critical_path:{slack:{observed:100}},coverage:{unknown:[],gaps:[]}};
+ p.ui.setSelection({type:'causal-operation',id:'process'});p.ui.renderInspector();const html=p.node('inspector').innerHTML;
+ assert.match(html,/Execution observed at/);assert.match(html,/PID/);assert.match(html,/python build.py/);assert.match(html,/Lifecycle boundaries unavailable/);
+ assert.match(html,/Slack in observed operation chain<\/span><span>Unknown/);assert.match(html,/CPU time/);assert.match(html,/Unavailable/);
 });

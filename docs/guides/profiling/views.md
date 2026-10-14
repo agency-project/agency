@@ -1,7 +1,8 @@
 # Profiler views and interpretation
 
-A working, read-only investigator at `/profiler`, alongside the existing live
-run dashboard. Three views, in this order, share a run, selected
+The execution profiler at `/profiler` sits alongside the live run dashboard.
+Saved executions are read-only; a connected, active application relay enables
+live controls. Three views, in this order, share a run, selected
 action/episode, inspector, event search, and time cursor: **Execution
 Trajectory** (the default agent-column view), **Timeline**, and **Profiler**. No frontend package
 installation or build step is needed.
@@ -18,7 +19,7 @@ continues to select an external profiler directory.
 
 The representative demo is available directly at
 <http://localhost:7860/profiler?run=demo-baseline&view=trajectory>.
-“Open research demo” also opens it from any view. Numbers **1–3** switch views;
+**Open recorded example** also opens it from any view. Numbers **1–3** switch views;
 **Escape** clears the selected event. Links to the removed views
 (`view=resources`, `context`, `agents`, `compare`) open the trajectory. Export run downloads the normalized data,
 including source labels.
@@ -45,13 +46,19 @@ For incremental execution, replay, provenance, and verification details, see
   filters, and time cursor. `layout=overlay` preserves the layout in shared URLs.
 - **Timeline:** agent calls and measured system resources on a shared
   wall-clock axis, with the same selection and time cursor.
-- **Profiler:** detailed Activity, LLM, Tools and Systems measurements.
+- **Profiler:** Activity, LLM, Tools and Systems measurements, plus
+  [Critical Path](../../architecture/observability.md#profiler-critical-path)
+  for observed dependencies and explicitly qualified gaps.
 - **Removed views:** Resources & waits, Context & information, the tandem
   trace board and Compare runs are no longer in the navigation. Their recorded
   data (spans, prompt provenance, counters, relationships and the run catalog)
   is still collected, served by the same endpoints and included in exports.
-- **Task progress:** obligations with evidence links and explicit unvalidated
-  work; evaluator result separated from inferred tool completion.
+- **Task evidence:** recorded obligations and evaluator outcomes remain in
+  normalized data and exports; there is no standalone Task progress view.
+- **Live controls:** pause/resume, stop/force stop, retained messages, supported
+  active redirects, and task submission for application-registered skills.
+  These require an active execution relay; see [control receipts and
+  limits](live-trajectory.md#pause-and-inspect-live-execution).
 
 ## Data flow and provenance
 
@@ -83,7 +90,7 @@ completion timestamp minus reported duration, with observer emission overhead.
 
 **Inferred:** action categories, episodes, command-referenced paths, summary
 labels, and workflow obligations. Activity completion means its recorded calls returned successfully;
-it is not proof of task correctness. Comparison similarity measures
+it is not proof of task correctness. Historical experiment similarity measures
 category ordering, not semantic equivalence. Identical commands across agents
 suggest duplication; concurrency alone does not prove resource interference.
 
@@ -101,17 +108,21 @@ prompts. Composition uses character counts; measured token totals are separate.
 Model-wait wall time unions overlapping intervals rather than adding nested or
 parallel spans. CPU work is not inferred from uninstrumented wall time.
 
-## Instrumentation to add next
+## Coverage limits
 
 1. Full prompt-chain references and content hashes instead of truncated span
    attributes, with explicit compaction/drop boundaries and source/file IDs.
-2. Supervisor/worker transfer manifests, message IDs, send/receive timestamps,
-   dependency IDs, and queue-release causes.
+2. Complete supervisor/worker transfer manifests, message IDs, send/receive
+   timestamps, and queue-release causes across all harnesses. Critical Path
+   uses the model/tool identity and prompt-history evidence that is recorded;
+   its graph is explicitly partial.
 3. Verified artifact inventories/diffs, task obligation IDs, and independent
    validation/evaluator events for workflows outside the saved experiments.
-4. Per-agent/cgroup resource attribution and sampled contention conditions;
-   exact CPU/I/O intervals where available. Live trajectory streaming now uses
-   canonical event databases; sampled live resource attribution remains future work.
+4. Per-agent sandbox CPU/RAM is available when recorded sandbox ownership and
+   fresh cgroup samples establish attribution. Host, workload, process and GPU
+   measurements retain their own scope. These samples do not establish exact
+   per-operation CPU/I/O intervals or prove contention. See
+   [metric scopes](../../live-metrics.md#agent-scope).
 
 ## Verification and screenshots
 
@@ -122,11 +133,12 @@ node --test tests/agwebui/investigator-model.test.mjs
 node --check agency/observability/agwebui/static/investigator.js
 ```
 
-Browser validation covered all six views, episode expansion, inspector links,
+Earlier browser validation covered the former six-view layout, episode expansion, inspector links,
 wait attribution/zoom, model context blocks, agent filters, divergence and run-B
 navigation, obligation evidence, empty searches, real E1A.1 baseline/contention
 runs, and the mobile layout. No browser console errors were observed. The mobile
 layout was checked at 390px and had no horizontal overflow.
 
-The [screenshot gallery](screenshots.md) includes all six finished views, a
-recorded resource view, and the mobile layout.
+The [screenshot gallery](screenshots.md) preserves those historical views,
+recorded resource evidence, and later live/replay layouts. Those captures do
+not establish the current navigation or release validation results.

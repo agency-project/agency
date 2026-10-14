@@ -1591,6 +1591,8 @@ class _Sampler(threading.Thread):
                 return dict(_cg_registry)
 
         self._gpu_collector = GPUCollector(self._nvml, _samples, scopes)
+        # Previous cumulative readings for host and pressure rates.
+        self._previous: "dict[str, tuple]" = {}
 
     def _workload_pids(self) -> "dict[int, str]":
         """Return every PID in the workload cgroup tree and its cgroup path.
@@ -1716,6 +1718,113 @@ class _Sampler(threading.Thread):
         for pid, cgroup_dir in self._workload_pids().items():
             self._sample_process(t, pid, cgroup_dir)
 
+    def _rate(self, t: int, key: str, value: float, unit: float = 1.0) -> "float | None":
+        """Per-second rate of a cumulative counter since this sampler's previous tick.
+
+        The first reading, a reset (negative delta) and a stalled clock yield
+        no value rather than a fabricated zero.
+        """
+        previous = self.__dict__.setdefault("_previous", {})
+        prior = previous.get(key)
+        previous[key] = (t, value)
+        if prior is None or t <= prior[0] or value < prior[1]:
+            return None
+        return (value - prior[1]) / unit / ((t - prior[0]) / 1e9)
+
+    def _tick_pressure(self, t: int, prefix: str, files: "dict[str, str]") -> None:
+        """Linux PSI as the percentage of wall time some/all tasks stalled.
+
+        Derived from the cumulative ``total=`` microseconds, not the kernel's
+        smoothed avg10, so each sample covers exactly one sampler interval.
+        Kernels without PSI simply produce no series.
+        """
+        for resource, path in files.items():
+            try:
+                with open(path, "rb") as f:
+                    lines = f.read().split(b"\n")
+            except OSError:
+                continue
+            for line in lines:
+                parts = line.split()
+                if not parts or parts[0] not in (b"some", b"full"):
+                    continue
+                # System-wide "full" CPU pressure is defined as zero; omit it.
+                if resource == "cpu" and parts[0] == b"full" and prefix == "host":
+                    continue
+                total = next((p[6:] for p in parts if p.startswith(b"total=")), None)
+                if total is None:
+                    continue
+                kind = parts[0].decode()
+                series = f"{prefix}:{resource}_psi_{kind}_pct"
+                value = self._rate(t, series, float(int(total)), unit=1e6 / 100)
+                if value is not None:
+                    _samples.append((t, series, min(100.0, value)))
+
+    def _tick_host(self, t: int) -> None:
+        """Machine-wide CPU, memory, pressure, disk and network gauges.
+
+        These measure every workload on the host, including processes outside
+        Agency, and are never attributed to an agent.
+        """
+        proc = self._proc_root
+        with suppress(OSError, ValueError, IndexError):
+            with (proc / "stat").open("rb") as f:
+                fields = [int(x) for x in f.readline().split()[1:9]]
+            # user nice system idle iowait irq softirq steal; guest time is
+            # already included in user/nice.
+            total, idle = float(sum(fields)), float(fields[3] + fields[4])
+            previous = self.__dict__.setdefault("_previous", {})
+            prior = previous.get("host:cpu_ticks")
+            previous["host:cpu_ticks"] = (t, (total, idle))
+            if prior is not None and total > prior[1][0]:
+                elapsed = total - prior[1][0]
+                busy = elapsed - (idle - prior[1][1])
+                _samples.append((t, "host:cpu_util_pct", max(0.0, 100.0 * busy / elapsed)))
+            _samples.append((t, "host:cpu_count", float(os.cpu_count() or 0)))
+        with suppress(OSError, ValueError, KeyError):
+            info = {}
+            with (proc / "meminfo").open("rb") as f:
+                for line in f:
+                    key, _, rest = line.partition(b":")
+                    info[key] = int(rest.split()[0])
+            _samples.append((t, "host:mem_total_mb", info[b"MemTotal"] / 1024))
+            _samples.append(
+                (t, "host:mem_used_mb", (info[b"MemTotal"] - info[b"MemAvailable"]) / 1024)
+            )
+        self._tick_pressure(
+            t, "host", {name: f"{proc}/pressure/{name}" for name in ("cpu", "memory", "io")}
+        )
+        # Whole physical disks only: partitions, loop and device-mapper
+        # devices would count the same bytes more than once.
+        with suppress(OSError, ValueError, IndexError):
+            read = written = 0
+            with (proc / "diskstats").open("rb") as f:
+                for line in f:
+                    parts = line.split()
+                    if os.path.exists(f"/sys/block/{parts[2].decode()}/device"):
+                        read += int(parts[5]) * 512
+                        written += int(parts[9]) * 512
+            for name, value in (("disk_read_mb_s", read), ("disk_write_mb_s", written)):
+                rate = self._rate(t, f"host:{name}", float(value), unit=2**20)
+                if rate is not None:
+                    _samples.append((t, f"host:{name}", rate))
+        # Physical interfaces only; container veth/bridge traffic is already
+        # counted once on the physical link it leaves through.
+        with suppress(OSError, ValueError, IndexError):
+            rx = tx = 0
+            with (proc / "net/dev").open("rb") as f:
+                for line in f.readlines()[2:]:
+                    iface, _, rest = line.partition(b":")
+                    if not os.path.exists(f"/sys/class/net/{iface.strip().decode()}/device"):
+                        continue
+                    parts = rest.split()
+                    rx += int(parts[0])
+                    tx += int(parts[8])
+            for name, value in (("net_rx_mb_s", rx), ("net_tx_mb_s", tx)):
+                rate = self._rate(t, f"host:{name}", float(value), unit=2**20)
+                if rate is not None:
+                    _samples.append((t, f"host:{name}", rate))
+
     def _tick_cgroups(self, t: int) -> None:
         """Sample every REGISTERED container (see container_started()) plus the
         registered runtime-daemon cgroups (conmon scopes / docker services),
@@ -1756,6 +1865,12 @@ class _Sampler(threading.Thread):
             _samples.append((t, f"cg:{label}:io_r", float(rb)))
             _samples.append((t, f"cg:{label}:io_w", float(wb)))
             io_done = True
+        # Pressure experienced by tasks inside this sandbox's cgroup only.
+        self._tick_pressure(
+            t,
+            f"sandbox:{label}",
+            {name: f"{cdir}/{name}.pressure" for name in ("cpu", "memory", "io")},
+        )
         self._tick_io_net(t, label, cdir, io_from_pids=not io_done)
 
     def _tick_io_net(self, t: int, label: str, scope_path: str, io_from_pids: bool = True) -> None:
@@ -1854,6 +1969,7 @@ class _Sampler(threading.Thread):
             for i, h in enumerate(self._handles):
                 self._gpu_collector.tick(t, i, h, sampled_at)
         self._tick_cgroups(t)
+        self._tick_host(t)
         # Reuse the sampled values and buffered logger; no second sampler or poller.
         logger = _profile_data_logger
         if logger is not None:
@@ -2303,8 +2419,20 @@ def _gauge_description(series: str) -> "tuple[str, str]":
         "power_w": "W",
         "power_w_est": "W",
         "rss_mb": "MB",
-    }.get(suffix, "value")
+        "cpu_util_pct": "percent of all host CPUs",
+        "cpu_count": "CPUs",
+        "mem_used_mb": "MB",
+        "mem_total_mb": "MB",
+        "disk_read_mb_s": "MB/s",
+        "disk_write_mb_s": "MB/s",
+        "net_rx_mb_s": "MB/s",
+        "net_tx_mb_s": "MB/s",
+    }.get(suffix, "percent of wall time stalled" if "_psi_" in suffix else "value")
     parts = series.split(":")
+    if parts[0] == "host":
+        return f"host {suffix}", unit
+    if parts[0] == "sandbox" and "_psi_" in suffix:
+        return f"sandbox {parts[1]} {suffix}", unit
     if parts[0] == "sandbox" and suffix == "mem_mb":
         return f"sandbox {parts[1]} memory", unit
     if parts[0].startswith("gpu"):

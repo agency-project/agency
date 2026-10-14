@@ -57,6 +57,35 @@ def test_history_pages_follow_start_identity_order_and_keep_concurrent_completio
     assert not trajectory_history(trajectory.run, "worker", query="nonmatching")["actions"]
 
 
+def test_syscalls_are_recorded_but_do_not_fill_trajectory_history(tmp_path):
+    from agency.observability.agwebui.trajectory import trajectory_history
+
+    source, actor = registered_source(tmp_path)
+    rows = [event(i + 3, "syscall_call", call_id=f"sys-{i}", syscall="sendto") for i in range(60)]
+    rows += [event(100, "syscall_result", call_id="sys-0", syscall="sendto", error="denied")]
+    rows += [event(101, "tool_call", call_id="real-tool", tool="execve")]
+    write_rows(actor, rows)
+    source.refresh(force=True)
+    while source.model.run["coverage"]["catching_up"]:
+        source.refresh(force=True)
+    run = source.model.snapshot()
+    assert len([a for a in run["actions"] if a["kind"] == "syscall"]) == 60
+    assert all(i["kind"] == "syscall" for i in run["intervals"] if "sys-" in i["id"])
+    assert run["metrics_totals"]["tools"] == 2
+    assert run["metrics_totals"]["tool_errors"] == 0
+    first = trajectory_history(run, "worker", active=True, limit=1)
+    assert first["actions"][0]["call_id"] == "real-tool"
+    assert first["has_more"]
+    second = trajectory_history(run, "worker", active=True, limit=1,
+                                before_start=first["actions"][0]["start"],
+                                before_id=first["actions"][0]["id"])
+    assert second["actions"][0]["call_id"] == "open"
+    assert not second["has_more"]
+    assert not trajectory_history(run, "worker", active=True, query="sendto")["actions"]
+    syscall = next(e for e in source.events if e["type"] == "syscall_call")
+    assert source.raw_event(syscall["id"])["payload"]["syscall"] == "sendto"
+
+
 def test_live_workload_metadata_reaches_snapshot_and_incremental_patch():
     trajectory = Trajectory("live", "Live execution")
     trajectory.apply(
@@ -329,6 +358,68 @@ def test_reconnect_after_journal_expiry_recovers_a_complete_snapshot(tmp_path):
     assert recovered["type"] == "snapshot"
     assert recovered["resynced"]
     assert recovered["run"]["actions"][0]["id"] == first["run"]["actions"][0]["id"]
+
+
+def test_journal_byte_budget_evicts_history_and_recovers_missing_revisions(tmp_path):
+    source, _actor = registered_source(tmp_path)
+    source.journal_byte_limit = 16000
+    for revision in range(1, 30):
+        source.revision = revision
+        source._retain_patch({"actions": [{"id": str(revision), "result": "x" * 6000}]})
+        assert source.journal_bytes <= source.journal_byte_limit
+        assert source.journal_bytes == sum(source._journal_sizes.values())
+    assert len(source.journal) < 29
+    assert source.message(1, source.epoch)["type"] == "snapshot"
+    current = source.message(28, source.epoch)
+    assert current["type"] == "updates"
+    assert current["patches"][0]["actions"][0]["id"] == "29"
+
+
+def test_oversized_patch_is_not_retained_and_empty_journal_resyncs(tmp_path):
+    source, _actor = registered_source(tmp_path)
+    source.journal_byte_limit = 4096
+    source.revision = 1
+    source._retain_patch({"meta": {"status": "running"}})
+    source.revision = 2
+    source._retain_patch({"actions": [{"result": "x" * 8000}]})
+    assert not source.journal
+    assert source.journal_bytes == 0
+    assert source._journal_sizes == {}
+    assert source.message(1, source.epoch)["type"] == "snapshot"
+    assert source.message(2, source.epoch)["patches"] == []
+    source.revision = 3
+    source._retain_patch({"meta": {"status": "completed"}})
+    assert source.message(1, source.epoch)["type"] == "snapshot"
+    assert source.message(2, source.epoch)["type"] == "updates"
+
+
+def test_live_websocket_delivers_critical_path_only_after_completion(tmp_path, monkeypatch):
+    from agency.observability.agwebui import server
+
+    source, actor = registered_source(tmp_path)
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    monkeypatch.setattr(server, "_trajectory_source", lambda: source)
+    with TestClient(server.app) as client:
+        with client.websocket_connect("/ws/trajectory") as ws:
+            first = ws.receive_json()
+            assert first["run"]["causal_graph"]["state"] == "pending"
+            assert first["run"]["causal_graph"]["nodes"] == []
+            write_rows(actor, [event(3, "tool_result", call_id="open", result="done")])
+            write_rows(tmp_path / "global_data.sqlite3", [event(4, "done", status="completed")])
+            for _ in range(10):
+                frame = ws.receive_json()
+                if frame["type"] == "snapshot":
+                    graph = frame["run"]["causal_graph"]
+                else:
+                    graph = next((p["meta"]["causal_graph"] for p in frame["patches"]
+                                  if "causal_graph" in p["meta"]), {})
+                if graph.get("nodes"):
+                    break
+            else:
+                raise AssertionError("Completed Critical Path was not delivered to the live client")
+            assert graph["operations"]
+            assert "state" not in graph
+            assert client.get("/api/trajectory/live").json()["run"]["causal_graph"]["nodes"]
 
 
 def test_missing_agent_database_is_disclosed_and_retried_without_losing_cursor(tmp_path):

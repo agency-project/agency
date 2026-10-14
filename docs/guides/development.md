@@ -3,7 +3,7 @@
 From the repository root:
 
 ```bash
-uv sync --extra dev --python 3.12
+uv sync --locked --extra dev --python 3.12
 uv run pre-commit install
 uv run pytest
 uv run pre-commit run --all-files
@@ -12,6 +12,12 @@ uv run pre-commit run --all-files
 Pre-commit runs Ruff and file hygiene checks; it may fix files in place.
 CI runs the same hooks and pytest. Most unit tests use model doubles;
 live container/harness tests require their documented opt-in settings.
+
+The full `uv run pytest` command discovers the release suite under `tests/`,
+as configured in `pyproject.toml`. Tests stored in benchmark directories have
+separate commands in their READMEs and are outside that default discovery.
+Report existing skips and environment-dependent failures with the result;
+passing unit tests does not validate opted-out live model or checkpoint tests.
 
 For example import and documentation coverage:
 

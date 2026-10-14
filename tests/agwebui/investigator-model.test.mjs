@@ -2,7 +2,22 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/investigator-model.js', import.meta.url),'utf8');
-const {overlapDuration, matchesAction, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements, systemMeasurements} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {overlapDuration, matchesAction, trajectoryActions, packActionTracks, groupCallStack, executionIdentity, readableExecutionTitle, executionMeasurements, systemMeasurements, systemActivity} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('syscalls remain system telemetry while trajectory groups and call counts exclude them',()=>{
+  const run={duration:30,actions:[
+    {id:'send',agent:'a',kind:'syscall',name:'sendto',start:1,duration:20,outcome:'running'},
+    {id:'exec',agent:'a',kind:'syscall',name:'execve',start:2,duration:1,outcome:'success'},
+    {id:'model',agent:'a',kind:'model',name:'model',start:3,outcome:'running'},
+    {id:'tool',agent:'a',kind:'tool',name:'execve',start:4,outcome:'success'},
+  ]};
+  assert.deepEqual(trajectoryActions(run).map(a=>a.id),['model','tool']);
+  assert.deepEqual(groupCallStack(run.actions).flatMap(g=>g.actions).map(a=>a.id).sort(),['model','tool']);
+  assert.equal(executionMeasurements(run).primary.find(m=>m[0]==='Calls')[1],2);
+  assert.equal(systemActivity(run).count,2);
+  assert.deepEqual(systemActivity(run).groups.map(g=>g.name).sort(),['execve','sendto']);
+  assert.equal(run.actions.length,4);
+});
 
 test('live cumulative CPU and disk counters become rates without double-counting recorded CPU percentages',()=>{
   const metrics=systemMeasurements({duration:2,counters:{

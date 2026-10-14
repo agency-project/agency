@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -70,6 +71,31 @@ TITLES = {
     "input": "Waiting for your input",
 }
 TERMINAL = {"completed", "failed", "cancelled"}
+JOURNAL_BYTE_LIMIT = 64 * 1024 * 1024
+
+
+def _patch_size(value, limit):
+    """Conservative heap bound; stop counting an oversized patch immediately.
+
+    Count shared immutable values per reference, so the estimate can overcount
+    but cannot hide the dictionaries/lists retained by the revision journal.
+    """
+    pending = [value]
+    containers = set()
+    size = 0
+    while pending and size <= limit:
+        item = pending.pop()
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in containers:
+                continue
+            containers.add(id(item))
+            if isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
+        size += sys.getsizeof(item)
+    return size
 
 
 def text(value):
@@ -115,7 +141,8 @@ def returned_preview(value):
 
 
 class Trajectory:
-    def __init__(self, run_id, title, *, mode="live", source="recorded"):
+    def __init__(self, run_id, title, *, mode="live", source="recorded", defer_causal_graph=None):
+        self.defer_causal_graph = mode == "live" if defer_causal_graph is None else defer_causal_graph
         self.run = {
             "id": run_id,
             "title": title,
@@ -150,6 +177,14 @@ class Trajectory:
             "edges": [],
             "intervals": [],
             "counters": {},
+            # Canonical events and resource_sample.sampled_at are both Unix
+            # wall-clock seconds from the same host, offset by one origin.
+            "clock": {
+                "events": "host Unix wall clock",
+                "resources": "host Unix wall clock",
+                "shared": True,
+                "origin": "first canonical event",
+            },
             "obligations": [],
             "signals": [],
             "messages": [],
@@ -518,7 +553,7 @@ class Trajectory:
             "agent": action["agent"],
             "action": action["id"],
             "kind": action["kind"]
-            if action["kind"] in {"model", "queue", "dependency"}
+            if action["kind"] in {"model", "queue", "dependency", "syscall"}
             else "tool",
             "start": action["start"],
             "duration": action["duration"],
@@ -534,6 +569,8 @@ class Trajectory:
         self.dirty["intervals"].add(action["id"])
 
     def _attention(self, action):
+        if action["kind"] == "syscall":
+            return  # Raw system-call failures belong to recorded system telemetry.
         actor = action["agent"]
         if action["kind"] == "edit" and action["outcome"] == "success":
             self.edit_version[actor] = self.edit_version.get(actor, 0) + 1
@@ -1005,6 +1042,19 @@ class Trajectory:
     def _causal_graph(self):
         from .causal_graph import build_graph
 
+        # Live monitoring must never build a history-sized Critical Path graph.
+        # A reopened completed run must finish reading its backlog first, too.
+        if self.defer_causal_graph and (
+            self.finished_at is None or self.run["coverage"]["catching_up"]
+        ):
+            self.run["causal_graph"] = {
+                "state": "pending",
+                "nodes": [],
+                "edges": [],
+                "operations": [],
+            }
+            self._graph_signature = "pending"
+            return
         signature = self._graph_revision
         if signature != getattr(self, "_graph_signature", None):
             self.run["causal_graph"] = build_graph(self.run)
@@ -1080,6 +1130,7 @@ def trajectory_history(
             a
             for a in run["actions"]
             if a["agent"] == agent
+            and a["kind"] != "syscall"
             and (a["outcome"] == "running") == active
             and query.lower()
             in " ".join(
@@ -1127,6 +1178,9 @@ class LiveSource:
         self.epoch = uuid.uuid4().hex
         self.revision = 0
         self.journal = deque(maxlen=512)
+        self.journal_byte_limit = JOURNAL_BYTE_LIMIT
+        self.journal_bytes = 0
+        self._journal_sizes = {}
         self.lock = threading.RLock()
         self.last_poll = 0
         self.refiner = None
@@ -1449,7 +1503,25 @@ class LiveSource:
             if self.refiner:
                 self.refiner.update(self.model)
             self.revision += 1
-            self.journal.append((self.revision, self.model.patch()))
+            self._retain_patch(self.model.patch())
+
+    def _retain_patch(self, patch):
+        if not self.journal:
+            self.journal_bytes = 0
+            self._journal_sizes.clear()
+        size = _patch_size(patch, self.journal_byte_limit)
+        # Eviction uses the existing snapshot recovery protocol. An oversized
+        # final patch is sent via a current snapshot rather than retained.
+        while self.journal and (
+            self.journal_bytes + size > self.journal_byte_limit
+            or self.journal.maxlen is not None and len(self.journal) >= self.journal.maxlen
+        ):
+            revision, _ = self.journal.popleft()
+            self.journal_bytes -= self._journal_sizes.pop(revision)
+        if size <= self.journal_byte_limit:
+            self.journal.append((self.revision, patch))
+            self._journal_sizes[self.revision] = size
+            self.journal_bytes += size
 
     def message(self, after=0, epoch=None):
         with self.lock:
@@ -1457,7 +1529,10 @@ class LiveSource:
                 epoch != self.epoch
                 or not after
                 or after > self.revision
-                or (self.journal and after < self.journal[0][0] - 1)
+                or (
+                    after < self.revision
+                    and (not self.journal or after < self.journal[0][0] - 1)
+                )
             ):
                 return {
                     "type": "snapshot",

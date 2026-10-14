@@ -1,7 +1,7 @@
 // Pure calculations over the existing projection, never a second subscription.
 export const defaults=['wall','agents','tools','models','tokens','errors'];
 export const categories=['Activity','LLM','Tools','Systems'];
-export const isTool=a=>!['model','queue','dependency','unknown','setup'].includes(a.kind);
+export const isTool=a=>!['model','queue','dependency','unknown','setup','syscall'].includes(a.kind);
 export const completed=a=>['success','failed','timeout','cancelled'].includes(a.outcome);
 export function percentile(values,p){const s=values.filter(Number.isFinite).sort((a,b)=>a-b);return s.length?s[Math.max(0,Math.ceil(s.length*p)-1)]:null;}
 export function peak(calls,end){const events=calls.filter(a=>!a.missing_start&&(a.outcome==='running'?end>a.start:a.duration>0)).flatMap(a=>[[a.start,1],[a.outcome==='running'?end:a.start+a.duration,-1]]).filter(([t])=>Number.isFinite(t)).sort((a,b)=>a[0]-b[0]||a[1]-b[1]);let n=0,max=0;for(const [,d] of events){n+=d;max=Math.max(max,n);}return max;}

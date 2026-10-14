@@ -18,6 +18,18 @@ def test_counters_replace_call_contribution_on_completion_and_replay():
     assert counters.update([call])["tool_errors"] == 0
 
 
+def test_syscalls_never_count_as_model_tool_invocations_or_errors():
+    counters = ExecutionCounters()
+    totals = counters.update([
+        {"id": "send", "kind": "syscall", "outcome": "running", "agent": "a"},
+        {"id": "exec", "kind": "syscall", "outcome": "failed", "agent": "a"},
+        {"id": "tool", "kind": "tool", "outcome": "success", "agent": "a"},
+    ])
+    assert totals["tools"] == totals["completed_tools"] == 1
+    assert totals["tool_errors"] == 0
+    assert counters.by_agent["a"]["tools"] == 1
+
+
 def test_partial_usage_and_wait_intervals():
     counters = ExecutionCounters()
     totals = counters.update(

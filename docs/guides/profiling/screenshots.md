@@ -1,4 +1,10 @@
-# Finished profiler views
+# Historical profiler screenshots
+
+These captures preserve earlier UI layouts and validation evidence. The first
+six views are from a superseded navigation layout; Resources & waits, Context
+& information, Multi-agent, Compare runs, and Task progress are not current
+standalone tabs. Use [current profiler views](views.md) for today's navigation
+and capabilities. Later captures also show the UI at the time they were recorded.
 
 The six primary screenshots use the explicitly synthetic three-agent demo.
 Additional screenshots show recorded E1A.1 telemetry, the mobile layout, and

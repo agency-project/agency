@@ -287,8 +287,8 @@ header and a **Current activity** area that supports
 multiple in-flight calls. Completed calls move into history ordered by newest
 start time, with stable action IDs breaking ties. Completion time does not reorder
 history. An inspected call keeps its execution/action identity as it moves.
-The **Multi-agent** view preserves expanded transcripts while live updates
-arrive and aligns concurrent work with any recorded system metrics.
+The trajectory's agent columns preserve expanded transcripts while live
+updates arrive. The Timeline aligns concurrent work with recorded system metrics.
 Expand an activity for its calls. Select a call for arguments, lifecycle,
 timing, output, artifacts, model links, and immutable source identifiers.
 Signals link to supporting calls or raw events. Agent focus retains explicit
@@ -334,8 +334,12 @@ describe a recorded pattern. These are separate kinds of evidence.
 
 `trajectory.py` supplies one incremental reducer for live, historical review,
 and replay. `LiveSource` reads the existing global/per-agent databases in
-batches of at most 500 meaningful rows per table. High-volume syscalls and
-streamed tokens do not become activity nodes. Producer changes add request
+batches of at most 500 meaningful rows per table. High-volume syscalls remain
+recorded system telemetry, available to the Systems profiler and evidence
+inspection, but are excluded from trajectory feeds, overlays, history pages,
+agent call counts, and tool invocation metrics. They cannot evict model/tool
+calls from the browser's live retention window. Streamed tokens do not become
+activity nodes. Producer changes add request
 correlation, forward native annotations, flush tool completion, and record
 workload lifecycle; interpretation runs outside the execution process.
 

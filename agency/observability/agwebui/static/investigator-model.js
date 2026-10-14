@@ -1,4 +1,9 @@
 // Shared, deterministic projections used by every view.
+export function trajectoryActions(run) {
+  // Keep kernel telemetry available to the Systems profiler, not the agent feed.
+  return (run?.actions || []).filter(action => action.kind !== 'syscall');
+}
+
 export function matchesAction(action, agent, query) {
   if (agent && action.agent !== agent) return false;
   return !query || `${action.name} ${action.intent} ${action.command} ${action.result} ${(action.files || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
@@ -31,6 +36,7 @@ export function packActionTracks(actions, minimumDuration = 0) {
 export function groupCallStack(actions) {
   const groups=[],running=new Map();
   for(const action of actions) {
+    if(action.kind==='syscall')continue;
     if(action.outcome!=='running') {
       groups.push({id:action.id,agent:action.agent,actions:[action],running:false,
         latest:action.start});
@@ -132,7 +138,7 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
 // A value is displayed only when its observation exists. Zero remains valid
 // reported usage; absent usage and empty resource series are not zero samples.
 export function executionMeasurements(run,{includeResources=true}={}) {
-  const actions=run.actions||[],agents=(run.agents||[]).filter(a=>a.id!=='workflow');
+  const actions=trajectoryActions(run),agents=(run.agents||[]).filter(a=>a.id!=='workflow');
   const models=actions.filter(a=>a.kind==='model');
   const input=models.filter(a=>Number.isFinite(a.tokens)),output=models.filter(a=>Number.isFinite(a.output_tokens));
   const sum=(items,key)=>items.reduce((total,a)=>total+a[key],0);
@@ -213,4 +219,28 @@ export function agentResources(run,ids,stale=10) {
     return sandboxes?{value,sandboxes}:null;
   };
   return {cpu:read('CPU',['cg','sandbox']),memory:read('RAM',['sandbox']),sandboxes:own.length,shared:linked.length-own.length};
+}
+
+// Attribution requires an explicit captured action identity. A timestamp or
+// PID overlap alone is insufficient, especially across reused processes.
+export function systemActivity(run, operationId=null) {
+  const graph=run.causal_graph||{},ops=new Map((graph.operations||[]).map(o=>[o.action_id||o.id,o]));
+  const groups=new Map();let count=0,unattributed=0,duration=0,unmeasured=0;
+  for(const action of run.actions||[]) {
+    if(action.kind!=='syscall')continue;
+    const meta=action.metadata||{};
+    const owners=[meta.process_action_id,meta.tool_action_id,meta.operation_action_id].filter(Boolean);
+    const identities=new Set(owners.map(id=>ops.get(id)?.id).filter(Boolean));
+    // Conflicting explicit identities are ambiguous; do not choose one.
+    const owner=identities.size===1&&owners.every(id=>ops.has(id))?ops.get(owners[0]):null;
+    if(!owner)unattributed++;
+    if(operationId&&owner?.id!==operationId)continue;
+    count++;
+    const measured=Number.isFinite(action.duration)&&!action.missing_start&&!['running','incomplete','interrupted','unknown'].includes(action.outcome)&&!action.missing_end;
+    if(measured)duration+=action.duration;else unmeasured++;
+    const name=action.name||'unknown syscall';
+    const g=groups.get(name)||{name,count:0,duration:0,unmeasured:0};
+    g.count++;if(measured)g.duration+=action.duration;else g.unmeasured++;groups.set(name,g);
+  }
+  return {count,unattributed,duration,unmeasured,groups:[...groups.values()].sort((a,b)=>b.duration-a.duration)};
 }

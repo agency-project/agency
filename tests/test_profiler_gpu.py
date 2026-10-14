@@ -223,6 +223,7 @@ def test_live_export_and_saved_trace_preserve_process_samples_and_states(collect
     sampler._tick_workload_cgroup = lambda t: None
     sampler._tick_processes = lambda t: None
     sampler._tick_cgroups = lambda t: None
+    sampler._tick_host = lambda t: None
     events = []
     monkeypatch.setattr(agprof, "_samples", c.samples)
     monkeypatch.setattr(

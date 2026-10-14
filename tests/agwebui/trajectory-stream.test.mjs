@@ -4,6 +4,18 @@ import {test} from 'node:test';
 const source=await readFile(new URL('../../agency/observability/agwebui/static/trajectory-stream.js',import.meta.url),'utf8');
 const {changedTrajectoryActions,mergeTrajectory,mergeTrajectorySnapshot,boundTrajectory,TrajectoryStream}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
+test('syscall floods cannot evict model and tool calls from the live window',()=>{
+  const real=[{id:'model',kind:'model',start:0,outcome:'running'},
+    {id:'tool',kind:'tool',start:0,outcome:'success'}];
+  const run={actions:[...real,...Array.from({length:3000},(_,i)=>({id:`sys-${i}`,kind:'syscall',start:i+1,outcome:i<1000?'running':'success'}))],counters:{}};
+  boundTrajectory(run);
+  assert.ok(run.actions.includes(real[0]));
+  assert.ok(run.actions.includes(real[1]));
+  assert.ok(run.actions.length<=2200);
+  assert.equal(run.coverage.client_inflight_windowed,undefined);
+  assert.ok(run.actions.some(a=>a.kind==='syscall'));
+});
+
 test('reconnect snapshots merge existing identities and duplicated samples without reviving completed calls',()=>{
   const action={id:'a',start:1,outcome:'success',event_ids:['start','end']};
   const run={actions:[action],episodes:[],counters:{cpu:[[1,2]]},coverage:{}};

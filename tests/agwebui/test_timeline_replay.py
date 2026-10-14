@@ -95,6 +95,7 @@ def test_sampler_persists_measured_samples_without_second_collection(monkeypatch
     )
     monkeypatch.setattr(sampler, "_tick_processes", lambda t: None)
     monkeypatch.setattr(sampler, "_tick_cgroups", lambda t: None)
+    monkeypatch.setattr(sampler, "_tick_host", lambda t: None)
     monkeypatch.setattr(
         sampler,
         "_tick_workload_cgroup",

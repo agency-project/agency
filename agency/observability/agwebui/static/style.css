@@ -1,32 +1,6 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
-  color-scheme: dark; /* always dark -- native form controls/scrollbars otherwise
-                          default to the OS/browser light theme regardless of the
-                          page's own (already dark-only) CSS variables below. */
-  --bg:               #1a1a1a;
-  --bg2:              #222;
-  --bg3:              #2a2a2a;
-  --border:           #3a3a3a;
-  --border-log:       #4a9eff;
-  --border-interact:  #e87d0d;
-  --text:             #d4d4d4;
-  --dim:              rgba(212,212,212,0.45);
-  --cyan:             #5fd7ff;
-  --yellow:           #ffaf00;
-  --green:            #5fd75f;
-  --red:              #ff5555;
-  /* Message-body brightness scale (white ratio against --text's grey,
-     212,212,212) -- user/assistant read at full brightness (plain --text,
-     no class needed); system/tool/syscall step down from there so a
-     glance at shade alone says how far a line is from the model's own
-     words. */
-  --body-system:      rgba(212,212,212,0.9);
-  --body-tool:        rgba(212,212,212,0.8);
-  --body-syscall:     rgba(212,212,212,0.7);
-  --font: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
-  --fs:               12.5px;
-}
+:root { --fs: 12.5px; }
 
 html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); }
 
@@ -53,7 +27,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   flex: 5;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border-log);
+  border: 1px solid var(--border);
   overflow: hidden;
 }
 
@@ -78,7 +52,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   flex: 7;
   display: flex;
   flex-direction: row;
-  border: 1px solid var(--border-interact);
+  border: 1px solid var(--border);
   border-top: none;
   overflow: hidden;
 }
@@ -92,7 +66,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
   inset: 0;
   align-items: center;
   justify-content: center;
-  background: rgba(74,158,255,0.15);
+  background: var(--selection-bg);
   border: 2px solid var(--border-log);
   color: var(--text);
   font-size: 13px;
@@ -192,7 +166,7 @@ body.resizing-panels {
   font-size: 10px;
   font-weight: normal;
   letter-spacing: 0;
-  opacity: 0.65;
+  color: var(--muted);
   white-space: nowrap;
 }
 
@@ -307,8 +281,8 @@ body.resizing-panels {
 #agent-actions button:hover:not(:disabled) { border-color: var(--border-log); color: var(--cyan); }
 #agent-actions button:disabled { color: var(--dim); cursor: default; opacity: 0.5; }
 
-#btn-pause-toggle.active { border-color: var(--red); color: var(--red); }
-#btn-pause-toggle.active:hover { border-color: var(--red); color: var(--red); }
+#btn-pause-toggle.active { border-color: var(--amber); color: var(--amber); }
+#btn-pause-toggle.active:hover { border-color: var(--amber); color: var(--amber); }
 
 /* --------------------------------------------------------- Panel titles */
 
@@ -331,7 +305,7 @@ body.resizing-panels {
   font-size: 10px;
   font-weight: normal;
   letter-spacing: 0;
-  opacity: 0.65;
+  color: var(--muted);
   white-space: nowrap;
 }
 
@@ -368,7 +342,7 @@ body.resizing-panels {
 }
 
 .done-banner {
-  color: var(--green);
+  color: var(--muted);
   font-weight: bold;
   padding: 4px 0;
 }
@@ -395,7 +369,7 @@ body.resizing-panels {
   margin-bottom: 1px;
 }
 .agent-entry:hover   { background: var(--bg3); }
-.agent-entry.focused { background: rgba(74,158,255,0.12); border-left: 2px solid var(--border-log); padding-left: 2px; }
+.agent-entry.focused { background: var(--selection-bg); border-left: 2px solid var(--border-log); padding-left: 2px; }
 
 .agent-name {
   white-space: nowrap;
@@ -412,13 +386,13 @@ body.resizing-panels {
 }
 
 .dot-inactive  { color: var(--dim); }
-.dot-finished  { color: var(--green); opacity: 0.6; }
-.dot-paused    { color: var(--red); }
-.status-llm    { color: var(--cyan); }
-.status-tool   { color: var(--yellow); }
+.dot-finished  { color: var(--muted); }
+.dot-paused    { color: var(--amber); }
+.status-llm    { color: var(--amber); }
+.status-tool   { color: var(--green); }
 .status-human  { color: var(--yellow); }
-.status-finished { color: var(--green); opacity: 0.6; }
-.status-paused { color: var(--red); }
+.status-finished { color: var(--muted); }
+.status-paused { color: var(--amber); }
 
 /* ------------------------------------------------------------ Tabs */
 
@@ -447,7 +421,7 @@ body.resizing-panels {
 
 .tab-count {
   font-size: 9.5px;
-  opacity: 0.7;
+  color: var(--muted);
   margin-left: 2px;
 }
 
@@ -483,13 +457,13 @@ body.resizing-panels {
 .msg-tool-result{ margin: 2px 0; }
 .msg-syslog     { margin: 3px 0; }
 .msg-metadata   { margin: 3px 0; }
-.msg-running    { color: var(--yellow); font-weight: bold; margin: 6px 0 2px; }
-.msg-paused     { color: var(--red); }
+.msg-running    { color: var(--green); font-weight: bold; margin: 6px 0 2px; }
+.msg-paused     { color: var(--amber); }
 
 .role-user      { color: var(--cyan);   font-weight: bold; }
-.role-tool-call { color: var(--yellow); font-weight: bold; }
-.role-assistant { color: var(--green);  font-weight: bold; }
-.dim            { opacity: 0.5; }
+.role-tool-call { color: var(--text-secondary); font-weight: bold; }
+.role-assistant { color: var(--text);  font-weight: bold; }
+.dim            { color: var(--muted); }
 
 /* Message-body brightness tiers -- see --body-* above. */
 .body-system    { color: var(--body-system); }
@@ -544,8 +518,8 @@ body.resizing-panels {
 
 ::-webkit-scrollbar              { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track        { background: var(--bg); }
-::-webkit-scrollbar-thumb        { background: #444; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover  { background: #666; }
+::-webkit-scrollbar-thumb        { background: var(--border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover  { background: var(--control-border); }
 
 /* --------------------------------------------------------- Config modal */
 
@@ -554,7 +528,7 @@ body.resizing-panels {
 #config-modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -642,8 +616,8 @@ body.resizing-panels {
   border-radius: 2px;
 }
 #config-modal-actions button:hover { border-color: var(--border-log); color: var(--cyan); }
-#config-update, #config-update-all { border-color: var(--green); color: var(--green); }
-#config-update:hover, #config-update-all:hover { border-color: var(--green); color: var(--green); }
+#config-update, #config-update-all { border-color: var(--blue); color: var(--blue); }
+#config-update:hover, #config-update-all:hover { border-color: var(--blue); color: var(--blue); }
 
 /* Navigation between the dashboard and the execution profiler. */
 #view-tabs { height: 38px; display: flex; gap: 6px; padding: 4px 10px; border-bottom: 1px solid var(--border); }
@@ -660,3 +634,26 @@ body.resizing-panels {
 .agent-column-actions button {background:none;border:1px solid var(--border);color:var(--text);padding:3px 6px;font:inherit;border-radius:2px;cursor:pointer}
 .agent-column-actions button:disabled {opacity:.5;cursor:default}
 .agent-column-actions #btn-kill:not(:disabled),.agent-column-actions .danger-control:not(:disabled) {color:var(--red);border-color:var(--red)}
+
+/* Shared shell, state, and interaction treatments; log content stays monospace. */
+body {font-family:var(--font);font-size:var(--fs)}
+#right,.panel-title,#view-tabs {background:var(--panel)}
+.panel-title {color:var(--text-secondary)}
+#shared-log,#agent-history,.side-panel-history {font-family:var(--mono)}
+.resource-badge {color:var(--muted)}
+.dot-running {color:var(--teal)}
+.dot-waiting,.status-waiting {color:var(--amber)}
+.dot-failed,.status-failed {color:var(--red)}
+#view-tabs .active {box-shadow:inset 0 -2px var(--blue)}
+#view-tabs a:hover,.agent-entry:hover {background:var(--surface-hover)}
+#nav-bar button,#agent-actions button,.agent-column-actions button,
+#agent-search,.config-field input,.config-field textarea,#config-modal-actions button,
+#view-tabs button,.investigator-link,#timeline-live-btn {border-color:var(--control-border)}
+.agent-column-actions button:hover:not(:disabled),#config-modal-actions button:hover:not(:disabled),
+#nav-bar button:hover:not(:disabled),#agent-actions button:hover:not(:disabled) {background:var(--surface-hover)}
+#agent-actions #btn-stop-all:not(:disabled),#btn-stop:not(:disabled) {color:var(--amber)}
+#agent-actions #btn-kill-all:not(:disabled),#btn-kill:not(:disabled) {background:var(--danger-bg)}
+#agent-actions #btn-kill-all:hover:not(:disabled),#btn-kill:hover:not(:disabled) {background:var(--danger-hover)}
+#agent-search:focus-visible,#agent-input:focus-visible,
+.config-field input[type="text"]:focus-visible,.config-field input[type="number"]:focus-visible,
+.config-field textarea:focus-visible {outline:2px solid var(--blue);outline-offset:2px}
