@@ -19,8 +19,20 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS
-from ...llm.agllm import agllm
+from ...llm import (
+    API_CONN_EXCS,
+    API_ERROR_EXCS,
+    BAD_REQUEST_EXCS,
+    RATE_LIMIT_EXCS,
+    UnusableResponseError,
+)
+from ...llm.agllm import agllm, dispatch_attempt
+from ...llm.response_check import (
+    EMPTY,
+    TRUNCATED,
+    inspect_response,
+    mark_incomplete_tool_calls,
+)
 from ...llm.usage_tracker import LlmUsageTracker
 
 if TYPE_CHECKING:
@@ -113,9 +125,78 @@ def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | No
     None if *error* isn't one of them (caller re-raises it unmodified)."""
     if isinstance(error, BAD_REQUEST_EXCS):
         return 400, False
+    if isinstance(error, UnusableResponseError):
+        return error.status_code, error.transient
     if isinstance(error, TRANSIENT_DISPATCH_EXCS):
         return 503, True
     return None
+
+
+def _retry_in_place(error: BaseException) -> bool:
+    """Whether a failure *after the response started* may be asked for again
+    by the host itself.
+
+    Nothing of a response reaches the harness before it is complete, so a
+    second ask is invisible to it and cannot repeat a side effect. It is
+    withheld where it cannot help or would be rude: a request the provider
+    rejects, a rate limit (the transport/caller owns bounded backoff), and anything that is not an ordinary exception.
+    """
+    if not isinstance(error, Exception):
+        return False
+    if isinstance(error, UnusableResponseError):
+        return error.retryable
+    return not isinstance(error, BAD_REQUEST_EXCS + RATE_LIMIT_EXCS)
+
+
+class _ResponsePolicy:
+    """llmconfig's handling of unusable responses, read once per request."""
+
+    def __init__(self, llm) -> None:
+        self.unusable_retries = max(0, int(getattr(llm, "unusable_response_retries", 0) or 0))
+        self.backoff_s = max(0.0, float(getattr(llm, "unusable_response_backoff_s", 0.0) or 0.0))
+        self.fail_on_empty = bool(getattr(llm, "fail_on_empty_response", True))
+        self.truncation_retries = max(0, int(getattr(llm, "truncation_retries", 0) or 0))
+        self.multiplier = float(getattr(llm, "truncation_output_multiplier", 2.0) or 2.0)
+        self.ceiling = getattr(llm, "truncation_max_output_tokens", None)
+
+    def next_output_cap(self, current: int) -> "int | None":
+        """The larger limit to re-ask with after a cut-off response, or None
+        when there is no room left to raise it."""
+        raised = int(current * self.multiplier)
+        if self.ceiling is not None:
+            raised = min(raised, int(self.ceiling))
+        return raised if raised > current else None
+
+
+def _unusable_error(
+    reason: str, detail: str, attempts: int, cause: "BaseException | None"
+) -> UnusableResponseError:
+    """The error reported to the harness once asking again has not helped.
+    Keeps the original failure's own text and its upstream identifiers."""
+    ids = getattr(cause, "response_ids", None) or {}
+    suffix = f"reason={reason}, attempts={attempts}"
+    if ids:
+        suffix += ", upstream=" + ",".join(f"{k}={v}" for k, v in sorted(ids.items()))
+    error = UnusableResponseError(
+        reason,
+        f"{detail} ({suffix})",
+        status_code=getattr(cause, "status_code", None) or 502,
+        details={"attempts": attempts, **ids, **(getattr(cause, "details", None) or {})},
+    )
+    error.__cause__ = cause
+    return error
+
+
+def _response_ids_of(message: "dict | None") -> dict:
+    """Upstream call identifiers a backend attached to the metadata block."""
+    for block in (message or {}).get("blocks") or []:
+        if block.get("type") != "metadata":
+            continue
+        fragments = block.get("data")
+        for fragment in fragments if isinstance(fragments, list) else [fragments]:
+            if isinstance(fragment, dict) and isinstance(fragment.get("response_ids"), dict):
+                return fragment["response_ids"]
+    return {}
 
 
 class _DispatchError(Exception):
@@ -346,6 +427,7 @@ class LlmHandlerServer:
         message: dict,
         *,
         ttft_ms: "float | None" = None,
+        retries: "list[dict] | None" = None,
     ) -> None:
         """Enrich this exchange's metadata block with its own new (non-
         cumulative) prompt token count and the skill/request it belongs to."""
@@ -353,6 +435,9 @@ class LlmHandlerServer:
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
             return
+        if retries:
+            # Why earlier asks for this same turn were discarded.
+            metadata_block["retries"] = retries
         if "usage" in metadata_block:
             usage = metadata_block.get("usage") or {}
             stop_reason = metadata_block.get("stop_reason")
@@ -389,6 +474,21 @@ class LlmHandlerServer:
 
     def context_limit(self) -> int:
         return self._backend.fetch_context_limit()
+
+    def _record_retry(self, call_label, attempt: int, reason: str, detail: str, **extra) -> dict:
+        """Durable record that one ask for this turn was discarded and why.
+        The discarded attempt's stream fragments are transient; this is what
+        remains of it."""
+        entry = {"attempt": attempt, "reason": reason, "detail": detail, **extra}
+        agname = getattr(self._data_logger, "_default_name", None)
+        self._data_logger.record_event(
+            type="llm_retry",
+            payload={"request_id": self._request_id, "model": self.resolve_model(), **entry},
+            call_label=call_label,
+            term_message=f"[{agname}] LLM    ↻  attempt {attempt} discarded: {reason}",
+            print_to_terminal=False,
+        )
+        return entry
 
     def dispatch(
         self,
@@ -429,66 +529,152 @@ class LlmHandlerServer:
                 raise _RequestAborted from error
             finalize_error(error)
 
+        def aborted() -> bool:
+            return abort_event is not None and abort_event.is_set()
+
+        policy = _ResponsePolicy(self._agconfig.llm)
+        backend = self._backend
+        unusable_left = policy.unusable_retries
+        truncation_left = policy.truncation_retries
+        retries: "list[dict]" = []
+        attempt = 0
         try:
-            with agprof.span(
-                "llm:attempt[0]",
-                parent_context=(
-                    self._profile_context_provider()
-                    if self._profile_context_provider
-                    else self._parent_context
-                ),
-            ) as attempt_span:
-                _annotate(
-                    attempt_span,
-                    model=self._backend.model,
-                    provider=type(self._backend).__name__,
-                    call_label=call_label,
-                    **agprof.detail_metadata("llm.messages", request.get("messages", [])),
-                    **_request_profile_metadata(request),
-                )
-                t0 = time.perf_counter()
-                try:
-                    result = self._backend.dispatch(request)
-                except BaseException as error:
-                    with suppress(BaseException):
+            while True:
+                retry: "tuple | None" = None
+                next_cap = None
+                with agprof.span(
+                    f"llm:attempt[{attempt}]",
+                    parent_context=(
+                        self._profile_context_provider()
+                        if self._profile_context_provider
+                        else self._parent_context
+                    ),
+                ) as attempt_span:
+                    _annotate(
+                        attempt_span,
+                        model=backend.model,
+                        provider=type(backend).__name__,
+                        call_label=call_label,
+                        **agprof.detail_metadata("llm.messages", request.get("messages", [])),
+                        **_request_profile_metadata(request),
+                    )
+                    t0 = time.perf_counter()
+                    try:
+                        with dispatch_attempt(
+                            attempt=attempt,
+                            retry_reason=retries[-1]["reason"] if retries else None,
+                            call_label=call_label,
+                        ):
+                            result = backend.dispatch(request)
+                    except BaseException as error:
+                        with suppress(BaseException):
+                            _annotate(
+                                attempt_span,
+                                outcome="failure",
+                                error_type=type(error).__name__,
+                            )
+                        if (
+                            isinstance(error, UnusableResponseError)
+                            and _retry_in_place(error)
+                            and unusable_left > 0
+                            and not aborted()
+                        ):
+                            retry = (error.reason, f"{type(error).__name__}: {error}")
+                        else:
+                            complete_failure(error)
+                            classified = _classify_dispatch_exception(error)
+                            if classified is None:
+                                raise
+                            status_code, transient = classified
+                            raise _DispatchError(
+                                str(error), status_code=status_code, transient=transient
+                            ) from error
+                    else:
+                        ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
+                        verdict = inspect_response(
+                            result["message"],
+                            result["stop_reason"],
+                            empty_is_unusable=policy.fail_on_empty,
+                        )
+                        deliver = verdict.usable
+                        if verdict.reason == TRUNCATED:
+                            if truncation_left > 0:
+                                next_cap = policy.next_output_cap(backend.output_token_cap())
+                            if next_cap is None:
+                                # No room left to raise the limit: hand the
+                                # cut-off turn on, marked so no adapter can
+                                # run its partial tool calls.
+                                mark_incomplete_tool_calls(result["message"])
+                                deliver = True
+                        if deliver:
+                            _annotate(
+                                attempt_span,
+                                outcome="success" if verdict.usable else "incomplete",
+                                **_response_profile_metadata(
+                                    result["message"], result["usage"], result["stop_reason"]
+                                ),
+                                ttft_ms=ttft_ms,
+                            )
+                            self._tag_metadata_block(
+                                request["messages"],
+                                result["message"],
+                                ttft_ms=ttft_ms,
+                                retries=retries,
+                            )
+                            with self._transcript_lock:
+                                self._transcript.append(
+                                    {
+                                        "request": request,
+                                        "response": result["message"],
+                                        "usage": result["usage"],
+                                        "finish_reason": result["stop_reason"],
+                                        "streaming": False,
+                                        "ts": time.time(),
+                                    }
+                                )
+                            self._finalize_success(call_label, request, result["message"])
+                            finalized = True
+                            return result
                         _annotate(
                             attempt_span,
-                            outcome="failure",
-                            error_type=type(error).__name__,
+                            outcome="retry",
+                            retry_reason=verdict.reason,
+                            **_response_profile_metadata(
+                                result["message"], result["usage"], result["stop_reason"]
+                            ),
                         )
-                    complete_failure(error)
-                    classified = _classify_dispatch_exception(error)
-                    if classified is None:
-                        raise
-                    status_code, transient = classified
-                    raise _DispatchError(
-                        str(error), status_code=status_code, transient=transient
-                    ) from error
-
-                ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
-                _annotate(
-                    attempt_span,
-                    outcome="success",
-                    **_response_profile_metadata(
-                        result["message"], result["usage"], result["stop_reason"]
-                    ),
-                    ttft_ms=ttft_ms,
-                )
-                self._tag_metadata_block(request["messages"], result["message"], ttft_ms=ttft_ms)
-                with self._transcript_lock:
-                    self._transcript.append(
-                        {
-                            "request": request,
-                            "response": result["message"],
-                            "usage": result["usage"],
-                            "finish_reason": result["stop_reason"],
-                            "streaming": False,
-                            "ts": time.time(),
-                        }
+                        if verdict.reason != TRUNCATED and (unusable_left <= 0 or aborted()):
+                            error = _unusable_error(
+                                verdict.reason, verdict.detail, attempt + 1, None
+                            )
+                            complete_failure(error)
+                            raise _DispatchError(
+                                str(error), status_code=error.status_code, transient=True
+                            ) from error
+                        retry = (verdict.reason, verdict.detail)
+                reason, detail = retry
+                if reason == TRUNCATED:
+                    truncation_left -= 1
+                    retries.append(
+                        self._record_retry(
+                            call_label,
+                            attempt,
+                            reason,
+                            detail,
+                            output_token_cap=backend.output_token_cap(),
+                            next_output_token_cap=next_cap,
+                        )
                     )
-                self._finalize_success(call_label, request, result["message"])
-                finalized = True
-                return result
+                    backend = backend.with_output_token_cap(next_cap)
+                else:
+                    unusable_left -= 1
+                    retries.append(self._record_retry(call_label, attempt, reason, detail))
+                    delay = policy.backoff_s * (2 ** (len(retries) - 1))
+                    if abort_event is not None:
+                        abort_event.wait(delay)
+                    elif delay:
+                        time.sleep(delay)
+                attempt += 1
         except BaseException as error:
             if not finalized:
                 complete_failure(error)
@@ -916,12 +1102,16 @@ class LlmHandlerServer:
                 finalize_cancelled()
             return enqueued
 
-        try:
-            if handle._cancel_event.is_set():
-                finalize_cancelled()
-                return
+        policy = _ResponsePolicy(self._agconfig.llm)
+        retries: "list[dict]" = []
+
+        def run_attempt(attempt: int, backend) -> tuple:
+            """One ask of the provider. Returns ("stop",) once this producer
+            has published its terminal item, ("ok" | "truncated", message,
+            usage, stop_reason, ttft_ms, verdict) for an assembled response,
+            or ("retry", reason, detail, cause) for one to discard."""
             with agprof.span(
-                "llm:attempt[0]",
+                f"llm:attempt[{attempt}]",
                 parent_context=(
                     self._profile_context_provider()
                     if self._profile_context_provider
@@ -930,8 +1120,8 @@ class LlmHandlerServer:
             ) as attempt_span:
                 _annotate(
                     attempt_span,
-                    model=self._backend.model,
-                    provider=type(self._backend).__name__,
+                    model=backend.model,
+                    provider=type(backend).__name__,
                     call_label=handle.call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
                     **_request_profile_metadata(request),
@@ -939,13 +1129,16 @@ class LlmHandlerServer:
                 t0 = time.perf_counter()
                 try:
                     stream_iter = iter(
-                        self._backend.dispatch_stream(request, on_client=handle._set_stream_ref)
+                        backend.dispatch_stream(request, on_client=handle._set_stream_ref)
                     )
                     first_item = next(stream_iter)
                 except StopIteration:
-                    _annotate(attempt_span, outcome="success")
                     empty_message = {"role": "assistant", "blocks": []}
                     _annotate(attempt_span, **_response_profile_metadata(empty_message, None, None))
+                    if policy.fail_on_empty:
+                        _annotate(attempt_span, outcome="retry", retry_reason=EMPTY)
+                        return ("retry", EMPTY, "provider stream carried no events", None)
+                    _annotate(attempt_span, outcome="success")
                     enqueued = handle.register_stream_exchange(
                         {
                             "type": "done",
@@ -959,9 +1152,9 @@ class LlmHandlerServer:
                     )
                     if not enqueued:
                         finalize_cancelled()
-                        return
+                        return ("stop",)
                     finalize_success(empty_message)
-                    return
+                    return ("stop",)
                 except BaseException as e:
                     # A producer thread must always publish a first terminal
                     # item. Otherwise the synchronous route remains blocked in
@@ -969,11 +1162,16 @@ class LlmHandlerServer:
                     _annotate(attempt_span, outcome="failure", error_type=type(e).__name__)
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
-                        return
+                        return ("stop",)
+                    if isinstance(e, UnusableResponseError) and _retry_in_place(e):
+                        # The provider answered and the answer was unusable;
+                        # a transport failure before any answer is left to the
+                        # SDK's own retries and to the harness.
+                        return ("retry", e.reason, f"{type(e).__name__}: {e}", e)
                     classified = _classify_dispatch_exception(e)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(e, status_code=status_code, transient=transient)
-                    return
+                    return ("stop",)
                 ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                 _annotate(attempt_span, ttft_ms=ttft_ms)
 
@@ -1038,57 +1236,160 @@ class LlmHandlerServer:
                             if block["data"] is None:
                                 block["data"] = []
                             block["data"].append(stream_item["data"])
+                        if stream_item.get("phase"):
+                            block["phase"] = stream_item["phase"]
                         block["ts_end"] = now
                         message = _blocks_to_message(blocks)
                         handle.register_stream_exchange(response=message)
                 except BaseException as e:
+                    partial = _blocks_to_message(blocks)
                     _annotate(
                         attempt_span,
                         outcome="failure",
                         error_type=type(e).__name__,
-                        **_response_profile_metadata(
-                            _blocks_to_message(blocks), usage, stop_reason
-                        ),
+                        **_response_profile_metadata(partial, usage, stop_reason),
                     )
                     if handle._cancel_event.is_set():
                         finalize_cancelled()
-                        return
+                        return ("stop",)
+                    if _retry_in_place(e):
+                        if not getattr(e, "response_ids", None):
+                            with suppress(Exception):
+                                e.response_ids = _response_ids_of(partial)
+                        return (
+                            "retry",
+                            getattr(e, "reason", "stream_interrupted"),
+                            f"{type(e).__name__}: {e}",
+                            e,
+                        )
+                    classified = _classify_dispatch_exception(e)
+                    status_code, transient = classified if classified is not None else (500, False)
                     publish_error(
                         e,
-                        status_code=500,
-                        transient=False,
+                        status_code=status_code,
+                        transient=transient,
                         streaming=False,
                         error=f"{type(e).__name__}: {e}",
                     )
-                    return
+                    return ("stop",)
 
                 if handle._cancel_event.is_set():
                     finalize_cancelled()
-                    return
+                    return ("stop",)
+                message = _blocks_to_message(blocks)
+                verdict = inspect_response(
+                    message, stop_reason, empty_is_unusable=policy.fail_on_empty
+                )
                 _annotate(
                     attempt_span,
-                    outcome="success",
-                    **_response_profile_metadata(_blocks_to_message(blocks), usage, stop_reason),
+                    outcome="success" if verdict.usable else "unusable",
+                    **({} if verdict.usable else {"unusable_reason": verdict.reason}),
+                    **_response_profile_metadata(message, usage, stop_reason),
                 )
-                message = _blocks_to_message(blocks)
-                enqueued = handle.register_stream_exchange(
-                    {
-                        "type": "done",
-                        "message": message,
-                        "usage": usage,
-                        "stop_reason": stop_reason,
-                    },
-                    request=request,
-                    response=message,
-                    usage=usage,
-                    finish_reason=stop_reason,
-                    streaming=False,
-                )
-                if not enqueued:
+                if verdict.usable:
+                    return ("ok", message, usage, stop_reason, ttft_ms, verdict)
+                if verdict.reason == TRUNCATED:
+                    return ("truncated", message, usage, stop_reason, ttft_ms, verdict)
+                cause = UnusableResponseError(verdict.reason, verdict.detail)
+                cause.response_ids = _response_ids_of(message)
+                return ("retry", verdict.reason, verdict.detail, cause)
+
+        def deliver(message, usage, stop_reason, ttft_ms) -> None:
+            enqueued = handle.register_stream_exchange(
+                {
+                    "type": "done",
+                    "message": message,
+                    "usage": usage,
+                    "stop_reason": stop_reason,
+                },
+                request=request,
+                response=message,
+                usage=usage,
+                finish_reason=stop_reason,
+                streaming=False,
+            )
+            if not enqueued:
+                finalize_cancelled()
+                return
+            self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms, retries=retries)
+            finalize_success(message)
+
+        try:
+            backend = self._backend
+            unusable_left = policy.unusable_retries
+            truncation_left = policy.truncation_retries
+            attempt = 0
+            while True:
+                if handle._cancel_event.is_set():
                     finalize_cancelled()
                     return
-                self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
-                finalize_success(message)
+                with dispatch_attempt(
+                    attempt=attempt,
+                    retry_reason=retries[-1]["reason"] if retries else None,
+                    call_label=handle.call_label,
+                ):
+                    outcome = run_attempt(attempt, backend)
+                kind = outcome[0]
+                if kind == "stop":
+                    return
+                if kind == "ok":
+                    deliver(*outcome[1:5])
+                    return
+                if kind == "truncated":
+                    _, message, usage, stop_reason, ttft_ms, verdict = outcome
+                    next_cap = (
+                        policy.next_output_cap(backend.output_token_cap())
+                        if truncation_left > 0
+                        else None
+                    )
+                    if next_cap is None:
+                        # No room left to raise the limit. The turn goes on
+                        # with its stop reason intact and its partial tool
+                        # calls marked, so an adapter reports it as incomplete
+                        # and can never run them.
+                        mark_incomplete_tool_calls(message)
+                        deliver(message, usage, stop_reason, ttft_ms)
+                        return
+                    truncation_left -= 1
+                    retries.append(
+                        self._record_retry(
+                            handle.call_label,
+                            attempt,
+                            TRUNCATED,
+                            verdict.detail,
+                            output_token_cap=backend.output_token_cap(),
+                            next_output_token_cap=next_cap,
+                            usage=usage,
+                            **_response_ids_of(message),
+                        )
+                    )
+                    backend = backend.with_output_token_cap(next_cap)
+                    attempt += 1
+                    continue
+                _, reason, detail, cause = outcome
+                if unusable_left <= 0:
+                    error = _unusable_error(reason, detail, attempt + 1, cause)
+                    publish_error(
+                        error,
+                        status_code=error.status_code,
+                        transient=True,
+                        streaming=False,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                    return
+                unusable_left -= 1
+                retries.append(
+                    self._record_retry(
+                        handle.call_label,
+                        attempt,
+                        reason,
+                        detail,
+                        **(getattr(cause, "response_ids", None) or {}),
+                    )
+                )
+                # Cancellation ends the wait at once; the loop head sees it.
+                handle._cancel_event.wait(policy.backoff_s * (2 ** (len(retries) - 1)))
+                attempt += 1
         except BaseException as e:
             if not finalized:
                 if handle._cancel_event.is_set():

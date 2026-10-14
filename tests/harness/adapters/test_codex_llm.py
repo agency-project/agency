@@ -477,7 +477,10 @@ def test_agency_to_harness_thinking_becomes_reasoning_item():
     agency_response = {
         "message": {
             "role": "assistant",
-            "blocks": [{"type": "thinking", "index": 0, "text": "pondering"}],
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "pondering"},
+                _text_block("done", 1),
+            ],
         },
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "stop",
@@ -486,6 +489,8 @@ def test_agency_to_harness_thinking_becomes_reasoning_item():
     reasoning_item = out["output"][0]
     assert reasoning_item["type"] == "reasoning"
     assert reasoning_item["summary"] == [{"type": "summary_text", "text": "pondering"}]
+    # The model's own order is kept: reasoning comes before what it led to.
+    assert [item["type"] for item in out["output"]] == ["reasoning", "message"]
 
 
 def test_agency_to_harness_unknown_block_reconstructed():
@@ -520,14 +525,15 @@ def test_agency_to_harness_foreign_origin_unknown_block_dropped():
                     "type": "anthropic_redacted_thinking",
                     "index": 0,
                     "data": {"data": "encrypted-blob"},
-                }
+                },
+                _text_block("done", 1),
             ],
         },
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "stop",
     }
     out = _backend()._format_context_agency_to_harness(agency_response, "m")
-    assert out["output"] == []
+    assert [item["type"] for item in out["output"]] == ["message"]
 
 
 def _parse_sse(text):
@@ -682,3 +688,276 @@ def test_tool_wire_name_truncates_from_the_front_when_over_64_chars():
     assert len(name) == 64
     # The tail -- the actual tool name -- survives the truncation intact.
     assert name.endswith("__exec")
+
+
+# ---------------------------------------------------------------------------
+# Incomplete, empty and malformed model responses
+#
+# Regressions for defects found in recorded Terminal-Bench runs: 30 responses
+# stopped at the output-token limit (29 with a tool call whose JSON arguments
+# were cut off) were sent to Codex as completed function calls, and 41 empty
+# responses were sent as completed turns, which Codex took as final answers.
+# ---------------------------------------------------------------------------
+
+TRUNCATED_ARGUMENTS = '{"cmd":"cat <<\'EOF\' > notes.txt\\n1. Linux scheduling determines'
+
+
+def _done(blocks, stop_reason, usage=None):
+    return {
+        "type": "done",
+        "message": {"role": "assistant", "blocks": blocks},
+        "usage": usage or {"prompt_tokens": 10, "completion_tokens": 4096, "total_tokens": 4106},
+        "stop_reason": stop_reason,
+    }
+
+
+def _tool_block(arguments, *, name="exec_command", call_id="call_1", index=0, **extra):
+    return {
+        "type": "tool_use",
+        "index": index,
+        "id": call_id,
+        "name": name,
+        "arguments": arguments,
+        **extra,
+    }
+
+
+def _stream_events(item, **kwargs):
+    text = "".join(_backend()._format_agency_stream_to_harness([item], "m", **kwargs))
+    return _parse_sse(text)
+
+
+def test_truncated_tool_call_is_reported_incomplete_and_never_emitted():
+    events = _stream_events(_done([_tool_block(TRUNCATED_ARGUMENTS)], "length"))
+    assert [name for name, _ in events] == ["response.created", "response.incomplete"]
+    response = events[-1][1]["response"]
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert response["usage"]["output_tokens"] == 4096
+    # Codex starts a tool the moment its output item arrives, so not even a
+    # well-formed call from a cut-off turn may be sent.
+    assert not any("function_call" in json.dumps(data) for _, data in events)
+
+
+def test_truncated_turn_emits_no_items_even_when_one_tool_call_is_whole():
+    blocks = [
+        _tool_block('{"cmd":"ls"}', call_id="whole"),
+        _tool_block(TRUNCATED_ARGUMENTS, call_id="cut", index=1, incomplete=True),
+    ]
+    events = _stream_events(_done(blocks, "length"))
+    assert [name for name, _ in events] == ["response.created", "response.incomplete"]
+
+
+def test_truncated_text_only_turn_is_incomplete_not_a_final_answer():
+    events = _stream_events(_done([_text_block("The answer is")], "length"))
+    assert [name for name, _ in events] == ["response.created", "response.incomplete"]
+
+
+def test_non_stream_truncated_turn_is_incomplete_with_no_output():
+    out = _backend()._format_context_agency_to_harness(
+        {
+            "message": {"role": "assistant", "blocks": [_tool_block(TRUNCATED_ARGUMENTS)]},
+            "usage": {"prompt_tokens": 1, "completion_tokens": 4096},
+            "stop_reason": "length",
+        },
+        "m",
+    )
+    assert out["status"] == "incomplete"
+    assert out["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert out["output"] == []
+
+
+def test_content_filter_stop_is_incomplete():
+    events = _stream_events(_done([_text_block("partial")], "content_filter"))
+    assert events[-1][0] == "response.incomplete"
+    assert events[-1][1]["response"]["incomplete_details"] == {"reason": "content_filter"}
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [],
+        [{"type": "metadata", "index": 0, "usage": None, "stop_reason": "stop"}],
+        [{"type": "thinking", "index": 0, "text": "", "signature": "openai_responses:abc"}],
+        [_text_block("")],
+    ],
+    ids=["no-blocks", "metadata-only", "reasoning-only", "empty-text"],
+)
+def test_empty_response_fails_before_any_frame_is_sent(blocks):
+    """The generator must raise on its first step: that is the only point at
+    which the route can still answer with an HTTP error instead of a 200."""
+    frames = _backend()._format_agency_stream_to_harness([_done(blocks, "stop")], "m")
+    with pytest.raises(ValueError, match="no message and no tool call"):
+        next(frames)
+
+
+@pytest.mark.parametrize("arguments", [TRUNCATED_ARGUMENTS, "not json", "[1, 2]"])
+def test_malformed_tool_call_with_a_normal_stop_reason_is_never_emitted(arguments):
+    frames = _backend()._format_agency_stream_to_harness(
+        [_done([_tool_block(arguments)], "tool_calls")], "m"
+    )
+    with pytest.raises(ValueError, match="incomplete arguments"):
+        next(frames)
+
+
+def test_truncated_custom_tool_call_fails_cleanly_instead_of_breaking_the_stream():
+    """A custom tool's arguments are unwrapped with json.loads. A cut-off one
+    used to raise after `response.created` had been sent, severing the SSE
+    stream Codex was reading."""
+    body = {"tools": [{"type": "custom", "name": "apply_patch", "description": "patch"}]}
+    from agency.harness.adapters.codex import _responses_tool_routes
+
+    routes = _responses_tool_routes(body)
+    wire_name = next(iter(routes))
+    cut = _tool_block('{"input":"*** Begin Patch\\n*** Add File: a.py', name=wire_name)
+    assert [n for n, _ in _stream_events(_done([cut], "length"), tool_routes=routes)] == [
+        "response.created",
+        "response.incomplete",
+    ]
+    frames = _backend()._format_agency_stream_to_harness(
+        [_done([cut], "tool_calls")], "m", tool_routes=routes
+    )
+    with pytest.raises(ValueError):
+        next(frames)
+
+
+def test_empty_text_with_a_valid_tool_call_is_a_normal_completed_turn():
+    """Empty content next to a tool call is the ordinary shape of a tool
+    turn (8,242 of 8,438 recorded responses), not an empty response."""
+    events = _stream_events(_done([_text_block(""), _tool_block('{"cmd":"ls"}', index=1)], "stop"))
+    assert events[-1][0] == "response.completed"
+    items = [d["item"] for n, d in events if n == "response.output_item.done"]
+    assert [i["type"] for i in items] == ["function_call"]
+    assert items[0]["call_id"] == "call_1" and items[0]["status"] == "completed"
+    assert json.loads(items[0]["arguments"]) == {"cmd": "ls"}
+
+
+def test_tool_call_with_no_arguments_is_complete():
+    events = _stream_events(_done([_tool_block("")], "tool_calls"))
+    item = next(d["item"] for n, d in events if n == "response.output_item.done")
+    assert item["arguments"] == "{}"
+
+
+def test_reasoning_state_tool_call_ids_and_phase_round_trip_through_codex():
+    """What Codex is sent, it sends back; translating that back must give the
+    backend the same reasoning state, call ids and message phase."""
+    signature = "openai_responses:rsn_opaque"
+    blocks = [
+        {"type": "thinking", "index": 0, "text": "", "signature": signature},
+        {"type": "text", "index": 1, "text": "Checking the CPU count.", "phase": "commentary"},
+        _tool_block('{"cmd":"nproc"}', call_id="call_abc", index=2),
+    ]
+    events = _stream_events(_done(blocks, "tool_calls"))
+    items = [d["item"] for n, d in events if n == "response.output_item.done"]
+    assert [i["type"] for i in items] == ["reasoning", "message", "function_call"]
+    assert items[0]["encrypted_content"] == signature and items[0]["summary"] == []
+    assert items[1]["phase"] == "commentary"
+    assert items[2]["call_id"] == "call_abc"
+
+    replay = [*items, {"type": "function_call_output", "call_id": "call_abc", "output": "6\n"}]
+    messages = _backend()._format_context_harness_to_agency({"input": replay})["messages"]
+    assert [m["role"] for m in messages] == ["assistant", "tool"]
+    thinking, text, tool = messages[0]["blocks"]
+    assert (thinking["type"], thinking["signature"]) == ("thinking", signature)
+    assert (text["text"], text["phase"]) == ("Checking the CPU count.", "commentary")
+    assert (tool["id"], tool["arguments"]) == ("call_abc", '{"cmd":"nproc"}')
+    assert messages[1]["blocks"][0] == {
+        "type": "tool_result",
+        "index": 0,
+        "tool_call_id": "call_abc",
+        "text": "6\n",
+    }
+
+
+def test_usage_details_reach_codex_when_the_backend_reports_them():
+    usage = {
+        "prompt_tokens": 2344,
+        "completion_tokens": 50,
+        "total_tokens": 2394,
+        "cached_tokens": 2342,
+        "reasoning_tokens": 45,
+    }
+    events = _stream_events(_done([_text_block("ok")], "stop", usage))
+    assert events[-1][1]["response"]["usage"] == {
+        "input_tokens": 2344,
+        "output_tokens": 50,
+        "total_tokens": 2394,
+        "input_tokens_details": {"cached_tokens": 2342},
+        "output_tokens_details": {"reasoning_tokens": 45},
+    }
+
+
+def _route_client(done_item=None, error=None):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    warnings = []
+
+    class Router:
+        def validate_token(self, token):
+            return True
+
+        def resolve_model(self, token):
+            return "m"
+
+        def log_warning(self, token, message):
+            warnings.append(message)
+
+        async def dispatch_stream_async(self, token, request):
+            if error is not None:
+                raise error
+            yield done_item
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    return TestClient(app), warnings
+
+
+def test_route_answers_an_empty_response_with_a_retryable_http_error_not_a_200():
+    client, _ = _route_client(_done([], "stop"))
+    with client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer t"},
+            json={"input": "hi", "stream": True},
+        )
+    assert response.status_code == 502
+    assert response.json()["error"]["transient"] is True
+    assert "no message and no tool call" in response.json()["error"]["message"]
+
+
+def test_route_streams_response_incomplete_for_a_truncated_turn():
+    client, _ = _route_client(_done([_tool_block(TRUNCATED_ARGUMENTS)], "length"))
+    with client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer t"},
+            json={"input": "hi", "stream": True},
+        )
+    assert response.status_code == 200
+    assert [name for name, _ in _parse_sse(response.text)] == [
+        "response.created",
+        "response.incomplete",
+    ]
+
+
+def test_route_reports_untranslated_request_fields_once():
+    client, warnings = _route_client(_done([_text_block("ok")], "stop"))
+    body = {
+        "input": "hi",
+        "stream": True,
+        "reasoning": {"effort": "high"},
+        "prompt_cache_key": "conversation-1",
+        "include": [],
+    }
+    with client:
+        for _ in range(2):
+            assert (
+                client.post(
+                    "/v1/responses", headers={"Authorization": "Bearer t"}, json=body
+                ).status_code
+                == 200
+            )
+    assert len(warnings) == 1
+    assert "prompt_cache_key" in warnings[0] and "reasoning" in warnings[0]
+    assert "include" not in warnings[0]  # empty values are not worth a warning

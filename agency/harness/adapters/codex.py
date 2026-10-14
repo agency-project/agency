@@ -10,6 +10,7 @@ from functools import partial
 
 from fastapi import Request
 
+from ...llm.response_check import tool_arguments_complete
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
@@ -154,7 +155,18 @@ def _responses_tools_to_agency(routes) -> "list[dict] | None":
     return converted or None
 
 
+class IncompleteToolCall(ValueError):
+    """A tool call whose arguments never finished generating. It has no
+    Responses representation Codex could safely receive: Codex starts a tool
+    as soon as its output item arrives."""
+
+
 def _tool_use_to_responses(block: dict, routes: "dict | None") -> dict:
+    if block.get("incomplete") or not tool_arguments_complete(block.get("arguments")):
+        raise IncompleteToolCall(
+            f"tool call {block.get('id') or '?'} ({block.get('name') or '?'}) has incomplete "
+            "arguments and cannot be executed"
+        )
     route = (routes or {}).get(block["name"])
     name = route["tool"]["name"] if route else block["name"]
     kind = route["tool"]["type"] if route else "function"
@@ -162,15 +174,109 @@ def _tool_use_to_responses(block: dict, routes: "dict | None") -> dict:
     if route and route["namespace"]:
         item["namespace"] = route["namespace"]
     if kind == "custom":
-        payload = json.loads(block.get("arguments", "{}"))
-        if not isinstance(payload, dict) or not isinstance(payload.get("input"), str):
-            raise ValueError("Codex custom tool requires a string input")
+        payload = json.loads(block.get("arguments") or "{}")
+        if not isinstance(payload.get("input"), str):
+            raise IncompleteToolCall(
+                f"custom tool call {block.get('id') or '?'} ({name}) carries no string input"
+            )
         item.update(type="custom_tool_call", input=payload["input"])
     else:
         item.update(
-            type="function_call", arguments=block.get("arguments", "{}"), status="completed"
+            type="function_call", arguments=block.get("arguments") or "{}", status="completed"
         )
     return item
+
+
+# Agency stop reasons that mean the model did not finish its turn, and the
+# Responses `incomplete_details.reason` Codex is told. Anything else is a
+# finished turn.
+_INCOMPLETE_REASONS = {
+    "length": "max_output_tokens",
+    "max_tokens": "max_output_tokens",
+    "max_output_tokens": "max_output_tokens",
+    "content_filter": "content_filter",
+}
+
+
+def _incomplete_reason(stop_reason) -> "str | None":
+    return _INCOMPLETE_REASONS.get(stop_reason)
+
+
+def _reasoning_item(block: dict) -> dict:
+    # `encrypted_content` is what makes the item replayable: Codex sends it
+    # back verbatim next turn and the Responses backend restores the model's
+    # reasoning from it. An empty summary is omitted, not sent as "".
+    return {
+        "type": "reasoning",
+        "id": f"rs_{uuid.uuid4().hex}",
+        "summary": [{"type": "summary_text", "text": block["text"]}] if block.get("text") else [],
+        "encrypted_content": block.get("signature", ""),
+    }
+
+
+def _output_items(message: dict, tool_routes) -> "list[dict]":
+    """Every Responses output item for one finished assistant message, built
+    before anything is sent so a block that cannot be represented fails the
+    request instead of severing a stream Codex is already reading.
+
+    Items keep the order the model produced them in. Codex replays them in
+    that order, and a reasoning item is only valid directly before the
+    message or tool call it led to."""
+    output: "list[dict]" = []
+    for b in message.get("blocks", []):
+        if b["type"] == "text":
+            if not b.get("text"):
+                continue
+            item = {
+                "type": "message",
+                "id": f"msg_{uuid.uuid4().hex}",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": b["text"], "annotations": []}],
+            }
+            if b.get("phase"):
+                item["phase"] = b["phase"]
+            output.append(item)
+        elif b["type"] == "thinking":
+            output.append(_reasoning_item(b))
+        elif b["type"] == "tool_use":
+            output.append(_tool_use_to_responses(b, tool_routes))
+        elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
+            output.append(_unknown_block_to_responses(b))
+    return output
+
+
+def _responses_usage(usage: "dict | None") -> dict:
+    usage = usage or {}
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    result = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    if usage.get("cached_tokens") is not None:
+        result["input_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+    if usage.get("reasoning_tokens") is not None:
+        result["output_tokens_details"] = {"reasoning_tokens": usage["reasoning_tokens"]}
+    return result
+
+
+def _require_actionable(output: "list[dict]") -> None:
+    """A completed response must carry something Codex can act on. One with
+    no message and no tool call would end the turn -- and the task -- as if
+    the model had answered. The host already refuses such a response; this
+    keeps the adapter from ever completing one on its own."""
+    if not any(item.get("type") != "reasoning" for item in output):
+        raise ValueError("model response has no message and no tool call")
+
+
+# Request fields this adapter translates. Every other field Codex sends is
+# decided by Agency's own llm configuration (model, reasoning, output limit,
+# storage) and is not forwarded.
+_TRANSLATED_REQUEST_FIELDS = frozenset(
+    {"model", "instructions", "input", "tools", "tool_choice", "stream"}
+)
 
 
 def _responses_tool_choice_to_agency(tool_choice):
@@ -330,6 +436,11 @@ class CodexAdapter(HarnessAdapter):
             # agency), it silently assumes some default that can be far off
             # from what the actual backend supports. This is the real number.
             toml_text += f"model_context_window = {int(context_limit)}\n"
+        retry_settings = ""
+        for name in ("request_max_retries", "stream_max_retries"):
+            value = getattr(self.agconfig.llm, "codex_" + name, None)
+            if value is not None:
+                retry_settings += f"{name} = {int(value)}\n"
         toml_text += (
             f"\n"
             f"[model_providers.{self._PROVIDER_NAME}]\n"
@@ -337,6 +448,7 @@ class CodexAdapter(HarnessAdapter):
             f'base_url = "{base_url}/v1"\n'
             f'env_key = "{self._ENV_KEY_NAME}"\n'
             f'wire_api = "responses"\n'
+            f"{retry_settings}"
             "\n"
             "[mcp_servers.agency]\n"
             f'url = "{base_url}/mcp"\n'
@@ -370,6 +482,7 @@ class CodexAdapter(HarnessAdapter):
                 return _auth_error()
             body = await request.json()
             model = router.resolve_model(token)
+            await self._report_untranslated_fields(router, token, body)
             agency_context = self._format_context_harness_to_agency(body)
             # Keep routing request-local: one adapter serves multiple tokens.
             tool_routes = _responses_tool_routes(body)
@@ -385,11 +498,42 @@ class CodexAdapter(HarnessAdapter):
                 # start_streaming_response for why the first frame comes first.
                 return await start_streaming_response(request, frames)
             agency_response = router.dispatch(token, agency_context)
-            return JSONResponse(
-                self._format_context_agency_to_harness(
+            try:
+                payload = self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes
                 )
+            except ValueError as exc:
+                return JSONResponse(
+                    {"error": {"message": str(exc), "type": "upstream_error", "transient": True}},
+                    status_code=502,
+                )
+            return JSONResponse(payload)
+
+    async def _report_untranslated_fields(self, router, token, body: dict) -> None:
+        """Say once, in the agent's own log, which request fields Codex set
+        that Agency does not forward -- so none is dropped unseen."""
+        ignored = tuple(
+            sorted(
+                key
+                for key, value in body.items()
+                if key not in _TRANSLATED_REQUEST_FIELDS and value not in (None, "", [], {})
             )
+        )
+        reported = self.__dict__.setdefault("_reported_untranslated", set())
+        if not ignored or ignored in reported:
+            return
+        reported.add(ignored)
+        message = (
+            f"Codex request field(s) {list(ignored)} are not forwarded to the model backend; "
+            "model, reasoning effort, output limit and storage come from Agency's llm "
+            "configuration."
+        )
+        try:
+            import anyio
+
+            await anyio.to_thread.run_sync(router.log_warning, token, message)
+        except Exception:  # noqa: S110 - a diagnostic must never fail a model request
+            pass
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
         messages: "list[dict]" = []
@@ -452,6 +596,10 @@ class CodexAdapter(HarnessAdapter):
                 elif itype is None or itype == "message":
                     role = item.get("role", "user")
                     blocks = _responses_content_to_blocks(item.get("content"))
+                    if role == "assistant" and item.get("phase"):
+                        for block in blocks:
+                            if block["type"] == "text":
+                                block["phase"] = item["phase"]
                     messages.append({"role": role, "blocks": blocks})
                 elif itype == "reasoning":
                     summary_text = "".join(
@@ -508,209 +656,103 @@ class CodexAdapter(HarnessAdapter):
     def _format_context_agency_to_harness(
         self, agency_response: dict, model: str, *, tool_routes=None
     ) -> dict:
-        message = agency_response["message"]
-        output: "list[dict]" = []
-        for b in message.get("blocks", []):
-            if b["type"] == "text":
-                output.append(
-                    {
-                        "type": "message",
-                        "id": f"msg_{uuid.uuid4().hex}",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": b["text"], "annotations": []}],
-                    }
-                )
-            elif b["type"] == "thinking":
-                output.append(
-                    {
-                        "type": "reasoning",
-                        "id": f"rs_{uuid.uuid4().hex}",
-                        "summary": [{"type": "summary_text", "text": b["text"]}],
-                        "encrypted_content": b.get("signature", ""),
-                    }
-                )
-            elif b["type"] == "tool_use":
-                output.append(_tool_use_to_responses(b, tool_routes))
-            elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
-                output.append(_unknown_block_to_responses(b))
-
-        usage = agency_response.get("usage") or {}
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
-        return {
+        response = {
             "id": f"resp_{uuid.uuid4().hex}",
             "object": "response",
-            "status": "completed",
             "model": model,
-            "output": output,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            },
+            "usage": _responses_usage(agency_response.get("usage")),
         }
+        reason = _incomplete_reason(agency_response.get("stop_reason"))
+        if reason is not None:
+            # A cut-off turn carries no output items: whatever was generated
+            # (half a sentence, half a tool call) is not something to act on.
+            return {
+                **response,
+                "status": "incomplete",
+                "incomplete_details": {"reason": reason},
+                "output": [],
+            }
+        output = _output_items(agency_response["message"], tool_routes)
+        _require_actionable(output)
+        return {**response, "status": "completed", "output": output}
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
         request_id = f"resp_{uuid.uuid4().hex}"
-        yield _sse(
-            "response.created",
-            {
-                "type": "response.created",
-                "response": {
-                    "id": request_id,
-                    "object": "response",
-                    "status": "in_progress",
-                    "model": model,
-                },
-            },
-        )
-
-        output_index = 0
-        text_item_id = None
         for item in agency_stream:
             if item["type"] == "delta":
                 # A redirect can supersede draft deltas. Responses SSE cannot
                 # retract them, so wait for the authoritative host checkpoint.
                 continue
 
-            text_parts = [
-                block.get("text", "")
-                for block in item["message"].get("blocks", [])
-                if block["type"] == "text"
-            ]
-            if any(text_parts):
-                text_item_id = f"msg_{uuid.uuid4().hex}"
-                yield _sse(
-                    "response.output_item.added",
-                    {
-                        "type": "response.output_item.added",
-                        "output_index": output_index,
-                        "item": {
-                            "type": "message",
-                            "id": text_item_id,
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
+            reason = _incomplete_reason(item.get("stop_reason"))
+            # Built before the first frame: anything that cannot be sent to
+            # Codex raises here, where it still becomes an HTTP error.
+            output = [] if reason is not None else _output_items(item["message"], tool_routes)
+            if reason is None:
+                _require_actionable(output)
+            envelope = {"id": request_id, "object": "response", "model": model}
+            yield _sse(
+                "response.created",
+                {"type": "response.created", "response": {**envelope, "status": "in_progress"}},
+            )
+            for output_index, output_item in enumerate(output):
+                if output_item["type"] == "message":
+                    yield _sse(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {**output_item, "status": "in_progress", "content": []},
                         },
-                    },
-                )
-                yield _sse(
-                    "response.output_text.delta",
-                    {
-                        "type": "response.output_text.delta",
-                        "item_id": text_item_id,
-                        "output_index": output_index,
-                        "delta": "".join(text_parts),
-                    },
-                )
-
-            if text_item_id is not None:
+                    )
+                    yield _sse(
+                        "response.output_text.delta",
+                        {
+                            "type": "response.output_text.delta",
+                            "item_id": output_item["id"],
+                            "output_index": output_index,
+                            "delta": output_item["content"][0]["text"],
+                        },
+                    )
+                else:
+                    yield _sse(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": output_item,
+                        },
+                    )
                 yield _sse(
                     "response.output_item.done",
                     {
                         "type": "response.output_item.done",
                         "output_index": output_index,
-                        "item": {
-                            "type": "message",
-                            "id": text_item_id,
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": "".join(text_parts),
-                                    "annotations": [],
-                                }
-                            ],
+                        "item": output_item,
+                    },
+                )
+            usage = _responses_usage(item.get("usage"))
+            if reason is not None:
+                # Codex treats this as a failed model response and applies its
+                # own retry policy; it never sees a partial tool call.
+                yield _sse(
+                    "response.incomplete",
+                    {
+                        "type": "response.incomplete",
+                        "response": {
+                            **envelope,
+                            "status": "incomplete",
+                            "incomplete_details": {"reason": reason},
+                            "usage": usage,
                         },
                     },
                 )
-                output_index += 1
-
-            for b in item["message"].get("blocks", []):
-                if b["type"] == "text":
-                    continue
-                idx = output_index
-                output_index += 1
-                if b["type"] == "thinking":
-                    reasoning_item = {
-                        "type": "reasoning",
-                        "id": f"rs_{uuid.uuid4().hex}",
-                        "summary": [{"type": "summary_text", "text": b["text"]}],
-                        "encrypted_content": b.get("signature", ""),
-                    }
-                    yield _sse(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "output_index": idx,
-                            "item": reasoning_item,
-                        },
-                    )
-                    yield _sse(
-                        "response.output_item.done",
-                        {
-                            "type": "response.output_item.done",
-                            "output_index": idx,
-                            "item": reasoning_item,
-                        },
-                    )
-                elif b["type"] == "tool_use":
-                    call_item = _tool_use_to_responses(b, tool_routes)
-                    yield _sse(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "output_index": idx,
-                            "item": call_item,
-                        },
-                    )
-                    yield _sse(
-                        "response.output_item.done",
-                        {
-                            "type": "response.output_item.done",
-                            "output_index": idx,
-                            "item": call_item,
-                        },
-                    )
-                elif b["type"].startswith(_RESPONSES_TYPE_PREFIX):
-                    native_item = _unknown_block_to_responses(b)
-                    yield _sse(
-                        "response.output_item.added",
-                        {
-                            "type": "response.output_item.added",
-                            "output_index": idx,
-                            "item": native_item,
-                        },
-                    )
-                    yield _sse(
-                        "response.output_item.done",
-                        {
-                            "type": "response.output_item.done",
-                            "output_index": idx,
-                            "item": native_item,
-                        },
-                    )
-
-            usage = item.get("usage") or {}
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
+                return
             yield _sse(
                 "response.completed",
                 {
                     "type": "response.completed",
-                    "response": {
-                        "id": request_id,
-                        "object": "response",
-                        "status": "completed",
-                        "model": model,
-                        "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens,
-                        },
-                    },
+                    "response": {**envelope, "status": "completed", "usage": usage},
                 },
             )
             return

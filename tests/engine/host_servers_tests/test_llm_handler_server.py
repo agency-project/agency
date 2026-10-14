@@ -157,8 +157,15 @@ def _cfg(**fields) -> agconfig:
     return agconfig(llmconfig(**fields))
 
 
+def _finish(reason="stop") -> "_FakeChunk":
+    """The chunk that ends a real Chat Completions stream. A stream without
+    one was cut off, and the backend reports it as such."""
+    return _FakeChunk([_FakeChoice(delta=_FakeDelta(), finish_reason=reason)])
+
+
 def _make_server(create_fn=None, **fields) -> "tuple[LlmHandlerServer, _FakeClient]":
     fields.setdefault("model", "gpt-test")
+    fields.setdefault("unusable_response_backoff_s", 0)
     server = LlmHandlerServer(_cfg(**fields), _FakeDataLogger(), usage_tracker=LlmUsageTracker())
     client = _FakeClient(create_fn)
     server._backend.make_client = lambda timeout: client
@@ -937,7 +944,11 @@ def test_start_stream_uses_spawn_traced(monkeypatch):
         return real_spawn_traced(fn, *args, **kwargs)
 
     monkeypatch.setattr(agprof, "spawn_traced", record_spawn)
-    server, _ = _make_server(create_fn=lambda **kwargs: iter([]))
+    server, _ = _make_server(
+        create_fn=lambda **kwargs: iter(
+            [_FakeChunk([_FakeChoice(delta=_FakeDelta(content="hi"))]), _finish()]
+        )
+    )
     handle = server.start_stream({"messages": []})
     assert _drain(handle)[-1]["type"] == "done"
     handle._thread.join(timeout=2.0)
@@ -996,7 +1007,13 @@ def test_llm_trace_captures_tools_tool_choice_and_unknown_request_fields(tmp_pat
     def create(**kwargs):
         usage = _FakeUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
         if streaming:
-            return iter([_FakeChunk([], usage=usage)])
+            return iter(
+                [
+                    _FakeChunk([_FakeChoice(delta=_FakeDelta(content="hi"))]),
+                    _finish(),
+                    _FakeChunk([], usage=usage),
+                ]
+            )
         return _FakeResult(
             [_FakeChoice(message=_FakeMessage(content="hi"), finish_reason="stop")], usage
         )
@@ -1030,7 +1047,7 @@ def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tm
     monkeypatch.setattr(agprof, "_require_linux", lambda: None)
 
     def create(**kwargs):
-        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(content="Hi"))])])
+        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(content="Hi"))]), _finish()])
 
     with agprof.session(tmp_path, sample_hz=0, sample_gpu=False):
         with agprof.span("engine-run"):
@@ -1069,6 +1086,7 @@ def test_start_stream_accumulates_tool_call_argument_fragments():
                         )
                     ]
                 ),
+                _finish("tool_calls"),
             ]
         )
 
@@ -1077,7 +1095,7 @@ def test_start_stream_accumulates_tool_call_argument_fragments():
     items = _drain(handle)
     done = items[-1]
     assert done["type"] == "done"
-    blocks = done["message"]["blocks"]
+    blocks = [b for b in done["message"]["blocks"] if b["type"] != "metadata"]
     assert len(blocks) == 1
     assert blocks[0]["type"] == "tool_use"
     assert blocks[0]["index"] == 0
@@ -1089,27 +1107,49 @@ def test_start_stream_accumulates_tool_call_argument_fragments():
 
 def test_start_stream_preserves_unrecognized_delta_field_with_named_type():
     def create(**kwargs):
-        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(refusal="no"))])])
+        return iter([_FakeChunk([_FakeChoice(delta=_FakeDelta(refusal="no"))]), _finish()])
 
     server, _ = _make_server(create_fn=create)
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
     done = items[-1]
-    blocks = done["message"]["blocks"]
+    blocks = [b for b in done["message"]["blocks"] if b["type"] != "metadata"]
     assert len(blocks) == 1
     assert blocks[0]["type"] == "openai_chatcompletions_refusal"
     assert blocks[0]["data"] == ["no"]
     handle._thread.join(timeout=2.0)
 
 
-def test_start_stream_no_chunks_at_all_yields_immediate_done():
+def test_start_stream_no_chunks_at_all_is_an_error_not_a_finished_turn():
+    """An HTTP 200 whose stream carries nothing used to be delivered as a
+    completed, empty assistant turn -- which a harness takes as the model's
+    final answer. It is asked for again and then reported as a failure."""
+    calls = []
+
     def create(**kwargs):
+        calls.append(kwargs)
         return iter([])
 
     server, client = _make_server(create_fn=create)
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
-    assert items == [
+    assert [i["type"] for i in items] == ["error"]
+    assert items[0]["transient"] is True and items[0]["status_code"] == 502
+    assert "reason=stream_interrupted" in items[0]["message"]
+    assert "attempts=3" in items[0]["message"]
+    assert len(calls) == 3  # the first ask plus unusable_response_retries
+    handle._thread.join(timeout=2.0)
+    assert client.closed is True
+
+
+def test_start_stream_no_chunks_passes_through_when_empty_is_allowed():
+    server, client = _make_server(
+        create_fn=lambda **kwargs: iter([]),
+        fail_on_empty_response=False,
+        strict_stream_termination=False,
+    )
+    handle = server.start_stream({"messages": []})
+    assert _drain(handle) == [
         {
             "type": "done",
             "message": {"role": "assistant", "blocks": []},
@@ -1167,18 +1207,15 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
     def create(**kwargs):
         return gen()
 
-    server, client = _make_server(create_fn=create)
+    server, client = _make_server(create_fn=create, unusable_response_retries=0)
     handle = server.start_stream({"messages": []})
     items = _drain(handle)
     # The "ok" delta is never individually delivered -- only the error item is.
-    assert items == [
-        {
-            "type": "error",
-            "message": "mid-stream failure",
-            "transient": False,
-            "status_code": 500,
-        }
-    ]
+    # A stream that breaks after it started is an upstream failure the harness
+    # may retry (it was reported as a permanent 500 before), and the original
+    # failure's own text is kept.
+    message = "RuntimeError: mid-stream failure (reason=stream_interrupted, attempts=1)"
+    assert items == [{"type": "error", "message": message, "transient": True, "status_code": 502}]
     handle._thread.join(timeout=2.0)
     assert client.closed is True
     assert server._data_logger.finalized == [
@@ -1186,7 +1223,7 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
             handle.call_label,
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: mid-stream failure"}),
+            _marker_chain({"error": f"UnusableResponseError: {message}"}),
         )
     ]
 
@@ -1808,6 +1845,7 @@ def test_build_app_dispatch_route_streaming_relays_ndjson_lines():
             [
                 _FakeChunk([_FakeChoice(delta=_FakeDelta(content="Hi"))]),
                 _FakeChunk([_FakeChoice(delta=_FakeDelta(content=None))]),
+                _finish(),
             ]
         )
 
@@ -1820,7 +1858,7 @@ def test_build_app_dispatch_route_streaming_relays_ndjson_lines():
     assert len(lines) == 1
     assert lines[0]["type"] == "done"
     assert lines[0]["message"]["role"] == "assistant"
-    blocks = lines[0]["message"]["blocks"]
+    blocks = [b for b in lines[0]["message"]["blocks"] if b["type"] != "metadata"]
     assert len(blocks) == 1
     assert blocks[0]["type"] == "text"
     assert blocks[0]["text"] == "Hi"

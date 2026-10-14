@@ -66,6 +66,35 @@ cfg = agconfig(llmconfig(
 ))
 ```
 
+### Responses that are not a finished turn
+
+A successful HTTP status does not mean the model produced a turn. Agency checks
+every response before a harness sees it:
+
+| Response | What Agency does | `llmconfig` field |
+|---|---|---|
+| No text and no tool call (an empty 200, or reasoning with no answer) | asks again, then reports a retryable error | `unusable_response_retries` (2), `fail_on_empty_response` (true) |
+| Stream that ends without its terminating event, or breaks after it started | asks again, then reports a retryable error | `unusable_response_retries`, `strict_stream_termination` (true) |
+| Tool call whose arguments are not a JSON object | asks again, then reports a retryable error | `unusable_response_retries` |
+| Cut off at the output limit | optionally asks again with a larger limit; otherwise passes it on with its stop reason, its incomplete tool calls marked | `truncation_retries` (0), `truncation_output_multiplier` (2), `truncation_max_output_tokens` |
+
+Asking again is safe: no part of a response reaches the harness, and no tool
+runs, before the response is complete. A rate limit, a rejected request and a
+failure before any response arrived are never retried here; the SDK and the
+harness handle those. Each discarded response is recorded as an `llm_retry`
+event and on the delivered exchange's metadata.
+
+`max_completion_tokens` limits reasoning and visible output together. A
+reasoning model needs far more than a few thousand: with a limit that is too
+low, responses stop inside a tool call's arguments. Empty content next to a
+valid tool call is an ordinary tool turn and is never treated as empty.
+
+The Codex adapter reports a cut-off response to Codex as `response.incomplete`
+and sends none of its items, since Codex starts a tool as soon as its item
+arrives. With `provider="openai_responses"`, reasoning items, tool-call ids and
+message phases round-trip through Codex unchanged; the Chat Completions
+backend cannot send reasoning state back and says so once when it drops it.
+
 ## Agent harnesses
 
 A harness is the program that executes the agent's task. Select it independently

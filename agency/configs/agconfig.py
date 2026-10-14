@@ -110,6 +110,9 @@ class llmconfig(confignamespace):
     aws_region: "str | None" = None
     model_listing_timeout_seconds: float = 10.0
     default_max_tokens: int = 32000
+    sdk_max_retries: int = 2
+    codex_request_max_retries: "int | None" = None
+    codex_stream_max_retries: "int | None" = None
     max_retries: int = 12
     idle_timeout: float = 900.0  # seconds to wait for first chunk
     stream_timeout: float = 1200.0  # seconds to wait between chunks mid-stream
@@ -122,6 +125,29 @@ class llmconfig(confignamespace):
     rate_limit_max_backoff_s: float = 80.0
     rate_limit_retry_after_jitter_s: float = 5.0
     default_context_limit: int = 200_000
+
+    # What the host does with a provider response it cannot hand to a harness
+    # as a finished turn (see agency/llm/response_check.py).
+    # An HTTP 200 with no text and no tool call, a stream that broke off, or a
+    # tool call whose arguments are not JSON is asked for again this many
+    # times before the failure is reported to the harness.
+    unusable_response_retries: int = 2
+    unusable_response_backoff_s: float = 1.0
+    # False restores the old behavior of passing an empty assistant turn
+    # through as a completed one.
+    fail_on_empty_response: bool = True
+    # A stream that ends without its terminating event is an error, not a
+    # (short) response.
+    strict_stream_termination: bool = True
+    # A response cut off at the output-token limit is asked for again with
+    # the limit multiplied, at most this many times and never above the
+    # ceiling. 0 leaves the cut-off response to the harness.
+    truncation_retries: int = 0
+    truncation_output_multiplier: float = 2.0
+    truncation_max_output_tokens: "int | None" = None
+    # OpenAI Responses API only: "auto" | "concise" | "detailed" asks for
+    # reasoning summaries (extra output tokens); None requests none.
+    reasoning_summary: "str | None" = None
 
     # Mock/replay LLM backend (agency/llm/mock.py)
     replay_db_path: "str | None" = None
