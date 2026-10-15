@@ -18,6 +18,8 @@ As agents tackle longer tasks, invoke tools, and work in parallel, understanding
 
 Agency connects **LLM requests, tool calls, and system activity** in one place, giving you the visibility to investigate execution, find bottlenecks, and understand what changed.
 
+We are model and harness agnostic! Run Claude Code, Codex, OpenCode, or Agency's native harness with supported backends including OpenAI, Anthropic, Bedrock, and local models via vLLM. [Get started](#getting-started)
+
 <!-- TODO(release): Record multi-agent live execution, invocation inspection, and runtime control. -->
 ![Agency Live Execution](docs/assets/agency-demo.webp)
 
