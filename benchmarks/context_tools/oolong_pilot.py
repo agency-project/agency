@@ -9,7 +9,7 @@ in pieces. Three arms:
 * ``B`` -- plus ``context_tools()`` (the model may edit its own context);
 * ``C`` -- B plus a short note in the task on how to use them.
 
-Run on a host set up with ``agency setup-host`` (see docs/setup-host.md)::
+Run on a host set up with ``agency setup-host`` (see docs/guides/host-setup.md)::
 
     sudo .venv/bin/agency run benchmarks/context_tools/oolong_pilot.py \\
         --data ~/bench/oolong_val_65536.jsonl --n 4 --arms A,B,C --out ~/bench/pilot

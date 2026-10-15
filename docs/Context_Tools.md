@@ -12,7 +12,7 @@ from agency import agskill, context_tools
 skill = agskill(name="research", prompt="...", add_host_mcp_tools=context_tools())
 ```
 
-A runnable walkthrough is `examples/12_self_context_editing.py`. The tools carry no
+A runnable walkthrough is `examples/14_self_context_editing.py`. The tools carry no
 instructions on when to edit; the skill prompt or input has to say.
 
 ## The tools

@@ -7,7 +7,7 @@ the task that the context is small and how to edit it. `analyze.py` breaks a
 `results.jsonl` down by arm with bootstrap intervals.
 
 ```sh
-sudo .venv/bin/agency setup-host --runtime podman          # docs/setup-host.md
+sudo .venv/bin/agency setup-host --runtime podman          # docs/guides/host-setup.md
 sudo podman build -t localhost/agency-bench:py312 benchmarks/context_tools
 uv run --no-project --with datasets python - <<'PY'        # the 128K-token slice
 from datasets import load_dataset; import json

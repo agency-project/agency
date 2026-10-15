@@ -67,7 +67,7 @@ def model_patches(learner) -> "list[str]":
 
 
 def main() -> None:
-    cfg, run_dir = tutorial_config("12_self_context_editing")
+    cfg, run_dir = tutorial_config("14_self_context_editing")
     learner = Agent("self_editor", agconfig=cfg)
 
     # 1. State a fact, have the model correct it in its own context, then ask.
