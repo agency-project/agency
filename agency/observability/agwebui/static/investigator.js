@@ -137,7 +137,7 @@ function seekPlayback(clock) {
   }
   // Leaving the live edge opens the recording at that instant, still playing
   // unless the view is frozen.
-  loadRun(run.id,null,true,{clock,play:!frozen,speed:Number($('replay-speed').value)||1});
+  loadRun(run.id,null,true,{clock,play:!frozen,speed:1});
 }
 function togglePlayback() {
   const run=currentExecution();if(!run||state.loading)return;
@@ -145,9 +145,9 @@ function togglePlayback() {
     const replay=state.replayState;if(!replay)return;
     if(replay.playing){pauseReplay();return;}
     if(replay.finished)state.stream?.sendReplay('seek',{clock:wallClockRange().start});
-    state.follow=true;state.stream?.sendReplay('play',{speed:Number($('replay-speed').value)||1});
+    state.follow=true;state.stream?.sendReplay('play',{speed:1});
   }
-  else if(!state.stream){const range=wallClockRange();loadRun(run.id,null,true,{clock:state.cursor>=range.end-.05?range.start:Math.max(range.start,state.cursor),play:true,speed:Number($('replay-speed').value)||1});}
+  else if(!state.stream){const range=wallClockRange();loadRun(run.id,null,true,{clock:state.cursor>=range.end-.05?range.start:Math.max(range.start,state.cursor),play:true,speed:1});}
   else if(state.displayPaused)resumeDisplay();else pauseDisplay();
 }
 let loadGeneration = 0;
@@ -775,8 +775,8 @@ function renderSession() {
   const frozen=viewFrozen();
   $('display-toggle').hidden=!run;
   $('display-toggle').disabled=!state.run||state.loading||replay&&state.transport!=='connected';
-  $('display-toggle').textContent=replay?(frozen?'Play':'Pause'):!state.stream?'Play recording':frozen?'Unfreeze view':'Freeze view';
-  $('display-toggle').title=!state.stream?'Play the recording from the time cursor':frozen?(replay?'Continue playing from the time cursor':'Apply buffered event updates and return to live'):'Hold the display at the time cursor; agents keep running';
+  $('display-toggle').textContent=frozen?'Unfreeze view':'Freeze view';
+  $('display-toggle').title=frozen?(replay||!state.stream?'Unfreeze the recording from the time cursor':'Apply buffered event updates and return to live'):'Freeze the display at the time cursor';
   $('display-toggle').setAttribute('aria-pressed',String(frozen));
   $('display-state').title=state.displayPaused?`View frozen · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.displayChanges)} calls changed · agents may still be running`:state.stream?(state.follow?'View following live':`History held · ${noticeCount(state.pendingNew)} newly buffered · ${noticeCount(state.unread)} calls changed`):'';
   $('display-state').textContent=state.displayPaused?'Frozen':state.stream?(state.follow?(replay?'Following replay':'Following live'):'History held'):run?.source==='synthetic'?'Synthetic example':'Recorded history';
@@ -795,7 +795,6 @@ function renderSession() {
   $('execution-message').title=$('execution-message').textContent;
   $('open-live').hidden=run?.id==='live'&&!replay;
   $('start-replay').hidden=!run||replay||run.id!=='live';
-  $('replay-speed').hidden=!replay;
   $('follow-live').hidden=!state.stream;
   $('follow-live').textContent='Jump to live';
   $('follow-live').title='Unfreeze and return every agent column and the causal graph to live';
@@ -1715,7 +1714,6 @@ $('display-toggle').onclick=togglePlayback;
 $('open-live').onclick=()=>{state.view='trajectory';loadRun('live');};
 $('start-replay').onclick=()=>loadRun(state.run.id,null,true);
 function pauseReplay() {return state.stream?.sendReplay('pause');}
-$('replay-speed').onchange=()=>{if(state.replayState?.playing)state.stream?.sendReplay('play',{speed:Number($('replay-speed').value)});};
 $('follow-live').onclick=()=>{if(state.replay&&state.run?.id==='live'){loadRun('live');return;}followLatest();$('call-stack')?.firstElementChild?.scrollIntoView({block:'start'});};
 $('reconnect-updates').onclick=()=>state.stream?.reconnect();
 // Transient control menus close after acting, clicking elsewhere, or Escape.

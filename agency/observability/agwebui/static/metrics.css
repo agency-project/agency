@@ -162,6 +162,7 @@
 .prof-table-scroll{overflow-x:auto}
 .prof-dashboard .prof-table{table-layout:auto;min-width:600px}
 .prof-dashboard .prof-table td{font-size:var(--font-size-meta);max-width:360px}
+.prof-call-input{margin:0;min-width:180px;max-height:240px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
 .prof-command-preview{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-width:40ch}
 .prof-recorded-command{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--font-size-meta)}
 .prof-dashboard .prof-table th{font-size:var(--font-size-meta);white-space:nowrap}

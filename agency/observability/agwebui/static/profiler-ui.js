@@ -1,5 +1,6 @@
 import {systemMeasurements, agentResources, systemActivity} from './investigator-model.js';
 import {profilerData, breakdown, timed, failure, toolCall, hasStart, operationState, performanceFindings, processResources, sampleExtrema} from './profiler-model.js';
+import {payloadValue, prettyJson} from './event-details.js';
 
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 const num = v => v == null || !Number.isFinite(v) ? 'Unavailable' : new Intl.NumberFormat('en', v !== 0 && Math.abs(v) < .1 ? {maximumSignificantDigits:3} : {maximumFractionDigits: 1, notation: Math.abs(v) >= 10000 ? 'compact' : 'standard'}).format(v);
@@ -47,9 +48,10 @@ function chart(title, observations, unit, data, {color = colors.llm, scatter = f
 }
 
 function callTable(id, calls, run, options) {
-  const rows = calls.map(a => ({...a, status:operationState(a, run, options), duration:timed(a) ? a.duration : null}));
+  const rows = calls.map(a => ({...a, input:a.kind === 'model' ? '' : payloadValue(a, 'input'), status:operationState(a, run, options), duration:timed(a) ? a.duration : null}));
   return table(id, rows, [
-    {key:'agent', label:'Agent'}, {key:'name', label:id.startsWith('requests') ? 'Request / model' : 'Operation', render:a => actionLink(a, a.model || a.name)},
+    {key:'agent', label:'Agent'}, {key:'name', label:id.startsWith('requests') ? 'Request / model' : 'Operation', render:a => actionLink(a, a.kind === 'model' ? a.model || a.name : a.name)},
+    ...(id.startsWith('requests') ? [] : [{key:'input', label:'Command / arguments', render:a => a.input ? `<pre class="prof-call-input" tabindex="0">${esc(prettyJson(a.input) ?? a.input)}</pre>${a.input_truncated ? '<span class="muted">Recorded preview · inspect for full input</span>' : ''}` : a.kind === 'model' ? '—' : 'Arguments not captured'}]),
     {key:'status', label:'Status', render:a => esc(a.status === 'running' ? 'Running · observed' : a.status === 'incomplete' ? 'Unknown / incomplete' : a.status)},
     {key:'start', label:'Start / end', render:a => !hasStart(a) ? 'Start missing' : `${sec(a.start)} / ${timed(a) ? sec(a.start + a.duration) : 'End unobserved'}`},
     {key:'duration', label:'E2E duration', render:a => latency(a.duration)},
@@ -134,7 +136,7 @@ function toolsView(run, data, options) {
   const active = [...data.active].sort((a, b) => a.start - b.start).slice(0, 10);
   const failed = data.tools.filter(failure).slice(-10), missing = data.tools.filter(a => operationState(a, run, options) === 'incomplete').slice(-10);
   html += section('Slow and unresolved operations', `<div class="prof-operation-lists">${[['Slowest completed',slow],['Longest observed open calls',active],['Failures',failed],['Missing completion',missing]].map(([title, calls]) => `<div><h4>${title}</h4>${calls.length ? `<ul>${calls.map(a => `<li>${actionLink(a)} <span>${esc(a.agent)} · ${timed(a) ? sec(a.duration) : operationState(a, run, options) === 'running' ? sec(Math.max(0, data.bounds[1] - a.start)) + ' open at display boundary' : 'End unobserved'}</span></li>`).join('')}</ul>` : empty('None observed.')}</div>`).join('')}</div>`);
-  return html + section('Call inspector', callTable('tools', data.tools, run, options), 'Searchable, sortable, 50 rows per page. Cancelled and unknown calls remain accessible.') + `<details class="prof-raw"><summary>Secondary latency distribution</summary>${chart('Tool duration distribution (sorted observations)', data.tools.filter(timed).map(a => a.duration).sort((a, b) => a - b).map((v, i) => [i, v]), 's', data, {indexed:true})}</details>`;
+  return html + section('Call inspector', callTable('tools', data.tools, run, options), 'Every retained tool execution has its own row, including repeated calls. Search includes recorded commands and arguments; 50 rows per page.') + `<details class="prof-raw"><summary>Secondary latency distribution</summary>${chart('Tool duration distribution (sorted observations)', data.tools.filter(timed).map(a => a.duration).sort((a, b) => a - b).map((v, i) => [i, v]), 's', data, {indexed:true})}</details>`;
 }
 
 function systemsView(run, data, options, measurements) {

@@ -1551,7 +1551,7 @@ small,.muted {
 /* Playback bar: display controls together, then the cursor, with the execution and connection state on one line beneath. */
 .cursor-bar {flex-wrap:wrap;row-gap:4px}
 .display-controls {display:flex;align-items:center;gap:6px}
-.display-controls button,#replay-speed {font-size:var(--font-size-ui);padding:4px 9px;white-space:nowrap}
+.display-controls button {font-size:var(--font-size-ui);padding:4px 9px;white-space:nowrap}
 .cursor-bar .session-state {flex-basis:100%;font-size:var(--font-size-meta);color:var(--muted)}
 #execution-state {font-size:var(--font-size-meta);font-weight:var(--font-weight-semibold);color:var(--text)}
 #execution-state[data-mode=live] {color:var(--teal)}
