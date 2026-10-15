@@ -10,11 +10,11 @@ Live debugging and systems profiling for AI agents.
 
 [Getting Started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
 
-Developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/).
+Developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/)
 
 </div>
 
-Agency is an open-source platform for **running, debugging, profiling, and controlling AI agents**.
+Agency is an open-source platform developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/) for **running, debugging, profiling, and controlling AI agents**.
 
 As agents tackle longer tasks, invoke tools, and work in parallel, understanding what they're actually doing gets harder. Model traces only tell part of the story. What is an agent waiting for? Where is time being spent? Why is one run slower than another?
 
