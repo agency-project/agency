@@ -36,18 +36,16 @@ def _request_for(handle: agdata):
         return orchestrator._requests[request_id]
 
 
-def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch, tmp_path):
+def test_agerror_leaves_the_context_unchanged_apart_from_the_failure_notice(monkeypatch, tmp_path):
     seed = [{"role": "user", "content": "committed"}]
 
     def execute(self, *, context, **_kwargs):
-        context.recent_transcript.append({"role": "assistant", "content": "must be discarded"})
-        context.harness_sessions["mutated"] = {"session_id": "must-be-discarded"}
         return agerror("ordinary skill failure")
 
     monkeypatch.setattr(AgentEngine, "execute", execute)
     ag = _agent(tmp_path)
-    ag.context = agcontext(
-        recent_transcript=seed,
+    ag.context = agcontext.from_messages(
+        seed,
         harness_sessions={"stable": {"session_id": "committed"}},
         retained_messages=[
             {
@@ -61,11 +59,11 @@ def test_agerror_rolls_output_context_back_to_committed_predecessor(monkeypatch,
     )
 
     invocation = ag.run(agskill("fails", ""), agdata())
-    request = _request_for(invocation)
+    output_context = ag.context  # the pending agcontext this run settles
 
     assert invocation.wait(timeout=2).to_dict() == {"error": "ordinary skill failure"}
-    output_context = request.context_future.result(timeout=2)
-    assert output_context.recent_transcript == seed
+    output_context.resolve_prev_dependencies()
+    assert output_context.get_resolved_transcript() == seed
     assert output_context.harness_sessions == {"stable": {"session_id": "committed"}}
     assert output_context.retained_messages == [
         {

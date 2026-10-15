@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import itertools
 import json
 import queue
@@ -21,10 +20,12 @@ from starlette.requests import ClientDisconnect
 
 from ...llm import API_CONN_EXCS, API_ERROR_EXCS, BAD_REQUEST_EXCS, RATE_LIMIT_EXCS
 from ...llm.agllm import agllm
+from ...llm.message_store import MessageStore, split_tool_schema
 from ...llm.usage_tracker import LlmUsageTracker
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
+    from ...agcontext import agcontext
     from ...observability.agdatalogger import agDataLogger
 
 TRANSIENT_DISPATCH_EXCS = (
@@ -43,19 +44,6 @@ def _annotate(span, **metadata) -> None:
 
 def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
-
-
-def _request_profile_metadata(request: dict) -> dict:
-    from ...observability.profiler import agprof
-
-    known = ("messages", "tools", "tool_choice")
-    return {
-        **agprof.detail_metadata("llm.tools", request.get("tools") or []),
-        **agprof.detail_metadata("llm.tool_choice", request.get("tool_choice")),
-        **agprof.detail_metadata(
-            "llm.request_extra", {k: v for k, v in request.items() if k not in known}
-        ),
-    }
 
 
 def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason) -> dict:
@@ -78,34 +66,6 @@ def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason)
         "stop_reason": stop_reason,
         **agprof.detail_metadata("llm.response", response),
     }
-
-
-def _payload_hash(payload: dict) -> str:
-    """Content-addressable storage key for one {role, **block} transcript
-    payload."""
-    role = payload.get("role")
-    block_type = payload.get("type")
-    if block_type == "tool_use" and payload.get("id"):
-        identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
-    elif block_type == "tool_result" and payload.get("tool_call_id"):
-        identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
-    elif block_type == "text":
-        identity = {"role": role, "type": block_type, "text": payload.get("text")}
-    elif block_type == "thinking":
-        # Current Claude models return thinking with empty text by default,
-        # so text alone would collapse every block of a run into one stored
-        # payload; the signature (Anthropic) / encrypted content (OpenAI
-        # Responses) is what tells them apart. Missing and "" normalize alike
-        # so a rich response block and its replay still dedupe.
-        identity = {
-            "role": role,
-            "type": block_type,
-            "text": payload.get("text"),
-            "signature": payload.get("signature") or "",
-        }
-    else:
-        identity = payload
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _display_tag(internal_kind: "str | None") -> "str | None":
@@ -315,6 +275,7 @@ class LlmHandlerServer:
         parent_context=None,
         request_id: "str | None" = None,
         skill_name: "str | None" = None,
+        context: "agcontext | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -332,6 +293,17 @@ class LlmHandlerServer:
         self._transcript_lock = threading.Lock()
         self._request_id = request_id
         self._skill_name = skill_name
+        # The skill run's agcontext. Its ``message_store`` is used here directly:
+        # ``message_patch_lookup`` is applied to every request, and every message
+        # and block hashed lands in its lookups. The engine sets the agcontext's
+        # ``message_hash_list`` once the skill run has committed.
+        self._context = context
+        self._message_store = context.message_store if context is not None else MessageStore()
+        # Per call_label, from the request's arrival until the reply: the hashes of
+        # the messages the harness sent and of the patched messages sent to the LLM
+        # backend, and the harness's own message dicts (for the usage tracker).
+        self._call_messages: "dict[str, dict]" = {}
+        self._call_messages_lock = threading.Lock()
 
         self.change_config(agconfig)
 
@@ -344,33 +316,43 @@ class LlmHandlerServer:
             entries.extend(handle.get_transcript())
         return entries
 
-    def get_main_transcript(self, needle: "str | None" = None) -> "list[dict]":
+    def get_main_history(self, needle: "str | None" = None) -> "list[str]":
+        """The skill run's final history as message hashes, which resolve against
+        this server's ``message_store``. The main call is the one whose harness
+        messages are the longest -- for a stateful harness the last -- and its
+        reply goes on the end."""
         entries = [
             entry
             for entry in self.get_all_transcripts()
             if isinstance(entry.get("request"), dict)
-            and isinstance(entry["request"].get("messages"), list)
             and isinstance(entry.get("response"), dict)
+            and entry.get("harness_message_hashes") is not None
         ]
         if not entries:
             return []
+
+        message_store = self._message_store
         candidates = entries
         if needle is not None:
             matching = [
                 e
                 for e in entries
                 if any(
-                    b.get("text") == needle
-                    for m in e["request"]["messages"]
-                    for b in m.get("blocks", [])
+                    payload.get("text") == needle
+                    for message_hash in e["harness_message_hashes"]
+                    for _block_hash, payload in message_store.payloads(message_hash)
                 )
             ]
             if matching:
                 candidates = matching
-        best = max(candidates, key=lambda e: len(e["request"]["messages"]))
-        messages = [m for m in best["request"]["messages"] if m.get("role") != "system"]
-        messages.append(best["response"])
-        return messages
+        best = max(candidates, key=lambda e: len(e["harness_message_hashes"]))
+        history = [
+            message_hash
+            for message_hash in best["harness_message_hashes"]
+            if message_store.role(message_hash) != "system"
+        ]
+        history.append(message_store.add_message(best["response"]))
+        return history
 
     def _tag_metadata_block(
         self,
@@ -430,9 +412,15 @@ class LlmHandlerServer:
     ) -> dict:
         from ...observability.profiler import agprof
 
-        internal_kind = request.get("agency_internal_kind")
-        request = self._prepare_request(request, abort_event=abort_event)
+        internal_kind = split_tool_schema(request.get("messages") or [])[3].get(
+            "agency_internal_kind"
+        )
         call_label = uuid.uuid4().hex[:12]
+        request = self._prepare_request(
+            request,
+            abort_event=abort_event,
+            call_label=call_label,
+        )
         self._data_logger.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
@@ -473,7 +461,6 @@ class LlmHandlerServer:
                     provider=type(self._backend).__name__,
                     call_label=call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
-                    **_request_profile_metadata(request),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -503,7 +490,11 @@ class LlmHandlerServer:
                     ),
                     ttft_ms=ttft_ms,
                 )
-                self._tag_metadata_block(request["messages"], result["message"], ttft_ms=ttft_ms)
+                self._tag_metadata_block(
+                    self._tracked_messages(call_label, request),
+                    result["message"],
+                    ttft_ms=ttft_ms,
+                )
                 with self._transcript_lock:
                     self._transcript.append(
                         {
@@ -513,6 +504,7 @@ class LlmHandlerServer:
                             "finish_reason": result["stop_reason"],
                             "streaming": False,
                             "ts": time.time(),
+                            **self._transcript_fields(call_label),
                         }
                     )
                 self._finalize_success(
@@ -547,9 +539,15 @@ class LlmHandlerServer:
         handle = _handle if _handle is not None else self._new_stream_handle(abort_event)
         if abort_event is not None and handle._cancel_event is not abort_event:
             raise ValueError("stream handle and abort event must use the same event")
-        internal_kind = request.get("agency_internal_kind")
-        request = self._prepare_request(request, abort_event=handle._cancel_event)
+        internal_kind = split_tool_schema(request.get("messages") or [])[3].get(
+            "agency_internal_kind"
+        )
         call_label = handle.call_label
+        request = self._prepare_request(
+            request,
+            abort_event=handle._cancel_event,
+            call_label=call_label,
+        )
         self._data_logger.record_event(
             type="agent_state",
             payload={"state": "waiting_llm"},
@@ -719,7 +717,7 @@ class LlmHandlerServer:
             server = http_request.app.state.llm_handler_server
             request = await http_request.json()
             try:
-                if request.get("stream"):
+                if request.pop("stream", False):
                     abort_event = threading.Event()
                     handle = server._new_stream_handle(abort_event)
                     worker, result = server._spawn_http_worker(
@@ -798,19 +796,60 @@ class LlmHandlerServer:
         request: dict,
         *,
         abort_event: "threading.Event | None" = None,
+        call_label: "str | None" = None,
     ) -> dict:
         prepared = copy.deepcopy(request)
-        # Callers wanting a display tag on the recorded exchange (see
-        # _display_tag()/_tag_response_message_for_display() below) must
-        # read this field BEFORE calling _prepare_request -- it's stripped
-        # here because it isn't a real request field any backend
-        # understands; passing it through to a real provider is a bad
-        # request (confirmed directly: litellm rejects it as an unknown
-        # field).
-        prepared.pop("agency_internal_kind", None)
         if abort_event is not None and abort_event.is_set():
             raise _RequestAborted
+        if call_label is not None:
+            # Hash once, right after translation; everything below (the patches,
+            # the record, the committed history) reuses these hashes.
+            self._stage_request(prepared, call_label)
         return prepared
+
+    # ------------------------------------------------------------------
+    # Message hashing and the persistent message_patch_lookup (llm/message_store.py)
+    # ------------------------------------------------------------------
+
+    def _stage_request(self, prepared: dict, call_label: str) -> None:
+        """Hash the harness's (translated) messages, then replace the request's
+        messages with the same messages rebuilt through ``message_patch_lookup``."""
+        harness_messages = prepared.get("messages")
+        if not isinstance(harness_messages, list):
+            return
+        with self._message_store:
+            harness_message_hashes = self._message_store.add_messages(harness_messages)
+            patched_messages = self._message_store.materialize(harness_message_hashes)
+            patched_message_hashes = self._message_store.add_messages(patched_messages)
+        prepared["messages"] = patched_messages
+        with self._call_messages_lock:
+            self._call_messages[call_label] = {
+                "harness_message_hashes": harness_message_hashes,
+                "patched_message_hashes": patched_message_hashes,
+                "harness_messages": harness_messages,
+            }
+
+    def _call_messages_of(self, call_label: "str | None") -> "dict | None":
+        with self._call_messages_lock:
+            return self._call_messages.get(call_label) if call_label is not None else None
+
+    def _tracked_messages(self, call_label: "str | None", request: dict) -> "list[dict]":
+        """The messages the usage tracker should match branches by: what the
+        harness sent, not what ``message_patch_lookup`` turned it into, or a patched
+        prefix would break the match with the harness's next, unpatched request. The
+        ``tool_schema`` message is left out as well: the tools a harness sends can
+        change between the calls of one conversation."""
+        call = self._call_messages_of(call_label)
+        messages = call["harness_messages"] if call is not None else request["messages"]
+        return split_tool_schema(messages)[0]
+
+    def _transcript_fields(self, call_label: "str | None") -> dict:
+        """What every transcript entry carries besides request and response."""
+        fields: dict = {"call_label": call_label}
+        call = self._call_messages_of(call_label)
+        if call is not None:
+            fields["harness_message_hashes"] = call["harness_message_hashes"]
+        return fields
 
     def _finalize_terminal(
         self,
@@ -820,69 +859,29 @@ class LlmHandlerServer:
         error: "BaseException | None" = None,
     ) -> None:
         """Record this exchange's non-success outcome. No prompt is
-        captured here (matching prior behavior) -- only a single synthetic
-        marker block on the response chain."""
+        captured here (matching prior behavior) -- the response is one
+        assistant message holding a single ``error`` or ``cancelled`` block."""
         agname = getattr(self._data_logger, "_default_name", None)
         if kind == "cancelled":
-            marker = {"cancelled": True}
+            block = {"type": "cancelled", "index": 0}
             suffix = "cancelled"
         else:
             suffix = f"{type(error).__name__}: {error}"
-            marker = {"error": suffix}
+            block = {"type": "error", "index": 0, "error": suffix}
+        with self._message_store:
+            response_message_hashes = [
+                self._message_store.add_message({"role": "assistant", "blocks": [block]})
+            ]
         self._data_logger.record_llm_exchange(
             call_label,
             exchange_type=f"llm_stream_{kind}",
-            prompt_chain=[],
-            response_chain=[(_payload_hash(marker), marker)],
+            message_store=self._message_store,
+            harness_message_hashes=[],
+            patched_message_hashes=[],
+            response_message_hashes=response_message_hashes,
             term_message=f"[{agname}] LLM    ✗  {suffix}",
             print_to_terminal=False,
         )
-
-    def _prompt_chain(self, request: dict) -> "list[tuple[str, dict]]":
-        """This exchange's *complete* prompt, as an ordered list of
-        (content hash, payload) pairs -- covers every block the request
-        carries, not just `messages`."""
-        candidates: "list[dict]" = []
-        for message in request.get("messages") or []:
-            role = message.get("role")
-            for block in message.get("blocks") or []:
-                candidates.append({"role": role, **block})
-        for tool in request.get("tools") or []:
-            function = tool.get("function") or {}
-            candidates.append(
-                {
-                    "role": "tool_schema",
-                    "type": "tool_definition",
-                    "name": function.get("name", ""),
-                    "description": function.get("description", ""),
-                    "parameters": function.get("parameters"),
-                }
-            )
-        if request.get("tool_choice") is not None:
-            candidates.append(
-                {"role": "tool_schema", "type": "tool_choice", "value": request["tool_choice"]}
-            )
-        # Catch-all for any field this function doesn't know to name yet --
-        # same reasoning as llm.request_extra on the span side: an unnamed
-        # field caused exactly this kind of silent gap once already, so a
-        # *new* one must show up here too instead of requiring someone to
-        # notice and hand-add it to the list above first.
-        known_keys = {"messages", "tools", "tool_choice"}
-        request_extra = {k: v for k, v in request.items() if k not in known_keys}
-        if request_extra:
-            candidates.append(
-                {"role": "tool_schema", "type": "request_extra", "value": request_extra}
-            )
-        return [(_payload_hash(payload), payload) for payload in candidates]
-
-    def _response_chain(self, response_message: "dict | None") -> "list[tuple[str, dict]]":
-        """This exchange's *complete* response, as an ordered list of
-        (content hash, payload) pairs."""
-        if response_message is None:
-            return []
-        role = response_message.get("role", "assistant")
-        candidates = [{"role": role, **block} for block in response_message.get("blocks") or []]
-        return [(_payload_hash(payload), payload) for payload in candidates]
 
     def _finalize_success(
         self,
@@ -895,14 +894,28 @@ class LlmHandlerServer:
         tag = _display_tag(internal_kind)
         if tag is not None:
             response_message = _tag_response_message_for_display(response_message, tag)
-        prompt_chain = self._prompt_chain(request)
-        response_chain = self._response_chain(response_message)
-        if prompt_chain or response_chain:
+        call = self._call_messages_of(call_label)
+        with self._message_store:
+            if call is not None:
+                harness_message_hashes = call["harness_message_hashes"]
+                patched_message_hashes = call["patched_message_hashes"]
+            else:
+                harness_message_hashes = patched_message_hashes = self._message_store.add_messages(
+                    request.get("messages") or []
+                )
+            response_message_hashes = (
+                [self._message_store.add_message(response_message)]
+                if response_message is not None
+                else []
+            )
+        if patched_message_hashes or response_message_hashes:
             self._data_logger.record_llm_exchange(
                 call_label,
                 exchange_type="llm_block",
-                prompt_chain=prompt_chain,
-                response_chain=response_chain,
+                message_store=self._message_store,
+                harness_message_hashes=harness_message_hashes,
+                patched_message_hashes=patched_message_hashes,
+                response_message_hashes=response_message_hashes,
             )
 
     def _run_stream_producer(
@@ -914,6 +927,7 @@ class LlmHandlerServer:
         from ...observability.profiler import agprof
 
         finalized = False
+        entry_fields = self._transcript_fields(handle.call_label)
 
         def finalize_error(error: BaseException) -> None:
             nonlocal finalized
@@ -981,7 +995,6 @@ class LlmHandlerServer:
                     provider=type(self._backend).__name__,
                     call_label=handle.call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
-                    **_request_profile_metadata(request),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -1003,6 +1016,7 @@ class LlmHandlerServer:
                         request=request,
                         response=empty_message,
                         streaming=False,
+                        **entry_fields,
                     )
                     if not enqueued:
                         finalize_cancelled()
@@ -1025,7 +1039,7 @@ class LlmHandlerServer:
                 _annotate(attempt_span, ttft_ms=ttft_ms)
 
                 handle.register_stream_exchange(
-                    request=request, response={"role": "assistant", "blocks": []}
+                    request=request, response={"role": "assistant", "blocks": []}, **entry_fields
                 )
                 blocks: "dict[int, dict]" = {}
                 usage = None
@@ -1134,7 +1148,9 @@ class LlmHandlerServer:
                 if not enqueued:
                     finalize_cancelled()
                     return
-                self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms)
+                self._tag_metadata_block(
+                    self._tracked_messages(handle.call_label, request), message, ttft_ms=ttft_ms
+                )
                 finalize_success(message)
         except BaseException as e:
             if not finalized:

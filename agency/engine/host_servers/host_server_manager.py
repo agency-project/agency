@@ -20,6 +20,7 @@ from .host_mcp_server import HostMcpServer, bind_data_logger_for_current_thread
 from .llm_handler_server import LlmHandlerServer
 
 if TYPE_CHECKING:
+    from ...agcontext import agcontext
     from ...configs.agconfig import agconfig as agconfig_cls
     from ...agent import agent
     from ...orchestrator.agresources import agResourcePool
@@ -76,6 +77,7 @@ class HostServerManager:
         *,
         is_cancelled: "Callable[[], bool] | None" = None,
         request_id: "str | None" = None,
+        context: "agcontext | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
@@ -89,6 +91,7 @@ class HostServerManager:
             parent_context=agprof.current_span_context(),
             request_id=request_id,
             skill_name=skill.name,
+            context=context,
         )
         self._interaction_server = HostInteractionServer(
             skill,

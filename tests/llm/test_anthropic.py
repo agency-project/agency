@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import httpx
 
+from agency.llm.message_store import with_tool_schema
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.anthropic import (
     _AnthropicBackend,
@@ -816,8 +817,10 @@ class TestFormatContextAgencyToBackend:
         )
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
-                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "messages": with_tool_schema(
+                    [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                    [{"type": "function", "function": {"name": "f"}}],
+                )
             }
         )
         assert kwargs == {
@@ -856,9 +859,11 @@ class TestFormatContextAgencyToBackend:
         backend = _AnthropicBackend(_cfg(model=model))
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
-                "tools": [{"type": "function", "function": {"name": "f"}}],
-                "tool_choice": "auto",
+                "messages": with_tool_schema(
+                    [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                    [{"type": "function", "function": {"name": "f"}}],
+                    "auto",
+                )
             }
         )
         assert kwargs["model"] == model
@@ -976,7 +981,7 @@ class TestFormatContextAgencyToBackend:
     def test_tool_choice_included_when_given(self):
         backend = _AnthropicBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [_text_msg("user", "x")], "tool_choice": "auto"}
+            {"messages": with_tool_schema([_text_msg("user", "x")], tool_choice="auto")}
         )
         assert kwargs["tool_choice"] == {"type": "auto"}
 
@@ -1478,9 +1483,7 @@ def fresh_warnings(monkeypatch):
 
 def _kwargs(model, tool_choice=None, **llm_fields):
     backend = _AnthropicBackend(_cfg(model=model, **llm_fields))
-    request = {"messages": [_text_msg("user", "call f")], "tools": _TOOLS}
-    if tool_choice is not None:
-        request["tool_choice"] = tool_choice
+    request = {"messages": with_tool_schema([_text_msg("user", "call f")], _TOOLS, tool_choice)}
     return backend._format_context_agency_to_backend(request)
 
 

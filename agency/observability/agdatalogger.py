@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..configs.agconfig import agconfig as agconfig_cls
+    from ..llm.message_store import MessageStore
 
 
 def _ts() -> str:
@@ -52,6 +53,9 @@ class agDataLogger:
         self._block_rows: list[tuple] = []
         self._exchange_rows: list[tuple] = []
         self._exchange_chain_rows: list[tuple] = []
+        self._message_structure_rows: list[tuple] = []
+        self._per_exchange_message_rows: list[tuple] = []
+        self._patch_rows: list[tuple] = []
         self._pending_count = 0
         self._last_flush_ts = 0.0
 
@@ -252,22 +256,59 @@ class agDataLogger:
         call_label: str,
         *,
         exchange_type: str,
-        prompt_chain: "list[tuple[str, dict]]",
-        response_chain: "list[tuple[str, dict]]",
+        message_store: "MessageStore",
+        harness_message_hashes: "list[str]",
+        patched_message_hashes: "list[str]",
+        response_message_hashes: "list[str]",
         name: "str | None" = None,
         object: "str | None" = None,
         term_message: "str | None" = None,
         print_to_terminal: bool = True,
     ) -> None:
         """Atomically clear every `stream_deltas` row for *call_label* (both
-        already-flushed and still-pending), store each distinct block
-        exactly once in the agent-global `blocks` table (keyed by content
-        hash)."""
+        already-flushed and still-pending), then record the exchange by message
+        hash, reading each hash from *message_store*'s lookups.
+
+        `message_structure_lookup` gets the record of each message of
+        *patched_message_hashes* (the prompt, as sent to the LLM backend) and
+        *response_message_hashes*, and `per_exchange_messages` their order. Each
+        distinct block of those messages is stored exactly once in the agent-global
+        `message_block_lookup` table (keyed by content hash), and `exchange_chain`
+        lists the blocks of the prompt and of the response in order. A block of
+        *harness_message_hashes* (what the harness sent) that is a key of the
+        store's `message_patch_lookup` was replaced in the prompt; the replacement is
+        kept in this database's `message_patch_lookup`, one row per replacement
+        block (a removed block is one row with a NULL `replacement_hash`), with the
+        blocks on both sides in `message_block_lookup`."""
         timestamp = time.time()
         name = self._default_name if name is None else name
         object = self._default_object if object is None else object
         if term_message is not None and print_to_terminal:
             print(_term_line(timestamp, term_message), file=sys.stderr)
+        with message_store:
+            blocks = message_store.message_block_lookup
+            structure = message_store.message_structure_lookup
+            patches = message_store.message_patch_lookup
+
+            prompt_messages = [(h, structure[h]) for h in patched_message_hashes]
+            response_messages = [(h, structure[h]) for h in response_message_hashes]
+            prompt_chain, response_chain = (
+                [
+                    (block_hash, blocks[block_hash])
+                    for _digest, record in messages
+                    for block_hash in record.get("blocks") or ()
+                ]
+                for messages in (prompt_messages, response_messages)
+            )
+            matched = dict.fromkeys(
+                block_hash
+                for message_hash in harness_message_hashes
+                for block_hash in structure[message_hash].get("blocks") or ()
+                if block_hash in patches
+            )
+            applied_patches = [
+                (key, blocks[key], [(h, blocks[h]) for h in patches[key]]) for key in matched
+            ]
         with self._lock:
             self._stream_delta_rows = [
                 row for row in self._stream_delta_rows if row[5] != call_label
@@ -288,6 +329,22 @@ class agDataLogger:
             for kind, chain in (("prompt", prompt_chain), ("response", response_chain)):
                 for seq, (digest, _payload) in enumerate(chain):
                     self._exchange_chain_rows.append((call_label, kind, seq, digest))
+            for kind, messages in (("prompt", prompt_messages), ("response", response_messages)):
+                for seq, (digest, record) in enumerate(messages):
+                    self._message_structure_rows.append(
+                        (digest, json.dumps(record), call_label, timestamp)
+                    )
+                    self._per_exchange_message_rows.append((call_label, kind, seq, digest))
+            for original_hash, original_payload, replacement in applied_patches:
+                self._block_rows.append(
+                    (original_hash, json.dumps(original_payload), call_label, timestamp)
+                )
+                for digest, payload in replacement:
+                    self._block_rows.append((digest, json.dumps(payload), call_label, timestamp))
+                if not replacement:
+                    self._patch_rows.append((call_label, original_hash, 0, None))
+                for seq, (digest, _payload) in enumerate(replacement):
+                    self._patch_rows.append((call_label, original_hash, seq, digest))
             self._pending_count += 1
             self._flush_locked()
             if self._conn is not None:
@@ -451,15 +508,15 @@ class agDataLogger:
             "CREATE INDEX IF NOT EXISTS idx_stream_deltas_call_label ON stream_deltas(call_label)"
         )
         # Content-addressable LLM transcript storage: each distinct block is
-        # stored once in `blocks`, keyed by its content hash (computed by
-        # the caller -- see `_payload_hash` in llm_handler_server.py); each
+        # stored once in `message_block_lookup`, keyed by its content hash (computed by
+        # the caller -- see `content_hash` in llm/message_store.py); each
         # exchange (one LLM dispatch/stream attempt, keyed by `call_label`)
         # references its full prompt and response as two ordered chains of
         # hashes into that shared store, rather than duplicating block
         # content per exchange.
         self._conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS blocks (
+            CREATE TABLE IF NOT EXISTS message_block_lookup (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hash TEXT NOT NULL UNIQUE,
                 payload TEXT NOT NULL,
@@ -496,6 +553,48 @@ class agDataLogger:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_exchange_chain_label ON exchange_chain(call_label)"
         )
+        # The same exchanges at message granularity: `message_structure_lookup`
+        # holds one record per distinct message ({"role", "blocks": [block hashes], ...}),
+        # `per_exchange_messages` orders them per exchange. With `message_block_lookup` this is
+        # enough to rebuild every request and response exactly.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_structure_lookup (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hash TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                call_label TEXT,
+                timestamp REAL NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS per_exchange_messages (
+                call_label TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                PRIMARY KEY (call_label, kind, seq)
+            )
+            """
+        )
+        # The persistent patches an exchange's request went through: each
+        # original block hash maps, in order, to the hashes of the blocks that
+        # stood in for it (several rows = several replacement blocks; one row
+        # with a NULL `replacement_hash` = the block was removed). Both sides
+        # are rows of `message_block_lookup`.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_patch_lookup (
+                call_label TEXT NOT NULL,
+                original_hash TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                replacement_hash TEXT,
+                PRIMARY KEY (call_label, original_hash, seq)
+            )
+            """
+        )
         self._conn.commit()
 
     def _maybe_flush_locked(self) -> None:
@@ -517,6 +616,9 @@ class agDataLogger:
             and not self._block_rows
             and not self._exchange_rows
             and not self._exchange_chain_rows
+            and not self._message_structure_rows
+            and not self._per_exchange_message_rows
+            and not self._patch_rows
         ):
             self._last_flush_ts = time.time()
             return
@@ -563,7 +665,7 @@ class agDataLogger:
                 # first produced this content, and `id` order is still
                 # exactly first-seen order).
                 self._conn.executemany(
-                    "INSERT OR IGNORE INTO blocks (hash, payload, call_label, timestamp) "
+                    "INSERT OR IGNORE INTO message_block_lookup (hash, payload, call_label, timestamp) "
                     "VALUES (?, ?, ?, ?)",
                     self._block_rows,
                 )
@@ -578,6 +680,24 @@ class agDataLogger:
                     "INSERT INTO exchange_chain (call_label, kind, seq, hash) VALUES (?, ?, ?, ?)",
                     self._exchange_chain_rows,
                 )
+            if self._message_structure_rows:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO message_structure_lookup (hash, payload, call_label, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    self._message_structure_rows,
+                )
+            if self._per_exchange_message_rows:
+                self._conn.executemany(
+                    "INSERT INTO per_exchange_messages (call_label, kind, seq, hash) "
+                    "VALUES (?, ?, ?, ?)",
+                    self._per_exchange_message_rows,
+                )
+            if self._patch_rows:
+                self._conn.executemany(
+                    "INSERT INTO message_patch_lookup "
+                    "(call_label, original_hash, seq, replacement_hash) VALUES (?, ?, ?, ?)",
+                    self._patch_rows,
+                )
         self._event_rows.clear()
         self._span_rows.clear()
         self._latest_value_rows.clear()
@@ -585,6 +705,9 @@ class agDataLogger:
         self._block_rows.clear()
         self._exchange_rows.clear()
         self._exchange_chain_rows.clear()
+        self._message_structure_rows.clear()
+        self._per_exchange_message_rows.clear()
+        self._patch_rows.clear()
         self._pending_count = 0
         self._last_flush_ts = time.time()
 
@@ -593,14 +716,14 @@ def reconstruct_llm_exchanges(
     connection: "sqlite3.Connection", exchange_type: "str | None" = None
 ) -> "list[dict]":
     """Read every recorded LLM exchange back out of *connection*'s
-    `exchanges`/`exchange_chain`/`blocks` tables, in the order they were
+    `exchanges`/`exchange_chain`/`message_block_lookup` tables, in the order they were
     recorded, joining each exchange's hash chains back into ordered prompt
     and response block lists. Pass *exchange_type* (e.g. ``"llm_block"``)
     to filter to one exchange type; omitted, all types (including
     ``"llm_stream_error"``/``"llm_stream_cancelled"``) are returned.
 
     Shared by every reader of this schema (the mock replay backend,
-    agwebui) so the exchanges/exchange_chain/blocks join logic exists in
+    agwebui) so the exchanges/exchange_chain/message_block_lookup join logic exists in
     exactly one place."""
     query = "SELECT call_label, id, type, timestamp, name, object, term_message FROM exchanges"
     params: tuple = ()
@@ -611,8 +734,9 @@ def reconstruct_llm_exchanges(
     exchange_rows = connection.execute(query, params).fetchall()
 
     chain_rows = connection.execute(
-        "SELECT exchange_chain.call_label, exchange_chain.kind, blocks.payload "
-        "FROM exchange_chain JOIN blocks ON blocks.hash = exchange_chain.hash "
+        "SELECT exchange_chain.call_label, exchange_chain.kind, message_block_lookup.payload "
+        "FROM exchange_chain JOIN message_block_lookup "
+        "ON message_block_lookup.hash = exchange_chain.hash "
         "ORDER BY exchange_chain.call_label, exchange_chain.kind, exchange_chain.seq"
     ).fetchall()
     chains: "dict[str, dict[str, list[dict]]]" = {}
@@ -637,6 +761,65 @@ def reconstruct_llm_exchanges(
             }
         )
     return exchanges
+
+
+def reconstruct_llm_messages(
+    connection: "sqlite3.Connection", call_label: str, kind: str = "prompt"
+) -> "list[dict]":
+    """Rebuild one exchange's *prompt* or *response* as the exact message list
+    that was recorded, from `per_exchange_messages`/`message_structure_lookup`/`message_block_lookup`."""
+    from ..llm.message_store import MessageStore
+
+    rows = connection.execute(
+        "SELECT message_structure_lookup.hash, message_structure_lookup.payload "
+        "FROM per_exchange_messages "
+        "JOIN message_structure_lookup "
+        "ON message_structure_lookup.hash = per_exchange_messages.hash "
+        "WHERE per_exchange_messages.call_label = ? AND per_exchange_messages.kind = ? "
+        "ORDER BY per_exchange_messages.seq",
+        (call_label, kind),
+    ).fetchall()
+    store = MessageStore()
+    ordered = []
+    for digest, payload in rows:
+        record = json.loads(payload)
+        store.message_structure_lookup[digest] = record
+        ordered.append(digest)
+        for block_hash in record.get("blocks") or []:
+            if block_hash not in store.message_block_lookup:
+                (block_json,) = connection.execute(
+                    "SELECT payload FROM message_block_lookup WHERE hash = ?", (block_hash,)
+                ).fetchone()
+                store.message_block_lookup[block_hash] = json.loads(block_json)
+    return store.materialize(ordered)
+
+
+def reconstruct_llm_patches(connection: "sqlite3.Connection", call_label: str) -> "list[dict]":
+    """The persistent patches applied to one exchange's request, as
+    ``{"original": block, "replacement": [block, ...], "original_hash": ...}``
+    (blocks without their role; an empty replacement means the block was removed)."""
+    from ..llm.message_store import block_of
+
+    def block(digest: str) -> dict:
+        (payload,) = connection.execute(
+            "SELECT payload FROM message_block_lookup WHERE hash = ?", (digest,)
+        ).fetchone()
+        return block_of(json.loads(payload))
+
+    rows = connection.execute(
+        "SELECT original_hash, replacement_hash FROM message_patch_lookup "
+        "WHERE call_label = ? ORDER BY rowid",
+        (call_label,),
+    ).fetchall()
+    patches: "dict[str, dict]" = {}
+    for original_hash, replacement_hash in rows:
+        entry = patches.setdefault(
+            original_hash,
+            {"original_hash": original_hash, "original": block(original_hash), "replacement": []},
+        )
+        if replacement_hash is not None:
+            entry["replacement"].append(block(replacement_hash))
+    return list(patches.values())
 
 
 def read_llm_exchanges(db_path: str, exchange_type: "str | None" = None) -> "list[dict]":

@@ -54,6 +54,7 @@ from .observability.profiler import agprof
 
 if TYPE_CHECKING:
     from .engine import AgentEngine
+    from .llm.message_store import MessageBlock
 
 
 def _resolve_agent_directory(agconfig: "agconfig_cls | None", field: str, classvar_default):
@@ -372,22 +373,47 @@ class agent:
 
         return handle if _is_ready(handle) else None
 
-    def pause(self) -> None:
-        """Pause this agent's harness at the OS-process level"""
+    def pause(self, timeout_s: float = 10.0, *, async_: bool = False) -> None:
+        """Pause this agent's harness at the OS-process level.
+
+        Synchronous by default: returns only once the harness is actually
+        stopped, not merely signalled. Raises ``TimeoutError`` if it is not
+        stopped within ``timeout_s``; the pause then stays requested, so
+        ``resume()`` still undoes it. With no harness process running, it
+        returns at once and the next one starts stopped.
+
+        ``async_=True`` only requests the stop and returns immediately,
+        without waiting to find out whether the harness actually parked (so
+        it never raises ``TimeoutError``, and ``timeout_s`` is unused)."""
+        not_parked = False
+        parked: "bool | None" = True
         with self._control_lock:
             self._paused = True
             handle = self._daemon_handle()
             if handle is not None:
                 try:
-                    with handle.client(timeout_s=10) as client:
-                        client.pause_harness()
+                    if async_:
+                        with handle.client(timeout_s=10) as client:
+                            client.pause_harness()
+                        parked = None  # requested only; not waited on
+                    else:
+                        with handle.client(timeout_s=timeout_s + 10) as client:
+                            ack = client.pause_harness(wait_timeout_s=timeout_s)
+                        if isinstance(ack, dict) and ack.get("parked") is False:
+                            not_parked = True
+                            parked = False
                 except Exception as exc:
                     print(f"[agent] WARNING: pause_harness() failed for {self.agname}: {exc}")
         self.data_logger.record_event(
             type="agent_paused",
-            payload={"agname": self.agname},
+            payload={"agname": self.agname, "parked": parked},
             term_message=f"[{self.agname}] PAUSE ▶  requested",
         )
+        if not_parked:
+            raise TimeoutError(
+                f"{self.agname}: harness was not stopped within {timeout_s}s "
+                "(still pause-requested; call resume() to undo)"
+            )
 
     def resume(self) -> None:
         with self._control_lock:
@@ -467,6 +493,42 @@ class agent:
         if not message.strip():
             raise ValueError("message must be a non-empty string")
         self._orchestrator.submit_context_message(self, message)
+
+    def patch_history(self, old_block: "MessageBlock", new_blocks: "list[MessageBlock]") -> str:
+        """Persistently replace one message block in everything this agent sends.
+
+        Every block equal to *old_block* (a ``MessageBlock``: the block as the
+        harness sends it, with the role of its message) is replaced by
+        *new_blocks* -- none removes it. The replacement is applied to each LLM
+        request just before it is sent and again whenever ``history`` is rebuilt,
+        in every later skill run, however often the harness resends the original.
+        Like ``queue_message`` it is ordered after submissions already made. If a
+        skill run of this agent is active it is also applied to that skill run at
+        once, so it lands at the next LLM call (call ``pause()`` first and
+        ``resume()`` after to choose which one). Returns the key, which is
+        ``old_block.hash``, for ``remove_history_patch``.
+        See docs/Message_Patches.md."""
+        from .llm.message_store import MessageBlock
+
+        if not isinstance(old_block, MessageBlock):
+            raise TypeError("old_block must be a MessageBlock")
+        if not isinstance(new_blocks, list) or not all(
+            isinstance(block, MessageBlock) for block in new_blocks
+        ):
+            raise TypeError("new_blocks must be a list of MessageBlock")
+        self._orchestrator.submit_context_patch(
+            self,
+            {"op": "add", "old": old_block, "new": list(new_blocks)},
+        )
+        return old_block.hash
+
+    def remove_history_patch(self, key: str) -> None:
+        """Withdraw a patch made with ``patch_history``."""
+        self._orchestrator.submit_context_patch(self, {"op": "remove", "key": key})
+
+    def clear_history_patches(self) -> None:
+        """Withdraw every patch."""
+        self._orchestrator.submit_context_patch(self, {"op": "clear"})
 
     def run(self, skill, skill_input: agdata, max_steps: "int | None" = None) -> agdata:
         """Submit ready work and immediately return its bare result agdata."""
@@ -649,7 +711,7 @@ class agent:
                 "parent_agent_id": self._parent_agent_id,
                 "harness": self.harness,
                 "llm_config": _llm_config_snapshot(self.agconfig),
-                "history": checkpoint_context.recent_transcript,
+                **checkpoint_context.message_state(),
                 "ts": _ts(),
             }
             if sandbox is not None and sandbox._checkpoint_image is not None:
@@ -756,7 +818,7 @@ class agent:
         ag.agconfig.agent.harness = ag.harness  # keep config snapshot consistent
         ag.engine = None
         ag.context = agcontext(
-            recent_transcript=list(state.get("history", [])),
+            **agcontext.message_state_fields(state),
             harness_sessions=state.get("harness_sessions", {}),
             retained_messages=state.get("retained_messages", []),
             harness_message_cursors=state.get("harness_message_cursors", {}),

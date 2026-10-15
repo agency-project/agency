@@ -101,6 +101,9 @@ class HostServicesClient:
             raise RuntimeError("no active upstream attempt token")
         return {ATTEMPT_TOKEN_HEADER: upstream}
 
+    def _dispatch_headers(self, token: str) -> dict[str, str]:
+        return self._attempt_headers(token)
+
     def quiesce_connections(self) -> None:
         """Remove host-external sockets before a container-level CRIU dump."""
         self.client.close()
@@ -227,7 +230,7 @@ class HostServicesClient:
         resp = self.client.post(
             f"/{mount}/dispatch",
             json=agency_context,
-            headers=self._attempt_headers(token),
+            headers=self._dispatch_headers(token),
         )
         if resp.status_code != 200:
             raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
@@ -238,7 +241,7 @@ class HostServicesClient:
             "POST",
             f"/{mount}/dispatch",
             json={**agency_context, "stream": True},
-            headers=self._attempt_headers(token),
+            headers=self._dispatch_headers(token),
         ) as resp:
             if resp.status_code != 200:
                 resp.read()
@@ -263,7 +266,7 @@ class HostServicesClient:
                 "POST",
                 f"/{mount}/dispatch",
                 json={**agency_context, "stream": True},
-                headers=self._attempt_headers(token),
+                headers=self._dispatch_headers(token),
             ) as response:
                 if response.is_error:
                     await response.aread()

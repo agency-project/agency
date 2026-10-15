@@ -111,7 +111,16 @@ class HarnessInteractionServer:
                     return JSONResponse({"error": "missing request_id"}, status_code=400)
                 self._control_handler(action, request_id=request_id)
             else:
-                self._control_handler(action)
+                wait_timeout_s = (
+                    (payload or {}).get("wait_timeout_s") if action == "pause" else None
+                )
+                if wait_timeout_s is not None:
+                    # Synchronous pause: reply only once the harness is stopped.
+                    result = self._control_handler(action, wait_timeout_s=float(wait_timeout_s))
+                else:
+                    result = self._control_handler(action)
+                if isinstance(result, dict):
+                    return JSONResponse({"ok": True, **result})
             return JSONResponse({"ok": True})
 
         @app.post("/lifecycle/{action}")

@@ -584,15 +584,24 @@ class HarnessManager:
                 print(f"[harness_daemon] WARNING: redirect delivery failed: {exc}")
                 return False
 
-    def control(self, action: str, *, request_id: str | None = None) -> None:
+    def control(
+        self,
+        action: str,
+        *,
+        request_id: str | None = None,
+        wait_timeout_s: "float | None" = None,
+    ) -> "dict | None":
         """Backs HarnessInteractionServer's /control/{action} route.
         No-op (not an error) when nothing is currently registered -- see
-        agent.py's cancel()/pause()/resume() for why that's safe."""
+        agent.py's cancel()/pause()/resume() for why that's safe.
+
+        ``pause`` with a ``wait_timeout_s`` is synchronous: it returns only
+        once the harness is actually stopped, as ``{"parked": bool}``."""
         with self._control_lock:
             if action == "cancel" and (
                 request_id is None or request_id != self._current_request_id
             ):
-                return
+                return None
             if action == "cancel":
                 self._current_request_cancelled = True
             if action == "pause":
@@ -602,16 +611,27 @@ class HarnessManager:
             handle = self._current_control_handle
             # A pause cannot begin midway through redirect's native input wait:
             # resume would otherwise block on this lock while input stayed frozen.
-            if handle is None:
-                return
-            if action == "pause":
-                handle.pause()
-            elif action == "resume":
-                handle.resume()
-            elif action == "cancel":
-                handle.kill()
-            else:
-                raise ValueError(f"unknown harness control action {action!r}")
+            if handle is not None:
+                if action == "pause":
+                    handle.pause()
+                elif action == "resume":
+                    handle.resume()
+                elif action == "cancel":
+                    handle.kill()
+                else:
+                    raise ValueError(f"unknown harness control action {action!r}")
+        if action == "pause" and wait_timeout_s is not None:
+            # Outside the control lock: cancel and resume must stay deliverable
+            # while this waits.
+            return self._await_pause(handle, wait_timeout_s)
+        return None
+
+    def _await_pause(self, handle: object, timeout_s: float) -> dict:
+        parked = True
+        waiter = getattr(handle, "wait_paused", None) if handle is not None else None
+        if callable(waiter):
+            parked = bool(waiter(timeout_s))
+        return {"parked": parked}
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token

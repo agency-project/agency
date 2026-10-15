@@ -98,6 +98,8 @@ third.wait()
 | `await ag.asyncio_run(skill, skill_input, max_steps=None)` | Submit work and await the resolved result. |
 | `ag.redirect(result, message)` | Deliver to that active execution or queue future context. |
 | `ag.queue_message(message)` | Enqueue ordered future context. |
+| `ag.patch_history(old_block, new_blocks)` | Replace a message block in everything sent to the LLM backend, including the active skill run's next call; returns a key. See [docs/Message_Patches.md](docs/Message_Patches.md). |
+| `ag.remove_history_patch(key)` / `ag.clear_history_patches()` | Withdraw one patch or all of them. |
 | `ag.pause()` | Freeze the current harness process and hold subsequently launched harnesses paused until resumed. |
 | `ag.resume()` | Resume the harness and clear the persistent pause request. |
 | `ag.is_paused()` | Report whether pause was requested. |
@@ -200,6 +202,7 @@ For Claude models on Bedrock, stick to the fields listed under **Anthropic** abo
 | [`08_checkpoints.py`](examples/08_checkpoints.py) | Single-agent and registry-wide save/load. |
 | [`09_observability.py`](examples/09_observability.py) | Orchestrator snapshots, event logs, state, and profiling. |
 | [`10_harnesses_and_webui.py`](examples/10_harnesses_and_webui.py) | Codex/native harness interchangeability and the Web UI. |
+| [`11_context_manipulation.py`](examples/11_context_manipulation.py) | `patch_history`: rewrite message blocks between skill runs or at an exact LLM call with `pause`/`resume`. |
 
 See [`examples/README.md`](examples/README.md) for more details on each example.
 

@@ -123,7 +123,6 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
     seen = {}
 
     def execute(self, *, context, is_cancelled, **_kwargs):
-        context.recent_transcript.append({"role": "assistant", "content": "uncommitted mutation"})
         entered_engine.set()
         assert enter_boundary.wait(timeout=2)
         cancelled = is_cancelled()
@@ -136,7 +135,7 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
     monkeypatch.setattr(AgentEngine, "execute", execute)
     ag = _agent(tmp_path)
     seed = [{"role": "user", "content": "committed"}]
-    ag.context = agcontext(recent_transcript=seed)
+    ag.context = agcontext.from_messages(seed)
     invocation = ag.run(agskill("controlled", ""), agdata())
     assert entered_engine.wait(timeout=2)
     request = _request_for(invocation)
@@ -156,6 +155,6 @@ def test_running_invocation_cancel_is_observed_by_its_exact_safe_boundary(monkey
     _terminal_error(invocation, "agent invocation cancelled")
     assert callback_finished.wait(timeout=2)
     assert seen["cancelled"] is True
-    assert request.context_future.result().recent_transcript == seed
+    assert request.context_future.result().get_resolved_transcript() == seed
     assert request.context_future.result().retained_messages == []
     assert ag.history.messages == seed

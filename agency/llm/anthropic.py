@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import httpx
 
 from .agllm import agllm
+from .message_store import split_tool_schema
 from .openai_responses import ENCRYPTED_REASONING_TAG
 
 try:
@@ -558,7 +559,8 @@ class _AnthropicBackend(agllm):
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         model = self.agconfig.llm.model or ""
         info = _anthropic_model_info(model)
-        system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        system, anthropic_messages = _agency_messages_to_anthropic(messages)
         kwargs: dict = dict(
             model=model,
             messages=anthropic_messages,
@@ -590,11 +592,11 @@ class _AnthropicBackend(agllm):
         effort = _effort_for_model(self.agconfig.llm.reasoning_effort, model, info)
         if effort is not None:
             kwargs["output_config"] = {"effort": effort}
-        anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
+        anthropic_tools = _agency_tools_to_anthropic(tools)
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
         anthropic_tool_choice = _tool_choice_for_model(
-            _agency_tool_choice_to_anthropic(request.get("tool_choice")), model, info
+            _agency_tool_choice_to_anthropic(tool_choice), model, info
         )
         if anthropic_tool_choice is not None:
             kwargs["tool_choice"] = anthropic_tool_choice

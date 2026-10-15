@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +17,7 @@ from agency.llm.mock import (
     poisson_timing,
 )
 from agency.observability.agdatalogger import agDataLogger
+from tests.exchange_helpers import record_exchange
 
 
 def _make_source_db(db_path: Path) -> agDataLogger:
@@ -27,30 +26,24 @@ def _make_source_db(db_path: Path) -> agDataLogger:
     return logger
 
 
-def _response_chain(payloads: "list[dict]") -> "list[tuple[str, dict]]":
-    """Build a response chain from a flat payload list, hashing each block
-    deterministically. This module doesn't need `_payload_hash`'s
-    identity-normalization rules (tool_use/tool_result/text-by-content
-    dedup) -- any unique, deterministic key works for seeding a source
-    db, since these fixtures never repeat a block across exchanges."""
-    return [
-        (hashlib.sha256(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest(), p)
-        for p in payloads
-    ]
-
-
 def _seed_exchange(
     logger: agDataLogger, call_label: str, exchange_type: str, payloads: list
 ) -> None:
     """Record one exchange into a source db the way a real run's
-    `LlmHandlerServer` would -- as a response-only chain (these fixtures
-    represent recorded model output, never a captured prompt)."""
-    logger.record_llm_exchange(
+    `LlmHandlerServer` would -- as one assistant response message (these
+    fixtures represent recorded model output, never a captured prompt)."""
+    record_exchange(
+        logger,
         call_label,
         exchange_type=exchange_type,
-        prompt_chain=[],
-        response_chain=_response_chain(payloads),
+        response=[{"role": "assistant", "blocks": payloads}],
     )
+
+
+def _replayed(blocks: "list[dict]") -> "list[dict]":
+    """The blocks a replay returns for *blocks* seeded by `_seed_exchange`: each
+    comes back as the data logger stored it, with its message's role."""
+    return [{"role": "assistant", **block} for block in blocks]
 
 
 _TEXT_EXCHANGE = [
@@ -147,7 +140,7 @@ def test_replay_dispatch_hook_gates_response_after_config_clone(tmp_path, stream
     if streaming:
         assert "".join(item.get("text", "") for item in result) == _TEXT_EXCHANGE[0]["text"]
     else:
-        assert result["message"]["blocks"] == _TEXT_EXCHANGE
+        assert result["message"]["blocks"] == _replayed(_TEXT_EXCHANGE)
 
 
 class TestReplayOrderingAndDispatch:
@@ -227,17 +220,22 @@ class TestReplayOrderingAndDispatch:
             "index": 0,
             "text": "resent history that must never leak into the replayed response",
         }
-        logger.record_llm_exchange(
+        record_exchange(
+            logger,
             "call1",
-            exchange_type="llm_block",
-            prompt_chain=_response_chain([colliding_prompt_block]),
-            response_chain=_response_chain(_TOOL_EXCHANGE),
+            prompt=[
+                {
+                    "role": colliding_prompt_block["role"],
+                    "blocks": [{k: v for k, v in colliding_prompt_block.items() if k != "role"}],
+                }
+            ],
+            response=[{"role": "assistant", "blocks": _TOOL_EXCHANGE}],
         )
         logger.stop()
 
         backend = _mock_backend(db_path)
         result = backend.dispatch({"messages": []})
-        assert result["message"]["blocks"] == _TOOL_EXCHANGE
+        assert result["message"]["blocks"] == _replayed(_TOOL_EXCHANGE)
 
 
 class TestDispatchStream:

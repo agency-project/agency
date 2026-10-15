@@ -154,7 +154,7 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
             *,
             is_cancelled=None,
             request_id=None,
-            recent_transcript=None,
+            context=None,
         ):
             self.agent = agent
             self.sandbox = sandbox
@@ -162,12 +162,11 @@ def test_real_engine_replays_queued_message_into_a_stateless_run(monkeypatch, tm
             self.resource_pool = resource_pool
             self.is_cancelled = is_cancelled
             self.request_id = request_id
-            self.recent_transcript = recent_transcript
             self.bound_tokens: list[str] = []
             self.cleared_tokens: list[str] = []
             self.active_token = None
             self.host_mcp_server = SimpleNamespace(collected_output=lambda: {})
-            self.llm_handler_server = SimpleNamespace(get_main_transcript=lambda _needle: [])
+            self.llm_handler_server = SimpleNamespace(get_main_history=lambda _needle: [])
             self.interaction_server = SimpleNamespace(last_bootstrap_ping_ts=None)
             managers.append(self)
 

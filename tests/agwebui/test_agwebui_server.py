@@ -5,7 +5,6 @@ latest_values), matching what the live execution process produces, rather
 than a hand-rolled schema of their own.
 """
 
-import hashlib
 import json
 import sqlite3
 import threading
@@ -14,6 +13,8 @@ import uuid
 from pathlib import Path
 
 import pytest
+
+from tests.exchange_helpers import record_exchange
 
 
 # ---------------------------------------------------------------------------
@@ -28,25 +29,27 @@ def _seed_llm_exchange(
     prompt_blocks: "list[dict] | None" = None,
 ) -> None:
     """Record one exchange the way a real LlmHandlerServer would, via
-    `agdatalogger.record_llm_exchange` -- content-addressable storage,
-    prompt and response as two independent chains (see
-    agdatalogger.py/llm_handler_server.py's `_prompt_chain`/
-    `_response_chain`). Blocks get a synthetic, unique hash for storage:
-    this module doesn't need `_payload_hash`'s identity-normalization
-    rules (tool_use/tool_result/text-by-content dedup), only a
-    deterministic key per distinct block."""
+    `agdatalogger.record_llm_exchange` -- content-addressable storage of the
+    prompt and the response as two independent message lists. Each block
+    carries its message's role under "role" (default "assistant"); consecutive
+    blocks with the same role become one message."""
 
-    def _chain(blocks: "list[dict]") -> "list[tuple[str, dict]]":
-        return [
-            (hashlib.sha256(json.dumps(b, sort_keys=True, default=str).encode()).hexdigest(), b)
-            for b in blocks
-        ]
+    def _messages(blocks: "list[dict]") -> "list[dict]":
+        messages: "list[dict]" = []
+        for block in blocks:
+            role = block.get("role", "assistant")
+            fields = {k: v for k, v in block.items() if k != "role"}
+            if messages and messages[-1]["role"] == role:
+                messages[-1]["blocks"].append(fields)
+            else:
+                messages.append({"role": role, "blocks": [fields]})
+        return messages
 
-    logger.record_llm_exchange(
+    record_exchange(
+        logger,
         call_label,
-        exchange_type="llm_block",
-        prompt_chain=_chain(prompt_blocks or []),
-        response_chain=_chain(response_blocks),
+        prompt=_messages(prompt_blocks or []),
+        response=_messages(response_blocks),
     )
 
 
@@ -610,11 +613,11 @@ def test_shared_log_relays_llm_stream_error_term_message(server):
     global_logger.stop()
 
     with client.websocket_connect("/ws") as ws:
-        agent_logger.record_llm_exchange(
+        record_exchange(
+            agent_logger,
             "call_1",
             exchange_type="llm_stream_error",
-            prompt_chain=[],
-            response_chain=[("h1", {"error": "boom"})],
+            response=[{"role": "assistant", "blocks": [{"type": "error", "error": "boom"}]}],
             name="Failing",
             term_message="[Failing] LLM    ✗  boom",
         )
@@ -636,11 +639,11 @@ def test_websocket_connect_replays_per_agent_log_backlog(server):
     agent_path = run_dir / "Backfilled_data.sqlite3"
     agent_logger = _make_data_logger(agent_path)
     agent_logger.record_event("agent_created", {}, term_message="[Backfilled] CREATED model=m")
-    agent_logger.record_llm_exchange(
+    record_exchange(
+        agent_logger,
         "call_1",
         exchange_type="llm_stream_cancelled",
-        prompt_chain=[],
-        response_chain=[("h1", {"cancelled": True})],
+        response=[{"role": "assistant", "blocks": [{"type": "cancelled"}]}],
         name="Backfilled",
         term_message="[Backfilled] LLM    ✗  cancelled",
     )
@@ -1001,8 +1004,7 @@ def test_agent_detail_endpoint_ignores_orchestrator_skill_call_and_live_messages
 def test_reconstruct_in_progress_messages_leading_user_block_gets_its_own_message():
     """A harness-injected user message (e.g. the initial prompt, or a
     mid-run system/user edit) shares the exchange's call_label but carries
-    role="user" in its {role, **block} payload (see llm_handler_server.
-    _prompt_chain) -- reconstruction keys on (call_label, role), so it
+    role="user" in its {role, **block} payload (see the recorded exchange's prompt) -- reconstruction keys on (call_label, role), so it
     must split into its own leading message before the assistant's own
     response blocks, even though both rows share call_label."""
     from agency.observability.agwebui.server import _reconstruct_in_progress_messages
@@ -1063,7 +1065,7 @@ def test_reconstruct_in_progress_messages_groups_blocks_by_call_label():
 
 def test_reconstruct_in_progress_messages_llm_block_tool_result_starts_new_message():
     """A tool_result is logged as an llm_block row with role='tool' (see
-    llm_handler_server._prompt_chain()) -- typically under the
+    llm_handler_server's request recording) -- typically under the
     *same* call_label as the next assistant turn it precedes (both get
     logged together once that next exchange finalizes), so it's the
     (call_label, role) key -- not call_label alone -- that must split them

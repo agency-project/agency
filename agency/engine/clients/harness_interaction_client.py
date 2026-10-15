@@ -11,6 +11,7 @@ from ...observability.profiler import agprof
 
 
 _LIFECYCLE_TIMEOUT_S = 30
+_PAUSE_RPC_MARGIN_S = 5.0
 
 
 class HarnessInteractionClient:
@@ -30,8 +31,22 @@ class HarnessInteractionClient:
         with agprof.span("agency:decode_harness_result"):
             return HarnessAttemptResult(**response.json())
 
-    def pause_harness(self) -> None:
-        self._client.post("/control/pause").raise_for_status()
+    def pause_harness(self, wait_timeout_s: "float | None" = None) -> dict:
+        """Pause the harness. With ``wait_timeout_s`` this returns only once
+        it is actually stopped: ``{"ok": True, "parked": bool}`` (``parked``
+        False if it did not stop in time). Without it the call just requests
+        the pause and returns ``{"ok": True}``."""
+        if wait_timeout_s is None:
+            response = self._client.post("/control/pause")
+        else:
+            # The RPC must outlive the wait it asks the daemon to perform.
+            response = self._client.post(
+                "/control/pause",
+                json={"wait_timeout_s": wait_timeout_s},
+                timeout=wait_timeout_s + _PAUSE_RPC_MARGIN_S,
+            )
+        response.raise_for_status()
+        return response.json()
 
     def redirect_harness(self, request_id: str, message: str) -> bool:
         response = self._client.post(

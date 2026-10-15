@@ -80,6 +80,7 @@ uv run python examples/smoke_test_models.py --model gpt-6-sol --skip-e2e
 | [`08_checkpoints.py`](08_checkpoints.py) | `save`, `load`, `save_all`, `load_all`, `all`, checkpointed context and filesystem state |
 | [`09_observability.py`](09_observability.py) | global orchestrator, `ExecutionScheduler`, `OrchestratorSnapshot`, `agDataLogger`, `record_state`, `agprof` |
 | [`10_harnesses_and_webui.py`](10_harnesses_and_webui.py) | interchangeable native/Codex harnesses, `agwebui`, graceful process shutdown |
+| [`11_context_manipulation.py`](11_context_manipulation.py) | `patch_history`, `remove_history_patch`, `clear_history_patches`, patching between skill runs and during one with `pause`/`resume` |
 
 Set `AGENCY_KEEP_EXAMPLE_CHECKPOINTS=1` to retain lesson 8's full sandbox
 checkpoint after its restore check. Set `AGENCY_WEBUI_LINGER=1` to keep lesson

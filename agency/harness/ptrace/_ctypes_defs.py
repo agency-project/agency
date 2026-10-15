@@ -19,6 +19,7 @@ import time via `_configure_libc()` instead of trusting each call site.
 from __future__ import annotations
 
 import ctypes
+import os
 import mmap
 import platform
 import socket
@@ -46,6 +47,20 @@ def _configure_libc() -> None:
 
 
 _configure_libc()
+
+SYS_TGKILL = 234  # x86_64; this module is guarded to x86_64 above
+
+
+def tgkill(tgid: int, tid: int, sig: int) -> None:
+    """Send *sig* to the single thread *tid* of process *tgid*.
+
+    ``kill(tid)`` is process-directed: the kernel hands it to one arbitrary
+    thread, so it cannot be used to signal every thread of a process."""
+    ctypes.set_errno(0)
+    if libc.syscall(ctypes.c_long(SYS_TGKILL), tgid, tid, sig) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
 
 # ---------------------------------------------------------------------------
 # ptrace(2) request / option / event constants (Linux, from <sys/ptrace.h>)

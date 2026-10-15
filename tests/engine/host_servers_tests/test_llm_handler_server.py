@@ -19,6 +19,12 @@ from starlette.responses import StreamingResponse
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
+from agency.llm.message_store import (
+    MessageBlock,
+    content_hash,
+    split_tool_schema,
+    with_tool_schema,
+)
 from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
@@ -120,12 +126,23 @@ class _FakeClient:
         self.closed = True
 
 
+def _block_chain(message_store, message_hashes) -> "list[tuple[str, dict]]":
+    """The (block hash, payload) of every block of the given messages, in order --
+    what `agDataLogger.record_llm_exchange` writes to `exchange_chain`."""
+    return [
+        (block_hash, message_store.message_block_lookup[block_hash])
+        for message_hash in message_hashes
+        for block_hash in message_store.message_structure_lookup[message_hash].get("blocks") or ()
+    ]
+
+
 class _FakeDataLogger:
     def __init__(self):
         self.events = []
         self.stream_deltas = []
         self.stream_delta_history = []
         self.finalized = []
+        self.exchanges = []
         self.operations = []
 
     def record_event(self, type, payload, call_label=None, update_latest_snapshot=False, **_kw):
@@ -142,13 +159,31 @@ class _FakeDataLogger:
         call_label,
         *,
         exchange_type,
-        prompt_chain,
-        response_chain,
+        message_store,
+        harness_message_hashes,
+        patched_message_hashes,
+        response_message_hashes,
         term_message=None,
         print_to_terminal=True,
     ):
         self.stream_deltas = [d for d in self.stream_deltas if d[2] != call_label]
-        self.finalized.append((call_label, exchange_type, prompt_chain, response_chain))
+        self.exchanges.append(
+            {
+                "call_label": call_label,
+                "message_store": message_store,
+                "harness_message_hashes": harness_message_hashes,
+                "patched_message_hashes": patched_message_hashes,
+                "response_message_hashes": response_message_hashes,
+            }
+        )
+        self.finalized.append(
+            (
+                call_label,
+                exchange_type,
+                _block_chain(message_store, patched_message_hashes),
+                _block_chain(message_store, response_message_hashes),
+            )
+        )
         self.operations.append(("finalize", call_label, exchange_type))
 
 
@@ -171,11 +206,11 @@ def _chain_payloads(chain: "list[tuple[str, dict]]") -> "list[dict]":
     return [payload for _digest, payload in chain]
 
 
-def _marker_chain(payload: dict) -> "list[tuple[str, dict]]":
-    """The single-entry response chain `_finalize_terminal` builds for an
-    error/cancelled marker -- mirrors production so tests don't duplicate
-    `_payload_hash`'s own logic."""
-    return [(mod._payload_hash(payload), payload)]
+def _marker_chain(block: dict) -> "list[tuple[str, dict]]":
+    """The single-entry response chain `_finalize_terminal` records for an
+    error/cancelled exchange: one assistant message holding *block*."""
+    marker = MessageBlock("assistant", block)
+    return [(marker.hash, marker.payload)]
 
 
 def _drain(handle) -> "list[dict]":
@@ -409,275 +444,228 @@ def _controlled_server(backend) -> LlmHandlerServer:
 
 
 # ---------------------------------------------------------------------------
-# _payload_hash -- transcript dedup identity
+# content_hash -- lossless content address
 # ---------------------------------------------------------------------------
 
 
-def test_payload_hash_treats_native_and_replayed_tool_use_as_the_same_call():
-    """A tool_use block gets logged once in its rich, backend-native shape
-    (with extra bookkeeping fields like text/signature/data/citations/
-    ts_start/ts_end) and again in the reduced shape native_harness's
-    OpenAI-chatcompletions wire protocol reconstructs when that same call is
-    replayed back into a later request (id/name/arguments only, and often a
-    different `index`) -- these must hash identically so the second one
-    doesn't get double-logged."""
-    rich = {
-        "role": "assistant",
-        "type": "tool_use",
-        "index": 1,
-        "text": "",
-        "signature": "",
-        "id": "call_1",
-        "name": "write",
-        "arguments": '{"a": 1}',
-        "data": None,
-        "citations": None,
-        "ts_start": 123.0,
-        "ts_end": 123.0,
-    }
-    replayed = {
-        "role": "assistant",
-        "type": "tool_use",
-        "index": 0,
-        "id": "call_1",
-        "name": "write",
-        "arguments": '{"a": 1}',
-    }
-    assert mod._payload_hash(rich) == mod._payload_hash(replayed)
-
-
-def test_payload_hash_distinguishes_different_tool_use_calls():
-    a = {"role": "assistant", "type": "tool_use", "index": 0, "id": "call_1", "name": "write"}
-    b = {"role": "assistant", "type": "tool_use", "index": 0, "id": "call_2", "name": "write"}
-    assert mod._payload_hash(a) != mod._payload_hash(b)
-
-
-def test_payload_hash_distinguishes_different_tool_results():
-    a = {"role": "tool", "type": "tool_result", "index": 0, "tool_call_id": "call_1", "text": "ok"}
-    b = {"role": "tool", "type": "tool_result", "index": 0, "tool_call_id": "call_2", "text": "ok"}
-    assert mod._payload_hash(a) != mod._payload_hash(b)
-
-
-def test_payload_hash_keeps_empty_text_thinking_blocks_with_different_signatures_distinct():
-    """Claude's default thinking display returns empty text; distinct blocks
-    differ only by signature and must not collapse into one stored payload."""
-    a = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-a"}
-    b = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-b"}
-    assert mod._payload_hash(a) != mod._payload_hash(b)
-
-
-def test_payload_hash_treats_native_and_replayed_thinking_as_the_same_block():
-    rich = {
-        "role": "assistant",
-        "type": "thinking",
-        "index": 2,
-        "text": "",
-        "signature": "sig-a",
-        "id": "",
-        "name": "",
-        "arguments": "",
-        "data": None,
-        "citations": None,
-        "ts_start": 1.0,
-        "ts_end": 2.0,
-    }
-    replayed = {
-        "role": "assistant",
-        "type": "thinking",
-        "index": 0,
-        "text": "",
-        "signature": "sig-a",
-    }
-    assert mod._payload_hash(rich) == mod._payload_hash(replayed)
-
-
-def test_payload_hash_unsigned_thinking_missing_and_empty_signature_match():
-    a = {"role": "assistant", "type": "thinking", "text": "t"}
-    b = {"role": "assistant", "type": "thinking", "text": "t", "signature": ""}
-    assert mod._payload_hash(a) == mod._payload_hash(b)
-
-
-def test_payload_hash_treats_native_and_resent_text_as_the_same_message():
-    """A text block gets logged once in its rich response shape (ts_start/
-    ts_end/index/etc.) and again in the reduced shape it takes when the
-    same message is resent inside a later request's history (role/type/
-    text/index only, often a different index) -- these must hash
-    identically so both occurrences resolve to one stored block."""
-    rich = {
-        "role": "assistant",
-        "type": "text",
-        "index": -1,
-        "text": "Let me look.",
-        "ts_start": 1.0,
-        "ts_end": 1.5,
-    }
-    resent = {"role": "assistant", "type": "text", "index": 0, "text": "Let me look."}
-    assert mod._payload_hash(rich) == mod._payload_hash(resent)
-
-
-def test_payload_hash_distinguishes_different_text():
+def test_content_hash_is_stable_and_ignores_key_order():
     a = {"role": "assistant", "type": "text", "index": 0, "text": "hi"}
-    b = {"role": "assistant", "type": "text", "index": 0, "text": "bye"}
-    assert mod._payload_hash(a) != mod._payload_hash(b)
+    b = {"text": "hi", "index": 0, "type": "text", "role": "assistant"}
+    assert content_hash(a) == content_hash(b) == content_hash(dict(a))
 
 
-def test_payload_hash_falls_back_to_whole_payload_for_metadata_blocks():
-    """metadata has no id-like stable identity field and is never resent
-    inside a later request, so it is still hashed on full content."""
-    a = {"role": "assistant", "type": "metadata", "index": 2**31 - 1, "stop_reason": "stop"}
-    b = {"role": "assistant", "type": "metadata", "index": 2**31 - 1, "stop_reason": "tool_use"}
-    assert mod._payload_hash(a) != mod._payload_hash(b)
-    assert mod._payload_hash(a) == mod._payload_hash(dict(a))
-
-
-# ---------------------------------------------------------------------------
-# _prompt_chain / _response_chain -- full per-exchange hash chains
-# ---------------------------------------------------------------------------
-
-
-def test_prompt_chain_includes_tool_definitions_and_tool_choice():
-    server, _client = _make_server()
-    request = {
-        "messages": [],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get the weather.",
-                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-                },
-            }
-        ],
-        "tool_choice": "auto",
+@pytest.mark.parametrize(
+    "field,other",
+    [
+        ("arguments", '{"cmd": "rm -rf /"}'),
+        ("name", "other_tool"),
+        ("id", "call_2"),
+        ("index", 3),
+        ("citations", [{"cited_text": "x"}]),
+        ("ts_start", 9.0),
+    ],
+)
+def test_content_hash_covers_every_tool_use_field(field, other):
+    base = {
+        "role": "assistant",
+        "type": "tool_use",
+        "index": 0,
+        "id": "call_1",
+        "name": "bash",
+        "arguments": '{"cmd": "ls"}',
     }
-    payloads = _chain_payloads(server._prompt_chain(request))
-    assert {
-        "role": "tool_schema",
-        "type": "tool_definition",
+    assert content_hash(base) != content_hash({**base, field: other})
+
+
+@pytest.mark.parametrize(
+    "field,other",
+    [
+        ("text", "[Old tool result content cleared]"),
+        ("tool_call_id", "call_2"),
+        ("raw_content", [1]),
+    ],
+)
+def test_content_hash_covers_every_tool_result_field(field, other):
+    base = {"role": "tool", "type": "tool_result", "index": 0, "tool_call_id": "c1", "text": "ok"}
+    assert content_hash(base) != content_hash({**base, field: other})
+
+
+def test_content_hash_distinguishes_text_index_and_extra_fields():
+    base = {"role": "user", "type": "text", "index": 0, "text": "hi"}
+    assert content_hash(base) != content_hash({**base, "text": "bye"})
+    assert content_hash(base) != content_hash({**base, "index": 3})
+    assert content_hash(base) != content_hash({**base, "citations": [{"a": 1}]})
+    assert content_hash(base) != content_hash({**base, "role": "assistant"})
+
+
+def test_content_hash_keeps_thinking_signatures_and_missing_signature_distinct():
+    a = {"role": "assistant", "type": "thinking", "index": 0, "text": "", "signature": "sig-a"}
+    b = {**a, "signature": "sig-b"}
+    no_sig = {"role": "assistant", "type": "thinking", "text": "t"}
+    empty_sig = {**no_sig, "signature": ""}
+    assert content_hash(a) != content_hash(b)
+    assert content_hash(no_sig) != content_hash(empty_sig)
+
+
+def test_content_hash_covers_metadata_blocks():
+    a = {"role": "assistant", "type": "metadata", "index": 2**31 - 1, "stop_reason": "stop"}
+    b = {**a, "stop_reason": "tool_use"}
+    assert content_hash(a) != content_hash(b)
+
+
+# ---------------------------------------------------------------------------
+# What one exchange records: the request's messages (the tool_schema message
+# included) and the response, by message hash
+# ---------------------------------------------------------------------------
+
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
         "name": "get_weather",
         "description": "Get the weather.",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    },
+}
+
+
+def _ok_server() -> LlmHandlerServer:
+    def create(**kwargs):
+        return _FakeResult([_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")])
+
+    server, _ = _make_server(create_fn=create)
+    return server
+
+
+def test_exchange_records_tool_definitions_and_tool_choice_as_the_tool_schema_message():
+    server = _ok_server()
+    server.dispatch({"messages": with_tool_schema([], [_WEATHER_TOOL], "auto")})
+
+    _call_label, _kind, prompt_chain, _response = server._data_logger.finalized[0]
+    payloads = _chain_payloads(prompt_chain)
+    assert {
+        "role": "tool_schema",
+        "type": "tool_definition",
+        "index": 0,
+        "tool": _WEATHER_TOOL,
     } in payloads
-    assert {"role": "tool_schema", "type": "tool_choice", "value": "auto"} in payloads
+    assert {"role": "tool_schema", "type": "tool_choice", "index": 1, "value": "auto"} in payloads
 
 
-def test_prompt_chain_gives_each_tool_its_own_hash():
+def test_exchange_gives_each_tool_its_own_block_hash():
     """One tool's schema changing produces a new hash only for that tool --
-    the sibling tool's chain entry (hash and payload) is untouched."""
-    server, _client = _make_server()
+    the sibling tool's block (hash and payload) is untouched."""
+    server = _ok_server()
     tool_a = {"type": "function", "function": {"name": "a", "description": "v1"}}
     tool_b = {"type": "function", "function": {"name": "b", "description": "v1"}}
-    chain1 = server._prompt_chain({"messages": [], "tools": [tool_a, tool_b]})
-
     tool_a_changed = {"type": "function", "function": {"name": "a", "description": "v2"}}
-    chain2 = server._prompt_chain({"messages": [], "tools": [tool_a_changed, tool_b]})
+    server.dispatch({"messages": with_tool_schema([], [tool_a, tool_b])})
+    server.dispatch({"messages": with_tool_schema([], [tool_a_changed, tool_b])})
 
+    (_l1, _k1, chain1, _r1), (_l2, _k2, chain2, _r2) = server._data_logger.finalized
     hashes1 = {digest for digest, _payload in chain1}
     hashes2 = {digest for digest, _payload in chain2}
     assert len(hashes1 & hashes2) == 1  # tool_b's hash survives unchanged
     changed_payload = next(payload for digest, payload in chain2 if digest not in hashes1)
-    assert changed_payload["name"] == "a"
-    assert changed_payload["description"] == "v2"
+    assert changed_payload["tool"]["function"]["name"] == "a"
+    assert changed_payload["tool"]["function"]["description"] == "v2"
 
 
-def test_prompt_chain_catches_a_field_it_has_no_name_for():
-    """The point of this catch-all is that a field neither `messages` nor
-    `tools` nor `tool_choice` still can't fall through unseen -- the exact
-    class of gap that made a live backend bug (a tool schema causing an
-    empty completion) invisible in every recorded run."""
-    server, _client = _make_server()
-    request = {"messages": [], "some_future_field": {"nested": "value"}}
-    payloads = _chain_payloads(server._prompt_chain(request))
-    assert {
-        "role": "tool_schema",
-        "type": "request_extra",
-        "value": {"some_future_field": {"nested": "value"}},
-    } in payloads
+def test_exchange_records_extra_request_fields_in_the_tool_schema_message():
+    """A field that is neither a message, a tool, nor `tool_choice` still can't
+    fall through unseen -- the exact class of gap that made a live backend bug
+    (a tool schema causing an empty completion) invisible in every recorded run."""
+    server = _ok_server()
+    extra = {"some_future_field": {"nested": "value"}}
+    server.dispatch({"messages": with_tool_schema([], extra=extra)})
+
+    payloads = _chain_payloads(server._data_logger.finalized[0][2])
+    assert {"role": "tool_schema", "type": "request_extra", "index": 0, "value": extra} in payloads
 
 
-def test_prompt_chain_returns_the_full_prompt_every_call_not_a_diff():
-    """Unlike the old `_new_transcript_payloads`, repeated calls with the
-    same request return the same chain every time -- deduplication now
-    happens at the storage layer (`blocks`' `INSERT OR IGNORE`), not by
-    omitting content already seen from this turn's chain."""
-    server, _client = _make_server()
-    request = {"messages": [], "tools": [{"type": "function", "function": {"name": "a"}}]}
-    first = server._prompt_chain(request)
-    second = server._prompt_chain(request)
+def test_exchange_records_the_full_prompt_every_call_not_a_diff():
+    """Repeated calls with the same request record the same prompt every time --
+    deduplication happens at the storage layer (`message_block_lookup`'s
+    `INSERT OR IGNORE`), not by omitting content already seen."""
+    server = _ok_server()
+    request = {"messages": with_tool_schema([], [{"type": "function", "function": {"name": "a"}}])}
+    server.dispatch(request)
+    server.dispatch(request)
+
+    (_l1, _k1, first, _r1), (_l2, _k2, second, _r2) = server._data_logger.finalized
     assert len(first) == 1
     assert first == second
 
 
-def test_response_chain_returns_empty_for_no_response():
-    server, _client = _make_server()
-    assert server._response_chain(None) == []
+def test_exchange_records_no_response_message_when_there_is_no_response():
+    server = _ok_server()
+    server._finalize_success("c", {"messages": []}, None)
+    assert server._data_logger.exchanges == []  # nothing to record: no prompt, no response
 
 
-def test_response_chain_tags_each_block_with_the_response_role():
-    server, _client = _make_server()
-    response = {
-        "role": "assistant",
-        "blocks": [{"type": "text", "index": 0, "text": "hi"}],
-    }
-    payloads = _chain_payloads(server._response_chain(response))
-    assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "hi"}]
+def test_exchange_response_blocks_carry_the_response_role():
+    server = _ok_server()
+    server.dispatch({"messages": []})
+    payloads = _chain_payloads(server._data_logger.finalized[0][3])
+    assert payloads[0] == {"role": "assistant", "type": "text", "index": 0, "text": "ok"}
 
 
-def test_resent_history_is_confined_to_the_prompt_chain_never_the_response_chain():
+def test_resent_history_is_confined_to_the_prompt_never_the_response():
     """The direct regression test for the resent-history bug PR #60 patched
     at the write-time-dedup layer: turn 2's request includes turn 1's own
     answer back as resent, reduced-shape history. Because prompt and
-    response are two independent chains now, that resent text can only
-    ever land in *this* turn's prompt chain -- it is structurally
-    impossible for it to collide with, or corrupt, a real `tool_use` block
-    in the response chain, regardless of how it happens to hash."""
-    server, _ = _make_server()
-    turn2_request = {
-        "messages": [
-            {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "Find the bug"}]},
-            {
-                "role": "assistant",
-                "blocks": [{"type": "text", "index": 0, "text": "Let me look."}],
-            },
-            {
-                "role": "tool",
-                "blocks": [
-                    {"type": "tool_result", "index": 0, "tool_call_id": "call_1", "text": "a.py"}
-                ],
-            },
-        ]
-    }
-    turn2_response = {
-        "role": "assistant",
-        "blocks": [
-            {"type": "text", "index": -1, "text": "Found it.", "ts_start": 2.0, "ts_end": 2.5},
-            {
-                "type": "tool_use",
-                "index": 0,
-                "id": "call_2",
-                "name": "read",
-                "arguments": '{"path": "a.py"}',
-            },
-            {
-                "type": "metadata",
-                "index": 2**31 - 1,
-                "stop_reason": "tool_use",
-                "usage": {"total_tokens": 2},
-            },
-        ],
-    }
-    prompt_payloads = _chain_payloads(server._prompt_chain(turn2_request))
-    response_payloads = _chain_payloads(server._response_chain(turn2_response))
+    response are two independent message lists, that resent text can only
+    ever land in *this* turn's prompt -- it is structurally impossible for it
+    to collide with, or corrupt, a real `tool_use` block in the response,
+    regardless of how it happens to hash."""
+    turn2_messages = [
+        {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "Find the bug"}]},
+        {"role": "assistant", "blocks": [{"type": "text", "index": 0, "text": "Let me look."}]},
+        {
+            "role": "tool",
+            "blocks": [
+                {"type": "tool_result", "index": 0, "tool_call_id": "call_1", "text": "a.py"}
+            ],
+        },
+    ]
 
-    # The resent text lives in the prompt chain...
+    class _Turn2Backend:
+        model = "m"
+
+        def dispatch(self, request):
+            return {
+                "message": {
+                    "role": "assistant",
+                    "blocks": [
+                        {"type": "text", "index": -1, "text": "Found it."},
+                        {
+                            "type": "tool_use",
+                            "index": 0,
+                            "id": "call_2",
+                            "name": "read",
+                            "arguments": '{"path": "a.py"}',
+                        },
+                    ],
+                },
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "stop_reason": "tool_use",
+            }
+
+    server, _ = _make_server()
+    server._backend = _Turn2Backend()
+    server.dispatch({"messages": turn2_messages})
+
+    _label, _kind, prompt_chain, response_chain = server._data_logger.finalized[0]
+    prompt_payloads = _chain_payloads(prompt_chain)
+    response_payloads = _chain_payloads(response_chain)
+
+    # The resent text lives in the prompt...
     assert any(
         p["role"] == "assistant" and p.get("index") == 0 and p["type"] == "text"
         for p in prompt_payloads
     )
-    # ...and never in the response chain: exactly turn 2's own three blocks,
-    # with an uncorrupted tool_use at index 0.
-    assert [p["type"] for p in response_payloads] == ["text", "tool_use", "metadata"]
+    # ...and never in the response: exactly turn 2's own blocks, with an
+    # uncorrupted tool_use at index 0.
+    assert [p["type"] for p in response_payloads] == ["text", "tool_use"]
     assert response_payloads[0]["text"] == "Found it."
     assert response_payloads[1]["id"] == "call_2"
     assert response_payloads[1]["name"] == "read"
@@ -806,9 +794,9 @@ def test_dispatch_passes_tool_choice_through_when_given():
     server, _ = _make_server(create_fn=create)
     server.dispatch(
         {
-            "messages": [],
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-            "tool_choice": "auto",
+            "messages": with_tool_schema(
+                [], [{"type": "function", "function": {"name": "get_weather"}}], "auto"
+            )
         }
     )
     assert seen["tool_choice"] == "auto"
@@ -833,7 +821,7 @@ def test_dispatch_bad_request_raises_dispatch_error_and_closes_client(monkeypatc
             server._data_logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "ValueError: bad request"}),
+            _marker_chain({"type": "error", "index": 0, "error": "ValueError: bad request"}),
         )
     ]
 
@@ -857,7 +845,7 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
             server._data_logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "ConnectionError: down"}),
+            _marker_chain({"type": "error", "index": 0, "error": "ConnectionError: down"}),
         )
     ]
 
@@ -878,7 +866,7 @@ def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
             server._data_logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: boom"}),
+            _marker_chain({"type": "error", "index": 0, "error": "RuntimeError: boom"}),
         )
     ]
 
@@ -992,11 +980,12 @@ def test_llm_trace_includes_transcript_and_token_counts(tmp_path, streaming):
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.skipif(sys.platform != "linux", reason="agprof requires Linux /proc and cgroups")
 def test_llm_trace_captures_tools_tool_choice_and_unknown_request_fields(tmp_path, streaming):
-    """Regression for a real gap: only `messages` was ever captured, so a
+    """Regression for a real gap: only the chat messages were ever captured, so a
     tool schema causing a live backend failure (empty completion) was
     invisible in every recorded run -- the request looked identical with
-    or without it. Anything else the request carries, known or not, must
-    show up too so a *future* field can't fall into the same hole."""
+    or without it. Tools, `tool_choice` and every other field travel in the
+    `tool_schema` message, so `llm.messages` shows them all and a *future*
+    field can't fall into the same hole."""
 
     def create(**kwargs):
         usage = _FakeUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
@@ -1006,13 +995,12 @@ def test_llm_trace_captures_tools_tool_choice_and_unknown_request_fields(tmp_pat
             [_FakeChoice(message=_FakeMessage(content="hi"), finish_reason="stop")], usage
         )
 
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    extra = {"an_unforeseen_future_field": {"nested": "value"}}
     with agprof.session(tmp_path, sample_hz=0, sample_gpu=False, auto_functions=False):
         server, _ = _make_server(create_fn=create)
         request = {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-            "tool_choice": "auto",
-            "an_unforeseen_future_field": {"nested": "value"},
+            "messages": with_tool_schema([{"role": "user", "content": "hi"}], tools, "auto", extra)
         }
         if streaming:
             handle = server.start_stream(request)
@@ -1022,12 +1010,14 @@ def test_llm_trace_captures_tools_tool_choice_and_unknown_request_fields(tmp_pat
             server.dispatch(request)
     trace = json.loads((tmp_path / "agprof.trace.json").read_text())
     args = next(e["args"] for e in trace["traceEvents"] if e.get("name") == "llm:attempt[0]")
-    assert json.loads(args["llm.tools"]) == request["tools"]
-    # detail_metadata stores an already-string value raw, not JSON-quoted.
-    assert args["llm.tool_choice"] == "auto"
-    assert json.loads(args["llm.request_extra"]) == {
-        "an_unforeseen_future_field": {"nested": "value"}
-    }
+    assert json.loads(args["llm.messages"]) == request["messages"]
+    chat_messages, traced_tools, traced_tool_choice, traced_extra = split_tool_schema(
+        json.loads(args["llm.messages"])
+    )
+    assert traced_tools == tools
+    assert traced_tool_choice == "auto"
+    assert traced_extra == extra
+    assert chat_messages == [{"role": "user", "content": "hi"}]
 
 
 def test_streaming_http_request_preserves_engine_run_parent_span(monkeypatch, tmp_path):
@@ -1139,7 +1129,12 @@ def test_start_stream_first_chunk_bad_request_becomes_error_item(monkeypatch):
     handle._thread.join(timeout=2.0)
     assert client.closed is True
     assert server._data_logger.finalized == [
-        (handle.call_label, "llm_stream_error", [], _marker_chain({"error": "ValueError: nope"}))
+        (
+            handle.call_label,
+            "llm_stream_error",
+            [],
+            _marker_chain({"type": "error", "index": 0, "error": "ValueError: nope"}),
+        )
     ]
 
 
@@ -1159,7 +1154,7 @@ def test_start_stream_first_chunk_transient_error_becomes_error_item(monkeypatch
             handle.call_label,
             "llm_stream_error",
             [],
-            _marker_chain({"error": "ConnectionError: down"}),
+            _marker_chain({"type": "error", "index": 0, "error": "ConnectionError: down"}),
         )
     ]
 
@@ -1191,7 +1186,9 @@ def test_start_stream_mid_stream_exception_becomes_error_item_and_stops():
             handle.call_label,
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: mid-stream failure"}),
+            _marker_chain(
+                {"type": "error", "index": 0, "error": "RuntimeError: mid-stream failure"}
+            ),
         )
     ]
 
@@ -1218,10 +1215,10 @@ def test_unclassified_first_stream_read_error_always_wakes_consumer():
             handle.call_label,
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: setup exploded"}),
+            _marker_chain({"type": "error", "index": 0, "error": "RuntimeError: setup exploded"}),
         )
     ]
-    assert server.get_main_transcript() == []
+    assert server.get_main_history() == []
 
 
 def test_controlled_paths_preserve_logger_call_labels_and_finalization():
@@ -1273,15 +1270,32 @@ def test_tag_response_message_for_display_handles_none():
     assert mod._tag_response_message_for_display(None, "Worker") is None
 
 
+def _kind_messages(internal_kind: str) -> "list[dict]":
+    """A request's messages carrying `agency_internal_kind`, which a harness
+    adapter puts in the `tool_schema` message's extra fields."""
+    return with_tool_schema([], extra={"agency_internal_kind": internal_kind})
+
+
+def test_internal_kind_never_reaches_the_provider():
+    """The tag is only for the host's display tag -- litellm rejects it as an
+    unknown field (confirmed directly against a real provider), so the backend
+    must not forward it."""
+    seen = {}
+
+    def create(**kwargs):
+        seen.update(kwargs)
+        return _FakeResult([_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")])
+
+    server, _ = _make_server(create_fn=create)
+    server.dispatch({"messages": _kind_messages("example_worker")})
+    assert "agency_internal_kind" not in seen
+
+
 def test_dispatch_tags_recorded_text_response_from_internal_kind():
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend)
 
-    server.dispatch({"messages": [], "agency_internal_kind": "example_worker"})
-
-    # The tag never reaches the actual backend -- litellm rejects it as an
-    # unknown field (confirmed directly against a real provider).
-    assert "agency_internal_kind" not in backend.requests[-1][1]
+    server.dispatch({"messages": _kind_messages("example_worker")})
 
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
@@ -1292,7 +1306,7 @@ def test_dispatch_tags_recorded_tool_use_name_from_internal_kind():
     backend = _RecordingBackend(final=False)
     server = _controlled_server(backend)
 
-    server.dispatch({"messages": [], "agency_internal_kind": "example_supervisor"})
+    server.dispatch({"messages": _kind_messages("example_supervisor")})
 
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
@@ -1314,11 +1328,10 @@ def test_start_stream_tags_recorded_response_from_internal_kind():
     backend = _RecordingBackend(final=True)
     server = _controlled_server(backend)
 
-    handle = server.start_stream({"messages": [], "agency_internal_kind": "example_worker"})
+    handle = server.start_stream({"messages": _kind_messages("example_worker")})
     assert _drain(handle)[-1]["type"] == "done"
     handle._thread.join(timeout=2.0)
 
-    assert "agency_internal_kind" not in backend.requests[-1][1]
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
     assert len(payloads) == 1
@@ -1343,7 +1356,7 @@ def test_malformed_nonstream_result_finalizes_the_logger_call_label():
             logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "KeyError: 'stop_reason'"}),
+            _marker_chain({"type": "error", "index": 0, "error": "KeyError: 'stop_reason'"}),
         )
     ]
 
@@ -1373,7 +1386,9 @@ def test_nonstream_outer_infrastructure_failure_finalizes_once(monkeypatch, fail
             logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": f"RuntimeError: {failure_point} failed"}),
+            _marker_chain(
+                {"type": "error", "index": 0, "error": f"RuntimeError: {failure_point} failed"}
+            ),
         )
     ]
     assert [operation[0] for operation in logger.operations] == ["finalize"]
@@ -1396,7 +1411,7 @@ def test_stream_spawn_failure_finalizes_the_logger_call_label(monkeypatch):
             logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: spawn failed"}),
+            _marker_chain({"type": "error", "index": 0, "error": "RuntimeError: spawn failed"}),
         )
     ]
 
@@ -1416,7 +1431,12 @@ def test_stream_spawn_failure_after_disconnect_finalizes_as_cancelled(monkeypatc
 
     logger = server._data_logger
     assert logger.finalized == [
-        (logger.events[0][2], "llm_stream_cancelled", [], _marker_chain({"cancelled": True}))
+        (
+            logger.events[0][2],
+            "llm_stream_cancelled",
+            [],
+            _marker_chain({"type": "cancelled", "index": 0}),
+        )
     ]
 
 
@@ -1438,7 +1458,9 @@ def test_stream_thread_start_failure_finalizes_and_removes_the_handle(monkeypatc
             logger.events[0][2],
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: thread start failed"}),
+            _marker_chain(
+                {"type": "error", "index": 0, "error": "RuntimeError: thread start failed"}
+            ),
         )
     ]
 
@@ -1466,7 +1488,9 @@ def test_outer_stream_producer_failure_wakes_consumer_and_finalizes(monkeypatch)
             handle.call_label,
             "llm_stream_error",
             [],
-            _marker_chain({"error": "RuntimeError: span annotation failed"}),
+            _marker_chain(
+                {"type": "error", "index": 0, "error": "RuntimeError: span annotation failed"}
+            ),
         )
     ]
 
@@ -1496,7 +1520,12 @@ def test_rejected_stream_error_enqueue_finalizes_as_cancelled():
     server._run_stream_producer({"messages": []}, handle)
 
     assert server._data_logger.finalized == [
-        ("rejected-error", "llm_stream_cancelled", [], _marker_chain({"cancelled": True}))
+        (
+            "rejected-error",
+            "llm_stream_cancelled",
+            [],
+            _marker_chain({"type": "cancelled", "index": 0}),
+        )
     ]
 
 
@@ -1913,6 +1942,17 @@ def test_build_app_dispatch_route_streaming_relays_ndjson_lines():
     assert blocks[0]["text"] == "Hi"
 
 
+def test_build_app_dispatch_route_does_not_pass_the_stream_flag_on():
+    """`stream` only chooses the transport; the request the backend sees (and the
+    exchange records) is just the message list."""
+    backend = _RecordingBackend(final=True)
+    server = _controlled_server(backend)
+    client = TestClient(server.build_app())
+    assert client.post("/dispatch", json={"messages": [], "stream": True}).status_code == 200
+    assert client.post("/dispatch", json={"messages": [], "stream": False}).status_code == 200
+    assert [request for _kind, request in backend.requests] == [{"messages": []}] * 2
+
+
 def test_build_app_dispatch_route_streaming_error_returns_error_status(monkeypatch):
     monkeypatch.setattr(mod, "BAD_REQUEST_EXCS", (ValueError,))
 
@@ -1953,7 +1993,12 @@ def test_stream_http_disconnect_before_first_item_joins_producer():
 
     logger = server._data_logger
     assert logger.finalized == [
-        (logger.events[0][2], "llm_stream_cancelled", [], _marker_chain({"cancelled": True}))
+        (
+            logger.events[0][2],
+            "llm_stream_cancelled",
+            [],
+            _marker_chain({"type": "cancelled", "index": 0}),
+        )
     ]
     assert all(
         handle._thread is None or not handle._thread.is_alive() for handle in server._handles
