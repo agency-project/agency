@@ -67,9 +67,7 @@ Agency compares recorded evidence, without guessing at causes.
 
 Agency provides a sandboxed execution environment, Python API, supported agent harnesses, and integrated telemetry. Your application keeps control of its workflow and orchestration.
 
-![Agency architecture](docs/assets/agency-runtime.png)
-
-[Editable architecture diagram](docs/assets/agency-runtime.mmd)
+![Agency architecture](docs/assets/agency-architecture.svg)
 
 | Layer | Supported options |
 | --- | --- |
