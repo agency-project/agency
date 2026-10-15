@@ -42,7 +42,7 @@ Trace model requests, tool calls, processes, and dependencies across agents. Ide
 Use the **Critical Path Profiler** after execution to investigate what held the run back.
 
 <!-- TODO(release): Record agent lanes, dependencies, critical path, and timeline zoom. -->
-![Agency Critical Path Profiler](docs/assets/agency-critical.webp)
+![Agency Critical Path Profiler](docs/assets/agency-critical.png)
 
 ### Detailed Profiler — Go deeper
 
