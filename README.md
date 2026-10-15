@@ -10,8 +10,6 @@ Live debugging and systems profiling for AI agents.
 
 [Getting Started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
 
-Developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/)
-
 </div>
 
 Agency is an open-source platform developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/) for **running, debugging, profiling, and controlling AI agents**.
