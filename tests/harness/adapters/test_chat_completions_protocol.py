@@ -1,21 +1,38 @@
-"""Tests for GrokAdapter's LLM wire-format translation -- plain OpenAI
-chat-completions <-> agency format, both directions, both streaming and
-non-streaming."""
-
-from __future__ import annotations
+"""Shared wire-format contracts exercised for each concrete harness adapter."""
 
 import json
 
-from agency.llm.message_store import split_tool_schema
+import pytest
+
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.grok import GrokAdapter
+from agency.harness.adapters.native import NativeAdapter
+from agency.harness.adapters.opencode import OpenCodeAdapter
+from agency.llm.message_store import split_tool_schema
 
 
-def _backend() -> GrokAdapter:
-    return GrokAdapter(agconfig())
+@pytest.fixture
+def backend(request):
+    return request.param(agconfig())
 
 
-def test_harness_to_agency_plain_messages():
+def _parse_sse(text):
+    events = []
+    for frame in text.strip().split("\n\n"):
+        if not frame:
+            continue
+        assert frame.startswith("data: ")
+        events.append(json.loads(frame[len("data: ") :]) if frame != "data: [DONE]" else "[DONE]")
+    return events
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_plain_messages(backend):
     body = {
         "model": "m",
         "messages": [
@@ -23,14 +40,20 @@ def test_harness_to_agency_plain_messages():
             {"role": "user", "content": "hello"},
         ],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"] == [
         {"role": "system", "blocks": [{"type": "text", "index": 0, "text": "be helpful"}]},
         {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "hello"}]},
     ]
 
 
-def test_harness_to_agency_assistant_with_tool_calls():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_assistant_with_tool_calls(backend):
     body = {
         "model": "m",
         "messages": [
@@ -47,7 +70,7 @@ def test_harness_to_agency_assistant_with_tool_calls():
             }
         ],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"][0]["blocks"] == [
         {"type": "text", "index": 0, "text": "checking"},
         {
@@ -60,12 +83,18 @@ def test_harness_to_agency_assistant_with_tool_calls():
     ]
 
 
-def test_harness_to_agency_tool_role_message():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_tool_role_message(backend):
     body = {
         "model": "m",
         "messages": [{"role": "tool", "tool_call_id": "call1", "content": "72F and sunny"}],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"] == [
         {
             "role": "tool",
@@ -81,7 +110,13 @@ def test_harness_to_agency_tool_role_message():
     ]
 
 
-def test_harness_to_agency_multimodal_content_array():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_multimodal_content_array(backend):
     body = {
         "model": "m",
         "messages": [
@@ -94,7 +129,7 @@ def test_harness_to_agency_multimodal_content_array():
             }
         ],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"][0]["blocks"] == [
         {"type": "text", "index": 0, "text": "what is this?"},
         {
@@ -105,7 +140,13 @@ def test_harness_to_agency_multimodal_content_array():
     ]
 
 
-def test_harness_to_agency_legacy_function_call_becomes_tool_use():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_legacy_function_call_becomes_tool_use(backend):
     body = {
         "model": "m",
         "messages": [
@@ -116,24 +157,36 @@ def test_harness_to_agency_legacy_function_call_becomes_tool_use():
             }
         ],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"][0]["blocks"] == [
         {"type": "tool_use", "index": 0, "id": "", "name": "get_weather", "arguments": "{}"}
     ]
 
 
-def test_harness_to_agency_refusal_field_preserved():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_refusal_field_preserved(backend):
     body = {
         "model": "m",
         "messages": [{"role": "assistant", "content": None, "refusal": "I can't help with that"}],
     }
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert agency["messages"][0]["blocks"] == [
         {"type": "openai_chatcompletions_refusal", "index": 0, "data": "I can't help with that"}
     ]
 
 
-def test_harness_to_agency_tools_and_tool_choice_pass_through_unchanged():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_harness_to_agency_tools_and_tool_choice_pass_through_unchanged(backend):
     tools = [
         {
             "type": "function",
@@ -142,12 +195,18 @@ def test_harness_to_agency_tools_and_tool_choice_pass_through_unchanged():
     ]
     tool_choice = {"type": "function", "function": {"name": "get_weather"}}
     body = {"model": "m", "messages": [], "tools": tools, "tool_choice": tool_choice}
-    agency = _backend()._format_context_harness_to_agency(body)
+    agency = backend._format_context_harness_to_agency(body)
     assert split_tool_schema(agency["messages"])[1] == tools
     assert split_tool_schema(agency["messages"])[2] == tool_choice
 
 
-def test_agency_to_harness_text_only():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_text_only(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -156,7 +215,7 @@ def test_agency_to_harness_text_only():
         "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
         "stop_reason": "stop",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     assert out["object"] == "chat.completion"
     choice = out["choices"][0]
     assert choice["message"] == {"role": "assistant", "content": "hi there"}
@@ -164,7 +223,13 @@ def test_agency_to_harness_text_only():
     assert out["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
 
 
-def test_agency_to_harness_tool_use_and_anthropic_stop_reason_normalized():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_tool_use_and_anthropic_stop_reason_normalized(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -181,7 +246,7 @@ def test_agency_to_harness_tool_use_and_anthropic_stop_reason_normalized():
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "tool_use",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     choice = out["choices"][0]
     assert choice["message"]["tool_calls"] == [
         {
@@ -194,7 +259,13 @@ def test_agency_to_harness_tool_use_and_anthropic_stop_reason_normalized():
     assert choice["finish_reason"] == "tool_calls"
 
 
-def test_agency_to_harness_thinking_becomes_reasoning_content():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_thinking_becomes_reasoning_content(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -203,12 +274,18 @@ def test_agency_to_harness_thinking_becomes_reasoning_content():
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "end_turn",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     assert out["choices"][0]["message"]["reasoning_content"] == "pondering"
     assert out["choices"][0]["finish_reason"] == "stop"
 
 
-def test_agency_to_harness_unknown_block_reconstructed_as_message_field():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_unknown_block_reconstructed_as_message_field(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -223,11 +300,17 @@ def test_agency_to_harness_unknown_block_reconstructed_as_message_field():
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "stop",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     assert out["choices"][0]["message"]["refusal"] == "I can't help with that"
 
 
-def test_agency_to_harness_foreign_origin_unknown_block_dropped():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_foreign_origin_unknown_block_dropped(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -238,12 +321,18 @@ def test_agency_to_harness_foreign_origin_unknown_block_dropped():
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "stop",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     assert "refusal" not in out["choices"][0]["message"]
     assert out["choices"][0]["message"] == {"role": "assistant", "content": None}
 
 
-def test_agency_to_harness_unknown_block_flattens_streaming_origin_fragments():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_to_harness_unknown_block_flattens_streaming_origin_fragments(backend):
     agency_response = {
         "message": {
             "role": "assistant",
@@ -258,21 +347,14 @@ def test_agency_to_harness_unknown_block_flattens_streaming_origin_fragments():
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         "stop_reason": "stop",
     }
-    out = _backend()._format_context_agency_to_harness(agency_response, "m")
+    out = backend._format_context_agency_to_harness(agency_response, "m")
     assert out["choices"][0]["message"]["refusal"] == "partial"
 
 
-def _parse_sse(text):
-    events = []
-    for frame in text.strip().split("\n\n"):
-        if not frame:
-            continue
-        assert frame.startswith("data: ")
-        events.append(json.loads(frame[len("data: ") :]) if frame != "data: [DONE]" else "[DONE]")
-    return events
-
-
-def test_agency_stream_to_harness_text_stream_ends_with_done():
+@pytest.mark.parametrize(
+    "backend", [GrokAdapter, OpenCodeAdapter], indirect=True, ids=lambda cls: cls.__name__
+)
+def test_agency_stream_to_harness_text_stream_ends_with_done(backend):
     stream = [
         {"type": "delta", "content": "Hel"},
         {"type": "delta", "content": "lo"},
@@ -286,7 +368,7 @@ def test_agency_stream_to_harness_text_stream_ends_with_done():
             "stop_reason": "stop",
         },
     ]
-    frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "m"))
+    frames = "".join(backend._format_agency_stream_to_harness(iter(stream), "m"))
     events = _parse_sse(frames)
     assert events[-1] == "[DONE]"
     # Strict clients (including Grok) require created on every SSE chunk,
@@ -309,7 +391,13 @@ def test_agency_stream_to_harness_text_stream_ends_with_done():
     assert usage_chunk["usage"]["completion_tokens"] == 2
 
 
-def test_agency_stream_to_harness_tool_use_emits_full_arguments_at_done():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_stream_to_harness_tool_use_emits_full_arguments_at_done(backend):
     stream = [
         {
             "type": "done",
@@ -329,7 +417,7 @@ def test_agency_stream_to_harness_tool_use_emits_full_arguments_at_done():
             "stop_reason": "tool_use",
         },
     ]
-    frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "m"))
+    frames = "".join(backend._format_agency_stream_to_harness(iter(stream), "m"))
     events = _parse_sse(frames)
     tool_call_chunk = next(
         e
@@ -351,7 +439,13 @@ def test_agency_stream_to_harness_tool_use_emits_full_arguments_at_done():
     assert finish_chunk["choices"][0]["finish_reason"] == "tool_calls"
 
 
-def test_agency_stream_to_harness_unknown_block_reconstructed():
+@pytest.mark.parametrize(
+    "backend",
+    [GrokAdapter, NativeAdapter, OpenCodeAdapter],
+    indirect=True,
+    ids=lambda cls: cls.__name__,
+)
+def test_agency_stream_to_harness_unknown_block_reconstructed(backend):
     stream = [
         {
             "type": "done",
@@ -363,7 +457,7 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
             "stop_reason": "stop",
         },
     ]
-    frames = "".join(_backend()._format_agency_stream_to_harness(iter(stream), "m"))
+    frames = "".join(backend._format_agency_stream_to_harness(iter(stream), "m"))
     events = _parse_sse(frames)
     unknown_chunk = next(
         e
@@ -373,7 +467,10 @@ def test_agency_stream_to_harness_unknown_block_reconstructed():
     assert unknown_chunk["choices"][0]["delta"]["refusal"] == "no"
 
 
-def test_stream_upstream_400_before_first_event_surfaces_provider_error():
+@pytest.mark.parametrize(
+    "backend", [GrokAdapter, OpenCodeAdapter], indirect=True, ids=lambda cls: cls.__name__
+)
+def test_stream_upstream_400_before_first_event_surfaces_provider_error(backend):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from agency.harness.clients.host_services_client import HostDispatchError
@@ -392,7 +489,7 @@ def test_stream_upstream_400_before_first_event_surfaces_provider_error():
             yield
 
     app = FastAPI()
-    _backend().register(app, Router())
+    backend.register(app, Router())
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",

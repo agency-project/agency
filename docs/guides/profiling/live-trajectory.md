@@ -413,7 +413,6 @@ render window, working earlier-page navigation, and actor filtering. All six
 profiler views and the original dashboard were checked again. The live feed
 was checked at 390px with no horizontal overflow; viewport overrides were
 reset. No application console errors were observed in the final browser check.
-Screenshots are in the [gallery](screenshots.md).
 
 Failures found and corrected during implementation: a saved demo edge lacked
 an ID (now assigned a stable derived ID); an optional absent RPC reason changed

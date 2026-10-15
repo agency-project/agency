@@ -329,6 +329,7 @@ def test_codex_agent_run_continues_same_cli_after_restore(tmp_path):
     """Actual Codex adapter + host LLM/MCP + engine run/commit/restore, no test dialect."""
     from pathlib import Path
     import agency
+
     runner = pytest.importorskip(
         "benchmarks.checkpoint_size_microbenchmark.runner",
         reason="benchmark sources are maintained outside the Agency repository",

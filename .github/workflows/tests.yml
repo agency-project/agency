@@ -6,6 +6,16 @@ on:
     branches: [master]
 
 jobs:
+  javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Run profiler JavaScript tests
+        run: node --test tests/agwebui/*.test.mjs tests/agwebui/test_live_follow.cjs
+
   pre-commit:
     runs-on: ubuntu-latest
     steps:

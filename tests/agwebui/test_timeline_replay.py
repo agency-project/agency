@@ -121,14 +121,19 @@ def test_reconnect_preserves_time_between_events(tmp_path, monkeypatch):
 
 def test_replay_range_uses_full_recording_and_seek_acknowledges_request(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_run_dir", tmp_path)
-    write_rows(tmp_path / "global_data.sqlite3", [
-        event(0, "workload_started", ts=100),
-        event(1, "tool_call", ts=120, call_id="one", tool="read", arguments={}),
-        event(2, "tool_result", ts=125, call_id="one", result="ok"),
-        event(3, "done", ts=130),
-    ])
-    with (TestClient(server.app) as client,
-          client.websocket_connect("/ws/trajectory?mode=replay&run=live") as ws):
+    write_rows(
+        tmp_path / "global_data.sqlite3",
+        [
+            event(0, "workload_started", ts=100),
+            event(1, "tool_call", ts=120, call_id="one", tool="read", arguments={}),
+            event(2, "tool_result", ts=125, call_id="one", result="ok"),
+            event(3, "done", ts=130),
+        ],
+    )
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/ws/trajectory?mode=replay&run=live") as ws,
+    ):
         opened = ws.receive_json()
         assert opened["run"]["execution_started_at"] is None
         bounds = opened["replay"]["wall_clock"]

@@ -16,5 +16,4 @@ have separate guides; the first run needs neither specialized setup.
 
 To contribute, read [Contributing](../CONTRIBUTING.md) and the
 [development guide](guides/development.md). Current limitations are recorded in
-[API contract issues](api/contracts.md). Superseded documents and validation
-history are preserved in the [archive](archive/README.md).
+[API contract issues](api/contracts.md).

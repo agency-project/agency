@@ -21,7 +21,7 @@ Run the tests closest to what you changed. For example:
 
 ```bash
 uv run pytest tests/test_agdata.py tests/test_agconfig.py
-uv run pytest tests/test_examples.py -k 'example_imports or imports_every_public_api'
+uv run pytest tests/test_examples.py
 uv run ruff check examples/quickstart.py
 uv run ruff format --check examples/quickstart.py
 ```
@@ -50,8 +50,8 @@ provisioning is unnecessary for unit tests or the native quickstart.
 
 Use the current implementation when older notes disagree. Keep code readable,
 avoid unrelated formatting changes, and never include credentials in examples
-or test fixtures. When replacing documentation, preserve the prior page under
-[`docs/archive/`](docs/archive/README.md) and update its path mapping.
+or test fixtures. Use Git history for superseded documentation and keep current
+reference pages aligned with source.
 
 ## Where to look
 
@@ -64,12 +64,10 @@ or test fixtures. When replacing documentation, preserve the prior page under
 
 Benchmarks are maintained outside this repository (locally in `~/Documents/benchmarks/`);
 their READMEs describe their own setup and measurement requirements.
-See [development notes](docs/guides/development.md)
-and the [earlier verification records](docs/archive/documentation-refactor.md) for
-historical documentation follow-ups; recheck those findings against current source.
+See [development notes](docs/guides/development.md) for validation commands.
 
 ## Documentation
 
-Run the [isolated documentation checks](docs/guides/development.md#documentation-build)
-before changing the API reference. The strict MkDocs build uses static source
-extraction and runs without installing Agency's runtime dependencies.
+Documentation is plain Markdown, readable directly on GitHub. When changing the
+API reference, check the linked Python source and update the reference tables.
+See the [documentation guidelines](docs/guides/development.md#documentation).

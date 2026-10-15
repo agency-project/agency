@@ -1,6 +1,6 @@
 # Configure local COW checkpoints
 
-The default checkpoint backend is image_commit. Optional cow_zfs uses a private latest-only filesystem snapshot for the same sandbox; optional checkpoint_fast_resume adds a best-effort CRIU process cache. The [checkpoint architecture](../architecture/sandbox.md) defines capture/restore ordering and fallback. The [previous implementation/experiment guide](../archive/stage3-docs-fast-checkpoint.md) is preserved as historical context, with its dated EC2 layout and measurements.
+The default checkpoint backend is image_commit. Optional cow_zfs uses a private latest-only filesystem snapshot for the same sandbox; optional checkpoint_fast_resume adds a best-effort CRIU process cache. The [checkpoint architecture](../architecture/sandbox.md) defines capture/restore ordering and fallback.
 
 ## Requirements and configuration
 
@@ -28,4 +28,4 @@ Enable checkpoint_fast_resume only on a checkpoint-capable host. GPU sandboxes r
 - Portable Agent.save/export and sandbox/agent fork are unsupported for cow_zfs. Use compatible image-based checkpoints for those operations; credentials and external mount data must be supplied again.
 - Destroy owns per-sandbox snapshots/datasets; shared image seeds/layers remain for host-managed garbage collection. Old-snapshot cleanup is best-effort and reported.
 
-See [sandbox API](../api/sandboxes.md#checkpoint-backends) for exact calls and [historical measurement scope](../archive/measurements.md). Specialized integration commands remain in [host setup](host-setup.md); this documentation stage did not provision or test a ZFS/CRIU host.
+See [sandbox API](../api/sandboxes.md#checkpoint-backends) for exact calls. Specialized integration commands remain in [host setup](host-setup.md); this documentation stage did not provision or test a ZFS/CRIU host.

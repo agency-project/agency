@@ -1010,7 +1010,9 @@ async def _no_cache_static(request, call_next):
     file, since a plain refresh can silently keep serving stale JS/CSS with
     no visible sign anything is wrong."""
     response = await call_next(request)
-    if request.url.path in ("/", "/profiler", "/critical-path") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/profiler", "/critical-path") or request.url.path.startswith(
+        "/static/"
+    ):
         response.headers["Cache-Control"] = "no-store"
     return response
 

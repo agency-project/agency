@@ -331,7 +331,9 @@ def build_graph(run, *, max_unmeasured_tools=None):
     failed_prompts = defaultdict(list)
     models = [a for a in actions if a["kind"] == "model"]
     omitted_tool_identities = 0
-    identity_limit = len(actions) + max_unmeasured_tools if max_unmeasured_tools is not None else None
+    identity_limit = (
+        len(actions) + max_unmeasured_tools if max_unmeasured_tools is not None else None
+    )
     for a in models:
         evidence = a.get("causal_evidence") or {}
         refs = evidence.get("response") or []
@@ -545,7 +547,11 @@ def build_graph(run, *, max_unmeasured_tools=None):
                 blocking=blocking,
             )
     if omitted_unmeasured_tools or omitted_tool_identities:
-        unknown.append({"reason": f"Projection size limit omitted {omitted_unmeasured_tools} unmeasured tool spans and {omitted_tool_identities} tool issuance identities"})
+        unknown.append(
+            {
+                "reason": f"Projection size limit omitted {omitted_unmeasured_tools} unmeasured tool spans and {omitted_tool_identities} tool issuance identities"
+            }
+        )
     # A successful execve proves execution of a process image, not its birth,
     # lifetime, exit status or syscall-to-tool ownership. Preserve the syscall
     # and project a separate process observation with unknown lifecycle bounds.

@@ -81,17 +81,6 @@ def _unknown_block_to_responses(b: dict) -> dict:
     return merged
 
 
-def _forward_usage_to_responses(usage: "dict | None") -> dict:
-    """Full copy, plus the Responses API's own field names layered on top."""
-    usage = dict(usage or {})
-    input_tokens = usage.get("prompt_tokens", 0)
-    output_tokens = usage.get("completion_tokens", 0)
-    usage["input_tokens"] = input_tokens
-    usage["output_tokens"] = output_tokens
-    usage["total_tokens"] = usage.get("total_tokens") or (input_tokens + output_tokens)
-    return usage
-
-
 def _responses_content_to_text(content) -> str:
     return "".join(b["text"] for b in _responses_content_to_blocks(content))
 

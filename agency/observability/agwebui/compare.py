@@ -212,16 +212,6 @@ def stats(actions):
     }
 
 
-def mean_field(actions, key):
-    total = count = 0
-    for action in actions:
-        value = number(action.get("metadata", {}).get(key))
-        if value is not None and value >= 0:
-            total += value
-            count += 1
-    return {"value": total / count if count else None, "samples": count}
-
-
 def activity(run):
     # One pass of scalar accumulators: no per-model/tool event collections.
     groups = {"models": {}, "tools": {}}

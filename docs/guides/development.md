@@ -18,6 +18,8 @@ as configured in `pyproject.toml`. Benchmark sources are maintained outside this
 repository (locally in `~/Documents/benchmarks/`). Tests that import them skip
 when the external package is unavailable. To include them, add the benchmark
 folder's parent to `PYTHONPATH`; benchmark READMEs describe their separate tests.
+The tool-annotation experiment tests are stored with the external benchmarks;
+Agency's annotation unit tests remain under `tests/tool_annotation_effect/`.
 Report existing skips and environment-dependent failures with the result;
 passing unit tests does not validate opted-out live model or checkpoint tests.
 
@@ -33,9 +35,15 @@ Operational references remain at [host setup](host-setup.md),
 their external directories. `scripts/agency-bench` uses `~/Documents/benchmarks/`
 by default; set `AGENCY_BENCHMARKS_DIR` to use a different location.
 
-Previous documentation and validation reports are preserved in
-[the documentation archive](../archive/README.md). Treat archived commands and
-implementation descriptions as historical; use the current code when they differ.
+## JavaScript tests
+
+With Node 24, run the profiler UI tests without installing npm dependencies:
+
+```bash
+node --test tests/agwebui/*.test.mjs tests/agwebui/test_live_follow.cjs
+```
+
+CI runs these tests separately from pytest.
 
 ## Documentation
 
@@ -43,7 +51,7 @@ Read the Markdown files directly on GitHub or in your editor. There is no
 separate documentation site or Python documentation build environment.
 
 When adding a public export, method, namespace or example import, update
-[docs/api/public-api.json](../api/public-api.json) and its reference page.
+the [API index](../api/index.md) and its reference page.
 Keep source links, configuration field tables, and behavioral explanations in
 sync with the Python implementation. Keep reader pages under guides, API, or
 architecture, and documentation assets under `docs/assets/`.

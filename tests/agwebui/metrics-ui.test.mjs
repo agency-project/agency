@@ -104,7 +104,8 @@ const measured=(measurement,extra={})=>({...run,execution_started_at:100,executi
 test('wall clock card shows the backend duration, its state and whether the boundary is automatic or manual',()=>{
   // Deliberately inconsistent timestamps: the card must show the reported duration, not derive one.
   const ended=metricsSummary(measured({state:'ended',automatic_end_at:900,effective_end_at:900,automatic_end_source:'workload_completed',end_source:'workload_done'},{duration:500,status:'running'}));
-  assert.match(ended,/Wall clock · automatic/);assert.match(ended,/20s · ended/);assert.doesNotMatch(ended,/800s|500s/);
+  const wallCard=ended.match(/data-metric-card="wall"[\s\S]*?<\/strong>/)[0];
+  assert.match(wallCard,/Wall clock · automatic/);assert.match(wallCard,/20s · ended/);assert.doesNotMatch(wallCard,/800s|500s/);
   assert.match(ended,/profiler finalization excluded/);
   assert.match(metricsSummary(measured({})),/20s · running/);
   const manual=metricsSummary(measured({state:'ended',policy:'manual',automatic_end_at:130,effective_end_at:120,end_source:'user'}));

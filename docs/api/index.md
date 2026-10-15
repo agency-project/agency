@@ -17,7 +17,7 @@ Application entry points are `Agent`/`agent`, `agdata`, skills, tools, schemas, 
 
 ## Root exports
 
-The [inventory manifest](public-api.json) maps every current root export and additional supported import to a destination. Update the manifest and reference pages when public exports or supported members change. `Agent` is the exact alias of `agent`, not a subclass.
+The tables below map public exports and supported imports to their reference pages. Update them when the public API changes. `Agent` is the exact alias of `agent`, not a subclass.
 
 | Root import | Reference |
 | --- | --- |

@@ -132,13 +132,3 @@ node --test tests/agwebui/investigator-model.test.mjs
 .venv/bin/ruff check agency/observability/agwebui tests/agwebui/test_investigator.py
 node --check agency/observability/agwebui/static/investigator.js
 ```
-
-Earlier browser validation covered the former six-view layout, episode expansion, inspector links,
-wait attribution/zoom, model context blocks, agent filters, divergence and run-B
-navigation, obligation evidence, empty searches, real E1A.1 baseline/contention
-runs, and the mobile layout. No browser console errors were observed. The mobile
-layout was checked at 390px and had no horizontal overflow.
-
-The [screenshot gallery](screenshots.md) preserves those historical views,
-recorded resource evidence, and later live/replay layouts. Those captures do
-not establish the current navigation or release validation results.

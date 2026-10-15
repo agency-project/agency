@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import threading
 import pytest
 from unittest.mock import MagicMock, patch
@@ -745,17 +747,39 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
 # Checkpointing (requires Docker)
 # ---------------------------------------------------------------------------
 
-_docker_ok = pytest.mark.skipif(
-    not (
-        lambda: (
-            __import__("subprocess")
-            .run(["docker", "info"], capture_output=True, timeout=10)
-            .returncode
-            == 0
-        )
-    )(),
-    reason="Docker not available",
+
+def _docker_available():
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+_docker_ok = pytest.mark.skipif(not _docker_available(), reason="Docker not available")
+
+
+@pytest.mark.parametrize(
+    "probe,available",
+    [
+        (None, False),
+        (0, True),
+        (1, False),
+        (OSError("missing"), False),
+        (subprocess.TimeoutExpired("docker info", 10), False),
+    ],
 )
+def test_docker_availability_handles_missing_or_unreachable_runtime(monkeypatch, probe, available):
+    monkeypatch.setattr(shutil, "which", lambda name: None if probe is None else "/usr/bin/docker")
+    run = MagicMock()
+    if isinstance(probe, Exception):
+        run.side_effect = probe
+    else:
+        run.return_value.returncode = probe
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _docker_available() is available
+    assert run.call_count == (0 if probe is None else 1)
 
 
 @_docker_ok

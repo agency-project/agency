@@ -113,19 +113,6 @@ def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0)
         return False
 
 
-def _thread_group_of(tid: int) -> int:
-    """Return the thread-group id of *tid*; *tid* itself if procfs can't say
-    (the thread already exited, or procfs is unavailable)."""
-    try:
-        with open(f"/proc/{tid}/status", encoding="utf-8") as status_file:
-            for line in status_file:
-                if line.startswith("Tgid:"):
-                    return int(line.split(":", 1)[1].strip())
-    except (OSError, ValueError):
-        pass
-    return tid
-
-
 def _is_thread_group_leader(pid: int) -> bool:
     """Return whether *pid* names a process rather than a non-leader thread.
 

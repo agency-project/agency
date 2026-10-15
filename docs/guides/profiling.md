@@ -146,7 +146,6 @@ explains attribution and measurement limits.
 
 ## Inspect a run
 
-Continue with [profiler views and interpretation](profiling/views.md),
-[live trajectory and replay](profiling/live-trajectory.md), or the
-[screenshot gallery](profiling/screenshots.md). These are details of the same
+Continue with [profiler views and interpretation](profiling/views.md) or
+[live trajectory and replay](profiling/live-trajectory.md). These are details of the same
 viewer, with recorded, inferred, synthetic and unavailable data kept distinct.
