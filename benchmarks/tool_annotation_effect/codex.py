@@ -18,6 +18,8 @@ from pathlib import Path
 
 from fastapi import Request
 
+from agency.llm.message_store import split_tool_schema, with_tool_schema
+
 from .common import native, read_events
 from .execution import agent_config, trace_metrics
 from .adapters import SweBenchAdapter
@@ -103,25 +105,28 @@ class CodexGateway:
             self.error = "dispatch deadline exhausted"
             raise RuntimeError(self.error)
         annotation = native("annotations")
-        context["tools"] = annotation.augment_schemas(context.get("tools") or [], self.arm)
+        # The adapter carries tools in a leading ``tool_schema`` message.
+        messages, tools, tool_choice, extra = split_tool_schema(context["messages"])
+        tools = annotation.augment_schemas(tools or [], self.arm)
         instruction = annotation.instruction(self.arm)
         if instruction:
-            if context["messages"] and context["messages"][0]["role"] in ("system", "developer"):
-                context["messages"][0]["blocks"].append(
+            if messages and messages[0]["role"] in ("system", "developer"):
+                messages[0]["blocks"].append(
                     {
                         "type": "text",
-                        "index": len(context["messages"][0]["blocks"]),
+                        "index": len(messages[0]["blocks"]),
                         "text": instruction,
                     }
                 )
             else:
-                context["messages"].insert(
+                messages.insert(
                     0,
                     {
                         "role": "system",
                         "blocks": [{"type": "text", "index": 0, "text": instruction}],
                     },
                 )
+        context["messages"] = with_tool_schema(messages, tools, tool_choice, extra)
         if self.calls == 0:
             self.trace(
                 "treatment",
@@ -129,7 +134,7 @@ class CodexGateway:
                     "arm": self.arm,
                     "harness": "codex",
                     "version": annotation.VERSION,
-                    "schemas": context["tools"],
+                    "schemas": tools,
                     "instruction": instruction,
                     "codex_version": self.config["codex_version"],
                 },

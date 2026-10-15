@@ -139,8 +139,15 @@ class Logger:
     def record_stream_delta(self, *args, **kwargs):
         pass
 
-    def record_llm_exchange(self, call_label, *, exchange_type, prompt_chain, response_chain, **_):
-        self.finalized.append((exchange_type, [payload for _hash, payload in response_chain]))
+    def record_llm_exchange(
+        self, call_label, *, exchange_type, message_store, response_message_hashes, **_
+    ):
+        response = [
+            payload
+            for message_hash in response_message_hashes
+            for _hash, payload in message_store.payloads(message_hash)
+        ]
+        self.finalized.append((exchange_type, response))
 
     def retries(self):
         return [payload for kind, payload, _ in self.events if kind == "llm_retry"]

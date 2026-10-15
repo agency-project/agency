@@ -17,6 +17,7 @@ nav:
       - Live metrics and profiler views: live-metrics.md
       - Host setup: guides/host-setup.md
       - Checkpoints: guides/checkpoints.md
+      - Message patches: Message_Patches.md
       - Development: guides/development.md
   - API reference:
       - Public API index: api/index.md

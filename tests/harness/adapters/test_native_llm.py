@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from agency.llm.message_store import split_tool_schema
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.native import NativeAdapter
 
@@ -144,8 +145,8 @@ def test_harness_to_agency_tools_and_tool_choice_pass_through_unchanged():
     tool_choice = {"type": "function", "function": {"name": "get_weather"}}
     body = {"model": "m", "messages": [], "tools": tools, "tool_choice": tool_choice}
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"] == tools
-    assert agency["tool_choice"] == tool_choice
+    assert split_tool_schema(agency["messages"])[1] == tools
+    assert split_tool_schema(agency["messages"])[2] == tool_choice
 
 
 def test_agency_to_harness_text_only():

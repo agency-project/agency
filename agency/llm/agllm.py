@@ -16,6 +16,9 @@ except ImportError:
 # unknown-field fallthrough when replaying history in build_kwargs.
 _UNKNOWN_FIELD_PREFIXES = ("openai_chatcompletions_", "anthropic_")
 
+# The second-system-class-message warning below repeats on every LLM call of a
+# harness that always does this, so it is printed once per process.
+
 
 # Common per-call generation params every OpenAI-compatible server accepts as
 # top-level chat.completions.create() kwargs (see agllm.build_kwargs's
@@ -557,7 +560,7 @@ class agllm:
                     f'(role:"{role}") message -- sending it as a `user` message '
                     "at its original position instead, since not every "
                     "OpenAI-compatible server's chat template tolerates more "
-                    "than one",
+                    "than one (this warning is printed once)",
                 )
                 wire_msg = {"role": "user", "content": text}
             else:

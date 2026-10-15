@@ -12,6 +12,7 @@ from functools import partial
 from fastapi import Request
 
 from ...llm.response_check import tool_arguments_complete
+from ...llm.message_store import with_tool_schema
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
@@ -662,9 +663,11 @@ class CodexAdapter(HarnessAdapter):
             for index, block in enumerate(message["blocks"]):
                 block["index"] = index
         return {
-            "messages": grouped,
-            "tools": _responses_tools_to_agency(_responses_tool_routes(raw_request)),
-            "tool_choice": _responses_tool_choice_to_agency(raw_request.get("tool_choice")),
+            "messages": with_tool_schema(
+                grouped,
+                _responses_tools_to_agency(_responses_tool_routes(raw_request)),
+                _responses_tool_choice_to_agency(raw_request.get("tool_choice")),
+            )
         }
 
     def _format_context_agency_to_harness(

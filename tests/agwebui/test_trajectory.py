@@ -5,6 +5,7 @@ from collections import deque
 
 from fastapi.testclient import TestClient
 
+from agency.llm.message_store import MessageStore
 from agency.observability.agwebui.trajectory import LiveSource, Trajectory, replay_events
 from agency.observability.agwebui.trajectory_semantics import validate_suggestion
 
@@ -714,24 +715,39 @@ def test_canonical_producer_flushes_start_and_result_while_logger_is_open(tmp_pa
         )
         source.refresh(force=True)
         assert source.model.actions["worker:model:model-1"]["outcome"] == "running"
+        store = MessageStore()
+        with store:
+            prompt = store.add_messages(
+                [
+                    {"role": "user", "blocks": [{"type": "text", "text": "Check the result"}]},
+                    {
+                        "role": "assistant",
+                        "blocks": [{"type": "thinking", "text": "hidden reasoning"}],
+                    },
+                ]
+            )
+            response = [
+                store.add_message(
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "text", "text": "Visible reply"},
+                            {"type": "thinking", "text": "hidden reasoning"},
+                            {
+                                "type": "metadata",
+                                "usage": {"prompt_tokens": 17, "completion_tokens": 4},
+                            },
+                        ],
+                    }
+                )
+            ]
         actor_log.record_llm_exchange(
             "model-1",
             exchange_type="llm_block",
-            prompt_chain=[
-                ("prompt", {"role": "user", "type": "text", "text": "Check the result"}),
-                (
-                    "hidden-prompt",
-                    {"role": "assistant", "type": "thinking", "text": "hidden reasoning"},
-                ),
-            ],
-            response_chain=[
-                ("response", {"type": "text", "text": "Visible reply"}),
-                ("hidden", {"type": "thinking", "text": "hidden reasoning"}),
-                (
-                    "usage",
-                    {"type": "metadata", "usage": {"prompt_tokens": 17, "completion_tokens": 4}},
-                ),
-            ],
+            message_store=store,
+            harness_message_hashes=prompt,
+            patched_message_hashes=prompt,
+            response_message_hashes=response,
         )
         source.refresh(force=True)
         invocation = source.model.actions["worker:model:model-1"]

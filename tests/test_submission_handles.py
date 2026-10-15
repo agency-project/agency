@@ -100,10 +100,11 @@ def test_resume_cannot_overtake_an_inflight_pause_rpc(tmp_path, monkeypatch):
         def __exit__(self, *args):
             lock.release()
 
-    def pause():
+    def pause(wait_timeout_s=None):
         pause_entered.set()
         assert release_pause.wait(2)
         delivered.append("pause")
+        return {"ok": True, "parked": True}
 
     daemon = MagicMock()
     client = daemon.client.return_value.__enter__.return_value

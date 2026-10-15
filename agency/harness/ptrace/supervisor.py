@@ -495,6 +495,11 @@ class agProxyPtraceHandle:
     def pause(self) -> None:
         self._loop.pause()
 
+    def wait_paused(self, timeout: "float | None" = None) -> bool:
+        """Block until every process in the tree is actually stopped after
+        pause(); False if that did not happen within *timeout*."""
+        return self._loop.wait_paused(timeout)
+
     def resume(self) -> None:
         self._loop.resume()
 

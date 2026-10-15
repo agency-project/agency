@@ -26,6 +26,7 @@ import httpx
 import openai
 
 from .agllm import agllm
+from .message_store import split_tool_schema
 from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBackend,
@@ -378,7 +379,8 @@ class _BedrockConverseBackend(agllm):
         return None
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
-        system, converse_messages = _agency_messages_to_converse(request["messages"])
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        system, converse_messages = _agency_messages_to_converse(messages)
         kwargs: dict = dict(modelId=self.agconfig.llm.model or "", messages=converse_messages)
         if system:
             kwargs["system"] = [{"text": system}]
@@ -397,10 +399,7 @@ class _BedrockConverseBackend(agllm):
             stop = self.agconfig.llm.stop
             inference_config["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
         kwargs["inferenceConfig"] = inference_config
-        tool_choice = request.get("tool_choice")
-        converse_tools = (
-            None if tool_choice == "none" else _agency_tools_to_converse(request.get("tools"))
-        )
+        converse_tools = None if tool_choice == "none" else _agency_tools_to_converse(tools)
         if converse_tools:
             tool_config: dict = {"tools": converse_tools}
             converse_tool_choice = _agency_tool_choice_to_converse(tool_choice)

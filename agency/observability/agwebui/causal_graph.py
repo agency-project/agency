@@ -15,6 +15,15 @@ import json
 import math
 
 
+def block_table(tables):
+    """The content-addressed block table of an agent database: `message_block_lookup`,
+    or `blocks` in runs recorded before that rename. None when neither exists."""
+    for name in ("message_block_lookup", "blocks"):
+        if name in tables:
+            return name
+    return None
+
+
 def _digest(block):
     # Role is normalized separately; providers may change role spelling at the boundary.
     value = {k: v for k, v in block.items() if k != "role"}
@@ -801,7 +810,7 @@ def enrich_saved_evidence(run, trace_path):
                     row[0]
                     for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 }
-                if not {"exchanges", "exchange_chain", "blocks"} <= tables:
+                if not {"exchanges", "exchange_chain"} <= tables or block_table(tables) is None:
                     continue
                 for label, agent, kind in con.execute("SELECT call_label,name,type FROM exchanges"):
                     key = (agent, label)

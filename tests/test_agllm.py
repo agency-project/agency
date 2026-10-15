@@ -258,14 +258,18 @@ def test_build_llm_kwargs_leading_developer_after_system_becomes_user(capsys):
     assert "second system-class" in capsys.readouterr().out
 
 
-def test_build_llm_kwargs_second_system_class_warns_once_per_process(capsys):
+def test_second_system_class_warning_is_printed_once_per_process(capsys):
     messages = [
         _sys_msg("You are Codex."),
         _msg("developer", "Some developer-level instructions."),
         _msg("user", "do X"),
     ]
-    build_llm_kwargs(_cfg(), messages, None)
-    build_llm_kwargs(_cfg(), messages, None)
+    for _ in range(3):
+        kw = build_llm_kwargs(_cfg(), messages, None)
+        assert kw["messages"][1] == {
+            "role": "user",
+            "content": "Some developer-level instructions.",
+        }
     assert capsys.readouterr().out.count("second system-class") == 1
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import pytest
 
+from agency.llm.message_store import split_tool_schema
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import CodexAdapter
 
@@ -164,7 +165,7 @@ def test_harness_to_agency_tools_and_tool_choice():
         "tool_choice": {"type": "function", "name": "get_weather"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"] == [
+    assert split_tool_schema(agency["messages"])[1] == [
         {
             "type": "function",
             "function": {
@@ -174,7 +175,10 @@ def test_harness_to_agency_tools_and_tool_choice():
             },
         }
     ]
-    assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+    assert split_tool_schema(agency["messages"])[2] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
 
 
 def test_additional_tools_are_definitions_not_assistant_messages():
@@ -189,8 +193,9 @@ def test_additional_tools_are_definitions_not_assistant_messages():
         ]
     }
     converted = _backend()._format_context_harness_to_agency(body)
-    assert converted["messages"] == [{"role": "user", "blocks": [_text_block("Run pwd")]}]
-    assert converted["tools"][0]["function"]["name"] == "pwd"
+    chat_messages, tools, _tool_choice, _extra = split_tool_schema(converted["messages"])
+    assert chat_messages == [{"role": "user", "blocks": [_text_block("Run pwd")]}]
+    assert tools[0]["function"]["name"] == "pwd"
 
 
 def test_namespaced_custom_tools_round_trip_without_shared_adapter_state():
@@ -220,7 +225,7 @@ def test_namespaced_custom_tools_round_trip_without_shared_adapter_state():
     }
     backend = _backend()
     converted = backend._format_context_harness_to_agency(body)
-    tools = converted["tools"]
+    tools = split_tool_schema(converted["messages"])[1]
     assert len(tools) == 2
     custom_name = tools[0]["function"]["name"]
     assert len(custom_name) <= 64
@@ -282,9 +287,9 @@ def test_namespace_function_identity_survives_history_and_forced_choice():
     }
     backend = _backend()
     converted = backend._format_context_harness_to_agency(body)
-    names = [tool["function"]["name"] for tool in converted["tools"]]
+    names = [tool["function"]["name"] for tool in split_tool_schema(converted["messages"])[1]]
     assert names[0] != names[1]
-    assert converted["tool_choice"]["function"]["name"] == names[0]
+    assert split_tool_schema(converted["messages"])[2]["function"]["name"] == names[0]
     response = {
         "message": {
             "blocks": [{"type": "tool_use", "id": "c", "name": names[0], "arguments": "{}"}]
@@ -317,7 +322,9 @@ def test_registered_route_restores_custom_calls_for_each_request(stream):
                         {
                             "type": "tool_use",
                             "id": "c",
-                            "name": request["tools"][0]["function"]["name"],
+                            "name": split_tool_schema(request["messages"])[1][0]["function"][
+                                "name"
+                            ],
                             "arguments": json.dumps({"input": "text(42)"}),
                         }
                     ]
@@ -416,13 +423,13 @@ def test_harness_to_agency_local_shell_call_item_preserved():
 def test_harness_to_agency_tool_choice_auto_passthrough():
     body = {"model": "m", "input": "hi", "tool_choice": "auto"}
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == "auto"
+    assert split_tool_schema(agency["messages"])[2] == "auto"
 
 
 def test_harness_to_agency_hosted_tool_choice_preserved_with_named_type():
     body = {"model": "m", "input": "hi", "tool_choice": {"type": "file_search"}}
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == {
+    assert split_tool_schema(agency["messages"])[2] == {
         "type": "openai_responses_file_search",
         "data": {"type": "file_search"},
     }

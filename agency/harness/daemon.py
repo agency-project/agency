@@ -594,16 +594,24 @@ class HarnessManager:
             return registry.get(identifier) if registry else {"id": identifier, "state": "unknown"}
 
     def control(
-        self, action: str, *, request_id: str | None = None, force: bool = True
-    ) -> dict | None:
+        self,
+        action: str,
+        *,
+        request_id: str | None = None,
+        force: bool = True,
+        wait_timeout_s: "float | None" = None,
+    ) -> "dict | None":
         """Backs HarnessInteractionServer's /control/{action} route.
         No-op (not an error) when nothing is currently registered -- see
-        agent.py's cancel()/pause()/resume() for why that's safe."""
+        agent.py's cancel()/pause()/resume() for why that's safe.
+
+        ``pause`` with a ``wait_timeout_s`` is synchronous: it returns only
+        once the harness is actually stopped, as ``{"parked": bool}``."""
         with self._control_lock:
             if action == "cancel" and (
                 request_id is None or request_id != self._current_request_id
             ):
-                return
+                return None
             if action == "cancel":
                 self._current_cancel_force = force or (
                     self._current_request_cancelled and self._current_cancel_force
@@ -629,12 +637,24 @@ class HarnessManager:
                 raise ValueError(f"unknown harness control action {action!r}")
             if not hasattr(self, "_control_observations"):
                 self._control_observations = ControlObservations()
-            return self._control_observations.add(
+            observation = self._control_observations.add(
                 action,
                 handle,
                 self._current_request_id,
                 getattr(self, "_current_attempt_token", None),
             )
+        if action == "pause" and wait_timeout_s is not None:
+            # Outside the control lock: cancel and resume must stay deliverable
+            # while this waits.
+            return {**self._await_pause(handle, wait_timeout_s), "observation": observation}
+        return observation
+
+    def _await_pause(self, handle: object, timeout_s: float) -> dict:
+        parked = True
+        waiter = getattr(handle, "wait_paused", None) if handle is not None else None
+        if callable(waiter):
+            parked = bool(waiter(timeout_s))
+        return {"parked": parked}
 
     def _dispatch_attempt(self, request: HarnessAttemptRequest) -> HarnessAttemptResult:
         token = request.attempt_token

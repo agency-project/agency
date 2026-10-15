@@ -116,7 +116,28 @@ class HarnessInteractionServer:
                     return JSONResponse({"error": "force must be a boolean"}, status_code=400)
                 observation = self._control_handler(action, request_id=request_id, force=force)
             else:
-                observation = self._control_handler(action)
+                wait_timeout_s = (
+                    (payload or {}).get("wait_timeout_s") if action == "pause" else None
+                )
+                if wait_timeout_s is not None:
+                    # Synchronous pause: reply only once the harness is stopped.
+                    result = self._control_handler(action, wait_timeout_s=float(wait_timeout_s))
+                    if isinstance(result, dict) and "parked" in result:
+                        observation = result.get("observation")
+                        return JSONResponse(
+                            {
+                                "ok": True,
+                                "parked": result["parked"],
+                                **(
+                                    {"observation": observation}
+                                    if isinstance(observation, dict)
+                                    else {}
+                                ),
+                            }
+                        )
+                    observation = result
+                else:
+                    observation = self._control_handler(action)
             return JSONResponse(
                 {
                     "ok": True,

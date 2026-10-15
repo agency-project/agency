@@ -55,7 +55,7 @@ print(state.running_count, state.blocked_count)
 
 ## Conversation context
 
-`agcontext(recent_transcript=None, harness_sessions=None, retained_messages=None, harness_message_cursors=None, _future=None)` holds ordered agent state. Omitted mappings/lists are fresh; supplied ones are retained. `_future` belongs to infrastructure. Prefer `agent.history` and `queue_message` for application changes.
+`agcontext(harness_sessions=None, retained_messages=None, harness_message_cursors=None, _future=None, *, message_hash_list=None, message_store=None)` holds ordered agent state. The transcript is a list of message hashes resolved against its `message_store`, which also holds the persistent message patches (see [Message patches](../Message_Patches.md)); `agcontext.from_messages(messages)` builds one from plain messages. Omitted mappings/lists are fresh; supplied ones are retained. `_future` belongs to infrastructure. Prefer `agent.history` and `queue_message` for application changes.
 
 `is_pending()` reports presence of a context future (even if done). `resolve_prev_dependencies()` blocks and merges predecessor state, returns None. `get_resolved_transcript()` blocks and returns a shallow list snapshot; `copy()` blocks and returns a deep independent context. `set_transcript(list)` replaces with a list copy without waiting itself.
 
@@ -131,13 +131,13 @@ def workload():
 
 ::: agency.agcontext.agcontext
     options:
-      members: ["__init__", "is_pending", "resolve_prev_dependencies", "get_resolved_transcript", "set_transcript", "append_retained_message", "pending_retained_messages", "advance_retained_cursor", "copy"]
+      members: ["__init__", "is_pending", "resolve_prev_dependencies", "get_resolved_transcript", "set_transcript", "from_messages", "message_state", "message_state_fields", "append_retained_message", "pending_retained_messages", "advance_retained_cursor", "copy"]
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
 ::: agency.orchestrator.orchestrator.GlobalAgentOrchestrator
     options:
-      members: ["__init__", "change_config", "submit", "submit_context_message", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown"]
+      members: ["__init__", "change_config", "submit", "submit_context_message", "submit_context_patch", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown"]
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 

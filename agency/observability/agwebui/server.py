@@ -743,7 +743,7 @@ def _json_object(value: str) -> dict:
 
 
 # record_llm_exchange() (agdatalogger.py) stores each distinct block once in
-# a content-addressable `blocks` table (keyed by content hash) and records
+# a content-addressable `message_block_lookup` table (keyed by content hash) and records
 # each exchange's full prompt and response as two ordered hash chains in
 # `exchange_chain`, rather than one `events` row per block the way the
 # older model did. The metadata block for an exchange is its own chain
@@ -767,7 +767,7 @@ _TOKEN_TOTALS_SQL = (
     "SUM(json_extract(b.payload, '$.usage.cache_write_tokens')) "
     "FROM exchange_chain ec "
     "JOIN exchanges e ON e.call_label = ec.call_label "
-    "JOIN blocks b ON b.hash = ec.hash "
+    "JOIN message_block_lookup b ON b.hash = ec.hash "
     "WHERE e.type = 'llm_block' AND ec.kind = 'response' "
     "AND json_extract(b.payload, '$.type') = 'metadata'"
 )
@@ -779,7 +779,7 @@ def _fetch_finalized_llm_block_rows(
     """Reproduce the flat, deduplicated `(type, call_label, payload_json,
     timestamp)` row sequence the older row-per-block `events` model used
     to hand to `_reconstruct_in_progress_messages` directly -- from the
-    content-addressable `exchanges`/`exchange_chain`/`blocks` schema.
+    content-addressable `exchanges`/`exchange_chain`/`message_block_lookup` schema.
 
     Each exchange's prompt chain (its full recorded request -- including
     any resent history, since a request's prompt is stored in full every
@@ -793,7 +793,7 @@ def _fetch_finalized_llm_block_rows(
         "SELECT e.call_label, e.timestamp, ec.hash, b.payload "
         "FROM exchanges e "
         "JOIN exchange_chain ec ON ec.call_label = e.call_label "
-        "JOIN blocks b ON b.hash = ec.hash "
+        "JOIN message_block_lookup b ON b.hash = ec.hash "
         "WHERE e.type = 'llm_block' "
         "ORDER BY e.id, ec.kind, ec.seq"
     ).fetchall()

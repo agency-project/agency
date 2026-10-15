@@ -15,7 +15,7 @@ from pathlib import Path
 import sqlite3
 import threading
 
-from .causal_graph import exchange_evidence, messages_evidence
+from .causal_graph import block_table, exchange_evidence, messages_evidence
 from .investigator import normalize_trace, object_value, reduce_samples, visible_model_response
 from .investigator import response_tool_ids
 
@@ -240,7 +240,8 @@ def _canonical_evidence(run, trace_path):
                     row[0]
                     for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 }
-                if {"exchanges", "exchange_chain", "blocks"} <= tables and by_label:
+                blocks_table = block_table(tables)
+                if {"exchanges", "exchange_chain"} <= tables and blocks_table and by_label:
                     for label, agent in con.execute("SELECT call_label,name FROM exchanges"):
                         key = (agent, label)
                         if key not in by_label:
@@ -249,7 +250,7 @@ def _canonical_evidence(run, trace_path):
                         metrics = {}
                         for kind, raw, block_hash in con.execute(
                             "SELECT c.kind,CASE WHEN length(CAST(b.payload AS BLOB))<=? THEN b.payload END,b.hash "
-                            "FROM exchange_chain c LEFT JOIN blocks b ON b.hash=c.hash "
+                            f"FROM exchange_chain c LEFT JOIN {blocks_table} b ON b.hash=c.hash "
                             "WHERE c.call_label=? ORDER BY c.kind,c.seq",
                             (MAX_EVENT_BYTES, label),
                         ):

@@ -1358,11 +1358,16 @@ class LiveSource:
 
     @staticmethod
     def _exchange(con, label, kind, *, full=False):
-        from .causal_graph import exchange_evidence
+        from .causal_graph import block_table, exchange_evidence
 
+        tables = {
+            row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
         chains = {"prompt": [], "response": []}
         for chain_kind, raw in con.execute(
-            "SELECT c.kind,b.payload FROM exchange_chain c JOIN blocks b ON b.hash=c.hash WHERE c.call_label=? ORDER BY c.kind,c.seq",
+            "SELECT c.kind,b.payload FROM exchange_chain c "
+            f"JOIN {block_table(tables) or 'message_block_lookup'} b ON b.hash=c.hash "
+            "WHERE c.call_label=? ORDER BY c.kind,c.seq",
             (label,),
         ):
             block = json.loads(raw)

@@ -10,7 +10,7 @@ uv run python examples/run_all.py
 ```
 
 Each example demonstrates a small workflow and prints the results. The runner
-executes lessons 01–11 in separate processes, continues after failures, and
+executes lessons 01–11 and 13 in separate processes, continues after failures, and
 returns a nonzero exit code if any lesson fails. The SWE-bench example requires
 its own prepared inputs and runs separately.
 
@@ -29,6 +29,7 @@ its own prepared inputs and runs separately.
 | [10_harnesses_and_webui.py](10_harnesses_and_webui.py) | Run native and Codex agents with a temporary dashboard. |
 | [11_live_trajectory.py](11_live_trajectory.py) | Record real local file edits and subprocess telemetry without a model. |
 | [12_swebench_live.py](12_swebench_live.py) | Run one prepared SWE-bench issue and export its patch. |
+| [13_context_manipulation.py](13_context_manipulation.py) | Rewrite message blocks sent to the model with `patch_history`, between skill runs and at an exact LLM call with `pause`/`resume`. |
 
 Lessons 01–10 share `_common.py`. They default to the included **native harness**,
 OpenAI Chat Completions with `gpt-6-luna`, `reasoning_effort="none"`, and a

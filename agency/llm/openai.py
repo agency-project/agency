@@ -6,6 +6,7 @@ import httpx
 import openai
 
 from .agllm import _RESPONSE_ID_HEADERS, StreamInterruptedError, agllm
+from .message_store import split_tool_schema
 
 _HANDLED_MESSAGE_FIELDS = {"role", "content", "tool_calls", "reasoning_content", "function_call"}
 _HANDLED_DELTA_FIELDS = {"role", "content", "reasoning_content", "tool_calls", "function_call"}
@@ -120,8 +121,8 @@ class _OpenAICompatibleBackend(agllm):
         return root or None
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
-        kwargs = self.build_kwargs(request["messages"], request.get("tools"))
-        tool_choice = request.get("tool_choice")
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        kwargs = self.build_kwargs(messages, tools)
         # Responses-style clients such as Codex may send tool_choice="auto"
         # even after their hosted tools were filtered from a Chat Completions
         # request. OpenAI rejects tool_choice when no tools are present.

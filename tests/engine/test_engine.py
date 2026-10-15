@@ -9,6 +9,7 @@ import pytest
 
 from agency.agdata import agdata
 from agency.agcontext import agcontext
+from agency.llm.message_store import MessageStore
 from agency.agschema import agschema
 from agency.agdata import agerror
 from agency.agpolicy import agpolicy
@@ -176,7 +177,7 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             *,
             is_cancelled=None,
             request_id=None,
-            recent_transcript=None,
+            context=None,
         ):
             self.agent = agent
             self.sandbox = sandbox
@@ -184,14 +185,13 @@ def _install_fake_host_server_manager(monkeypatch, results, collected_sequence=N
             self.resource_pool = resource_pool
             self.is_cancelled = is_cancelled
             self.request_id = request_id
-            self.recent_transcript = recent_transcript
             self.started = False
             self.stopped = False
             self.change_config_calls = []
             self.active_attempt_token = None
             self.bound_attempt_tokens = []
             self.cleared_attempt_tokens = []
-            self.llm_handler_server = SimpleNamespace(get_main_transcript=lambda _needle: [])
+            self.llm_handler_server = SimpleNamespace(get_main_history=lambda _needle: [])
 
             self.host_mcp_server = SimpleNamespace(
                 collected_output=lambda: next(collected_iter) if collected_iter is not None else {}
@@ -713,7 +713,7 @@ def test_execute_stops_the_host_server_manager_when_daemon_launch_fails(monkeypa
     )
     with pytest.raises(RuntimeError, match="launch failed"):
         engine.execute(
-            SimpleNamespace(recent_transcript=[]),
+            SimpleNamespace(),
             skill,
             SimpleNamespace(),
             SimpleNamespace(),
@@ -1097,7 +1097,7 @@ def test_execute_builds_execution_result_from_final_attempt(monkeypatch):
     skill = SimpleNamespace(
         sandbox_mcp_tools=[], policy=agpolicy(), output_schema=None, max_output_schema_retries=3
     )
-    context = SimpleNamespace(marker="ctx", harness_sessions={}, recent_transcript=[])
+    context = SimpleNamespace(marker="ctx", harness_sessions={})
 
     result = engine.execute(
         context, skill, SimpleNamespace(), SimpleNamespace(), engine._agent.sandbox
@@ -1293,16 +1293,19 @@ def test_watchdog_never_health_checks_without_a_daemon_handle(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _fake_host_server_manager_with_transcript(transcript, *, collected_output=None):
+def _fake_host_server_manager_with_transcript(transcript, *, collected_output=None, store=None):
     seen: dict = {}
 
-    def get_main_transcript(needle):
+    store = store if store is not None else MessageStore()
+    hashes = store.add_messages(transcript)
+
+    def get_main_history(needle):
         seen["needle"] = needle
-        return transcript
+        return hashes
 
     return (
         SimpleNamespace(
-            llm_handler_server=SimpleNamespace(get_main_transcript=get_main_transcript),
+            llm_handler_server=SimpleNamespace(get_main_history=get_main_history),
             host_mcp_server=SimpleNamespace(
                 collected_output=lambda: collected_output if collected_output is not None else {}
             ),
@@ -1311,14 +1314,17 @@ def _fake_host_server_manager_with_transcript(transcript, *, collected_output=No
     )
 
 
-def test_build_execution_result_populates_recent_transcript_from_llm_handler_server():
+def test_build_execution_result_stages_the_main_chain_for_the_commit():
     engine = AgentEngine(_FakeAgent())
     transcript = [
         {"role": "user", "content": "do the work"},
         {"role": "assistant", "content": "done"},
     ]
-    engine._host_server_manager, seen = _fake_host_server_manager_with_transcript(transcript)
     context = agcontext()
+    # The server hashes into the agcontext's own message_store.
+    engine._host_server_manager, seen = _fake_host_server_manager_with_transcript(
+        transcript, store=context.message_store
+    )
     skill = SimpleNamespace(output_schema=None, _build_prompt=lambda: "system")
 
     result = engine._build_execution_result(
@@ -1330,8 +1336,31 @@ def test_build_execution_result_populates_recent_transcript_from_llm_handler_ser
     )
 
     assert result == agdata(result="done")
-    assert context.recent_transcript == transcript
+    # Staged on the engine; `execute` writes it into the agcontext once the run commits.
+    assert context.message_store.materialize(engine._pending_message_hash_list) == transcript
+    assert context.message_hash_list == []
     assert seen["needle"] == "do the work"
+
+
+def test_build_execution_result_stages_nothing_for_a_failed_attempt():
+    engine = AgentEngine(_FakeAgent())
+    context = agcontext()
+    engine._host_server_manager, seen = _fake_host_server_manager_with_transcript(
+        [{"role": "user", "content": "do the work"}], store=context.message_store
+    )
+    skill = SimpleNamespace(output_schema=None, _build_prompt=lambda: "system")
+
+    result = engine._build_execution_result(
+        context,
+        skill,
+        HarnessAttemptResult(ok=False, error_message="boom"),
+        engine._agent.sandbox,
+        PromptPayload("system", "do the work"),
+    )
+
+    assert result == agerror("boom")
+    assert engine._pending_message_hash_list is None
+    assert "needle" not in seen
 
 
 def test_build_execution_result_uses_collected_structured_output():

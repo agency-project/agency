@@ -17,6 +17,7 @@ from fastapi import Request
 
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .openai_chat_completions import CHAT_KEEPALIVE_FRAME, chat_error_frame
+from ...llm.message_store import with_tool_schema
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 from .streaming import start_streaming_response, stream_response
@@ -418,11 +419,14 @@ class NativeAdapter(HarnessAdapter):
                 )
             messages.append({"role": role, "blocks": blocks})
 
+        internal_kind = raw_request.get("agency_internal_kind")
         return {
-            "messages": messages,
-            "tools": raw_request.get("tools"),
-            "tool_choice": raw_request.get("tool_choice"),
-            "agency_internal_kind": raw_request.get("agency_internal_kind"),
+            "messages": with_tool_schema(
+                messages,
+                raw_request.get("tools"),
+                raw_request.get("tool_choice"),
+                {"agency_internal_kind": internal_kind} if internal_kind is not None else None,
+            )
         }
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:

@@ -1,7 +1,7 @@
 # Agents and lifecycle
 
 ```python
-from agency import Agent, agent, agdata, agskill
+from agency import Agent, MessageBlock, agent, agdata, agskill
 ```
 
 `Agent is agent`. Construct with `Agent(name=None, *, sandbox=None, agconfig=None, harness=None)`. A supplied base name is allocated a unique suffix in the live registry; omitted names are generated. Configuration must select an LLM via provider or model. Precedence is explicit config, `Agent.default_agconfig`, then an active team's configured LLM; missing configuration raises `TypeError`. The chosen config is cloned. `harness` overrides its agent namespace; the default is `native`. Annotation experiment modes require native (`ValueError` otherwise).
@@ -15,6 +15,7 @@ Construction registers the agent and opens its logger/process orchestrator. The 
 | `run(skill, skill_input, max_steps=None)` | Pending `agdata`; waits briefly for scheduler acknowledgement, then execution continues in the background. Requires an `agdata` input (`TypeError`). A supplied `max_steps` must be a positive integer excluding bool (`ValueError`); `None` uses `skill.react_max_steps` from config, default 4096 for native. External CLI adapters may not enforce this step limit. |
 | `await asyncio_run(skill, skill_input, max_steps=None)` | Waits asynchronously and returns the resolved wrapper. Same submission contract as `run`. Cancelling the waiter leaves execution running. |
 | `queue_message(message)` | Returns `None`. Enqueues a retained user message in the same context sequence as runs, without starting an engine/container. Non-string or empty strings raise `TypeError`/`ValueError`. Only submissions after this enqueue inherit it. |
+| `patch_history(old_block, new_blocks)` | Returns a patch key. Persistently replaces a message block in everything sent to the LLM backend, including the active skill run's next LLM call. `remove_history_patch(key)` / `clear_history_patches()` withdraw one or all patches. See [Message patches](../Message_Patches.md). |
 | `history` | Getter blocks for preceding work and returns `agdata(messages=[...])`, a snapshot of the most recent reconstructed transcript, not a cumulative history of every invocation. Setter accepts `agdata(messages=...)`, resolves it and pending context, then replaces the transcript. |
 | `record_state(state, skill=None, tool=None)` | Returns `None`; writes and flushes a state event. Logging/persistence errors can propagate. |
 
@@ -38,7 +39,7 @@ print(payload["summary"])
 
 ## Controls and configuration
 
-`pause()`, `resume()`, `cancel(handle)`, `redirect(handle, message)` return `None`; `is_paused()` returns bool. Pause is agent-wide, persistent across requests and best-effort at the harness boundary. Paused work can still be admitted and consume a slot. See [targeting and timing](results.md#targeting-and-timing) before relying on cancellation or redirect delivery.
+`pause(timeout_s=10.0, *, async_=False)`, `resume()`, `cancel(handle)`, `redirect(handle, message)` return `None`; `is_paused()` returns bool. Pause is agent-wide and persistent across requests. By default `pause()` blocks until the running harness is actually stopped and raises `TimeoutError` if it is not within `timeout_s` (the pause stays requested); `async_=True` only requests the stop. Pair it with `patch_history()` to land a patch at an exact LLM call. Paused work can still be admitted and consume a slot. See [targeting and timing](results.md#targeting-and-timing) before relying on cancellation or redirect delivery.
 
 `stop(*, force=False)` cancels this agent's currently outstanding work and clears its pause intent. Request-owned active engines receive a cancellation request using SIGTERM by default or SIGKILL with `force=True`; queued work can be cancelled without an engine. A successful return is `None` and does not independently confirm process exit or cleanup. Stop does not unregister the agent or prevent later `run()` submissions. It does not stop other agents or shut down the process orchestrator.
 
@@ -65,4 +66,10 @@ Saved LLM metadata omits API keys and AWS credentials; the whole configuration i
 
 ::: agency.agent.agent
     options:
-      members: ["__init__", "run", "asyncio_run", "queue_message", "redirect", "cancel", "stop", "pause", "resume", "is_paused", "history", "output_path", "container_output_path", "change_config", "get_config_copy", "record_state", "fork", "all", "save", "load", "save_all", "load_all"]
+      members: ["__init__", "run", "asyncio_run", "queue_message", "patch_history", "remove_history_patch", "clear_history_patches", "redirect", "cancel", "stop", "pause", "resume", "is_paused", "history", "output_path", "container_output_path", "change_config", "get_config_copy", "record_state", "fork", "all", "save", "load", "save_all", "load_all"]
+
+[Source: message_store.py](../../agency/llm/message_store.py)
+
+::: agency.llm.message_store.MessageBlock
+    options:
+      members: ["__init__", "from_payload", "role", "type", "hash", "payload", "to_dict"]

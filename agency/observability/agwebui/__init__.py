@@ -88,7 +88,12 @@ def _dispatch_command(cmd: dict) -> None:
                 break
     elif ctype in ("pause_all", "resume_all"):
         for a in _agent_cls.all():
-            (a.pause if ctype == "pause_all" else a.resume)()
+            # pause() now waits for the harness to stop and raises if it does
+            # not; one agent failing to stop must not leave the rest unpaused.
+            try:
+                (a.pause if ctype == "pause_all" else a.resume)()
+            except Exception as _e:
+                print(f"[agwebui] WARNING: {ctype} failed for {a.agname}: {_e}")
     elif ctype in ("stop", "kill", "stop_all", "kill_all"):
         targets = [a for a in _agent_cls.all() if ctype.endswith("_all") or a.agname == agname]
         for a in targets:

@@ -5,6 +5,7 @@
     "agerror": "agency.agdata.agerror",
     "agcanceled": "agency.agdata.agcanceled",
     "agcontext": "agency.agcontext.agcontext",
+    "MessageBlock": "agency.llm.message_store.MessageBlock",
     "agschema": "agency.agschema.agschema",
     "agtype": "agency.agtype.agtype",
     "agfile": "agency.agtype.agfile",
@@ -41,6 +42,9 @@
         "run",
         "asyncio_run",
         "queue_message",
+        "patch_history",
+        "remove_history_patch",
+        "clear_history_patches",
         "redirect",
         "cancel",
         "stop",
@@ -59,6 +63,19 @@
         "load",
         "save_all",
         "load_all"
+      ]
+    },
+    {
+      "object": "agency.llm.message_store.MessageBlock",
+      "page": "agents.md",
+      "members": [
+        "__init__",
+        "from_payload",
+        "role",
+        "type",
+        "hash",
+        "payload",
+        "to_dict"
       ]
     },
     {
@@ -406,6 +423,9 @@
         "resolve_prev_dependencies",
         "get_resolved_transcript",
         "set_transcript",
+        "from_messages",
+        "message_state",
+        "message_state_fields",
         "append_retained_message",
         "pending_retained_messages",
         "advance_retained_cursor",
@@ -420,6 +440,7 @@
         "change_config",
         "submit",
         "submit_context_message",
+        "submit_context_patch",
         "redirect_request",
         "cancel_request",
         "cancel_agent",
@@ -540,7 +561,10 @@
         "interrupt_external_span": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
         "cancel_external_span": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
         "gpu_lease_begin": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
-        "gpu_lease_end": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point."
+        "gpu_lease_end": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "current_execution_attributes": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "current_span_id": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point.",
+        "session_identity": "Runtime instrumentation callback/helper used by harnesses, samplers, or container backends; not an application profiling entry point."
       }
     },
     {
@@ -564,7 +588,6 @@
     "agency.llm.usage_tracker.LlmUsageTracker": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
     "agency.native_harness.llm_client.LLMClient": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
     "agency.llm.agllm.agllm": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
-    "agency.observability.agwebui._flush_loop": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof.",
     "agency.llm.openai._OpenAICompatibleBackend": "Advanced diagnostic example integration; implementation adapter, transport, server, or private test hook. Not a supported application API; application entry points are Agent, agpolicy, agwebui and agprof."
   },
   "subpackage_exports": {

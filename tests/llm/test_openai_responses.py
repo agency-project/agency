@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agency.llm.message_store import with_tool_schema
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
 from agency.llm.agllm import agllm
@@ -246,7 +247,7 @@ def test_chat_completions_tools_are_flattened_and_strict_only_when_given():
         {"type": "function", "function": {"name": "b", "strict": True}},
     ]
     kwargs = _backend()._format_context_agency_to_backend(
-        {"messages": [_text_msg("user", "hi")], "tools": tools}
+        {"messages": with_tool_schema([_text_msg("user", "hi")], tools)}
     )
     assert kwargs["tools"] == [
         {"type": "function", "name": "a", "description": "A", "parameters": {"type": "object"}},
@@ -272,9 +273,11 @@ def test_chat_completions_tools_are_flattened_and_strict_only_when_given():
 def test_tool_choice_translated_when_tools_present(tool_choice, expected):
     kwargs = _backend()._format_context_agency_to_backend(
         {
-            "messages": [_text_msg("user", "hi")],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-            "tool_choice": tool_choice,
+            "messages": with_tool_schema(
+                [_text_msg("user", "hi")],
+                [{"type": "function", "function": {"name": "f"}}],
+                tool_choice,
+            )
         }
     )
     assert kwargs["tool_choice"] == expected
@@ -283,14 +286,16 @@ def test_tool_choice_translated_when_tools_present(tool_choice, expected):
 def test_tool_choice_dropped_without_tools_or_when_foreign():
     backend = _backend()
     no_tools = backend._format_context_agency_to_backend(
-        {"messages": [_text_msg("user", "hi")], "tool_choice": "auto"}
+        {"messages": with_tool_schema([_text_msg("user", "hi")], tool_choice="auto")}
     )
     assert "tool_choice" not in no_tools
     foreign = backend._format_context_agency_to_backend(
         {
-            "messages": [_text_msg("user", "hi")],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-            "tool_choice": {"type": "openai_responses_web_search", "data": {}},
+            "messages": with_tool_schema(
+                [_text_msg("user", "hi")],
+                [{"type": "function", "function": {"name": "f"}}],
+                {"type": "openai_responses_web_search", "data": {}},
+            )
         }
     )
     assert "tool_choice" not in foreign
@@ -496,7 +501,7 @@ def test_streamed_turn_accumulates_on_host_and_replays_as_next_request():
     server = LlmHandlerServer(_cfg(), _NullDataLogger(), LlmUsageTracker())
     server._backend.make_client = lambda timeout: client
 
-    handle = server.start_stream({"messages": [_text_msg("user", "weather?")], "tools": []})
+    handle = server.start_stream({"messages": [_text_msg("user", "weather?")]})
     item = handle.first()
     while item["type"] not in ("done", "error"):
         item = handle.first()
