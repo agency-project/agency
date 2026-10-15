@@ -1,71 +1,87 @@
-<div align="center">
+ <div align="center">
 
-<!-- TODO(release): Replace with the final Agency logo. -->
-<img src="docs/assets/agency_light.png" alt="Agency logo" width="500" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agency_wide.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/agency_light.png">
+  <img alt="Agency logo" src="docs/assets/agency_light.png" width="500">
+</picture>
 
-**Live debugging and systems profiling for AI agents**
+Live debugging and systems profiling for AI agents.
 
-[Getting started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
+[Getting Started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
+
+Developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/).
 
 </div>
 
-As AI agents execute longer workflows, invoke tools, and run concurrently, understanding what they are doing—and why they are slow or stuck—gets harder. Model traces alone do not explain process activity, resource contention, or critical-path delays.
+Agency is an open-source platform for **running, debugging, profiling, and controlling AI agents**.
 
-**Agency 0.1** is an open-source platform for observing, debugging, profiling, and controlling agent execution. It connects model requests, tool calls, and system-level activity in one environment, so you can investigate a run while it happens and analyze what happened afterward.
+As agents tackle longer tasks, invoke tools, and work in parallel, understanding what they're actually doing gets harder. Model traces only tell part of the story. What is an agent waiting for? Where is time being spent? Why is one run slower than another?
 
-<!-- TODO(release): Replace with an actual product recording. -->
+Agency connects **LLM requests, tool calls, and system activity** in one place, giving you the visibility to investigate execution, find bottlenecks, and understand what changed.
+
+<!-- TODO(release): Record multi-agent live execution, invocation inspection, and runtime control. -->
+![Agency Live Execution](docs/assets/agency-live-execution.gif)
 
 ## What you can do with Agency
 
-### Live Trajectory — see what your agents are doing
+### Live Execution — See what's happening
 
-Follow agent execution as it happens. Inspect model requests, tool calls, tool outputs, failures, and waits across agents, without reconstructing the run from scattered logs. Pause, resume, or cancel supported executions through Agency's controls.
+Think **htop + gdb for AI agents**.
 
-The same view provides a historical execution record when a run finishes.
+Watch agents execute in real time. Inspect model requests, tool calls, outputs, failures, and waits across agents. Pause, resume, or stop supported executions directly from the dashboard.
 
-<!-- TODO(release): Record multiple agents executing, inspecting an invocation, and exercising a supported control. -->
+When execution finishes, the same view becomes a navigable history of everything that happened.
 
-### Critical Path Profiler — find what determines completion time
+### Critical Path — Find what's slowing you down
 
-See how work and dependencies unfold on a shared wall-clock axis, with separate lanes for agents and their system activity. Trace the sequence of work that governs total execution time, distinguish useful overlap from idle time, and investigate long model calls, tools, and scheduling delays.
+See where wall-clock time actually goes.
 
-Critical-path analysis is primarily a **post-run** workflow: use Live Trajectory while agents are running, then examine the recorded execution to understand its bottlenecks.
+Trace model requests, tool calls, processes, and dependencies across agents. Identify the work determining completion time, distinguish parallel execution from waiting, and zoom into bottlenecks.
 
-<!-- TODO(release): Show agent lanes, dependencies, critical path, and time-axis zoom. -->
+Use the **Critical Path Profiler** after execution to investigate what held the run back.
 
-### Detailed Profiler — investigate where time and resources go
+<!-- TODO(release): Record agent lanes, dependencies, critical path, and timeline zoom. -->
+![Agency Critical Path Profiler](docs/assets/agency-critical-path.gif)
 
-Drill into recorded evidence across **LLM requests, tool calls, and systems**: durations, errors and retries, reported token usage, process activity, CPU, memory, I/O, and optional GPU metrics. Use linked execution records to move from a high-level symptom to the underlying event or resource trace.
+### Detailed Profiler — Go deeper
 
-Agency distinguishes recorded measurements from interpretations. Missing metrics are shown as unavailable rather than estimated.
+Dig into the measurements behind execution.
 
-<!-- TODO(release): Show LLM, tool, and systems profiling views. -->
+Explore LLM latency, token usage, tool durations, errors, retries, CPU, memory, I/O, and optional GPU metrics. Follow linked records from high-level activity down to individual events and processes.
 
-### Compare Runs — understand what changed
+No invented numbers. Missing measurements stay missing.
 
-Compare completed runs side by side: execution trajectories, model and tool activity, elapsed time, recorded resource usage, failures, and outcomes. Inspect where paths diverge and which observed measurements differ.
+### Compare Runs — Understand what changed
 
-Comparisons use **historical run data only**. Agency does not invent missing data or assign an unsupported cause to a difference.
+Compare completed runs side by side.
 
-<!-- TODO(release): Show selection of two historical runs and trajectory/metrics comparison. -->
+Examine execution trajectories, model and tool activity, latency, resource usage, failures, and outcomes. Find where execution paths diverged and which measurements changed.
+
+Agency compares recorded evidence, without guessing at causes.
+
+<!-- TODO(release): Record two historical runs with trajectory and metric comparisons. -->
+![Agency Compare Runs](docs/assets/agency-compare-runs.gif)
 
 ## Underneath your agent stack
 
-Agency provides an execution environment and a Python interface for running agent workloads. Your application still owns its workflow logic—whether that is a Python loop, a state machine, or a supervisor/worker system. Agency provides supported harness and model integrations, execution controls, and telemetry.
+Agency provides a sandboxed execution environment, Python API, supported agent harnesses, and integrated telemetry. Your application keeps control of its workflow and orchestration.
 
-![Agency underneath application orchestration](docs/assets/agency-runtime.png)
+![Agency architecture](docs/assets/agency-runtime.png)
 
 [Editable architecture diagram](docs/assets/agency-runtime.mmd)
 
 | Layer | Supported options |
 | --- | --- |
 | Agent harnesses | Native, Claude Code, Codex, OpenCode, Grok, Kimi |
-| Model backends | OpenAI Chat Completions / Responses, Anthropic, Amazon Bedrock, and tool-capable OpenAI-compatible endpoints (including vLLM) |
-| Environment | Linux sandboxes using Docker or Podman; configurable resources and mounts |
+| Model backends | OpenAI Chat Completions / Responses, Anthropic, Amazon Bedrock, OpenAI-compatible endpoints (including vLLM) |
+| Environment | Linux sandboxes using Docker or Podman, with configurable resources and mounts |
 
-Harness and model compatibility depends on model capabilities, configuration, and external CLI versions. External harness CLIs must be installed separately. See [configuration and requirements](docs/guides/configuration.md).
+Compatibility depends on model capabilities, configuration, and external CLI versions. External harness CLIs must be installed separately.
 
-> **Experimental: existing coding-agent sessions.** Agency's integration with the Claude Code and Codex CLIs on Linux is experimental. Some Agency features—including parts of profiling, interception, and interactive control—may not be available for those sessions. The supported Python-orchestrated workflows provide the more complete Agency experience; consult the current documentation before relying on a specific capability.
+**Experimental:** Integration with existing Claude Code and Codex CLI sessions on Linux is experimental. Profiling, interception, and execution controls may be limited. Python-orchestrated workflows currently provide the most complete experience.
+
+See [configuration and requirements](docs/guides/configuration.md).
 
 ## Getting started
 
@@ -73,8 +89,8 @@ Harness and model compatibility depends on model capabilities, configuration, an
 
 - Linux x86-64 and Python 3.12+
 - Git and [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- A local Docker or Podman engine (`docker info` or `podman info`)
-- An API key for your configured model provider
+- Docker or Podman
+- API key for your configured model provider
 
 ### Install and run
 
@@ -85,86 +101,38 @@ uv sync --locked --python 3.12
 
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="gpt-6-luna"
+
 uv run python examples/quickstart.py
 ```
 
-This example runs Agency's native harness with OpenAI Chat Completions and function tools. The model must accept `reasoning_effort="none"`; change the configured model if necessary. Model API usage may incur charges. The example reads your exported environment variables; it does not automatically load `.env`.
+This runs a native agent in an isolated sandbox. The configured model must support `reasoning_effort="none"`. Model API usage may incur charges.
 
-First startup needs network access to pull a sandbox image and install dependencies. The quickstart does not require a GPU, ZFS, or CRIU; GPU passthrough is disabled. For troubleshooting, see the [getting started guide](docs/getting-started.md).
+First startup requires network access for the sandbox image and dependencies. No GPU, ZFS, or CRIU required.
 
-### Run an agent in Python
-
-Agency's Python API lets you choose the harness and model backend independently. This is the workload used in [`examples/quickstart.py`](examples/quickstart.py):
-
-```python
-import os
-from pathlib import Path
-
-from agency import Agent, agdata, agskill
-from agency.configs.agconfig import agconfig, llmconfig, resourcesconfig, sandboxconfig
-
-cfg = agconfig(
-    llmconfig(
-        provider="openai",
-        base_url="https://api.openai.com/v1",
-        model=os.environ.get("OPENAI_MODEL", "gpt-6-luna"),
-        api_key=os.environ["OPENAI_API_KEY"],
-        reasoning_effort="none",
-        max_completion_tokens=4096,
-    ),
-    sandboxconfig(gpu_passthrough=False),
-    resourcesconfig(idle_cpus=1),
-)
-
-task = agskill(
-    name="code_and_test",
-    prompt="Complete the request in /workspace. Run the code, then summarize the result.",
-    input_schema=agdata(request=str),
-    output_schema=agdata(summary=str),
-)
-
-worker = Agent("coder", agconfig=cfg, harness="native")
-result = worker.run(
-    task,
-    agdata(request="Write sum_even(numbers) in Python and run assertions for empty and mixed lists."),
-)
-result.wait()
-print(result.summary)
-print(f"Run directory: {Path(worker.data_logger.db_path).parent.parent}")
-```
-
-Save as `first_agent.py` and run `uv run python first_agent.py` from the checkout. `run()` returns a pending result; call `wait()` before reading the output. On failure, inspect `result.to_dict()` for `error`. The code executes in `/workspace` inside the sandbox, and the printed host directory preserves run logs after sandbox cleanup.
-
-### Open the dashboard and profiler
+### Launch the dashboard
 
 ```bash
 AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=workload \
   uv run python examples/quickstart.py --webui
 ```
 
-Open the [dashboard](http://localhost:7860/) to follow execution and the [profiler](http://localhost:7860/profiler) to inspect model, tool, and systems data. Recorded traces remain available for analysis after the run. The web server binds to `0.0.0.0`; avoid exposing it to untrusted networks without appropriate access controls.
+Open [localhost:7860](http://localhost:7860/) for live execution and [localhost:7860/profiler](http://localhost:7860/profiler) for profiling.
 
-See the [profiling guide](docs/guides/profiling.md) and [profiler views reference](docs/guides/profiling/views.md) for collection scope, available data, and limitations.
+The dashboard binds to `0.0.0.0` by default; don't expose it to untrusted networks without appropriate access controls.
+
+For Python integration, see [`examples/quickstart.py`](examples/quickstart.py). You can configure the harness and model independently, define tasks with typed inputs and outputs, and collect execution records for later analysis.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — install Agency and run an example.
-- [Configuration](docs/guides/configuration.md) — harnesses, providers, and environments.
-- [Profiling](docs/guides/profiling.md) — collect traces and interpret execution evidence.
-- [Examples](examples/README.md) — agent workflows, tools, context, and files.
-- [API reference](docs/api/index.md) — Python interfaces and current contracts.
-- [Architecture](docs/architecture/index.md) — execution runtime and system design.
+- [Getting Started](docs/getting-started.md) — Installation and first run
+- [Configuration](docs/guides/configuration.md) — Harnesses, models, and environments
+- [Profiling](docs/guides/profiling.md) — Recording and interpreting execution
+- [Examples](examples/README.md) — Agent workflows and integrations
+- [API Reference](docs/api/index.md) — Python interfaces
+- [Architecture](docs/architecture/index.md) — Runtime and system design
 
 ## Contributing
 
-Agency is open source and welcomes bug reports, feedback, and contributions. Read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and testing instructions.
+Agency is open source. Contributions, bug reports, and feedback are welcome.
 
-<!-- RELEASE ASSET CHECKLIST (temporary paths above):
-- docs/assets/agency-logo-placeholder.png
-- docs/assets/agency-overview.gif
-- docs/assets/agency-live-trajectory.gif
-- docs/assets/agency-critical-path.gif
-- docs/assets/agency-detailed-profiler.gif
-- docs/assets/agency-compare-runs.gif
-Replace these with real assets and remove this checklist before release.
--->
+See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
