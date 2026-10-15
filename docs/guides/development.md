@@ -14,8 +14,10 @@ CI runs the same hooks and pytest. Most unit tests use model doubles;
 live container/harness tests require their documented opt-in settings.
 
 The full `uv run pytest` command discovers the release suite under `tests/`,
-as configured in `pyproject.toml`. Tests stored in benchmark directories have
-separate commands in their READMEs and are outside that default discovery.
+as configured in `pyproject.toml`. Benchmark sources are maintained outside this
+repository (locally in `~/Documents/benchmarks/`). Tests that import them skip
+when the external package is unavailable. To include them, add the benchmark
+folder's parent to `PYTHONPATH`; benchmark READMEs describe their separate tests.
 Report existing skips and environment-dependent failures with the result;
 passing unit tests does not validate opted-out live model or checkpoint tests.
 
@@ -28,7 +30,8 @@ uv run pytest tests/test_examples.py
 Operational references remain at [host setup](host-setup.md),
 [checkpoint configuration](checkpoints.md), and
 [profiling and trace artifacts](profiling.md#raw-trace-artifacts). Benchmark instructions stay in
-their respective `benchmarks/` directories.
+their external directories. `scripts/agency-bench` uses `~/Documents/benchmarks/`
+by default; set `AGENCY_BENCHMARKS_DIR` to use a different location.
 
 Previous documentation and validation reports are preserved in
 [the documentation archive](../archive/README.md). Treat archived commands and

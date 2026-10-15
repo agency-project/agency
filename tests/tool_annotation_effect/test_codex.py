@@ -3,6 +3,11 @@ import json
 
 import pytest
 
+pytest.importorskip(
+    "benchmarks.tool_annotation_effect",
+    reason="benchmark sources are maintained outside the Agency repository",
+)
+
 from benchmarks.tool_annotation_effect.codex import CodexGateway, result_category
 from benchmarks.tool_annotation_effect.common import read_events
 from benchmarks.tool_annotation_effect.planning import validate

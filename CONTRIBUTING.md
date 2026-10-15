@@ -62,8 +62,9 @@ or test fixtures. When replacing documentation, preserve the prior page under
 - `tests/`: corresponding unit and integration coverage.
 - [Examples](examples/README.md) and [documentation](docs/index.md): user workflows.
 
-Benchmarks remain under `benchmarks/`; their READMEs describe their own setup
-and measurement requirements. See [development notes](docs/guides/development.md)
+Benchmarks are maintained outside this repository (locally in `~/Documents/benchmarks/`);
+their READMEs describe their own setup and measurement requirements.
+See [development notes](docs/guides/development.md)
 and the [earlier verification records](docs/archive/documentation-refactor.md) for
 historical documentation follow-ups; recheck those findings against current source.
 

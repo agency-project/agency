@@ -3,6 +3,13 @@ import json
 import sys
 from types import SimpleNamespace, ModuleType
 
+import pytest
+
+pytest.importorskip(
+    "benchmarks.tool_annotation_effect",
+    reason="benchmark sources are maintained outside the Agency repository",
+)
+
 from benchmarks.tool_annotation_effect.adapters import (
     SweBenchAdapter,
     TerminalBenchAdapter,

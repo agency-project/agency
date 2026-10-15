@@ -1,6 +1,13 @@
 import copy
 import json
 
+import pytest
+
+pytest.importorskip(
+    "benchmarks.tool_annotation_effect",
+    reason="benchmark sources are maintained outside the Agency repository",
+)
+
 from benchmarks.tool_annotation_effect.analysis import (
     analyze,
     compare_actions,

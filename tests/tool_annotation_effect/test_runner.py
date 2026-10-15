@@ -3,6 +3,11 @@ import json
 
 import pytest
 
+pytest.importorskip(
+    "benchmarks.tool_annotation_effect",
+    reason="benchmark sources are maintained outside the Agency repository",
+)
+
 from benchmarks.tool_annotation_effect.common import atomic_json, read_json
 from benchmarks.tool_annotation_effect.planning import build_plan, save_plan, load_plan, validate
 from benchmarks.tool_annotation_effect.runner import run, evaluate, rows
