@@ -66,6 +66,59 @@ class TestSanitizeTag:
         assert _sanitize_tag("a/b") != _sanitize_tag("a-b")
 
 
+class TestDetachedExecution:
+    @chroot
+    def test_interactive_harness_can_allocate_a_pty(self):
+        sb = _make_backend()
+        try:
+            output, rc = sb.exec(
+                "python3 -c 'import os; master, slave = os.openpty(); "
+                'assert os.isatty(slave); os.close(master); os.close(slave); print("ok")\''
+            )
+            assert rc == 0, output
+            assert output.strip() == "ok"
+        finally:
+            sb.destroy()
+
+    @chroot
+    def test_python_semaphores_can_be_created_inside_jail(self):
+        sb = _make_backend()
+        try:
+            output, rc = sb.exec(
+                "python3 -c 'import multiprocessing; "
+                "semaphore = multiprocessing.BoundedSemaphore(1); "
+                'assert semaphore.acquire(False); semaphore.release(); print("ok")\''
+            )
+            assert rc == 0, output
+            assert output.strip() == "ok"
+        finally:
+            sb.destroy()
+
+    def test_launch_failure_is_reported(self, monkeypatch):
+        sb = _make_backend()
+        monkeypatch.setattr(sb, "_exec_with_pid_tracking", lambda *args: ("unshare failed", 1))
+        with pytest.raises(RuntimeError, match="unshare failed"):
+            sb.exec_detached("sleep 20")
+
+    @chroot
+    def test_daemon_returns_immediately_and_is_owned_for_teardown(self):
+        sb = _make_backend()
+        try:
+            started = time.monotonic()
+            sb.exec_detached("sleep 20")
+            assert time.monotonic() - started < 5
+            assert sb.get_live_pids()
+            groups = set(sb._invocation_pgids)
+            sb.stop()
+            sb._invocation_pgids = groups
+            deadline = time.monotonic() + 3
+            while sb.get_live_pids() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not sb.get_live_pids()
+        finally:
+            sb.destroy()
+
+
 # ---------------------------------------------------------------------------
 # _own_host_pids -- chroot processes run directly on the host (no PID
 # namespace to translate through, unlike _ContainerBackendBase's version),

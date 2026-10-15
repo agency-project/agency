@@ -1,0 +1,134 @@
+# Profiler views and interpretation
+
+The execution profiler at `/profiler` sits alongside the live run dashboard.
+Saved executions are read-only; a connected, active application relay enables
+live controls. Three views, in this order, share a run, selected
+action/episode, inspector, event search, and time cursor: **Execution
+Trajectory** (the default agent-column view), **Timeline**, and **Profiler**. No frontend package
+installation or build step is needed.
+
+## Open it
+
+Follow the [profiling guide](../profiling.md#open-a-run) to start the server
+or reopen your application's log directory.
+
+Open <http://localhost:7860/profiler>. The catalog discovers saved traces under
+`agency_runs/` and `artifacts/`, the E1A.1 experiment catalog, native annotation
+observer logs, and the configured profiler directory. `AGENCY_PROFILE_DIR`
+continues to select an external profiler directory.
+
+The representative demo is available directly at
+<http://localhost:7860/profiler?run=demo-baseline&view=trajectory>.
+**Open recorded example** also opens it from any view. Numbers **1–3** switch views;
+**Escape** clears the selected event. Links to the removed views
+(`view=resources`, `context`, `agents`, `compare`) open the trajectory. Export run downloads the normalized data,
+including source labels.
+
+All investigator views start without a viewer build. The embedded
+Perfetto viewer has been removed; recorded Chrome traces remain available
+through the raw trace download endpoints. Native observer JSONL remains
+available in the investigator.
+
+For incremental execution, replay, provenance, and verification details, see
+[Live trajectory](live-trajectory.md). The current run is available at
+<http://localhost:7860/profiler?run=live&view=trajectory>.
+
+## What is implemented
+
+- **Trajectory:** live lifecycle updates and saved-trace replay through one
+  incremental reducer; declared-purpose/category episodes with fixed actor and
+  request boundaries; evidence-backed attention and history/follow controls;
+  expandable model/tool actions, commands, results, timing, files, and metadata.
+  Episode list includes selectable agent columns, pinned running calls, and
+  completed history with newest activity first. The Layout dropdown switches
+  between Episode list and Agent overlay. The overlay places each agent's actions on a shared time axis, separates nested
+  actions into tracks, and retains the same selection, inspector, agent/search
+  filters, and time cursor. `layout=overlay` preserves the layout in shared URLs.
+- **Timeline:** agent calls and measured system resources on a shared
+  wall-clock axis, with the same selection and time cursor.
+- **Profiler:** Activity, LLM, Tools and Systems measurements, plus
+  [Critical Path](../../architecture/observability.md#critical-path)
+  for observed dependencies and explicitly qualified gaps.
+- **Removed views:** Resources & waits, Context & information, the tandem
+  trace board and Compare runs are no longer in the navigation. Their recorded
+  data (spans, prompt provenance, counters, relationships and the run catalog)
+  is still collected, served by the same endpoints and included in exports.
+- **Task evidence:** recorded obligations and evaluator outcomes remain in
+  normalized data and exports; there is no standalone Task progress view.
+- **Live controls:** pause/resume, stop/force stop, retained messages, supported
+  active redirects, and task submission for application-registered skills.
+  These require an active execution relay; see [control receipts and
+  limits](live-trajectory.md#pause-and-inspect-live-execution).
+
+## Data flow and provenance
+
+`server.py` adds `/api/investigator/runs`, `/api/investigator/runs/{id}`, and a
+read-only raw trace endpoint. Paths are server-side catalog entries, addressed
+by stable hashes; API callers cannot supply arbitrary filesystem paths.
+
+`investigator.py` adapts Chrome/Perfetto JSON and native observer JSONL into one
+schema: agents, actions, episodes, intervals, counters, edges, and obligations.
+It converts trace microseconds to seconds, retains outcome/timing/provenance
+metadata, decodes named resource counters, and groups consecutive actions per
+agent. Explicit measured durations remain separate from coverage gaps.
+The catalog refreshes every 30 seconds; four normalized saved runs are cached
+by file modification time. Counter series are reduced to at most about 800
+points for rendering. Full raw traces remain available through the download endpoints.
+
+The frontend is native HTML/CSS/ES modules, matching the repository's existing
+frontend architecture. `investigator.js` owns shared selection and rendering;
+`investigator-model.js` contains alignment, filtering, and interval-union logic.
+The responsive layout moves the inspector below the investigation on narrower
+screens. User-supplied trace strings are HTML-escaped.
+
+**Real:** saved tool commands/results and admission IDs; native model-stated
+purpose annotations joined by `event_id`; model usage; timed spans; sampled CPU
+and memory; explicit agent parents; recorded prompt text; E1A.1 condition,
+repetition, and official evaluator outcomes; native experiment verifier results.
+Native observer durations have `observer_duration` timing; their start is the
+completion timestamp minus reported duration, with observer emission overhead.
+
+**Inferred:** action categories, episodes, command-referenced paths, summary
+labels, and workflow obligations. Activity completion means its recorded calls returned successfully;
+it is not proof of task correctness. Historical experiment similarity measures
+category ordering, not semantic equivalence. Identical commands across agents
+suggest duplication; concurrency alone does not prove resource interference.
+
+**Synthetic:** `investigator_demo.py` contains two explicitly labeled executions.
+`trajectory_scenarios.py` separately contains edge-case and 5,000-call stress fixtures.
+This fixture includes three agents, delegation, handoff differences, dependency
+and scheduler waits, resource pressure, a failed test followed by recovery,
+context changes, a trajectory insertion, and an unvalidated GPU obligation.
+Recorded runs are never silently supplemented with demo measurements.
+
+**Unavailable:** missing prompt/resource/communication data stays unavailable.
+Truncated `llm.messages` attributes are recovered only through complete JSON
+message prefixes and marked incomplete; dropped blocks are unknown for partial
+prompts. Composition uses character counts; measured token totals are separate.
+Model-wait wall time unions overlapping intervals rather than adding nested or
+parallel spans. CPU work is not inferred from uninstrumented wall time.
+
+## Coverage limits
+
+1. Full prompt-chain references and content hashes instead of truncated span
+   attributes, with explicit compaction/drop boundaries and source/file IDs.
+2. Complete supervisor/worker transfer manifests, message IDs, send/receive
+   timestamps, and queue-release causes across all harnesses. Critical Path
+   uses the model/tool identity and prompt-history evidence that is recorded;
+   its graph is explicitly partial.
+3. Verified artifact inventories/diffs, task obligation IDs, and independent
+   validation/evaluator events for workflows outside the saved experiments.
+4. Per-agent sandbox CPU/RAM is available when recorded sandbox ownership and
+   fresh cgroup samples establish attribution. Host, workload, process and GPU
+   measurements retain their own scope. These samples do not establish exact
+   per-operation CPU/I/O intervals or prove contention. See
+   [metric scopes](../../live-metrics.md#agent-scope).
+
+## Verification and screenshots
+
+```sh
+.venv/bin/pytest tests/agwebui tests/test_profiler_presentation.py -q
+node --test tests/agwebui/investigator-model.test.mjs
+.venv/bin/ruff check agency/observability/agwebui tests/agwebui/test_investigator.py
+node --check agency/observability/agwebui/static/investigator.js
+```

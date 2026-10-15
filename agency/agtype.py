@@ -362,18 +362,16 @@ class agfile(agtype):
 class agpath(agtype):
     """Path-only string field_name for agskill schemas.
 
-    Unlike a plain ``str`` field (where the framework tries to be helpful
-    and auto-resolves a path-looking value to that file's contents — see
-    ``agschema.make_field_handler``) or ``agfile`` (whose output is always
-    resolved to file content), ``agpath`` means the field *is* a path and
-    must stay a path.  Neither prepare() nor recover() touch the sandbox
-    filesystem — the value passes through unchanged; only its shape is
-    checked.
+    ``agpath`` keeps a path as a path. Unlike ``agfile`` recovery, neither
+    prepare() nor recover() reads the sandbox filesystem. The value passes
+    through unchanged; only its path-like shape is checked. Plain ``str``
+    output also remains text but does not impose this path-shape contract.
 
     Input fields
     ------------
     The value must look like a path (``_looks_like_path``); anything else
-    fails schema validation before the skill runs.
+    fails an explicit ``agschema.validate_input()`` check. Skill execution
+    does not invoke that check automatically.
 
     Output fields
     ------------
@@ -537,7 +535,8 @@ class agbinary(agtype):
     Input  (``prepare``): ``bytes``, a local host file path (``str``), or a
     base64 data URL (``str`` starting with ``data:``).
 
-    Output (``recover``): always ``bytes``.
+    Output (successful ``recover``): ``bytes``. Schema recovery is best-effort;
+    a failed read can leave the original path value and emit a warning.
 
     Example::
 

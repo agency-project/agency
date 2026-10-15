@@ -1,8 +1,10 @@
 # Trace presentation schema, version 1
 
-The embedded Perfetto viewer groups recorded work by conceptual owner. The
-exporter retains ordinary Chrome slices, counters, details and flow events;
-the viewer extension only arranges their tracks and adds activity summaries.
+The exporter retains ordinary Chrome slices, counters, details and flow events
+with ownership metadata. The embedded Perfetto viewer has been removed; the
+layout and viewer behavior below document its historical interpretation of
+that metadata. The current execution investigator is described in
+[profiling guide](../../../docs/guides/profiling.md).
 
 ```text
 Workflow / Main
@@ -114,5 +116,6 @@ never cross ownership paths. Legacy traces with no ownership annotations use
 the original layout. Standard Perfetto can still open exported JSON, but the
 object hierarchy and decoded counter labels require the embedded extension.
 
-The plugin source lives beside `build_perfetto.py` and participates in the
-build fingerprint. Starting the web UI rebuilds stale generated assets.
+The embedded plugin and its build tooling are no longer shipped. Web UI
+startup does not download or build Perfetto assets; the trace export format
+and its ownership metadata remain supported.

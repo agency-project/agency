@@ -246,8 +246,9 @@ class agskill:
     Both schemas are serialised and appended to the system prompt so the LLM
     knows the contract.
 
-    Input is validated before the loop runs.  Output is validated after each
-    final (non-tool-call) LLM response; on failure a correction message is
+    Input schemas describe the prompt and preparation, but execution does not
+    automatically call validate_input(). Call it on resolved inputs when needed.
+    Output is validated after each final (non-tool-call) LLM response; on failure a correction message is
     injected and the loop retries up to max_output_schema_retries times.
     """
 

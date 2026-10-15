@@ -96,7 +96,7 @@ def _terminal_screen(columns: int, lines: int):
     return _Screen(columns, lines)
 
 
-def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0) -> None:
+def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0) -> bool:
     """A fire-and-forget ptrace() restart/setoptions call: *pid* may have
     already exited and been reaped between being observed and acted on here
     -- an ordinary race in a multi-process tree, not a bug, so it's
@@ -104,24 +104,13 @@ def _ptrace_ignoring_esrch(request: int, pid: int, addr: int = 0, data: int = 0)
     ptrace() wrapper raises PtraceError, not ProcessLookupError, for this)."""
     try:
         pt.ptrace(request, pid, addr, data)
+        return True
     except ProcessLookupError:
-        pass
+        return False
     except pt.PtraceError as exc:
         if exc.errno != errno.ESRCH:
             raise
-
-
-def _thread_group_of(tid: int) -> int:
-    """Return the thread-group id of *tid*; *tid* itself if procfs can't say
-    (the thread already exited, or procfs is unavailable)."""
-    try:
-        with open(f"/proc/{tid}/status", encoding="utf-8") as status_file:
-            for line in status_file:
-                if line.startswith("Tgid:"):
-                    return int(line.split(":", 1)[1].strip())
-    except (OSError, ValueError):
-        pass
-    return tid
+        return False
 
 
 def _is_thread_group_leader(pid: int) -> bool:
@@ -141,6 +130,19 @@ def _is_thread_group_leader(pid: int) -> bool:
     except (OSError, ValueError):
         return True
     return True
+
+
+def _stop_task(pid: int) -> None:
+    """Deliver a distinct stop to this TID, rather than the process signal queue.
+
+    kill(tid, SIGSTOP) is process-directed even when tid names a worker thread;
+    those signals coalesce and can stop only a few threads under ptrace.
+    """
+    with open(f"/proc/{pid}/status", encoding="utf-8") as status_file:
+        tgid = next(int(line.split(":", 1)[1]) for line in status_file if line.startswith("Tgid:"))
+    if pt.libc.tgkill(tgid, pid, signal.SIGSTOP) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 def _kernel_executable_path(pid: int) -> "str | None":
@@ -234,16 +236,18 @@ class TracerLoop:
         self.stderr_r: "int | None" = None
 
         self._known_pids: "set[int]" = set()
-        # pause()/resume(): _held_pids marks a pid that must not be
-        # auto-continued the next time its SIGSTOP delivery-stop is
-        # dispatched; _parked_pids marks one that has actually reached that
-        # stop and is currently withheld there, awaiting resume()'s deferred
-        # PTRACE_CONT. See _dispatch()'s generic-signal fallthrough.
+        # pause()/resume(): held tasks must not be restarted at any stop;
+        # parked tasks have reached one and await a deferred restart.
         self._held_pids: "set[int]" = set()
         self._parked_pids: "set[int]" = set()
+        self._parked_restarts: "dict[int, tuple[int, int]]" = {}
+        self._pause_stop_pids: "set[int]" = set()
         # Pids resume() wants continued -- drained and actually PTRACE_CONT'd
         # by _run() on the dedicated tracer thread (see resume()'s docstring).
-        self._resume_requests: "list[int]" = []
+        self._resume_requests: "list[tuple[int, int, int]]" = []
+        self._resume_in_progress: "set[int]" = set()
+        self._resume_unobserved: "set[int]" = set()
+        self._exit_observation_lost = False
         self._process_pids: "set[int]" = set()
         self._pending_clone_pids: "set[int]" = set()
         # A child's own stops can be reaped before its parent's
@@ -714,6 +718,7 @@ class TracerLoop:
                 pending = list(self._known_pids)
                 to_resume = list(self._resume_requests)
                 self._resume_requests.clear()
+                self._resume_in_progress.update(pid for pid, _, _ in to_resume)
             # resume()'s PTRACE_CONT must be issued from this dedicated
             # tracer thread -- ptrace's tracer identity is per-thread, so a
             # call from resume()'s own (arbitrary) caller thread would fail.
@@ -723,9 +728,12 @@ class TracerLoop:
                 from ._checkpoint_handoff import resume_groups
 
                 resume_groups(self)
-            for pid in to_resume:
-                request = pt.PTRACE_SYSCALL if pid in self._pending_syscall_exit else pt.PTRACE_CONT
-                _ptrace_ignoring_esrch(request, pid, 0, 0)
+            for pid, request, data in to_resume:
+                restarted = self._restart(pid, request, data)
+                with self._lock:
+                    if restarted is False:
+                        self._resume_unobserved.add(pid)
+                    self._resume_in_progress.discard(pid)
             # A kill can overtake a clone notification. Its auto-attached child
             # still needs its exit-stop resumed, even though it never entered
             # _known_pids. Waiting only on known PIDs strands that child and
@@ -734,6 +742,9 @@ class TracerLoop:
             try:
                 got_pid, status = os.waitpid(-1, os.WNOHANG | pt.WAIT_ALL | pt.WAIT_NOTHREAD)
             except ChildProcessError:
+                if pending:
+                    with self._lock:
+                        self._exit_observation_lost = True
                 for pid in pending:
                     self._forget(pid, -1)
                 break
@@ -769,7 +780,7 @@ class TracerLoop:
                     self._parked_pids.add(pid)
                     self._state_changed.notify_all()
                     return
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
             return
 
         with self._lock:
@@ -784,15 +795,7 @@ class TracerLoop:
             _ptrace_ignoring_esrch(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
             with self._lock:
                 self._options_applied.add(pid)
-                if pid in self._held_pids:
-                    # A child's own initial SIGSTOP and pause()'s SIGSTOP are the
-                    # same standard signal and coalesce into this one stop. Taking
-                    # it as "just the initial stop" would continue a pid the pause
-                    # is meant to hold, and the pause would be lost for it.
-                    self._parked_pids.add(pid)
-                    self._state_changed.notify_all()
-                    return
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
             return
 
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_SECCOMP:
@@ -814,11 +817,11 @@ class TracerLoop:
                 new_pid,
                 is_process=None if event == pt.PTRACE_EVENT_CLONE else True,
             )
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
             return
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXEC:
             self._commit_exec(pid)
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
             return
         if sig == signal.SIGTRAP and event == pt.PTRACE_EVENT_EXIT:
             # Process disappearance itself is handled via WIFEXITED or
@@ -837,33 +840,80 @@ class TracerLoop:
             # hold it stopped is to withhold the restart call entirely once
             # pause() has asked for this pid to stop -- see pause()/resume().
             with self._lock:
+                if pid in self._pause_stop_pids:
+                    self._pause_stop_pids.discard(pid)
+                    forward = 0
                 if pid in self._held_pids:
                     self._parked_pids.add(pid)
                     self._state_changed.notify_all()
                     return
-        _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, forward)
+        self._restart(pid, data=forward)
+
+    def _restart(self, pid, request=None, data=0):
+        # Every stop is a safe pause boundary, including syscall and clone
+        # stops that can overtake a pending SIGSTOP. Retain the restart mode
+        # so resume still observes an admitted syscall's matching exit.
+        with self._lock:
+            if request is None:
+                request = pt.PTRACE_SYSCALL if pid in self._pending_syscall_exit else pt.PTRACE_CONT
+            if pid in self._held_pids:
+                self._parked_pids.add(pid)
+                self._parked_restarts[pid] = (request, data)
+                self._state_changed.notify_all()
+                return
+        return _ptrace_ignoring_esrch(request, pid, 0, data)
 
     def pause(self) -> None:
-        """Stop every currently-known pid in the traced tree. Unlike
-        kill(), this must wait for each pid's own SIGSTOP delivery-stop to
-        reach _dispatch() (on the dedicated tracer thread) before it is
-        actually withheld -- see _dispatch()'s generic-signal fallthrough.
+        """Request a stop for every known task, holding it at its next stop.
+
+        Each thread needs its own signal. Any intervening syscall/clone/exec
+        stop also parks the task before it can execute further userspace.
 
         Returns once the stops have been requested; wait_paused() blocks
-        until they have taken hold. A process spawned while the pause is
-        pending is held from its first stop (see _remember_spawn())."""
+        until they have taken hold. A task spawned while the pause is
+        pending is held from its first stop (see _remember_spawn()).
+        """
         with self._lock:
             pids = list(self._known_pids)
             self._pause_requested = True
             self._held_pids |= set(pids)
-        for pid in pids:
-            # Thread-directed: every thread is its own tracee and must take its
-            # own stop, or the process keeps running on its other threads.
-            try:
-                pt.tgkill(_thread_group_of(pid), pid, signal.SIGSTOP)
-            except OSError as exc:
-                if exc.errno != errno.ESRCH:
-                    raise
+            for pid in pids:
+                try:
+                    _stop_task(pid)
+                    self._pause_stop_pids.add(pid)
+                except (ProcessLookupError, FileNotFoundError):
+                    # The task exited between its last wait status and pause.
+                    pass
+
+    def _control_snapshot(self) -> dict:
+        """Observe tracer-owned tasks, never infer application from sent signals."""
+        with self._lock:
+            known = set(self._known_pids)
+            parked = known & self._parked_pids
+            if self._checkpoint_detached or self._exit_observation_lost:
+                local = "unknown"
+            elif self._finished.is_set() and not known:
+                local = "exited"
+            elif not known or self._pending_clone_pids:
+                local = "pending"
+            elif known <= self._held_pids and known <= parked:
+                local = "suspended"
+            elif (
+                not (known & self._held_pids)
+                and not parked
+                and not self._resume_requests
+                and not self._resume_in_progress
+                and not (known & self._resume_unobserved)
+            ):
+                local = "continued"
+            else:
+                local = "pending"
+            return {
+                "local_state": local,
+                "task_count": len(known),
+                "parked_count": len(parked),
+                "returncode": self._returncode,
+            }
 
     def wait_paused(self, timeout: "float | None" = None) -> bool:
         """Block until every live pid is parked after pause(). False on
@@ -912,8 +962,11 @@ class TracerLoop:
             parked = list(self._parked_pids)
             self._parked_pids.clear()
             self._held_pids.clear()
+            for pid in parked:
+                request = pt.PTRACE_SYSCALL if pid in self._pending_syscall_exit else pt.PTRACE_CONT
+                request, data = self._parked_restarts.pop(pid, (request, 0))
+                self._resume_requests.append((pid, request, data))
             self._pause_requested = False
-            self._resume_requests.extend(parked)
             self._state_changed.notify_all()
 
     def _handle_seccomp_stop(self, pid: int) -> None:
@@ -1001,9 +1054,9 @@ class TracerLoop:
             # like any other syscall's exit.
             with self._lock:
                 self._pending_syscall_exit[pid] = (stop, decision.call_id)
-            _ptrace_ignoring_esrch(pt.PTRACE_SYSCALL, pid, 0, 0)
+            self._restart(pid, pt.PTRACE_SYSCALL)
         else:
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
 
     def _handle_syscall_exit_stop(self, pid: int, pending: tuple) -> None:
         stop, call_id = pending
@@ -1016,7 +1069,7 @@ class TracerLoop:
             # rather than crash the whole tracer loop over one lost value.
             return_value = None
         finally:
-            _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)
+            self._restart(pid)
         if self._syscall_exit_hook is not None and return_value is not None:
             self._syscall_exit_hook(stop, call_id, return_value)
 
@@ -1033,9 +1086,8 @@ class TracerLoop:
             if unannounced:
                 self._unannounced_pids.add(pid)
             self._known_pids.add(pid)
-            if self._pause_requested:
-                # Auto-attached children report a PTRACE_EVENT_STOP first;
-                # holding the pid parks it there, so it never runs.
+            if self._pause_requested or self._held_pids:
+                # Threads/children born just before pause must inherit it.
                 self._held_pids.add(pid)
             self._state_changed.notify_all()
             if is_process is None:
@@ -1108,6 +1160,10 @@ class TracerLoop:
             self._pending_exec_paths.pop(pid, None)
             self._pending_syscall_exit.pop(pid, None)
             self._options_applied.discard(pid)
+            self._parked_pids.discard(pid)
+            self._resume_unobserved.discard(pid)
+            self._parked_restarts.pop(pid, None)
+            self._pause_stop_pids.discard(pid)
             if pid == self.root_pid:
                 self._returncode = exit_code
             was_process = pid in self._process_pids
@@ -1144,6 +1200,19 @@ class TracerLoop:
         if self._stdin_writer is not None:
             self._stdin_writer.join()
         return self._returncode
+
+    def terminate(self) -> None:
+        """Deliver SIGTERM and release paused tasks so their handlers can run."""
+        if self._checkpoint_detached:
+            self.checkpoint_handoff("reattach")
+        with self._lock:
+            pids = list(self._known_pids)
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        self.resume()
 
     def kill(self) -> None:
         if self._checkpoint_detached:

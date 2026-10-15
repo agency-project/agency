@@ -47,7 +47,7 @@ class TestOpenAICompatibleBackend:
         with patch("agency.llm.openai.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
-            api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0)
+            api_key="k", base_url="http://x/v1", timeout=httpx.Timeout(5.0), max_retries=2
         )
 
     def test_make_client_defaults_api_key_to_empty(self):
@@ -55,7 +55,7 @@ class TestOpenAICompatibleBackend:
         with patch("agency.llm.openai.openai.OpenAI") as MockCls:
             backend.make_client(httpx.Timeout(5.0))
         MockCls.assert_called_once_with(
-            api_key="EMPTY", base_url="http://x/v1", timeout=httpx.Timeout(5.0)
+            api_key="EMPTY", base_url="http://x/v1", timeout=httpx.Timeout(5.0), max_retries=2
         )
 
     def test_tokenize_url_strips_v1_suffix(self):
@@ -202,7 +202,7 @@ class TestFormatStreamToAgency:
     def test_unrecognized_delta_field_streamed_with_named_type(self):
         chunk = _ev(
             usage=None,
-            choices=[_ev(delta=_SdkObj(content=None, refusal="no"), finish_reason=None)],
+            choices=[_ev(delta=_SdkObj(content=None, refusal="no"), finish_reason="stop")],
         )
         items = list(_OpenAICompatibleBackend(_cfg())._format_stream_to_agency(iter([chunk])))
         unknown_items = [
@@ -219,7 +219,7 @@ class TestFormatStreamToAgency:
             ),
             _ev(
                 usage=None,
-                choices=[_ev(delta=_SdkObj(content=None, refusal="b"), finish_reason=None)],
+                choices=[_ev(delta=_SdkObj(content=None, refusal="b"), finish_reason="stop")],
             ),
         ]
         items = list(_OpenAICompatibleBackend(_cfg())._format_stream_to_agency(iter(chunks)))
@@ -285,6 +285,7 @@ class TestSignedThinking:
                 ],
             ),
         ]
+        chunks.append(_ev(usage=None, choices=[_ev(delta=_SdkObj(), finish_reason="stop")]))
         items = list(_OpenAICompatibleBackend(_cfg())._format_stream_to_agency(iter(chunks)))
         thinking = [i for i in items if i.get("block_type") == "thinking"]
         assert [(i["index"], i.get("text"), i.get("signature")) for i in thinking] == [

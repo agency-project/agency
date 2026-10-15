@@ -33,6 +33,9 @@ def _merge_owner(parent, metadata):
         for key in PROCESS_KEYS:
             owner.pop(key, None)
     owner.update({k: metadata[k] for k in OWNER_KEYS if metadata.get(k) is not None})
+    if metadata.get("agency.process_identity_unknown"):
+        for key in PROCESS_KEYS:
+            owner.pop(key, None)
     return owner
 
 

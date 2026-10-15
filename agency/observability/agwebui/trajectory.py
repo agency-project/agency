@@ -1,0 +1,1691 @@
+"""Incremental, evidence-preserving trajectory projection of canonical logger events.
+
+This module never drives an agent. The same reducer consumes live SQLite rows
+and replay prefixes; raw rows stay in their original databases or trace files.
+"""
+
+from __future__ import annotations
+
+import copy
+import bisect
+import math
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from pathlib import Path
+
+from . import measurement
+from .investigator import classify, object_value
+
+EVENT_TYPES = (
+    "resource_sample",
+    "workload_started",
+    "workload_completed",
+    "done",
+    "agent_registered",
+    "agent_created",
+    "agent_forked",
+    "agent_state",
+    "agent_paused",
+    "agent_resumed",
+    "agent_stop_requested",
+    "ui_intervention",
+    "tool_call",
+    "tool_result",
+    "syscall_call",
+    "syscall_result",
+    "skill_start",
+    "skill_call",
+    "skill_error",
+    "skill_cancelled",
+    "request_submitted",
+    "request_started",
+    "request_blocked",
+    "request_ready",
+    "request_completed",
+    "request_failed",
+    "request_cancelled",
+    "input_required",
+    "input_resolved",
+    "delegation",
+    "handoff",
+    "tool_annotation",
+)
+TITLES = {
+    "investigate": "Inspecting the behavior",
+    "edit": "Attempting a change",
+    "test": "Checking the behavior",
+    "review": "Reviewing the result",
+    "tool": "Running tools",
+    "model": "Waiting for a model response",
+    "queue": "Awaiting scheduler admission",
+    "dependency": "Waiting for dependencies",
+    "setup": "Executing the requested skill",
+    "input": "Waiting for your input",
+}
+TERMINAL = {"completed", "failed", "cancelled"}
+JOURNAL_BYTE_LIMIT = 64 * 1024 * 1024
+
+
+def _patch_size(value, limit):
+    """Conservative heap bound; stop counting an oversized patch immediately.
+
+    Count shared immutable values per reference, so the estimate can overcount
+    but cannot hide the dictionaries/lists retained by the revision journal.
+    """
+    pending = [value]
+    containers = set()
+    size = 0
+    while pending and size <= limit:
+        item = pending.pop()
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in containers:
+                continue
+            containers.add(id(item))
+            if isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
+        size += sys.getsizeof(item)
+    return size
+
+
+def text(value):
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+
+
+def fingerprint(value):
+    return hashlib.sha256(text(value).encode()).hexdigest()[:20]
+
+
+def tool_outcome(payload):
+    result = object_value(payload.get("result", payload.get("output")))
+    if payload.get("error"):
+        return "failed"
+    if isinstance(result, dict):
+        if result.get("error") or result.get("isError") is True:
+            return "failed"
+        if any(result.get(key) not in (None, 0) for key in ("returncode", "exit_code")):
+            return "failed"
+    return payload.get("outcome", "success")
+
+
+def returned_preview(value):
+    parsed = object_value(value)
+    if isinstance(parsed, dict):
+        output = text(parsed.get("stdout") or parsed.get("stderr") or "")
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        failures = [line for line in lines if re.search(r"AssertionError|^FAILED|Error:", line)]
+        exit_code = parsed.get("exit_code", parsed.get("returncode"))
+        if exit_code is not None:
+            detail = " · ".join(failures[:2] or lines[-2:])
+            return f"exit_code={exit_code} · {detail}"[:240]
+        if isinstance(parsed.get("artifacts"), list) and parsed["artifacts"]:
+            return (
+                "Tool reported artifacts: "
+                + ", ".join(
+                    str(item.get("path", "unattributed"))
+                    for item in parsed["artifacts"]
+                    if isinstance(item, dict)
+                )[:200]
+            )
+    return text(value)[:240]
+
+
+class Trajectory:
+    def __init__(self, run_id, title, *, mode="live", source="recorded", defer_causal_graph=None):
+        self.defer_causal_graph = (
+            mode == "live" if defer_causal_graph is None else defer_causal_graph
+        )
+        self.run = {
+            "id": run_id,
+            "title": title,
+            "subtitle": "Canonical Agency event stream",
+            "source": source,
+            "mode": mode,
+            "model": "Recorded in event metadata",
+            "harness": "Agency",
+            "duration": 0,
+            "execution_started_at": None,
+            "execution_wall_time": 0,
+            # Wall-clock measurement is distinct from agent execution and from
+            # workload completion: the automatic boundary comes from recorded
+            # events, the effective one may be a user override. Timestamps
+            # share the event clock; *_offset is seconds on the trace axis.
+            "measurement": {
+                "state": "pending",
+                "policy": "automatic",
+                "held": False,
+                "automatic_end_at": None,
+                "automatic_end_source": None,
+                "automatic_end_offset": None,
+                "effective_end_at": None,
+                "end_source": None,
+                "end_offset": None,
+            },
+            "status": "unknown",
+            "resolved": None,
+            "actions": [],
+            "episodes": [],
+            "agents": [],
+            "edges": [],
+            "intervals": [],
+            "counters": {},
+            # Canonical events and resource_sample.sampled_at are both Unix
+            # wall-clock seconds from the same host, offset by one origin.
+            "clock": {
+                "events": "host Unix wall clock",
+                "resources": "host Unix wall clock",
+                "shared": True,
+                "origin": "first canonical event",
+            },
+            "obligations": [],
+            "signals": [],
+            "messages": [],
+            "coverage": {
+                "events": 0,
+                "spans": 0,
+                "gaps": [],
+                "catching_up": False,
+                "context": "Only recorded visible messages and linked model prompts are exposed.",
+                "relationships": "Only explicitly recorded delegation and dependency links.",
+            },
+        }
+        # Saved traces already use run-relative time; preserve alignment with
+        # their resource lanes even if the first observable call starts later.
+        self.origin = None if mode == "live" else 0
+        self.seen = set()
+        self.actions = {}
+        self._graph_revision = 0
+        self.episodes = {}
+        self.agents = {}
+        self.current = {}
+        self.actor_request = {}
+        self.actor_clock = {}
+        self.checks = {}
+        self.edit_version = {}
+        self.failed_checks = {}
+        self.model_links = {}
+        self.pending_model_links = {}
+        self.dirty = {key: set() for key in ("actions", "episodes", "agents", "edges")}
+        self.signals = {}
+        self.dirty["signals"] = set()
+        self.finished_at = None
+        # Latest observed instant. Unlike the trace duration it keeps advancing
+        # after the final lifecycle event, so a held measurement can continue.
+        self.clock = None
+        self.override = None
+        self.measured = set()
+        self.running = set()
+        self.intervals = {}
+        self.dirty["intervals"] = set()
+        self.pauses = {}
+        self.counter_updates = {}
+
+    def _agent(self, actor):
+        if actor not in self.agents:
+            agent = {
+                "id": actor,
+                "label": actor,
+                "role": "Fixture actor" if self.run["source"] == "synthetic" else "Recorded actor",
+                "parent": None,
+                "model": None,
+                "harness": None,
+                "status": "unknown",
+            }
+            self.agents[actor] = agent
+            self.run["agents"].append(agent)
+        self.dirty["agents"].add(actor)
+        return self.agents[actor]
+
+    def _signal(self, key, title, explanation, evidence, severity="inspect", active=True):
+        self.signals[key] = {
+            "id": key,
+            "title": title,
+            "explanation": explanation,
+            "evidence": evidence,
+            "severity": severity,
+            "active": active,
+        }
+        self.dirty["signals"].add(key)
+
+    def _agent_status(self, agent, status):
+        agent["execution_state"] = status
+        agent["status"] = "paused" if agent.get("paused") else status
+
+    def _execution_duration(self, action, end):
+        """Exclude recorded control intervals without changing the trace's time axis."""
+        start = action["started_ts"]
+        paused = sum(
+            max(0, min(end, right if right is not None else end) - max(start, left))
+            for left, right in self.pauses.get(action["agent"], [])
+        )
+        return max(0, end - start - paused)
+
+    def _close_signal(self, key):
+        if key in self.signals and self.signals[key]["active"]:
+            self.signals[key]["active"] = False
+            self.dirty["signals"].add(key)
+
+    def _episode(self, action, late=False):
+        actor = action["agent"]
+        kind = "investigate" if action["kind"] in {"read", "search"} else action["kind"]
+        workstreams = action.get("workstream_ids") or []
+        group = (action["request_id"], tuple(workstreams) if workstreams else kind)
+        previous = self.current.get(actor)
+        episode = self.episodes.get(previous)
+        if (
+            late
+            or not episode
+            or episode["group"] != group
+            or episode["closed"]
+            or len(episode["actions"]) >= 8
+        ):
+            if episode and not late:
+                episode["closed"] = True
+                self.dirty["episodes"].add(episode["id"])
+            episode_id = f"episode:{action['id']}"
+            episode = {
+                "id": episode_id,
+                "agent": actor,
+                "kind": kind,
+                "title": action["intent"] or TITLES.get(kind, "Unclassified activity"),
+                "label_source": "declared" if action["intent"] else "deterministic",
+                "intent": action["intent"],
+                "actions": [],
+                "start": action["start"],
+                "end": action["start"],
+                "status": "running",
+                "inferred": True,
+                "latest_result": "No result recorded yet.",
+                "group": group,
+                "closed": False,
+                "late": late,
+                "annotation": None,
+            }
+            self.episodes[episode_id] = episode
+            self.run["episodes"].append(episode)
+            if not late:
+                self.current[actor] = episode_id
+        episode["actions"].append(action["id"])
+        action["episode"] = episode["id"]
+        self.dirty["episodes"].add(episode["id"])
+
+    def _refresh_episode(self, action):
+        episode = self.episodes[action["episode"]]
+        calls = [self.actions[key] for key in episode["actions"]]
+        episode["start"] = min(a["start"] for a in calls)
+        episode["end"] = max(a["start"] + a["duration"] for a in calls)
+        statuses = {a["outcome"] for a in calls}
+        episode["status"] = (
+            "running"
+            if "running" in statuses
+            else "failed"
+            if "failed" in statuses
+            else "incomplete"
+            if "incomplete" in statuses
+            else "cancelled"
+            if "cancelled" in statuses
+            else "completed"
+            if statuses == {"success"}
+            else "unknown"
+        )
+        if action.get("result") or action.get("error"):
+            episode["latest_result"] = (
+                action.get("result_preview") or (action.get("error") or action["result"])[:240]
+            )
+            episode["latest_action"] = action["id"]
+        self.dirty["episodes"].add(episode["id"])
+
+    def _call(self, event, kind, key, *, ending=False):
+        self._graph_revision += 1
+        actor, payload, timestamp = event["actor"], event["payload"], event["ts"]
+        action_id = payload.get("action_id") or f"{actor}:{key}"
+        action = self.actions.get(action_id)
+        if action is None:
+            arguments = payload.get("arguments") or (
+                {
+                    k: payload[k]
+                    for k in ("pid", "path", "argv", "program", "address", "port")
+                    if payload.get(k) is not None
+                }
+                if kind == "syscall"
+                else {}
+            )
+            command = (
+                arguments.get("command", text(arguments))
+                if isinstance(arguments, dict)
+                else text(arguments)
+            )
+            annotation = payload.get("annotation") or {}
+            declared = annotation.get("raw", {}) if annotation.get("status") == "valid" else {}
+            declared = declared if isinstance(declared, dict) else {}
+            intent = payload.get("intent") or declared.get("purpose") or ""
+            name = payload.get("tool") or payload.get("name") or payload.get("syscall") or kind
+            category = payload.get("kind") or (
+                classify(f"tool:{name}", command) if kind == "tool" else kind
+            )
+            late = timestamp < self.actor_clock.get(actor, timestamp)
+            self.actor_clock[actor] = max(timestamp, self.actor_clock.get(actor, timestamp))
+            action = {
+                "id": action_id,
+                "agent": actor,
+                "name": name,
+                "kind": category,
+                "intent": intent,
+                "command": command[:8000],
+                "arguments": text(arguments)[:8000],
+                "input_truncated": payload.get("input_truncated", False)
+                or len(text(arguments)) > 8000,
+                "result": "",
+                "error": "",
+                "start": max(0, timestamp - self.origin),
+                "started_ts": timestamp,
+                "duration": 0,
+                "outcome": "unknown" if ending else "running",
+                "timing": "host_event_boundary",
+                "source": event.get("source", "canonical_event"),
+                "tokens": None,
+                "output_tokens": None,
+                "files": [],
+                "artifacts": [],
+                "metadata": {},
+                "context": None,
+                "event_ids": [],
+                "call_id": payload.get("call_id") or event.get("call_label"),
+                "model_tool_call_id": payload.get("model_tool_call_id")
+                or annotation.get("model_tool_call_id"),
+                "model_id": payload.get("model_id")
+                or self.model_links.get(
+                    (
+                        actor,
+                        payload.get("model_tool_call_id") or annotation.get("model_tool_call_id"),
+                    )
+                ),
+                "parent_id": payload.get("parent_id"),
+                "request_id": payload.get("request_id") or self.actor_request.get(actor),
+                "request_correlation": payload.get("request_correlation")
+                or (
+                    "explicit"
+                    if payload.get("request_id")
+                    else "actor_context_fallback"
+                    if self.actor_request.get(actor)
+                    else "unavailable"
+                ),
+                "workstream_ids": declared.get("workstream_ids", []),
+                "missing_start": ending,
+                "result_hash": None,
+                "result_preview": "",
+                "edit_version": self.edit_version.get(actor, 0),
+            }
+            self.actions[action_id] = action
+            self.run["actions"].append(action)
+            if action["model_tool_call_id"] and not action["model_id"]:
+                self.pending_model_links.setdefault(
+                    (actor, action["model_tool_call_id"]), []
+                ).append(action_id)
+            self._episode(action, late)
+        action["event_ids"].append(event["id"])
+        if payload.get("request_id"):
+            action["request_id"] = payload["request_id"]
+            action["request_correlation"] = payload.get("request_correlation") or "explicit"
+        if payload.get("model"):
+            action["model"] = payload["model"]
+        tool_identity = payload.get("model_tool_call_id") or (payload.get("annotation") or {}).get(
+            "model_tool_call_id"
+        )
+        if tool_identity and not action.get("model_tool_call_id"):
+            action["model_tool_call_id"] = tool_identity
+            action["model_id"] = payload.get("model_id") or self.model_links.get(
+                (actor, tool_identity)
+            )
+            if not action["model_id"]:
+                self.pending_model_links.setdefault((actor, tool_identity), []).append(action_id)
+        if isinstance(payload.get("tool_call_ids"), list):
+            action["tool_call_ids"] = list(
+                dict.fromkeys(
+                    item
+                    for item in [*action.get("tool_call_ids", []), *payload["tool_call_ids"]]
+                    if isinstance(item, str) and item
+                )
+            )
+        if payload.get("causal_evidence") is not None:
+            action["causal_evidence"] = payload["causal_evidence"]
+        if not ending:
+            missing_start = action["missing_start"]
+            action["missing_start"] = False
+            action["start"] = max(0, timestamp - self.origin)
+            action["started_ts"] = timestamp
+            if missing_start:
+                arguments = payload.get("arguments") or {}
+                action["arguments"] = text(arguments)[:8000]
+                action["command"] = (
+                    arguments.get("command", text(arguments))
+                    if isinstance(arguments, dict)
+                    else text(arguments)
+                )[:8000]
+                action["name"] = payload.get("tool", action["name"])
+                action["duration"] = max(0, action.get("end_ts", timestamp) - timestamp)
+            if not action["result_hash"]:
+                action["outcome"] = "failed" if payload.get("allowed") is False else "running"
+                if payload.get("allowed") is False:
+                    action["error"] = payload.get("reason") or "Policy denied tool admission."
+                    action["result_preview"] = action["error"]
+                    self._attention(action)
+        else:
+            result = payload.get("result", payload.get("output", ""))
+            action["result"] = text(result)[:8000]
+            action["output_truncated"] = (
+                payload.get("output_truncated", False)
+                or len(text(result)) > 8000
+                or len(text(payload.get("error", ""))) > 8000
+            )
+            action["error"] = text(payload["error"])[:8000] if payload.get("error") else ""
+            action["result_hash"] = fingerprint(action["error"] or result)
+            action["result_preview"] = (
+                action["error"][:240]
+                or payload.get("recorded_result_preview")
+                or returned_preview(result)
+            )
+            first_result = action["end_ts"] if "end_ts" in action else None
+            action["end_ts"] = timestamp
+            action["duration"] = max(0, timestamp - self.origin - action["start"])
+            action["outcome"] = tool_outcome(payload)
+            action["tokens"] = payload.get("tokens") if kind == "model" else None
+            action["output_tokens"] = payload.get("output_tokens") if kind == "model" else None
+            action["context"] = payload.get("context")
+            if kind == "model" and payload.get("model_response") is not None:
+                action["model_response"] = payload["model_response"]
+            if kind == "model" and isinstance(action["context"], dict):
+                action["input_truncated"] = bool(action["context"].get("truncated"))
+            action["files"] = payload.get("files") or []
+            action["timing"] = payload.get("timing", action["timing"])
+            parsed_result = object_value(result)
+            artifacts = payload.get("artifacts") or (
+                parsed_result.get("artifacts", []) if isinstance(parsed_result, dict) else []
+            )
+            action["artifacts"] = (
+                [item for item in artifacts if isinstance(item, dict)]
+                if isinstance(artifacts, list)
+                else []
+            )
+            if first_result is None:
+                self._attention(action)
+        if action["outcome"] == "running" and self.finished_at is not None:
+            action["outcome"] = "incomplete"
+        action["execution_duration"] = self._execution_duration(
+            action, action.get("end_ts", timestamp)
+        )
+        if action["outcome"] == "running":
+            self.running.add(action_id)
+        else:
+            self.running.discard(action_id)
+        action["metadata"] = {
+            **action["metadata"],
+            **(
+                {k: payload[k] for k in ("pid", "program", "path", "return_value") if k in payload}
+                if kind == "syscall"
+                else {}
+            ),
+            **payload.get("metadata", {}),
+            "event_ids": action["event_ids"],
+            "call_id": action["call_id"],
+            "request_id": action["request_id"],
+            "request_correlation": action["request_correlation"],
+            "missing_start": action["missing_start"],
+            "parent_id": action["parent_id"],
+            "source": action["source"],
+        }
+        self.dirty["actions"].add(action_id)
+        self._interval(action)
+        self._refresh_episode(action)
+        return action
+
+    def _interval(self, action):
+        interval = {
+            "id": action["id"],
+            "agent": action["agent"],
+            "action": action["id"],
+            "kind": action["kind"]
+            if action["kind"] in {"model", "queue", "dependency", "syscall"}
+            else "tool",
+            "start": action["start"],
+            "duration": action["duration"],
+            "label": action["intent"] or action["name"],
+            "source": action["source"],
+        }
+        if action["id"] not in self.intervals:
+            self.run["intervals"].append(interval)
+        else:
+            self.intervals[action["id"]].update(interval)
+            interval = self.intervals[action["id"]]
+        self.intervals[action["id"]] = interval
+        self.dirty["intervals"].add(action["id"])
+
+    def _attention(self, action):
+        if action["kind"] == "syscall":
+            return  # Raw system-call failures belong to recorded system telemetry.
+        actor = action["agent"]
+        if action["kind"] == "edit" and action["outcome"] == "success":
+            self.edit_version[actor] = self.edit_version.get(actor, 0) + 1
+            # A recorded edit is sufficient to break an equivalent-check sequence.
+            self.checks[actor] = []
+            if f"repeat:{actor}" in self.signals:
+                self._close_signal(f"repeat:{actor}")
+        if action["outcome"] == "failed":
+            self._signal(
+                f"failure:{action['id']}",
+                "Recorded call failure",
+                action["result_preview"] or "The call reported a failure.",
+                [action["id"]],
+            )
+        if action["kind"] not in {"test", "review"}:
+            return
+        failure_key = (actor, action["command"])
+        if action["outcome"] == "failed":
+            self.failed_checks.setdefault(failure_key, []).append(action["id"])
+        elif action["outcome"] == "success":
+            for failed_id in self.failed_checks.pop(failure_key, []):
+                self._close_signal(f"failure:{failed_id}")
+                self.signals[f"failure:{failed_id}"]["followed_by"] = action["id"]
+        checks = self.checks.setdefault(actor, [])
+        if action["missing_start"]:
+            return
+        if checks and self.actions[checks[-1][1]].get("end_ts", 0) > action["started_ts"]:
+            checks.clear()
+            if f"repeat:{actor}" in self.signals:
+                self._close_signal(f"repeat:{actor}")
+        signature = (
+            action["command"],
+            fingerprint(action["result_preview"])
+            if action["outcome"] == "failed"
+            else action["result_hash"],
+            action["outcome"],
+            action["edit_version"],
+        )
+        if checks and checks[-1][0] != signature:
+            checks.clear()
+            if f"repeat:{actor}" in self.signals:
+                self._close_signal(f"repeat:{actor}")
+        checks.append((signature, action["id"]))
+        if len(checks) < 3:
+            return
+        failed = action["outcome"] == "failed"
+        self._signal(
+            f"repeat:{actor}",
+            "Repeated matching failures" if failed else "Equivalent checks repeated",
+            f"{len(checks)} consecutive checks returned the same recorded result. "
+            "No intervening edit was recorded for this actor; unobserved changes remain possible.",
+            [key for _, key in checks[-5:]],
+        )
+
+    def apply(self, event):
+        if event["id"] in self.seen:
+            return False
+        self.seen.add(event["id"])
+        self.run["coverage"]["events"] += 1
+        if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+            event = {
+                **event,
+                "ts": (self.origin or 0) + self.run["duration"],
+                "source": "timestamp_missing_ordered_at_last_observation",
+            }
+        if self.origin is None:
+            self.origin = event["ts"]
+            self.run["time_origin"] = self.origin
+        self.run["duration"] = max(self.run["duration"], event["ts"] - self.origin)
+        self.clock = event["ts"] if self.clock is None else max(self.clock, event["ts"])
+        actor = event.get("actor") or "unattributed"
+        event = {**event, "actor": actor}
+        payload, kind = event["payload"], event["type"]
+        # UI/program startup includes setup and human input. Start elapsed
+        # agent time only at an observed execution boundary; keep the original
+        # trace origin so earlier resource samples and setup remain aligned.
+        if self.finished_at is None and (
+            kind in {"request_started", "skill_start", "tool_call"}
+            or kind == "agent_state"
+            and payload.get("state") in {"running", "waiting_llm"}
+        ):
+            started = self.run["execution_started_at"]
+            self.run["execution_started_at"] = (
+                event["ts"] if started is None else min(started, event["ts"])
+            )
+        if kind == "resource_sample":
+            at = max(0, event["ts"] - self.origin)
+            for name, value in payload.get("values", {}).items():
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    point = [at, value]
+                    series = self.run["counters"].setdefault(name, [])
+                    bisect.insort(series, point)
+                    self.counter_updates.setdefault(name, []).append(point)
+        elif kind == "workload_started":
+            self.run["status"] = "running"
+            self.run["task"] = payload.get("task")
+            for field in ("model", "harness", "dataset"):
+                if payload.get(field):
+                    self.run[field] = payload[field]
+        elif kind == "workload_completed":
+            # The workload callback returned. Profiler finalization follows and
+            # the terminal lifecycle still arrives as `done`; this says nothing
+            # about task success.
+            self.run["measurement"].update(
+                automatic_end_at=event["ts"], automatic_end_source="workload_completed"
+            )
+        elif kind == "done":
+            if self.run["measurement"]["automatic_end_at"] is None:
+                # Legacy and programmatic recordings have only this boundary.
+                # A recorded gap back to callback return survives a lost
+                # workload_completed event and is valid on any event clock.
+                gap = payload.get("finalization_seconds")
+                self.run["measurement"].update(
+                    automatic_end_at=event["ts"]
+                    - (gap if measurement.finite(gap) and gap >= 0 else 0),
+                    automatic_end_source="replay_boundary"
+                    if event.get("source") == "replay_boundary_not_recorded_lifecycle"
+                    else "done",
+                )
+            self.run["status"] = payload.get("status", "unknown")
+            if self.run["status"] == "unknown":
+                self._signal(
+                    "final-state",
+                    "Final execution state is unavailable",
+                    "The recording ended without an explicit final execution status. Task success is not established.",
+                    [event["id"]],
+                )
+            self.finished_at = event["ts"]
+            self._graph_revision += 1
+            if self.running:
+                self._signal(
+                    "unfinished",
+                    "Some calls have no recorded end",
+                    "Execution reached its final boundary with unfinished telemetry. These calls are retained as incomplete, not successful.",
+                    list(self.running),
+                )
+            for action_id in list(self.running):
+                action = self.actions[action_id]
+                if action["outcome"] == "running":
+                    action["outcome"] = "incomplete"
+                    self.dirty["actions"].add(action["id"])
+                    self._refresh_episode(action)
+            self.running.clear()
+            for episode in self.episodes.values():
+                episode["closed"] = True
+                self.dirty["episodes"].add(episode["id"])
+            for agent in self.agents.values():
+                if agent.get("paused"):
+                    agent["paused"] = False
+                    self._agent_status(agent, self.run["status"])
+                    self.dirty["agents"].add(agent["id"])
+        else:
+            agent = self._agent(actor)
+            if kind in {"agent_created", "agent_forked", "agent_registered"}:
+                # Process ancestry is deliberately not turned into delegation.
+                agent["identity"] = "execution_actor"
+                if payload.get("parent_agname"):
+                    agent["parent"] = payload["parent_agname"]
+                    agent["parent_source"] = "recorded_parent_agname"
+                config = payload.get("llm_config") or {}
+                if isinstance(config, dict) and config.get("model"):
+                    agent["model"] = config["model"]
+                if payload.get("harness"):
+                    agent["harness"] = payload["harness"]
+            elif kind == "ui_intervention":
+                state = payload.get("state", "unknown")
+                command = payload.get("requested_action", "unknown")
+                arguments = {
+                    "command": payload.get("message") or command,
+                    "input": payload.get("input"),
+                    "task": payload.get("task"),
+                }
+                action = self._call(
+                    {
+                        **event,
+                        "payload": {
+                            "action_id": f"{actor}:control:{payload.get('relay_id', '')}:{payload.get('command_id', event['id'])}",
+                            "name": command,
+                            "kind": "control",
+                            "arguments": arguments,
+                            "request_id": payload.get("invocation"),
+                            "outcome": state,
+                            "result": payload.get("result", {}),
+                            "metadata": {"scope": "human_intervention", "recorded_state": state},
+                        },
+                    },
+                    "control",
+                    payload.get("command_id", event["id"]),
+                    ending=state != "requested",
+                )
+                action.update(
+                    target_agent=payload.get("target_agent", actor),
+                    requested_action=command,
+                    outcome=state,
+                    command=payload.get("message") or command,
+                    control_scope="human_intervention",
+                )
+                self.running.discard(action["id"])
+                self._refresh_episode(action)
+            elif kind in {"agent_paused", "agent_resumed"}:
+                if event["ts"] >= agent.get("control_ts", 0) and self.finished_at is None:
+                    agent["control_ts"] = event["ts"]
+                    intervals = self.pauses.setdefault(actor, [])
+                    if kind == "agent_paused" and not agent.get("paused"):
+                        intervals.append([event["ts"], None])
+                        agent["paused"] = True
+                    elif kind == "agent_resumed" and agent.get("paused"):
+                        intervals[-1][1] = event["ts"]
+                        agent["paused"] = False
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
+                    self.tick(event["ts"], force=True)
+            elif kind == "agent_stop_requested":
+                if event["ts"] >= agent.get("stop_ts", 0):
+                    agent["stop_ts"] = event["ts"]
+                    agent["stop_force"] = bool(payload.get("force"))
+                    # This confirms delivery, not process exit. Terminal state
+                    # still comes from the scheduler's existing request events.
+                    agent["paused"] = False
+                    intervals = self.pauses.get(actor, [])
+                    if intervals and intervals[-1][1] is None:
+                        intervals[-1][1] = event["ts"]
+                    self._agent_status(agent, agent.get("execution_state", "unknown"))
+            elif kind == "agent_state":
+                if event["ts"] >= agent.get("state_ts", 0):
+                    self._agent_status(agent, payload.get("state", "unknown"))
+                    agent["state_ts"] = event["ts"]
+                # The engine names the sandbox this agent executes in; resource
+                # series of that label are the agent's container measurements.
+                if isinstance(payload.get("sandbox"), str):
+                    agent["sandbox"] = payload["sandbox"]
+                if payload.get("state") == "waiting_llm" and event.get("call_label"):
+                    self._call(event, "model", f"model:{event['call_label']}")
+            elif kind in {
+                "tool_call",
+                "tool_result",
+                "model_result",
+                "syscall_call",
+                "syscall_result",
+            }:
+                call_kind = (
+                    "model"
+                    if kind == "model_result"
+                    else "syscall"
+                    if kind.startswith("syscall_")
+                    else "tool"
+                )
+                key = payload.get("call_id") or event.get("call_label") or event["id"]
+                if call_kind == "model":
+                    key = f"model:{key}"
+                action = self._call(event, call_kind, key, ending=kind.endswith("result"))
+                if call_kind == "model":
+                    model_id = payload.get("action_id") or f"{actor}:{key}"
+                    for tool_id in action.get("tool_call_ids", []):
+                        self.model_links[(actor, tool_id)] = model_id
+                        for action_id in self.pending_model_links.pop((actor, tool_id), []):
+                            self.actions[action_id]["model_id"] = model_id
+                            self.dirty["actions"].add(action_id)
+            elif kind.startswith("request_"):
+                request = payload.get("request_id") or event["id"]
+                self.actor_request[actor] = request
+                if kind == "request_submitted":
+                    self._call(event, "queue", f"queue:{request}")
+                elif kind in {"request_started", "request_cancelled", "request_failed"}:
+                    queue = self.actions.get(f"{actor}:queue:{request}")
+                    if queue and queue["outcome"] == "running":
+                        self._call(
+                            {
+                                **event,
+                                "payload": {
+                                    **payload,
+                                    "outcome": {
+                                        "request_started": "success",
+                                        "request_cancelled": "cancelled",
+                                        "request_failed": "failed",
+                                    }[kind],
+                                },
+                            },
+                            "queue",
+                            f"queue:{request}",
+                            ending=True,
+                        )
+                if kind == "request_blocked":
+                    self._call(event, "dependency", f"dependency:{request}")
+                    self._signal(
+                        f"wait:{request}",
+                        "Recorded dependency wait",
+                        text(
+                            payload.get("dependencies")
+                            or payload.get("reason")
+                            or "Scheduler marked this request blocked."
+                        ),
+                        [f"{actor}:dependency:{request}"],
+                    )
+                if kind in {
+                    "request_ready",
+                    "request_started",
+                    "request_completed",
+                    "request_cancelled",
+                    "request_failed",
+                }:
+                    wait = self.actions.get(f"{actor}:dependency:{request}")
+                    if wait and wait["outcome"] == "running":
+                        self._call(
+                            {**event, "payload": {**payload, "outcome": "success"}},
+                            "dependency",
+                            f"dependency:{request}",
+                            ending=True,
+                        )
+                    if f"wait:{request}" in self.signals:
+                        self._close_signal(f"wait:{request}")
+                if kind == "request_failed":
+                    self._signal(
+                        f"request:{request}",
+                        "Execution request failed",
+                        text(payload.get("error") or payload),
+                        [event["id"]],
+                    )
+                self._agent_status(agent, kind.removeprefix("request_"))
+            elif kind == "skill_start":
+                self._call(
+                    {**event, "payload": {**payload, "name": payload.get("skill")}},
+                    "setup",
+                    f"skill:{payload.get('request_id') or payload.get('ts') or event['id']}",
+                )
+            elif kind == "skill_call":
+                key = f"skill:{payload.get('request_id') or payload.get('ts_start')}"
+                self._call(event, "setup", key, ending=True)
+            elif kind in {"skill_error", "skill_cancelled"}:
+                request = payload.get("request_id") or self.actor_request.get(actor)
+                action = self.actions.get(f"{actor}:skill:{request}")
+                if action:
+                    self._call(
+                        {
+                            **event,
+                            "payload": {
+                                **payload,
+                                "outcome": "cancelled" if kind == "skill_cancelled" else "failed",
+                            },
+                        },
+                        "setup",
+                        f"skill:{request}",
+                        ending=True,
+                    )
+                else:
+                    self._signal(
+                        event["id"], "Recorded skill interruption", text(payload), [event["id"]]
+                    )
+            elif kind == "input_required":
+                self._signal(
+                    f"input:{actor}",
+                    "Your input is requested",
+                    text(payload.get("message") or payload),
+                    [event["id"]],
+                    "required",
+                )
+                self._agent_status(agent, "waiting_input")
+            elif kind == "input_resolved" and f"input:{actor}" in self.signals:
+                self._close_signal(f"input:{actor}")
+            elif kind in {"delegation", "handoff"}:
+                edge = {
+                    "id": event["id"],
+                    "from": actor,
+                    "to": payload.get("to", "unattributed"),
+                    "kind": kind,
+                    "label": payload.get("task") or payload.get("message") or "Recorded handoff",
+                    "time": max(0, event["ts"] - self.origin),
+                    "source": event.get("source", "canonical_event"),
+                    "event_id": event["id"],
+                }
+                self.run["edges"].append(edge)
+                self.dirty["edges"].add(edge["id"])
+        if (
+            self.run["status"] == "unknown"
+            and kind in {"request_started", "skill_start", "tool_call"}
+            and self.finished_at is None
+        ):
+            self.run["status"] = "running"
+        if "unfinished" in self.signals:
+            missing = [
+                action["id"]
+                for action in self.actions.values()
+                if action["outcome"] == "incomplete" and "end_ts" not in action
+            ]
+            if missing != self.signals["unfinished"]["evidence"]:
+                self.signals["unfinished"]["evidence"] = missing
+                self.dirty["signals"].add("unfinished")
+            if not missing:
+                self._close_signal("unfinished")
+        self._execution_clock()
+        return True
+
+    def apply_measurement(self, record):
+        """Overlay one user measurement command; execution events are never altered."""
+        if record["id"] in self.measured:
+            return False
+        self.measured.add(record["id"])
+        self.override = None if record["type"] == "reset" else record
+        self._execution_clock()
+        return True
+
+    def _execution_clock(self):
+        started = self.run["execution_started_at"]
+        state = self.run["measurement"]
+        now = self.clock if self.clock is not None else (self.origin or 0) + self.run["duration"]
+        held = bool(self.override) and self.override["type"] == "hold"
+        if self.override and not held:
+            end, source = self.override["at"], self.override.get("source", "user")
+        elif held:
+            end, source = None, None
+        else:
+            end = state["automatic_end_at"]
+            source = None if end is None else "workload_done"
+        origin = self.origin or 0
+        automatic = state["automatic_end_at"]
+        state.update(
+            # A boundary later than the displayed instant (a replay prefix) has
+            # not been reached yet.
+            state="pending"
+            if started is None
+            else "ended"
+            if end is not None and end <= now
+            else "running",
+            policy="manual" if self.override else "automatic",
+            held=held,
+            automatic_end_offset=None if automatic is None else automatic - origin,
+            effective_end_at=end,
+            end_source=source,
+            end_offset=None if end is None else end - origin,
+        )
+        measured_to = now if end is None else min(now, end)
+        self.run["execution_wall_time"] = 0 if started is None else max(0, measured_to - started)
+
+    def tick(self, now, *, force=False):
+        self.clock = now if self.clock is None else max(self.clock, now)
+        if self.finished_at is None and self.origin is not None:
+            self.run["duration"] = max(self.run["duration"], now - self.origin)
+        self._execution_clock()
+        for action_id in self.running:
+            action = self.actions[action_id]
+            if action["outcome"] == "running":
+                end = self.origin + self.run["duration"]
+                pauses = self.pauses.get(action["agent"], [])
+                if pauses and pauses[-1][1] is None:
+                    end = min(end, pauses[-1][0])
+                duration = max(0, end - action["started_ts"])
+                execution_duration = self._execution_duration(action, end)
+                if (
+                    force
+                    or int(duration) != int(action["duration"])
+                    or int(execution_duration) != int(action.get("execution_duration", 0))
+                ):
+                    action["duration"] = duration
+                    action["execution_duration"] = execution_duration
+                    self.dirty["actions"].add(action["id"])
+                    self._interval(action)
+                    self._refresh_episode(action)
+
+    def _metrics(self):
+        from .metrics import ExecutionCounters
+
+        if not hasattr(self, "metrics_counters"):
+            self.metrics_counters = ExecutionCounters()
+            calls = self.actions.values()
+        else:
+            calls = (self.actions[key] for key in self.dirty["actions"])
+        self.run["metrics_totals"] = self.metrics_counters.update(calls)
+        self.run["metrics_by_agent"] = self.metrics_counters.by_agent
+
+    def _causal_graph(self):
+        from .causal_graph import build_graph
+
+        # Live monitoring must never build a history-sized Critical Path graph.
+        # A reopened completed run must finish reading its backlog first, too.
+        if self.defer_causal_graph and (
+            self.finished_at is None or self.run["coverage"]["catching_up"]
+        ):
+            self.run["causal_graph"] = {
+                "state": "pending",
+                "nodes": [],
+                "edges": [],
+                "operations": [],
+            }
+            self._graph_signature = "pending"
+            return
+        signature = self._graph_revision
+        if signature != getattr(self, "_graph_signature", None):
+            self.run["causal_graph"] = build_graph(self.run)
+            self._graph_signature = signature
+        for node in self.run["causal_graph"]["nodes"]:
+            if node["phase"] == "open":
+                node["time"] = self.run["duration"]
+        self.run["causal_graph"]["summary"]["execution_duration"] = (
+            self.run["execution_wall_time"]
+            if self.run["execution_started_at"] is not None
+            else self.run["duration"]
+        )
+
+    def patch(self):
+        self._metrics()
+        self._causal_graph()
+        maps = {
+            "actions": self.actions,
+            "episodes": self.episodes,
+            "agents": self.agents,
+            "edges": {edge["id"]: edge for edge in self.run["edges"]},
+            "intervals": self.intervals,
+            "signals": self.signals,
+        }
+        patch = {
+            key: [
+                copy.deepcopy(maps[key][item_id])
+                for item_id in sorted(ids, key=lambda item_id: maps[key][item_id].get("start", 0))
+            ]
+            for key, ids in self.dirty.items()
+        }
+        patch["meta"] = {
+            key: copy.deepcopy(self.run[key])
+            for key in (
+                "metrics_totals",
+                "metrics_by_agent",
+                "status",
+                "duration",
+                "execution_started_at",
+                "execution_wall_time",
+                "measurement",
+                "coverage",
+                "task",
+                "model",
+                "harness",
+                "dataset",
+                "time_origin",
+            )
+            if key in self.run
+        }
+        if self._graph_signature != getattr(self, "_published_graph_signature", None):
+            patch["meta"]["causal_graph"] = copy.deepcopy(self.run["causal_graph"])
+            self._published_graph_signature = self._graph_signature
+        patch["counter_samples"] = self.counter_updates
+        self.counter_updates = {}
+        for ids in self.dirty.values():
+            ids.clear()
+        return patch
+
+    def snapshot(self):
+        self._metrics()
+        self._causal_graph()
+        self.run["signals"] = list(self.signals.values())
+        return copy.deepcopy(self.run)
+
+
+def trajectory_history(
+    run, agent, *, before_start=None, before_id="", active=False, query="", limit=50
+):
+    """Page observed calls by start time and identity, independent of completion time."""
+    calls = sorted(
+        (
+            a
+            for a in run["actions"]
+            if a["agent"] == agent
+            and a["kind"] != "syscall"
+            and (a["outcome"] == "running") == active
+            and query.lower()
+            in " ".join(
+                str(a.get(k, "")) for k in ("name", "intent", "command", "result", "files")
+            ).lower()
+        ),
+        key=lambda a: (-a["start"], a["id"]),
+    )
+    if before_start is not None:
+        calls = [
+            a
+            for a in calls
+            if a["start"] < before_start or (a["start"] == before_start and a["id"] > before_id)
+        ]
+    page = calls[:limit]
+    episode_ids = {a.get("episode") for a in page}
+    return copy.deepcopy(
+        {
+            "actions": page,
+            "execution": {"id": run["id"], "time_origin": run.get("time_origin")},
+            "episodes": [e for e in run["episodes"] if e["id"] in episode_ids],
+            "has_more": len(calls) > limit,
+        }
+    )
+
+
+class LiveSource:
+    """One incremental reader per server run directory, shared by all clients."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self.model = Trajectory("live", f"Current execution · {self.directory.parent.name}")
+        self.paths = {"global": self.directory / "global_data.sqlite3"}
+        self.events = []
+        self.profile_path = (
+            Path(os.environ.get("AGENCY_PROFILE_DIR", self.directory.parent / "profiler"))
+            / "profile_data.sqlite3"
+        )
+        self.cursors = {}
+        self.measurement_path = self.directory / measurement.LOG_NAME
+        self.measurement_offset = 0
+        self.measurements = []
+        self.measurement_rejected = 0
+        self.lease_written = 0
+        self.epoch = uuid.uuid4().hex
+        self.revision = 0
+        self.journal = deque(maxlen=512)
+        self.journal_byte_limit = JOURNAL_BYTE_LIMIT
+        self.journal_bytes = 0
+        self._journal_sizes = {}
+        self.lock = threading.RLock()
+        self.last_poll = 0
+        self.refiner = None
+        if os.environ.get("AGENCY_TRAJECTORY_LABEL_CONFIG"):
+            from .trajectory_semantics import SemanticRefiner
+
+            self.refiner = SemanticRefiner(os.environ["AGENCY_TRAJECTORY_LABEL_CONFIG"])
+        self.model.run["coverage"]["semantics"] = (
+            "Deterministic grouping; optional semantic refinement disabled."
+        )
+        self._measurements()
+        self._expire_abandoned_hold()
+
+    def _measurements(self):
+        records, self.measurement_offset, rejected = measurement.read(
+            self.measurement_path, self.measurement_offset
+        )
+        self.measurement_rejected += rejected
+        for record in records:
+            if self.model.apply_measurement(record):
+                self.measurements.append(record)
+
+    def _expire_abandoned_hold(self):
+        """A measurement held open by a server that has since stopped ended with it.
+
+        Without this, reopening an old run would keep counting to the present."""
+        hold = self.model.override
+        if not hold or hold["type"] != "hold":
+            return
+        held_until = max(hold["recorded_at"], measurement.read_lease(self.directory) or 0)
+        if time.time() - held_until <= measurement.LEASE_STALE:
+            return
+        record = {
+            "id": f"hold-expired:{hold['id']}"[:128],
+            "type": "end",
+            "at": held_until,
+            "recorded_at": time.time(),
+            "source": "hold_expired",
+        }
+        try:
+            measurement.append(self.measurement_path, record)
+            self._measurements()
+        except OSError:
+            # A read-only recording still gets a bounded, in-memory boundary.
+            if self.model.apply_measurement(record):
+                self.measurements.append(record)
+
+    def renew_hold(self):
+        """Called by the running server so a held measurement outlives reloads, not the server."""
+        with self.lock:
+            hold = self.model.override
+            if (
+                hold
+                and hold["type"] == "hold"
+                and time.monotonic() - self.lease_written >= measurement.LEASE_INTERVAL
+            ):
+                self.lease_written = time.monotonic()
+                try:
+                    measurement.write_lease(self.directory, time.time())
+                except OSError:
+                    pass  # The hold then expires at its last successful renewal.
+
+    def _now(self):
+        """Present time, unless the execution process died without recording completion.
+
+        Its relay heartbeat is removed on a clean shutdown; one left stale means
+        the process is gone, so time stops at its last recorded sign of life
+        instead of running indefinitely."""
+        now = time.time()
+        if self.model.finished_at is not None:
+            return now
+        try:
+            beat = (self.directory / "ui_commands" / ".heartbeat").stat().st_mtime
+        except OSError:
+            return now
+        return now if now - beat < 30 else max(beat, self.model.clock or beat)
+
+    def measure(self, command, identifier, *, elapsed=None, execution=None):
+        """Validate and persist one user boundary command, then project it.
+
+        The timestamp is this server's; raises ValueError for a rejected command."""
+        if command not in measurement.COMMANDS:
+            raise ValueError("Unsupported measurement command.")
+        if not isinstance(identifier, str) or not identifier or len(identifier) > 128:
+            raise ValueError("A nonblank command ID of at most 128 characters is required.")
+        with self.lock:
+            self.refresh(force=True)
+            model = self.model
+            if execution != {"id": model.run["id"], "time_origin": model.run.get("time_origin")}:
+                raise ValueError("Execution changed; reopen the current run before measuring.")
+            if identifier in model.measured:
+                return {"recorded": False, "duplicate": True}
+            now, started = time.time(), model.run["execution_started_at"]
+            record = {"id": identifier, "type": command, "recorded_at": now}
+            if command == "end":
+                if started is None:
+                    raise ValueError("Wall-clock measurement has not started.")
+                if elapsed is None:
+                    record["at"] = now
+                elif not measurement.finite(elapsed) or elapsed < 0:
+                    raise ValueError("Elapsed seconds must be a finite, non-negative number.")
+                elif started + elapsed > now:
+                    raise ValueError("The measurement cannot end in the future.")
+                else:
+                    record["at"] = started + elapsed
+                record["source"] = "user"
+            elif elapsed is not None:
+                raise ValueError("Only an end boundary accepts elapsed seconds.")
+            elif (command == "hold" and model.run["measurement"]["held"]) or (
+                command == "reset" and model.override is None
+            ):
+                return {"recorded": False, "unchanged": True}
+            if len(self.measurements) >= measurement.MAX_RECORDS:
+                raise ValueError("This run reached its measurement edit limit.")
+            measurement.append(self.measurement_path, record)
+            self.refresh(force=True)
+            return {"recorded": True}
+
+    def _rows(self, source, path):
+        if not path.is_file():
+            return [], f"{source}: event database unavailable"
+        con = None
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+            tables = {
+                row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            rows = []
+            next_cursors = {}
+            for table in ("events", "exchanges"):
+                if table not in tables:
+                    continue
+                cursor_key = (source, table)
+                cursor = self.cursors.get(cursor_key, "")
+                payload = "payload" if table == "events" else "'{}'"
+                types = (
+                    f" AND type IN ({','.join('?' for _ in EVENT_TYPES)})"
+                    if table == "events"
+                    else ""
+                )
+                parameters = (cursor, *EVENT_TYPES) if table == "events" else (cursor,)
+                batch = con.execute(
+                    f"SELECT id,type,timestamp,name,call_label,{payload} FROM {table} WHERE id>?{types} ORDER BY id LIMIT 500",
+                    parameters,
+                ).fetchall()
+                if len(batch) == 500:
+                    self.model.run["coverage"]["catching_up"] = True
+                for row_id, kind, ts, actor, label, raw in batch:
+                    body = json.loads(raw)
+                    if table == "exchanges":
+                        body = self._exchange(con, label, kind)
+                        kind = "model_result"
+                    event = {
+                        "id": f"{source}/{table}/{row_id}",
+                        "type": kind,
+                        "ts": body.get("sampled_at", ts) if kind == "resource_sample" else ts,
+                        "actor": actor,
+                        "call_label": label,
+                        "payload": body,
+                        "source": "canonical_sqlite",
+                    }
+                    rows.append(event)
+                    next_cursors[cursor_key] = row_id
+                    if kind == "agent_registered" and body.get("db_path") and actor:
+                        self.paths[f"actor:{actor}"] = Path(body["db_path"])
+            self.cursors.update(next_cursors)
+            return rows, None
+        except (sqlite3.Error, ValueError, OSError):
+            return [], f"{source}: telemetry could not be read; retrying"
+        finally:
+            if con is not None:
+                con.close()
+
+    @staticmethod
+    def _exchange(con, label, kind, *, full=False):
+        from .causal_graph import block_table, exchange_evidence
+
+        tables = {
+            row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        chains = {"prompt": [], "response": []}
+        for chain_kind, raw in con.execute(
+            "SELECT c.kind,b.payload FROM exchange_chain c "
+            f"JOIN {block_table(tables) or 'message_block_lookup'} b ON b.hash=c.hash "
+            "WHERE c.call_label=? ORDER BY c.kind,c.seq",
+            (label,),
+        ):
+            block = json.loads(raw)
+            # Hidden reasoning is not part of the trajectory's evidence surface.
+            if block.get("type") not in {"thinking", "reasoning", "redacted_thinking"}:
+                chains[chain_kind].append(block)
+        metadata = next((b for b in chains["response"] if b.get("type") == "metadata"), {})
+        native = metadata.get("data")
+        if isinstance(native, list):
+            native = next(
+                (item for item in reversed(native) if isinstance(item, dict) and item.get("model")),
+                {},
+            )
+        recorded_model = metadata.get("model") or (
+            native.get("model") if isinstance(native, dict) else None
+        )
+        visible = [b.get("text", "") for b in chains["response"] if b.get("type") == "text"]
+        response_blocks = [b for b in chains["response"] if b.get("type") != "metadata"]
+        # Keep source-backed previews bounded without dropping tool-use evidence.
+        # The raw-event endpoint calls full=True and returns these captured
+        # visible blocks unchanged; provider metadata/private reasoning stays out.
+        response_preview = response_blocks if full else response_blocks[:80]
+        response_truncated = not full and (
+            len(response_blocks) > 80 or any(len(text(block)) > 1200 for block in response_preview)
+        )
+        model_response = {
+            "blocks": [
+                block
+                if full or len(text(block)) <= 1200
+                else {
+                    **{key: block[key] for key in ("type", "id", "name") if key in block},
+                    "preview": text(block)[:1200],
+                    "chars": len(text(block)),
+                    "truncated": True,
+                }
+                for block in response_preview
+            ]
+        }
+        markers = next((b for b in chains["response"] if b.get("error") or b.get("cancelled")), {})
+        prompt = chains["prompt"] if full else chains["prompt"][:80]
+        preview_limit = None if full else 1200
+        return {
+            "model": recorded_model if isinstance(recorded_model, str) else None,
+            "model_response": model_response,
+            "causal_evidence": exchange_evidence(chains["prompt"], chains["response"]),
+            "output_truncated": response_truncated,
+            "result": "\n".join(visible),
+            "error": markers.get("error"),
+            "outcome": "failed"
+            if kind == "llm_stream_error"
+            else "cancelled"
+            if kind == "llm_stream_cancelled"
+            else "success",
+            "tokens": metadata.get("usage", {}).get("prompt_tokens"),
+            "output_tokens": metadata.get("usage", {}).get("completion_tokens"),
+            "tool_call_ids": [
+                b["id"] for b in chains["response"] if b.get("type") == "tool_use" and b.get("id")
+            ],
+            "request_id": metadata.get("request_id"),
+            # Provider-native data may include hidden reasoning. Expose only
+            # captured identity / usage timing, never the opaque native body.
+            "metadata": {
+                key: metadata[key]
+                for key in ("request_id", "skill", "stop_reason", "ttft_ms", "new_prompt_tokens")
+                if metadata.get(key) is not None
+            },
+            "context": {
+                "source": "recorded",
+                "available": bool(chains["prompt"]),
+                "blocks": [
+                    {
+                        "source": b.get("role", "unknown"),
+                        "role": b.get("role", "unknown"),
+                        "change": "recorded",
+                        "preview": text(b)[:preview_limit],
+                        "chars": len(text(b)),
+                    }
+                    for b in prompt
+                ],
+                "chars": sum(len(text(b)) for b in chains["prompt"]),
+                "dropped": [],
+                "complete": True,
+                "comparison_available": False,
+                "truncated": not full
+                and (len(chains["prompt"]) > 80 or any(len(text(b)) > 1200 for b in prompt)),
+            },
+        }
+
+    def refresh(self, *, force=False):
+        with self.lock:
+            if not force and time.monotonic() - self.last_poll < 0.25:
+                return
+            self.last_poll = time.monotonic()
+            self.model.run["coverage"]["catching_up"] = False
+            self._measurements()
+            events, gaps = [], []
+            if self.measurement_rejected:
+                gaps.append(
+                    f"measurement: {self.measurement_rejected} unreadable override records ignored"
+                )
+            if self.profile_path.is_file():
+                self.paths["profiler"] = self.profile_path
+            # Read global registration first, including agents created after connection.
+            rows, gap = self._rows("global", self.paths["global"])
+            events.extend(rows)
+            if gap:
+                gaps.append(gap)
+            for source, path in list(self.paths.items()):
+                if source == "global":
+                    continue
+                rows, gap = self._rows(source, path)
+                events.extend(rows)
+                if gap:
+                    gaps.append(gap)
+            for event in events:
+                if not isinstance(event.get("ts"), (int, float)) or not math.isfinite(event["ts"]):
+                    event["ts"] = (self.model.origin or 0) + self.model.run["duration"]
+                    event["source"] = "timestamp_missing_ordered_at_last_observation"
+            events.sort(key=lambda e: (e["ts"], e["id"]))
+            # Retain bounded replay evidence, not a second copy of huge tool
+            # outputs. Immutable originals remain available in their SQLite rows.
+            for event in events:
+                payload = dict(event["payload"])
+                for key, flag in (
+                    ("arguments", "input_truncated"),
+                    ("result", "output_truncated"),
+                    ("output", "output_truncated"),
+                    ("error", "output_truncated"),
+                ):
+                    if key in payload and len(text(payload[key])) > 8000:
+                        if key in {"result", "output"}:
+                            payload["recorded_result_preview"] = returned_preview(payload[key])
+                        payload[key] = text(payload[key])[:8000]
+                        payload[flag] = True
+                self.events.append({**event, "payload": payload})
+            for event in events:
+                self.model.apply(event)
+            self.model.run["coverage"]["gaps"] = gaps
+            self.model.tick(self._now())
+            if self.refiner:
+                self.refiner.update(self.model)
+            self.revision += 1
+            self._retain_patch(self.model.patch())
+
+    def _retain_patch(self, patch):
+        if not self.journal:
+            self.journal_bytes = 0
+            self._journal_sizes.clear()
+        size = _patch_size(patch, self.journal_byte_limit)
+        # Eviction uses the existing snapshot recovery protocol. An oversized
+        # final patch is sent via a current snapshot rather than retained.
+        while self.journal and (
+            self.journal_bytes + size > self.journal_byte_limit
+            or self.journal.maxlen is not None
+            and len(self.journal) >= self.journal.maxlen
+        ):
+            revision, _ = self.journal.popleft()
+            self.journal_bytes -= self._journal_sizes.pop(revision)
+        if size <= self.journal_byte_limit:
+            self.journal.append((self.revision, patch))
+            self._journal_sizes[self.revision] = size
+            self.journal_bytes += size
+
+    def message(self, after=0, epoch=None):
+        with self.lock:
+            if (
+                epoch != self.epoch
+                or not after
+                or after > self.revision
+                or (after < self.revision and (not self.journal or after < self.journal[0][0] - 1))
+            ):
+                return {
+                    "type": "snapshot",
+                    "run": self.model.snapshot(),
+                    "cursor": self.revision,
+                    "epoch": self.epoch,
+                    "resynced": bool(epoch),
+                }
+            updates = [patch for revision, patch in self.journal if revision > after]
+            return {
+                "type": "updates",
+                "patches": updates,
+                "cursor": self.revision,
+                "epoch": self.epoch,
+            }
+
+    def raw_event(self, event_id):
+        with self.lock:
+            source, table, row_id = event_id.rsplit("/", 2)
+            if source not in self.paths or table not in {"events", "exchanges"}:
+                raise KeyError(event_id)
+            con = sqlite3.connect(f"file:{self.paths[source]}?mode=ro", uri=True)
+            try:
+                con.row_factory = sqlite3.Row
+                row = con.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+                if row is None:
+                    raise KeyError(event_id)
+                result = dict(row)
+                if table == "events":
+                    result["payload"] = json.loads(result["payload"])
+                else:
+                    result["payload"] = self._exchange(
+                        con, result["call_label"], result["type"], full=True
+                    )
+                return result
+            finally:
+                con.close()
+
+
+def replay_events(run):
+    """Reconstruct start/end observations; never put end evidence in a start."""
+    events = []
+    for action in run["actions"]:
+        actor = action["agent"]
+        common = {
+            "action_id": action["id"],
+            "call_id": action["id"],
+            "kind": action["kind"],
+            "tool": action["name"],
+            "arguments": object_value(action["arguments"])
+            if action.get("arguments")
+            else {"command": action["command"]},
+            "intent": action.get("intent", ""),
+            "request_id": action.get("request_id"),
+            "request_correlation": action.get("request_correlation"),
+            "model": action.get("model"),
+            "model_id": action.get("model_id"),
+            "model_tool_call_id": action.get("model_tool_call_id"),
+            "causal_evidence": action.get("causal_evidence"),
+            "metadata": {
+                key: value
+                for key, value in action.get("metadata", {}).items()
+                if key
+                in {
+                    "agency.agent_id",
+                    "agency.span_id",
+                    "agency.parent_span_id",
+                    "model",
+                    "harness",
+                    "call_id",
+                }
+            },
+        }
+        model = action["kind"] == "model"
+        start = {**common, "state": "waiting_llm"} if model else common
+        if model and action.get("causal_evidence"):
+            start["causal_evidence"] = {**action["causal_evidence"], "response": []}
+        events.append(
+            {
+                "id": f"replay/start/{action['id']}",
+                "actor": actor,
+                "ts": action["start"],
+                "type": "agent_state" if model else "tool_call",
+                "call_label": action["id"],
+                "payload": start,
+                "source": "reconstructed_trace_boundary",
+            }
+        )
+        if action["outcome"] not in {"interrupted", "incomplete", "running"}:
+            events.append(
+                {
+                    "id": f"replay/end/{action['id']}",
+                    "actor": actor,
+                    "ts": action["start"] + action["duration"],
+                    "type": "model_result" if model else "tool_result",
+                    "call_label": action["id"],
+                    "payload": {
+                        **common,
+                        "result": action["result"],
+                        "outcome": action["outcome"],
+                        "tokens": action.get("tokens"),
+                        "output_tokens": action.get("output_tokens"),
+                        "tool_call_ids": action.get("tool_call_ids", []),
+                        "model_response": action.get("model_response"),
+                        "context": action.get("context"),
+                        "files": action.get("files"),
+                        "timing": action.get("timing"),
+                        "metadata": action.get("metadata", {}),
+                    },
+                    "source": "reconstructed_trace_boundary",
+                }
+            )
+    for edge in run.get("edges", []):
+        if edge["kind"] in {"delegation", "handoff"}:
+            events.append(
+                {
+                    "id": f"replay/edge/{edge.get('id') or fingerprint(edge)}",
+                    "actor": edge["from"],
+                    "ts": edge.get("time") or 0,
+                    "type": edge["kind"],
+                    "payload": {"to": edge["to"], "task": edge["label"]},
+                    "source": "recorded_trace_relationship",
+                }
+            )
+    events.sort(key=lambda e: (e["ts"], 0 if "/start/" in e["id"] else 1, e["id"]))
+    # Exhausting a saved trace does not establish task success or a complete lifecycle.
+    events.append(
+        {
+            "id": "replay/exhausted",
+            "actor": "workflow",
+            "ts": run["duration"],
+            "type": "done",
+            "payload": {"status": run.get("status", "unknown")},
+            "source": "replay_boundary_not_recorded_lifecycle",
+        }
+    )
+    return events
+
+
+def historical_projection(run):
+    model = Trajectory(run["id"], run["title"], mode="review", source=run["source"])
+    for event in replay_events(run):
+        model.apply(event)
+    projected = model.snapshot()
+    # Existing attribution, resources, evaluator evidence and context stay intact.
+    for key in ("actions", "episodes", "signals", "mode", "status"):
+        run[key] = projected[key]
+    from .causal_graph import build_graph
+
+    run["causal_graph"] = build_graph(run)
+    return run

@@ -1,9 +1,9 @@
 """Shared runtime setup for the numbered tutorials.
 
-The tutorials default to Codex running on an OpenAI model, but the harness and
+The tutorials default to the native harness running on an OpenAI model, but the harness and
 model backend remain independent. Change either with environment variables:
 
-    AGENCY_HARNESS=codex
+    AGENCY_HARNESS=native
     AGENCY_LLM_PROVIDER=openai
     AGENCY_LLM_MODEL=gpt-6-luna
     OPENAI_API_KEY=...
@@ -26,18 +26,18 @@ from agency.configs.agconfig import (
     agentconfig,
     agconfig,
     llmconfig,
+    harnessadapterconfig,
     orchestratorconfig,
+    resourcesconfig,
     sandboxconfig,
 )
 
 
-DEFAULT_HARNESS = "codex"
+DEFAULT_HARNESS = "native"
 DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
 
-# Profiling gets its own explicit lesson. Keeping process-lifetime profiling
-# off everywhere else makes the tutorial suite faster and its artifacts easier
-# to understand.
+# Enable profiling explicitly in lesson 9.
 os.environ.setdefault("AGENCY_PROFILE", "0")
 
 
@@ -63,6 +63,8 @@ def tutorial_config(
     llm_kwargs: dict[str, object] = {
         "provider": provider,
         "model": model,
+        "reasoning_effort": os.environ.get("AGENCY_REASONING_EFFORT", "none"),
+        "max_completion_tokens": int(os.environ.get("AGENCY_MAX_COMPLETION_TOKENS", "4096")),
     }
     if provider in ("openai", "openai_responses"):
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -71,6 +73,17 @@ def tutorial_config(
         if api_key:
             llm_kwargs["api_key"] = api_key
         llm_kwargs["base_url"] = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    elif provider == "litellm":
+        api_key = os.environ.get("LITELLM_API_KEY")
+        base_url = os.environ.get("LITELLM_BASE_URL")
+        if not api_key and require_llm:
+            raise SystemExit("LITELLM_API_KEY is required for AGENCY_LLM_PROVIDER=litellm")
+        if not base_url and require_llm:
+            raise SystemExit("LITELLM_BASE_URL is required for AGENCY_LLM_PROVIDER=litellm")
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        if base_url:
+            llm_kwargs["base_url"] = base_url
     elif provider == "anthropic":
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key and require_llm:
@@ -106,8 +119,11 @@ def tutorial_config(
             output_dir=str(run_dir / "agent_output"),
         ),
         sandboxconfig(
-            base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "docker.io/library/python:3.12-slim")
+            base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "docker.io/library/python:3.12-slim"),
+            gpu_passthrough=False,
         ),
+        resourcesconfig(idle_cpus=1),
+        harnessadapterconfig(binary_path=os.environ.get("AGENCY_CODEX_BINARY")),
         orchestratorconfig(
             max_concurrent_engines=max_concurrent_engines,
             db_path=str(run_dir / "agency.sqlite3"),

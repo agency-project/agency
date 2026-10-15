@@ -14,6 +14,9 @@ from .agllm import (
     API_CONN_EXCS,
     RATE_LIMIT_EXCS,
     API_ERROR_EXCS,
+    ProviderResponseError,
+    StreamInterruptedError,
+    UnusableResponseError,
 )
 
 __all__ = [
@@ -22,4 +25,7 @@ __all__ = [
     "API_CONN_EXCS",
     "RATE_LIMIT_EXCS",
     "API_ERROR_EXCS",
+    "ProviderResponseError",
+    "StreamInterruptedError",
+    "UnusableResponseError",
 ]

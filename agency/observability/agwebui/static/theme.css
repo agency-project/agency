@@ -1,0 +1,161 @@
+/* Agency 1.0 — Blue is the identity. Slate is the environment. Teal is life.
+   Shared by both entry points. Keep authored UI colors here, including SVGs.
+   Low-contrast dividers are structural; actionable boundaries use --control-border.
+   Text tokens meet AA on their intended surfaces; do not dim metadata with opacity. */
+/* Unmodified variable fonts from the official geist package; provenance and OFL
+   license live in fonts/. Relative URLs also work behind a mounted static path. */
+@font-face {
+  font-family: "Geist";
+  src: url("./fonts/Geist-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("./fonts/GeistMono-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+
+  --midnight-navy: #111317;
+  --dark-slate: #1B1E24;
+  --steel-slate: #353B45;
+  --steel-blue: #6298D9;
+  --ice-white: #E8EFF7;
+  --teal: #35BFA5;
+  --amber: #D9A654;
+  --red: #DF7179;
+  --cool-gray: #8795A7;
+
+  --bg: var(--midnight-navy);
+  --panel: var(--dark-slate);
+  --panel2: color-mix(in srgb, var(--dark-slate) 65%, var(--midnight-navy));
+  --surface-hover: color-mix(in srgb, var(--dark-slate) 96%, var(--ice-white));
+  --line: color-mix(in srgb, var(--steel-slate) 65%, var(--midnight-navy));
+  --border-strong: var(--steel-slate);
+  --control-border: color-mix(in srgb, var(--steel-slate) 35%, var(--cool-gray));
+  --text: var(--ice-white);
+  --text-secondary: color-mix(in srgb, var(--ice-white) 70%, var(--steel-slate));
+  --muted: var(--cool-gray);
+  --blue: var(--steel-blue);
+  --green: var(--teal);
+
+  --selection-bg: color-mix(in srgb, var(--blue) 12%, var(--bg));
+  --selection-hover: color-mix(in srgb, var(--blue) 18%, var(--bg));
+  --success-bg: color-mix(in srgb, var(--teal) 10%, var(--bg));
+  --warning-bg: color-mix(in srgb, var(--amber) 10%, var(--bg));
+  --danger-bg: color-mix(in srgb, var(--red) 10%, var(--bg));
+  --danger-hover: color-mix(in srgb, var(--red) 16%, var(--bg));
+  --neutral-bg: var(--panel2);
+  --model-bg: var(--selection-bg);
+  --model-color: var(--blue);
+  --tool-bg: var(--panel2);
+  --tool-color: var(--text-secondary);
+  --tool-border: var(--control-border);
+
+  /* Separate labelled chart lanes and dashed cumulative series preserve meaning
+     without requiring a distinct hue for every measurement or operation. */
+  --chart-cpu: var(--teal);
+  --chart-memory: var(--blue);
+  --chart-disk: var(--text-secondary);
+  --chart-network: var(--cool-gray);
+  --chart-pressure: var(--amber);
+  --chart-io: var(--blue);
+  --chart-grid: var(--line);
+  --chart-band: var(--panel2);
+  --chart-band-host: var(--bg);
+  --chart-event: var(--text-secondary);
+  --chart-ink: var(--midnight-navy);
+  --cursor-color: var(--ice-white);
+  --overlay: color-mix(in srgb, var(--midnight-navy) 78%, transparent);
+  --popup-shadow: 0 4px 12px color-mix(in srgb, var(--midnight-navy) 45%, transparent);
+
+  --font-sans: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+  --font-size-page: 24px;
+  --font-size-heading: 16px;
+  --font-size-agent: 16px;
+  --font-size-action: 14px;
+  --font-size-ui: 13px;
+  --font-size-meta: 12px;
+  --font-size-code: 13px;
+  --font-size-code-small: 12px;
+  --font-size-brand: 32px;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --line-height-heading: 1.3;
+  --line-height-ui: 1.5;
+  --line-height-code: 1.6;
+  --fs: var(--font-size-ui);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-control: 5px;
+  --radius-surface: 6px;
+  --control-height: 32px;
+  --font: var(--font-sans);
+  --sans: var(--font-sans);
+  --mono: var(--font-mono);
+
+  /* Compatibility names for the compact live dashboard. */
+  --bg2: var(--panel);
+  --bg3: var(--panel2);
+  --border: var(--line);
+  --border-log: var(--blue);
+  --border-interact: var(--blue);
+  --dim: var(--muted);
+  --cyan: var(--blue);
+  --yellow: var(--amber);
+  --body-system: var(--text-secondary);
+  --body-tool: var(--text-secondary);
+  --body-syscall: var(--muted);
+}
+
+/* Common defaults for every view, including native controls and SVG labels. */
+body {
+  font: var(--font-weight-regular) var(--font-size-ui)/var(--line-height-ui) var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+
+button, input, select, textarea, summary { font: inherit; }
+button, summary { font-weight: var(--font-weight-medium); }
+h1, h2, h3 { line-height: var(--line-height-heading); font-weight: var(--font-weight-semibold); }
+h1 { font-size: var(--font-size-page); }
+h2 { font-size: var(--font-size-heading); }
+h3 { font-size: var(--font-size-action); }
+strong, b { font-weight: var(--font-weight-medium); }
+small { font-size: var(--font-size-meta); }
+code, pre, kbd, samp, .mono {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code);
+  line-height: var(--line-height-code);
+  font-weight: var(--font-weight-regular);
+}
+svg text { font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+
+::selection { background: var(--blue); color: var(--bg); }
+
+:where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+}
+
+:where(input, select, textarea) { accent-color: var(--blue); }
+:where(input, textarea)::placeholder { color: var(--muted); opacity: 1; }
+:where(button, input, select, textarea):disabled { cursor: default; }
+:where(button, summary, a) { -webkit-tap-highlight-color: transparent; }
+
+/* No pulsing or animated color is needed to convey operational state. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

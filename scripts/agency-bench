@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Terminal-Bench 4.0 contention benchmark launcher. Run from anywhere.
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+benchmarks_dir="${AGENCY_BENCHMARKS_DIR:-$HOME/Documents/benchmarks}"
+if [[ ! -d "$benchmarks_dir/terminalbench_contention" ]]; then
+    echo "Benchmarks are stored outside Agency. Set AGENCY_BENCHMARKS_DIR to their folder." >&2
+    exit 1
+fi
+cd "$(dirname "$benchmarks_dir")"
+export PYTHONPATH="$PWD:$repo${PYTHONPATH:+:$PYTHONPATH}"
+exec "$repo/.venv/bin/python" -m benchmarks.terminalbench_contention "$@"

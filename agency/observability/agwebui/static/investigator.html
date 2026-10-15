@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/theme.css">
+<link rel="stylesheet" href="/static/control-confirmation.css">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
+<title>Agency · Execution profiler</title>
+<link rel="stylesheet" href="/static/investigator.css">
+<link rel="stylesheet" href="/static/metrics.css">
+<link rel="stylesheet" href="/static/causal-graph.css">
+</head>
+<body class="profiler-workspace">
+<div id="workspace">
+<aside class="sidebar">
+<a class="brand" href="/profiler"><span class="brand-mark">a</span><span>agency<span class="brand-caption">Execution profiler</span></span></a>
+<div class="side-caption">Views</div>
+<nav id="views" aria-label="Execution views"><button data-view="trajectory" class="active" aria-current="page"><span class="view-number">1</span>Execution Trajectory</button><button data-view="profiler" aria-current="false"><span class="view-number">2</span>Profiler</button><a href="/critical-path" class="compare-nav-link"><span class="view-number">3</span>Critical Path Profiler</a><a href="/compare" class="compare-nav-link"><span class="view-number">4</span>Compare Runs</a></nav>
+<div class="side-bottom"><button id="demo" class="demo-button">Open recorded example <span>↗</span></button><button id="open-live">Current live execution</button></div>
+</aside>
+<div class="workspace-main">
+<header class="topbar"><h1 id="view-label">Execution Trajectory</h1><div class="top-actions"><button id="refresh" title="Refresh saved run catalog">↻ Refresh</button><button id="export" title="Export the complete recording, including updates beyond a frozen view">↓ Export run</button></div></header>
+<div class="run-controls"><select id="run-select" aria-label="Execution"></select><details class="catalog-filters"><summary>Catalog filters</summary><div><label>Model<select id="model-filter" aria-label="Model filter"><option value="">All models</option></select></label><label>Harness<select id="harness-filter" aria-label="Harness filter"><option value="">All harnesses</option></select></label></div></details></div>
+<div id="summary-strip" class="summary-strip"><section id="metrics" class="metrics" aria-label="Run summary"></section></div>
+<section id="system-metrics" class="system-metrics" aria-label="System metrics"></section>
+<div class="cursor-bar">
+<div class="playback-track"><output id="cursor-value" aria-label="Selected execution time">0.0s</output><input id="cursor" type="range" min="0" max="100" value="0" step="any" aria-label="Playback position on the wall clock"><span id="duration-label"></span></div>
+<div class="playback-controls"><div class="display-controls" role="group" aria-label="Display"><button id="display-toggle" class="display-control" title="Freeze the display while agents continue executing" aria-pressed="false" hidden>Freeze view</button><button id="follow-live" class="display-control" title="Return the display to the newest activity" hidden>Jump to live</button></div><button id="start-replay" hidden title="Review recorded events in playback">Replay</button><button id="reconnect-updates" hidden>Reconnect</button><div class="session-state"><strong id="execution-state">Reading execution</strong><span id="transport-state"></span><span id="display-state" role="status"></span></div></div>
+</div>
+<!-- Mounted controls retain focus and pending commands when the view changes. -->
+<div id="control-park" hidden><section id="trajectory-controls" class="trajectory-controls" aria-label="Execution and agent controls"><div id="all-agent-controls" class="all-agent-controls" role="group" aria-label="All agents controls"><button id="execution-all" class="execution-control" disabled>Pause All</button><button id="execution-stop-all" class="execution-control stop-control" disabled>Stop All</button><button id="execution-kill-all" class="execution-control danger-control" disabled>Kill All</button></div><span id="execution-message" role="status" aria-live="polite"></span><details id="control-evidence" hidden><summary>Control evidence</summary><p id="control-outcomes" tabindex="0" aria-label="Per-agent control observations"></p></details><p id="control-scope" class="sr-only"></p></section></div>
+<!-- Execution context belongs to the dedicated profiler, with all evidence preserved. -->
+<div id="details-park" hidden><section id="execution-details" class="execution-context" aria-label="Execution context"><h2 id="run-title">Execution</h2><p id="run-subtitle"></p><p id="run-description"></p><label>Execution identifier<div class="identifier-copy"><input id="execution-id" readonly aria-label="Execution identifier"><button id="copy-execution-id">Copy ID</button><span id="copy-id-status" role="status"></span></div></label><div id="execution-metadata"></div><section id="secondary-metrics" aria-label="Detailed measurements"></section></section></div>
+<section id="connection-guide" class="connection-guide" hidden><button id="connection-close">Close connection guide</button><h2>Run or connect your agents</h2><p>Agent execution requires a Linux x86-64 host, Python 3.12+, and a local working Docker or Podman engine. Model credentials and harness setup are required for real agent tasks. The browser can open the profiler URL separately; the Python driver and containers run on the supported host.</p><pre>from agency import Agent, agdata, agskill
+from agency.observability.agwebui import agwebui
+
+TASK = agskill(name="echo", prompt="Return the supplied label.",
+               input_schema=agdata(label=str),
+               output_schema=agdata(answer=str))
+
+def workload():
+    agent = Agent("worker", agconfig=config, harness="native")
+    result = agent.run(TASK, agdata(label="hello"))
+    result.wait()
+
+# config is your existing validated agconfig (provider + sandbox).
+# Call explicitly after configuration. This starts agent/model work.
+agwebui.run(workload, run_dir=config.agent.log_dir, port=7860)</pre><p>Open <code>http://localhost:7860/profiler?run=live</code>. The existing wrapper binds its server to <code>0.0.0.0</code>; the standalone log viewer can instead bind to loopback using <code>--host 127.0.0.1</code>. A separate viewer pointed at a log directory can inspect events but has no execution relay. No UI action here starts this example.</p><p>Use the repository’s <code>examples/10_harnesses_and_webui.py</code> and configuration guide for the verified full setup. Run task is enabled only for skills explicitly registered by that live application; selecting a task does not submit it.</p></section><div id="investigation" class="investigation"><main id="content" tabindex="-1"><div class="loading-state">Reading execution data…</div></main><div id="inspector-resizer" role="separator" aria-label="Resize selection inspector" aria-orientation="vertical" aria-controls="inspector" tabindex="0" title="Drag to resize; Left and Right arrow keys adjust width" hidden></div><aside id="inspector" class="inspector" aria-label="Selection inspector" hidden></aside></div>
+<footer class="statusbar"><span id="status" role="status">Loading…</span><span>Agency traces · local execution profiler</span></footer>
+</div></div>
+<script type="module" src="/static/investigator.js"></script>
+</body></html>

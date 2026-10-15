@@ -292,7 +292,7 @@ class TestReapOrphanedLifecycleImages:
         doesn't fail -- this is the specific call whose broken
         `--format` string previously made returncode != 0 look like "no
         orphans found" instead of "the command itself is malformed"."""
-        if subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode != 0:
+        if not _docker_available():
             pytest.skip("Docker daemon not reachable")
         result = subprocess.run(
             [
@@ -1306,8 +1306,9 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
             agconfig=cfg,
         )
         sb._gpu_count_requested = 1
-        with pytest.raises(RuntimeError, match="CPU-only policy"):
-            sb._ensure_started()
+        with patch.object(sb, "_inspect_container_state", return_value=(False, "")):
+            with pytest.raises(RuntimeError, match="CPU-only policy"):
+                sb._ensure_started()
 
     def test_docker_run_uses_profiler_cgroup_parent(self):
         from agency.sandbox.docker import _DockerBackend
@@ -1467,10 +1468,61 @@ def _host_gpu_available() -> bool:
 podman_only = pytest.mark.skipif(not _podman_available(), reason="Podman daemon not reachable")
 
 
+def _podman_gpu_available() -> bool:
+    """Probe host CDI setup with known-good flags, independently of _gpu_flags."""
+    if not (_podman_available() and _host_gpu_available()):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "podman",
+                "run",
+                "--rm",
+                "--pull=never",
+                "--device",
+                "nvidia.com/gpu=all",
+                "docker.io/library/python:3.12-slim",
+                "nvidia-smi",
+                "-L",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "GPU" in result.stdout
+
+
 podman_gpu = pytest.mark.skipif(
-    not (_podman_available() and _host_gpu_available()),
-    reason="Podman daemon or NVIDIA GPU not available",
+    not _podman_gpu_available(),
+    reason="requires usable Podman NVIDIA CDI passthrough and the local Python image",
 )
+
+
+@pytest.mark.parametrize(
+    "probe,usable",
+    [
+        (subprocess.CompletedProcess([], 0, stdout="GPU 0: fixture"), True),
+        (subprocess.CompletedProcess([], 126, stdout="", stderr="unresolvable CDI devices"), False),
+        (subprocess.CompletedProcess([], 0, stdout=""), False),
+        (OSError("missing runtime"), False),
+        (subprocess.TimeoutExpired("podman", 30), False),
+    ],
+)
+def test_podman_gpu_probe_checks_independent_runtime_prerequisites(monkeypatch, probe, usable):
+    monkeypatch.setitem(globals(), "_podman_available", lambda: True)
+    monkeypatch.setitem(globals(), "_host_gpu_available", lambda: True)
+    run = MagicMock()
+    if isinstance(probe, Exception):
+        run.side_effect = probe
+    else:
+        run.return_value = probe
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _podman_gpu_available() is usable
+    command = run.call_args.args[0]
+    assert "--pull=never" in command
+    assert command[command.index("--device") + 1] == "nvidia.com/gpu=all"
 
 
 class TestPodmanGpuPassthroughIntegration:

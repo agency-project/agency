@@ -16,6 +16,7 @@ _PAUSE_RPC_MARGIN_S = 5.0
 
 class HarnessInteractionClient:
     def __init__(self, uds_path: str, timeout_s: "float | None" = 300.0) -> None:
+        self._uds_path = uds_path
         self._client = httpx.Client(
             transport=httpx.HTTPTransport(uds=uds_path),
             base_url="http://agency-sandbox",
@@ -45,6 +46,25 @@ class HarnessInteractionClient:
                 json={"wait_timeout_s": wait_timeout_s},
                 timeout=wait_timeout_s + _PAUSE_RPC_MARGIN_S,
             )
+        self._remember_control(response)
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            return {}
+
+    def _remember_control(self, response) -> None:
+        self._last_control_observation = None
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            return
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        if isinstance(observation, dict) and isinstance(observation.get("id"), str):
+            self._last_control_observation = {**observation, "uds_path": self._uds_path}
+
+    def _control_observation(self, identifier: str) -> dict:
+        response = self._client.get(f"/control_observation/{identifier}")
         response.raise_for_status()
         return response.json()
 
@@ -56,12 +76,14 @@ class HarnessInteractionClient:
         return response.json()["delivered"] is True
 
     def resume_harness(self) -> None:
-        self._client.post("/control/resume").raise_for_status()
+        self._remember_control(self._client.post("/control/resume"))
 
-    def cancel_harness(self, request_id: str) -> None:
-        self._client.post(
-            "/control/cancel", json={"request_id": request_id}, timeout=10
-        ).raise_for_status()
+    def cancel_harness(self, request_id: str, *, force: bool = True) -> None:
+        self._remember_control(
+            self._client.post(
+                "/control/cancel", json={"request_id": request_id, "force": force}, timeout=10
+            )
+        )
 
     def prepare_fast_checkpoint(self) -> dict:
         response = self._client.post(

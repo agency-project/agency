@@ -16,7 +16,7 @@ ag.resume()                                  # the next LLM call carries the pat
 ag.remove_history_patch(key)                 # or ag.clear_history_patches()
 ```
 
-A runnable walkthrough is `examples/11_context_manipulation.py`.
+A runnable walkthrough is `examples/13_context_manipulation.py`.
 
 ## The API
 

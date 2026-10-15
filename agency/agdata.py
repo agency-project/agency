@@ -16,6 +16,40 @@ class AgError(RuntimeError):
     """Raised when accessing a non-error field on an agerror instance."""
 
 
+def _wait_evidence(values, kind: str) -> dict:
+    if not agprof.enabled():
+        return {}
+    sources = {}
+    unidentified = 0
+    for value in values:
+        if not isinstance(value, agdata):
+            unidentified += 1
+            continue
+        identity = object.__getattribute__(value, "__dict__")
+        request_id = identity.get("_execution_id")
+        if request_id is None:
+            unidentified += 1
+            continue
+        owner = identity.get("_execution_agent")
+        sources[request_id] = {
+            "request_id": request_id,
+            "agent_id": str(owner.agname) if owner is not None else None,
+            "kind": "result_wait",
+            "evidence": "result_handle",
+        }
+    execution = agprof.current_execution_attributes()
+    return {
+        "request_id": execution.get("agency.run_id"),
+        "wait_kind": kind,
+        "dependencies": list(sources.values()),
+        "dependency_request_ids": sorted(sources),
+        "dependency_agent_ids": sorted(
+            {source["agent_id"] for source in sources.values() if source["agent_id"]}
+        ),
+        "unidentified_dependency_count": unidentified,
+    }
+
+
 class agdata:
     """Generic data container with dict serialization.
 
@@ -43,6 +77,7 @@ class agdata:
             resolved = f.result()
         else:
             with agprof.span("sync:result_wait"):
+                agprof.annotate(**_wait_evidence([self], "result"))
                 resolved = f.result()
         if not isinstance(resolved, agdata):
             raise TypeError(
@@ -64,7 +99,9 @@ class agdata:
         if timeout is not None:
             f = object.__getattribute__(self, "_future")
             if f is not None:
-                f.result(timeout=timeout)
+                with agprof.span("sync:result_wait"):
+                    agprof.annotate(**_wait_evidence([self], "result_timeout"))
+                    f.result(timeout=timeout)
         self._resolve()
         return self
 
@@ -76,7 +113,9 @@ class agdata:
         # underlying future for any other concurrent awaiter.
         f = object.__getattribute__(self, "_future")
         if f is not None:
-            await asyncio.shield(asyncio.wrap_future(f))
+            with agprof.span("sync:result_wait"):
+                agprof.annotate(**_wait_evidence([self], "async_result"))
+                await asyncio.shield(asyncio.wrap_future(f))
         self._resolve()
         return self
 
@@ -93,15 +132,17 @@ class agdata:
             for r in results:
                 print(r.report_path)   # all resolved, no further blocking
         """
-        for p in pending:
-            resolver = getattr(p, "_resolve", None)
-            if callable(resolver):
-                resolver()
-                continue
-            waiter = getattr(p, "wait", None)
-            if not callable(waiter):
-                raise TypeError(f"object is not waitable: {type(p).__name__}")
-            waiter()
+        with agprof.span("sync:wait_all"):
+            agprof.annotate(**_wait_evidence(pending, "all"))
+            for p in pending:
+                resolver = getattr(p, "_resolve", None)
+                if callable(resolver):
+                    resolver()
+                    continue
+                waiter = getattr(p, "wait", None)
+                if not callable(waiter):
+                    raise TypeError(f"object is not waitable: {type(p).__name__}")
+                waiter()
         return pending
 
     # ------------------------------------------------------------------
@@ -242,8 +283,10 @@ class agerror(agdata):
 
         return agerror("context limit exceeded")
 
-    Callers check with ``isinstance(result, agerror)``.
-    Accessing any field other than ``.error`` raises AgError.
+    Direct instances support ``isinstance(result, agerror)`` and raise AgError
+    for missing non-error fields. Pending agdata/agtask wrappers copy the error
+    payload on resolution without changing class: inspect their to_dict() for
+    "error"; missing output fields on those wrappers raise AttributeError.
     """
 
     def __init__(self, message: str):
@@ -264,8 +307,9 @@ class agerror(agdata):
 class agcanceled(agerror):
     """Returned when an invocation was cancelled via ``agent.cancel(handle)``.
 
-    A typed subclass of ``agerror`` so callers can ``isinstance(result, agcanceled)``
-    instead of string-matching ``.error``.
+    Direct instances are typed subclasses of ``agerror``. Pending agdata
+    wrappers retain only the error payload when resolved, so their callers
+    cannot distinguish cancellation by isinstance().
     """
 
     def __init__(self, message: str = "agent invocation cancelled"):

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -69,7 +70,7 @@ def _all_agteam_subclasses(cls):
 
 
 def _dispatch_command(cmd: dict) -> None:
-    """Apply one pause/resume command written by the webui server process.
+    """Apply one execution/config command written by the webui server process.
 
     The (isolated, no-agency-imports) server process can only write a plain
     file describing what it wants; this side -- running inside the
@@ -93,6 +94,14 @@ def _dispatch_command(cmd: dict) -> None:
                 (a.pause if ctype == "pause_all" else a.resume)()
             except Exception as _e:
                 print(f"[agwebui] WARNING: {ctype} failed for {a.agname}: {_e}")
+    elif ctype in ("stop", "kill", "stop_all", "kill_all"):
+        targets = [a for a in _agent_cls.all() if ctype.endswith("_all") or a.agname == agname]
+        for a in targets:
+            try:
+                a.stop(force=ctype.startswith("kill"))
+            except Exception as exc:
+                # One failed RPC must not prevent stopping the remaining agents.
+                print(f"[agwebui] WARNING: {ctype} failed for {a.agname}: {exc}")
     elif ctype == "update_config":
         # Merge into the agent's existing agconfig. The webui editor only
         # ships a safe_snapshot() (LLM knobs etc.) -- replacing the whole
@@ -167,25 +176,40 @@ def _flush_loop(stop_event: threading.Event, interval: float = 0.5) -> None:
                 print(f"[agwebui] WARNING: failed to flush data logger for {a.agname}: {_e}")
 
 
-def _poll_commands(command_dir: Path, stop_event: threading.Event) -> None:
+def _poll_commands(command_dir: Path, stop_event: threading.Event, relay=None) -> None:
+    from .relay import ProfilerRelay
+
+    relay = relay or ProfilerRelay(command_dir)
     command_dir.mkdir(parents=True, exist_ok=True)
-    while not stop_event.is_set():
-        for f in sorted(command_dir.glob("*.json")):
-            try:
-                cmd = json.loads(f.read_text(encoding="utf-8"))
-                _dispatch_command(cmd)
-            except Exception as _e:
-                print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
-            finally:
+    # Lets the profiler distinguish a working relay from a standalone log viewer.
+    heartbeat = command_dir / ".heartbeat"
+    try:
+        while not stop_event.is_set():
+            heartbeat.touch()
+            relay.publish()
+            for f in sorted(command_dir.glob("*.json")):
                 try:
-                    f.unlink()
-                except FileNotFoundError:
-                    # Command file may already be removed by another actor;
-                    # this cleanup is best-effort.
-                    pass
+                    cmd = json.loads(f.read_text(encoding="utf-8"))
+                    if cmd.get("id"):
+                        relay.dispatch(cmd)
+                    else:
+                        # Backwards-compatible programmatic config/legacy files.
+                        _dispatch_command(cmd)
                 except Exception as _e:
-                    print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
-        stop_event.wait(0.2)
+                    print(f"[agwebui] WARNING: failed to apply command {f.name}: {_e}")
+                finally:
+                    try:
+                        f.unlink()
+                    except FileNotFoundError:
+                        # Command file may already be removed by another actor;
+                        # this cleanup is best-effort.
+                        pass
+                    except Exception as _e:
+                        print(f"[agwebui] WARNING: failed to remove command file {f.name}: {_e}")
+            stop_event.wait(0.2)
+
+    finally:
+        relay.close()
 
 
 class agwebui:
@@ -210,6 +234,7 @@ class agwebui:
         run_dir: Path | None = None,
         port: int = 7860,
         linger: bool = True,
+        ui_tasks: dict | None = None,
         **kwargs,
     ) -> None:
         """Run *fn(\\*args, \\*\\*kwargs)* with the web UI active.
@@ -240,10 +265,6 @@ class agwebui:
                     f"Stop the existing server before starting a new run."
                 )
 
-        from .build_perfetto import ensure_viewer
-
-        ensure_viewer()
-
         if run_dir is None:
             # Same directory every agent()/agteam() already writes its own
             # agDataLogger database to (unless overridden via `log_dir` on
@@ -253,7 +274,18 @@ class agwebui:
             run_dir = _DEFAULT_LOG_DIR
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        # The collector and the server must agree even when callers use a
+        # custom log_dir. An already-running session owns its output path.
+        profile_dir = (
+            agprof.active_output_dir()
+            or Path(os.environ.get("AGENCY_PROFILE_DIR", run_dir.parent / "profiler"))
+        ).resolve()
+        server_env = {**os.environ, "AGENCY_PROFILE_DIR": str(profile_dir)}
+
         ui = cls(run_dir=run_dir, port=port)
+        from .relay import ProfilerRelay
+
+        relay = ProfilerRelay(run_dir / "ui_commands", ui_tasks)
 
         server_log = open(run_dir / "server.log", "w")
         ui._server_log = server_log
@@ -269,6 +301,7 @@ class agwebui:
             ],
             stdout=server_log,
             stderr=server_log,
+            env=server_env,
         )
 
         # Wait up to 10 s for the server to be ready.
@@ -325,7 +358,7 @@ class agwebui:
         command_stop = threading.Event()
         threading.Thread(
             target=_poll_commands,
-            args=(run_dir / "ui_commands", command_stop),
+            args=(run_dir / "ui_commands", command_stop, relay),
             daemon=True,
             name="agwebui-commands",
         ).start()
@@ -340,21 +373,69 @@ class agwebui:
         ).start()
 
         with sigterm_as_exit("agwebui") as sigterm_received:
+            execution_status = "completed"
+            workload_completed_at = None
             try:
-                with agprof.workload():
-                    fn(*args, **kwargs)
+                get_orchestrator().data_logger.record_event(
+                    "workload_started",
+                    {"task": getattr(fn, "__name__", "workload")},
+                    name="webui",
+                    object="agwebui",
+                    flush=True,
+                )
+                with agprof.workload(out_dir=profile_dir):
+                    try:
+                        fn(*args, **kwargs)
+                    except Exception:
+                        execution_status = "failed"
+                        raise
+                    except BaseException:
+                        execution_status = "cancelled"
+                        raise
+                    finally:
+                        # Callback return is the automatic wall-clock boundary.
+                        # Record it before the profiler context exits: trace
+                        # export, summaries and telemetry flushing that follow
+                        # are not workload time. It reports that the callback
+                        # ended and how, never whether the task succeeded.
+                        workload_completed_at = time.time()
+                        try:
+                            get_orchestrator().data_logger.record_event(
+                                "workload_completed",
+                                {
+                                    "status": "cancelled"
+                                    if sigterm_received.is_set()
+                                    else execution_status
+                                },
+                                name="webui",
+                                object="agwebui",
+                                flush=True,
+                            )
+                        except Exception as _e:
+                            print(f"[agwebui] WARNING: failed to emit workload_completed: {_e}")
             except Exception:
+                execution_status = "failed"
                 import traceback
 
                 traceback.print_exc()
+            except BaseException:
+                execution_status = "cancelled"
+                raise
             finally:
                 command_stop.set()
                 try:
                     from ...orchestrator import get_orchestrator
 
+                    done = {
+                        "status": "cancelled" if sigterm_received.is_set() else execution_status
+                    }
+                    if workload_completed_at is not None:
+                        # Keeps the boundary recoverable if the event above was
+                        # lost or profiler cleanup failed.
+                        done["finalization_seconds"] = max(0.0, time.time() - workload_completed_at)
                     get_orchestrator().data_logger.record_event(
                         "done",
-                        {},
+                        done,
                         name="webui",
                         object="agwebui",
                         update_latest_snapshot=True,

@@ -27,7 +27,8 @@ import re
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from ...configs.agconfig import agconfig as agconfig_cls
@@ -129,6 +130,7 @@ class _ProcessSpanStart:
     wall_ns: int
     executable: str
     external_span: object | None
+    identity: dict = field(default_factory=dict)
 
 
 _SAFE_EXECUTABLE_CHARACTERS = frozenset(
@@ -275,6 +277,42 @@ class _ProcessLifecycleProfiler:
                 "pid": pid,
                 "executable": executable,
             }
+            try:
+                process_dir = Path("/proc") / str(pid)
+                stat = (process_dir / "stat").read_text()
+                fields = stat[stat.rfind(") ") + 2 :].split()
+                start_ticks, parent_pid = int(fields[19]), int(fields[1])
+                status = (process_dir / "status").read_text()
+                namespace_pid = int(
+                    next(line for line in status.splitlines() if line.startswith("NSpid:")).split()[
+                        -1
+                    ]
+                )
+                metadata.update(
+                    {
+                        "agency.namespace_pid": namespace_pid,
+                        "agency.process_start_ticks": start_ticks,
+                        "agency.pid_namespace": os.readlink(process_dir / "ns/pid"),
+                        "agency.process_identity": f"{pid}-{start_ticks}",
+                        "ppid": parent_pid,
+                    }
+                )
+                parent = self._processes.get(parent_pid)
+                if parent is not None:
+                    # A live, kernel-observed parent span is stronger evidence
+                    # than an unqualified parent PID in a historical trace.
+                    metadata["parent_process_identity"] = parent.identity.get(
+                        "agency.process_identity"
+                    )
+                else:
+                    parent_stat = (Path("/proc") / str(parent_pid) / "stat").read_text()
+                    parent_ticks = int(parent_stat[parent_stat.rfind(") ") + 2 :].split()[19])
+                    if parent_ticks <= start_ticks:
+                        metadata["parent_process_identity"] = f"{parent_pid}-{parent_ticks}"
+            except (OSError, ValueError, IndexError, StopIteration):
+                # Kernel identity may be unavailable during late callback
+                # replay. Retain the observed interval without guessing it.
+                pass
             self._processes[pid] = _ProcessSpanStart(
                 start_perf_ns,
                 start_wall_ns,
@@ -286,6 +324,7 @@ class _ProcessLifecycleProfiler:
                     metadata=metadata,
                     parent_context=self._parent_context,
                 ),
+                metadata,
             )
 
     def on_exec(self, pid: int, executable_path: "str | None") -> None:
@@ -404,6 +443,9 @@ class agProxyPtraceHandle:
         with self._loop._lock:
             return bool(self._loop._held_pids & self._loop._known_pids)
 
+    def _control_snapshot(self) -> dict:
+        return self._loop._control_snapshot()
+
     def close(self) -> None:
         self.kill()
         try:
@@ -442,6 +484,10 @@ class agProxyPtraceHandle:
             self._loop.on_exit(callback)
         else:
             self._loop.on_exit(lambda pid, _code: callback(pid))
+
+    def terminate(self) -> None:
+        """Request graceful shutdown of this launch's tracked process tree."""
+        self._loop.terminate()
 
     def kill(self) -> None:
         self._loop.kill()

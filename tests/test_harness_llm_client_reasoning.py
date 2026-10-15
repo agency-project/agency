@@ -95,3 +95,37 @@ def test_transient_in_stream_error_after_content_is_not_retried(monkeypatch):
     result = client.dispatch("m", [{"role": "user", "content": "hi"}])
     assert "error" in result
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("max_attempts", [1, 2, 5])
+def test_transient_stream_errors_respect_attempt_limit_and_report_completion(
+    monkeypatch, max_attempts
+):
+    client, calls = _sequenced_client([_error_chunk(transient=True)], monkeypatch)
+    client.max_attempts = max_attempts
+    events = []
+    client.observer = lambda event, payload: events.append((event, payload))
+
+    result = client.dispatch("m", [{"role": "user", "content": "hi"}], internal_kind="worker")
+
+    assert result == {"error": "dispatch failed: overloaded"}
+    assert len(calls) == max_attempts
+    completed = [payload for event, payload in events if event == "model_dispatch_complete"]
+    assert completed == [
+        {
+            "usage": None,
+            "finish_reason": "error",
+            "attempts": max_attempts,
+            "internal_kind": "worker",
+        }
+    ]
+
+
+def test_transient_stream_error_after_reasoning_signature_is_not_retried(monkeypatch):
+    body = _sse([{"reasoning_signature": "sig"}]).replace("data: [DONE]\n\n", "")
+    client, calls = _sequenced_client([body + _error_chunk(True)], monkeypatch)
+
+    assert client.dispatch("m", [{"role": "user", "content": "hi"}]) == {
+        "error": "dispatch failed: overloaded"
+    }
+    assert len(calls) == 1

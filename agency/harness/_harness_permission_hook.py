@@ -104,7 +104,13 @@ def _check_tool_policy(payload: dict) -> "tuple[str, str | None, str | None]":
         return "deny", "Cannot check invocation admission: agpolicy gateway not configured", None
 
     try:
-        body = json.dumps({"tool_name": tool_name, "tool_input": tool_input}).encode()
+        body = json.dumps(
+            {
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "model_tool_call_id": _tool_use_id(payload),
+            }
+        ).encode()
         req = urllib.request.Request(
             base_url.rstrip("/") + "/agpolicy/check_tool",
             data=body,

@@ -1,3 +1,4 @@
+import {requestControlConfirmation, refreshControlConfirmation} from './control-confirmation.js';
 // app.js — Agency Web UI client
 // Connects to the WebSocket, processes events, and renders the dashboard.
 
@@ -21,6 +22,8 @@ const state = {
   focusedIdx: 0,
   autoSelected: false,     // true once the first agent has been auto-selected
   activeTab:  'all',       // 'all' | 'live' | 'idle' | 'finished'
+  executionControls: null,
+  controlRequests: new Map(),
   timeline: {
     liveMode:  true,
     indexLen:  0,
@@ -34,9 +37,13 @@ const state = {
 // ANSI → HTML
 // ---------------------------------------------------------------------------
 
+// Standard ANSI colors follow the readable UI palette. Explicit xterm-256
+// payload colors below remain faithful to captured terminal output.
 const ANSI16 = [
-  '#000','#a00','#0a0','#880','#00a','#a0a','#0aa','#aaa',
-  '#555','#f55','#5f5','#ff5','#55f','#f5f','#5ff','#fff',
+  'var(--muted)','var(--red)','var(--teal)','var(--amber)',
+  'var(--blue)','var(--blue)','var(--blue)','var(--text-secondary)',
+  'var(--muted)','var(--red)','var(--teal)','var(--amber)',
+  'var(--blue)','var(--blue)','var(--blue)','var(--text)',
 ];
 
 function xterm256(n) {
@@ -71,7 +78,7 @@ function ansiToHtml(text) {
       const css = [
         color && `color:${color}`,
         bold  && 'font-weight:bold',
-        dim   && 'opacity:0.5',
+        dim   && 'color:var(--muted)',
       ].filter(Boolean).join(';');
       out.push(css ? `<span style="${css}">${esc}</span>` : esc);
     }
@@ -294,6 +301,7 @@ const $resourceStats    = document.getElementById('resource-stats');
 const $btnPauseToggle   = document.getElementById('btn-pause-toggle');
 const $btnPauseAll      = document.getElementById('btn-pause-all');
 const $btnResumeAll     = document.getElementById('btn-resume-all');
+const stopButtons = ['btn-stop','btn-kill','btn-stop-all','btn-kill-all'].map(id=>document.getElementById(id));
 const $btnUpdateConfig  = document.getElementById('btn-update-config');
 const $configOverlay    = document.getElementById('config-modal-overlay');
 const $configTitle      = document.getElementById('config-modal-title');
@@ -363,7 +371,7 @@ function updateInteractionTitle() {
     return;
   }
 
-  const ag      = state.agents.get(agname) || { color: '#d4d4d4' };
+  const ag      = state.agents.get(agname) || { color: 'var(--text-secondary)' };
   const usage   = state.tokenUsage.get(agname);
   const metaTxt = agentMetaText(ag);
   const metaHtml = metaTxt ? `<span class="meta-badge">${esc(metaTxt)}</span>` : '';
@@ -371,7 +379,7 @@ function updateInteractionTitle() {
     ? `<span class="token-badge">${fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite)}</span>`
     : '';
   $interactionTitle.innerHTML =
-    `<span style="color:${ag.color || '#d4d4d4'}">${esc(agname)}</span>  [${idx + 1}/${n}]  ← →` +
+    `<span style="color:var(--text-secondary)">${esc(agname)}</span>  [${idx + 1}/${n}]  ← →` +
     `<span class="badge-group">${metaHtml}${tokHtml}</span>`;
   $navLabel.textContent = `${idx + 1} / ${n}`;
 }
@@ -403,7 +411,7 @@ function appendLog(line) {
 
 // agterm-style colorization: term_message lines are plain text of the form
 // "[agname] rest of the message" -- color just the agent tag, matching the
-// old terminal-based agui's per-agent-colored `[agname]` prefix, and leave
+// terminal agent prefix. Use a neutral identity color in the web UI and leave
 // the rest to ansiToHtml (term_message never contains ANSI codes, but this
 // keeps escaping consistent with every other log line). Every event carries
 // its own `ts` (see server.py's _build_envelope), so a short HH:MM:SS
@@ -415,7 +423,7 @@ function colorizeTermMessage(termMessage, color, ts) {
   if (!m || !color) {
     return tsPrefix + ansiToHtml(termMessage);
   }
-  const tag = `<span style="color:${color};font-weight:bold">${esc(m[1])}</span>`;
+  const tag = `<span style="color:var(--text-secondary);font-weight:var(--font-weight-medium)">${esc(m[1])}</span>`;
   return tsPrefix + tag + ansiToHtml(m[2]);
 }
 
@@ -595,7 +603,7 @@ function renderAgentList() {
     }
 
     const indent = tname ? 12 : 0;
-    const ag = state.agents.get(agname) || { color: '#d4d4d4', state: 'inactive', skill: null, tool: null };
+    const ag = state.agents.get(agname) || { color: 'var(--text-secondary)', state: 'inactive', skill: null, tool: null };
     const isFocused = agname === focused;
     frags.push(renderAgentEntry(agname, ag, indent, isFocused));
   }
@@ -605,7 +613,17 @@ function renderAgentList() {
 }
 
 function updateAgentActionsBar() {
+  refreshControlConfirmation();
   const agname = currentAgent();
+  const connected=dashboardExecutionAvailable()&&state.controlRequests.size===0;
+  const active=ag=>ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
+  $btnPauseAll.disabled=!connected||state.controlRequests.size>0;
+  $btnResumeAll.disabled=!connected||state.controlRequests.size>0;
+  stopButtons.forEach((button,i)=>{button.disabled=!connected||!(i<2?active(state.agents.get(agname)):[...state.agents.values()].some(active));});
+  document.querySelectorAll('.side-panel .agent-column-actions').forEach(group=>{
+    const html=dashboardAgentControls(group.dataset.agname);
+    if(group.innerHTML!==html)group.innerHTML=html;
+  });
   if (!agname) {
     $btnPauseToggle.disabled = true;
     $btnPauseToggle.textContent = 'Pause';
@@ -615,14 +633,15 @@ function updateAgentActionsBar() {
   }
   const ag = state.agents.get(agname);
   const paused = ag ? ag.state === 'paused' : false;
-  $btnPauseToggle.disabled = false;
-  $btnPauseToggle.textContent = paused ? 'Resume' : 'Pause';
+  $btnPauseToggle.disabled = !connected||!active(ag);
+  const pendingControl=[...state.controlRequests.values()].find(request=>request.targets.includes(agname));
+  $btnPauseToggle.textContent = pendingControl?(pendingControl.type.startsWith('pause')?'Pausing…':pendingControl.type.startsWith('resume')?'Resuming…':'Control pending…'):paused?'Resume':'Pause';
   $btnPauseToggle.classList.toggle('active', paused);
-  $btnUpdateConfig.disabled = false;
+  $btnUpdateConfig.disabled = !connected;
 }
 
 function renderAgentEntry(agname, ag, indent, isFocused) {
-  const color = ag.color || '#d4d4d4';
+  const color = 'var(--text-secondary)';
   const focusedClass = isFocused ? ' focused' : '';
   const { state: st, skill, tool } = ag;
   let dot, statusHtml;
@@ -630,6 +649,15 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
   if (st === 'finished') {
     dot = `<span class="dot-finished">✓</span>`;
     statusHtml = `<span class="status-finished">finished</span>`;
+  } else if (st === 'failed' || st === 'error') {
+    dot = `<span class="dot-failed">!</span>`;
+    statusHtml = `<span class="status-failed">${esc(st)}</span>`;
+  } else if (st === 'cancelled' || st === 'destroyed') {
+    dot = `<span class="dot-inactive">■</span>`;
+    statusHtml = `<span class="dim">${esc(st)}</span>`;
+  } else if (['queued', 'blocked_on_dependency', 'blocked_on_resource', 'blocked', 'waiting'].includes(st)) {
+    dot = `<span class="dot-waiting">◷</span>`;
+    statusHtml = `<span class="status-waiting">${esc(st.replaceAll('_', ' '))}</span>`;
   } else if (st === 'paused') {
     dot = `<span class="dot-paused">⏸</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-paused">paused</span>`;
@@ -637,19 +665,19 @@ function renderAgentEntry(agname, ag, indent, isFocused) {
     dot = `<span class="dot-inactive">○</span>`;
     statusHtml = `<span class="dim">idle</span>`;
   } else if (st === 'llm') {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-waiting">◷</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-llm">LLM Wait</span>`;
   } else if (st === 'tool') {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-running">●</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-tool">${esc(tool || 'tool')}</span>`;
   } else if (st === 'proc_wait') {
-    dot = `<span style="color:${color}">●</span>`;
-    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="dim">Shell Wait</span>`;
+    dot = `<span class="dot-waiting">◷</span>`;
+    statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-waiting">Shell Wait</span>`;
   } else if (st === 'human') {
-    dot = `<span style="color:${color}">●</span> <span class="status-human">?</span>`;
+    dot = `<span class="dot-waiting">◷</span> <span class="status-human">?</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')}</span>: <span class="status-human">Input Pending</span>`;
   } else {
-    dot = `<span style="color:${color}">●</span>`;
+    dot = `<span class="dot-running">●</span>`;
     statusHtml = `<span class="dim">${esc(skill || '')} - running</span>`;
   }
 
@@ -752,7 +780,7 @@ function buildHistoryHtml(agname) {
             argsText = esc(b.arguments || '');
           }
           frags.push(
-            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(b.name || '?')} ▶</span>\n` +
+            `<div class="msg-tool-call">${tsHtml}<span class="role-tool-call">⚙ Tool ${esc(b.name || '?')} ▶</span>\n` +
             `<span class="body-tool">${argsText}</span></div>`
           );
         } else if (b.type === 'metadata' && state.fullLogsEnabled) {
@@ -774,7 +802,7 @@ function buildHistoryHtml(agname) {
         if (b.type === 'tool_result') {
           const name = toolNamesByCallId.get(b.tool_call_id) || '?';
           frags.push(
-            `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ TOOL ${esc(name)} ✓</span>\n` +
+            `<div class="msg-tool-result">${tsHtml}<span class="role-tool-call">⚙ Tool ${esc(name)} ✓</span>\n` +
             `<span class="body-tool">${esc(b.text || '')}</span></div>`
           );
         }
@@ -928,7 +956,7 @@ function renderSidePanels() {
             `<button class="side-panel-close" title="Unpin">&times;</button>` +
           `</span>` +
         `</div>` +
-        `<div class="side-panel-history"></div>`;
+        `<div class="agent-column-actions" role="group" aria-label="Agent controls" data-agname="${esc(agname)}">${dashboardAgentControls(agname)}</div><div class="side-panel-history"></div>`;
       panel.querySelector('.side-panel-close').addEventListener('click', () => unpinAgent(agname));
       const historyEl = panel.querySelector('.side-panel-history');
       panelAutoScroll.set(agname, true);
@@ -953,13 +981,15 @@ function renderSidePanels() {
     els.panel.style.flex = `0 0 ${width}px`;
     els.panel.style.width = `${width}px`;
 
-    const ag = state.agents.get(agname) || { color: '#d4d4d4' };
+    const ag = state.agents.get(agname) || { color: 'var(--text-secondary)' };
     els.agnameEl.textContent = agname;
-    els.agnameEl.style.color = ag.color || '#d4d4d4';
+    els.agnameEl.style.color = 'var(--text-secondary)';
     els.metaEl.textContent = agentMetaText(ag);
     const usage = state.tokenUsage.get(agname);
     els.tokenEl.textContent = usage ? fmtTokens(usage.inp, usage.out, usage.history, usage.cacheRead, usage.cacheWrite) : '';
 
+    const controls=els.panel.querySelector('.agent-column-actions'),html=dashboardAgentControls(agname);
+    if(controls.innerHTML!==html)controls.innerHTML=html;
     els.historyEl.innerHTML = buildHistoryHtml(agname);
     if (panelAutoScroll.get(agname) !== false) els.historyEl.scrollTop = els.historyEl.scrollHeight;
   }
@@ -1027,7 +1057,7 @@ function handleEvent(ev) {
     case 'agent_registered':
       if (!state.agents.has(ev.agname)) {
         state.agents.set(ev.agname, {
-          color: ev.color || '#d4d4d4',
+          color: ev.color || 'var(--text-secondary)',
           state: 'inactive', skill: null, tool: null, config: {},
         });
         state.agentOrder.push(ev.agname);
@@ -1049,7 +1079,7 @@ function handleEvent(ev) {
       break;
 
     case 'agent_config': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4', state: 'inactive', skill: null, tool: null };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)', state: 'inactive', skill: null, tool: null };
       state.agents.set(ev.agname, { ...existing, config: ev.config || {} });
       if (!state.agentOrder.includes(ev.agname)) state.agentOrder.push(ev.agname);
       break;
@@ -1063,7 +1093,7 @@ function handleEvent(ev) {
     case 'request_failed':
     case 'request_cancelled':
     case 'request_destroyed': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)' };
       const stateMap = {
         request_submitted: 'queued',
         request_blocked: 'blocked_on_dependency',
@@ -1086,10 +1116,10 @@ function handleEvent(ev) {
     }
 
     case 'agent_state': {
-      const existing = state.agents.get(ev.agname) || { color: '#d4d4d4' };
+      const existing = state.agents.get(ev.agname) || { color: 'var(--text-secondary)' };
       state.agents.set(ev.agname, {
         ...existing,
-        color: ev.color || existing.color || '#d4d4d4',
+        color: ev.color || existing.color || 'var(--text-secondary)',
         state: normalizeAgentState(ev.state),
         skill: ev.skill,
         tool:  ev.tool,
@@ -1213,7 +1243,7 @@ async function loadAgentDetail(agname) {
     agentDetailSignatures.set(agname, signature);
 
     state.histories.set(agname, newMessages);
-    const existing = state.agents.get(agname) || { color: '#d4d4d4' };
+    const existing = state.agents.get(agname) || { color: 'var(--text-secondary)' };
     state.agents.set(agname, {
       ...existing,
       state: normalizeAgentState(agentState.state) || existing.state || 'inactive',
@@ -1319,21 +1349,82 @@ $agentList.addEventListener('dragstart', e => {
 // Pause / resume actions
 // ---------------------------------------------------------------------------
 
+function dashboardAgentControls(agname) {
+  const ag=state.agents.get(agname),connected=dashboardExecutionAvailable()&&state.controlRequests.size===0;
+  const enabled=connected&&ag&&!['inactive','finished','cancelled','error','destroyed'].includes(ag.state);
+  const name=esc(agname),paused=ag?.state==='paused';
+  return `<span class="control-section-label">Agent controls</span><button data-agent-control="${paused?'resume':'pause'}" data-agname="${name}" ${enabled?'':'disabled'}>${paused?'Resume':'Pause'}</button><button data-agent-control="stop" data-agname="${name}" title="Graceful stop (SIGTERM)" ${enabled?'':'disabled'}>Stop</button><button class="danger-control" data-agent-control="kill" data-agname="${name}" title="Force exit (SIGKILL)" ${enabled?'':'disabled'}>SIGKILL</button><button data-agent-control="config" data-agname="${name}" ${connected?'':'disabled'}>Update Config</button>`;
+}
+$interaction.addEventListener('click',event=>{
+  const button=event.target.closest('[data-agent-control]');
+  if(!button||button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
+  const agname=button.dataset.agname,type=button.dataset.agentControl;
+  if(type==='config')openConfigModal(agname);
+  else sendDashboardControl(type,agname);
+});
+
 $btnPauseToggle.addEventListener('click', () => {
   const agname = currentAgent();
   if (!agname) return;
   const ag = state.agents.get(agname);
   const type = (ag && ag.state === 'paused') ? 'resume' : 'pause';
-  ws.send(JSON.stringify({ type, agname }));
+  sendDashboardControl(type, agname);
 });
 
 $btnPauseAll.addEventListener('click', () => {
-  ws.send(JSON.stringify({ type: 'pause_all' }));
+  sendDashboardControl('pause_all');
 });
 
 $btnResumeAll.addEventListener('click', () => {
-  ws.send(JSON.stringify({ type: 'resume_all' }));
+  sendDashboardControl('resume_all');
 });
+stopButtons.forEach((button,i)=>button.addEventListener('click',()=>{
+  if(button.disabled||!state.timeline.liveMode||ws.readyState!==WebSocket.OPEN)return;
+  const all=i>=2,type=`${i%2?'kill':'stop'}${all?'_all':''}`;
+  sendDashboardControl(type,all?undefined:currentAgent());
+}));
+
+function dashboardExecutionAvailable() {
+  return state.timeline.liveMode&&ws.readyState===WebSocket.OPEN&&state.executionControls?.available&&state.executionControls?.relay_id;
+}
+function sendDashboardControl(type,agname) {
+  if(!dashboardExecutionAvailable()||state.controlRequests.size)return;
+  const controls=state.executionControls,targets=type.endsWith('_all')?[...controls.agents]:[agname];
+  if(!targets.length||targets.some(target=>!controls.agents.includes(target)))return;
+  const identity=JSON.stringify(controls.execution),relay=controls.relay_id;
+  const validate=()=>{
+    if(!dashboardExecutionAvailable())return 'The live execution is disconnected or unavailable. Reopen confirmation after reconnecting.';
+    const current=state.executionControls;
+    if(current.relay_id!==relay||JSON.stringify(current.execution)!==identity)return 'The execution changed. Reopen confirmation for the intended execution.';
+    if(targets.some(target=>!current.agents.includes(target))||(type.endsWith('_all')&&JSON.stringify(current.agents)!==JSON.stringify(targets)))return 'The target agents changed. Review the new targets.';
+    return state.controlRequests.size?'Another control request is pending.':'';
+  };
+  const submit=()=>{
+    if(validate())return;
+    const id=globalThis.crypto?.randomUUID?.()||`dashboard-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    state.controlRequests.set(id,{type,targets});
+    ws.send(JSON.stringify({type,agname,id,targets,relay_id:relay,execution:controls.execution}));
+    appendLog(`[agent controls] ${type} requested for ${targets.join(', ')}; application unconfirmed.`);
+    updateAgentActionsBar();
+    setTimeout(()=>{if(state.controlRequests.has(id))appendLog(`[agent controls] Timed out waiting for ${type} confirmation for ${targets.join(', ')}. Outcome unknown; request will not be retried.`);},30000);
+  };
+  if(type.startsWith('stop')||type.startsWith('kill'))requestControlConfirmation({force:type.startsWith('kill'),execution:controls.execution?.id||'Live',targets,validate,onConfirm:submit});
+  else submit();
+}
+function receiveDashboardControlResult(result) {
+  if(!state.controlRequests.has(result.id))return;
+  if(result.error||result.targets?.some(target=>typeof target==='object')) {
+    const pending=result.targets?.some(target=>target.application?.state==='pending');
+    const signature=JSON.stringify(result.targets||result.error);
+    const request=state.controlRequests.get(result.id);
+    if(signature!==request.signature){
+      request.signature=signature;
+      appendLog(`[agent controls] ${result.error||result.targets.map(target=>`${target.agname}: API ${target.state}${target.application?' · local application '+target.application.state:''}${target.application?.detail?' · '+target.application.detail:target.detail?' · '+target.detail:''}`).join('; ')}. Observations concern local harness tasks; remote work and cleanup are unconfirmed.`);
+    }
+    if(!pending)state.controlRequests.delete(result.id);
+    updateAgentActionsBar();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Config editor modal
@@ -1432,10 +1523,25 @@ $configUpdateAll.addEventListener('click', () => {
 
 const ws = new WebSocket(`ws://${location.host}/ws`);
 let wsClosed = false;
+let lastDashboardControlsRequest=0;
+function requestDashboardControls() {
+  if(ws.readyState!==WebSocket.OPEN||Date.now()-lastDashboardControlsRequest<1000)return;
+  lastDashboardControlsRequest=Date.now();ws.send(JSON.stringify({type:'execution_controls_request'}));
+}
+ws.onopen = () => {requestDashboardControls();updateAgentActionsBar();};
 
 ws.onmessage = e => {
   try {
     const ev = JSON.parse(e.data);
+    if(ev.type==='execution_controls') {
+      if(state.executionControls?.relay_id&&state.executionControls.relay_id!==ev.execution_controls?.relay_id) {
+        state.controlRequests.clear();appendLog('[agent controls] Execution process changed; previous outcomes remain unconfirmed.');
+      }
+      state.executionControls=ev.execution_controls;
+      for(const result of state.executionControls?.receipts||[])receiveDashboardControlResult(result);
+      updateAgentActionsBar();return;
+    }
+    if(ev.type==='execution_command_result'){receiveDashboardControlResult(ev);return;}
     // In historical mode, only accept timeline_sync and ignore live events.
     if (!state.timeline.liveMode && ev.type !== 'timeline_sync') return;
     handleEvent(ev);
@@ -1444,7 +1550,10 @@ ws.onmessage = e => {
 
 ws.onclose = () => {
   wsClosed = true;
+  state.executionControls=null;
+  updateAgentActionsBar();
   appendLog('\x1b[31m[web ui] connection closed — reload to reconnect\x1b[0m');
+  if(state.controlRequests.size)appendLog('[agent controls] Connection lost after submission; outcomes are unknown. Requests will not be retried.');
 };
 
 ws.onerror = () => {
@@ -1475,6 +1584,7 @@ ws.onerror = () => {
 async function _pollAgentDetailLoop() {
   if (wsClosed) return;
   if (state.timeline.liveMode) {
+    requestDashboardControls();
     const agname = currentAgent();
     const toPoll = new Set(state.pinnedAgents);
     if (agname) toPoll.add(agname);

@@ -1375,6 +1375,36 @@ def test_workload_scope_stops_session_when_workload_raises(monkeypatch):
     assert events == ["start", "workload", "stop"]
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_workload_uses_supplied_output_directory_unless_environment_overrides(
+    monkeypatch, tmp_path, override
+):
+    starts = []
+    destination = tmp_path / "run" / "profiler"
+    configured = str(tmp_path / "configured-profiler")
+    monkeypatch.setenv("AGENCY_PROFILE", "1")
+    monkeypatch.setenv("AGENCY_PROFILE_SCOPE", "workload")
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    if override:
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", configured)
+    monkeypatch.setattr(agprof, "enabled", lambda: False)
+    monkeypatch.setattr(agprof, "start", lambda out_dir: starts.append(out_dir))
+    monkeypatch.setattr(agprof, "stop", lambda: None)
+
+    with agprof.workload(out_dir=destination):
+        pass
+
+    assert starts == [configured if override else destination]
+
+
+def test_active_output_directory_belongs_only_to_active_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(agprof, "_out_dir", tmp_path)
+    monkeypatch.setattr(agprof, "_session", None)
+    assert agprof.active_output_dir() is None
+    monkeypatch.setattr(agprof, "_session", object())
+    assert agprof.active_output_dir() == tmp_path
+
+
 @pytest.mark.parametrize(
     ("profile_value", "scope"),
     [
@@ -1576,16 +1606,26 @@ def test_default_and_invalid_scopes_do_not_autostart(monkeypatch, scope):
     agprof._maybe_autostart()
 
 
-def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
+@pytest.mark.parametrize("destination", ["custom_run", "environment", "active_session"])
+def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path, destination):
     import agency.observability.agwebui as agwebui_module
-    from agency.observability.agwebui import build_perfetto
-
-    monkeypatch.setattr(build_perfetto, "ensure_viewer", lambda: None)
 
     events = []
+    run_dir = tmp_path / "custom-run" / "logs"
+    expected_profile_dir = run_dir.parent / "profiler"
+    monkeypatch.delenv("AGENCY_PROFILE_DIR", raising=False)
+    active_dir = None
+    if destination == "environment":
+        expected_profile_dir = tmp_path / "configured-profiler"
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", str(expected_profile_dir))
+    elif destination == "active_session":
+        expected_profile_dir = active_dir = tmp_path / "active-profiler"
+        monkeypatch.setenv("AGENCY_PROFILE_DIR", str(tmp_path / "unused-profiler"))
+    monkeypatch.setattr(agprof, "active_output_dir", lambda: active_dir)
 
     @contextmanager
-    def workload():
+    def workload(*, out_dir):
+        assert out_dir == expected_profile_dir
         events.append("profile-start")
         try:
             yield
@@ -1616,7 +1656,12 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
             return 1
 
     monkeypatch.setattr(agwebui_module.agprof, "workload", workload)
-    monkeypatch.setattr(agwebui_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    def start_server(*args, **kwargs):
+        assert kwargs["env"]["AGENCY_PROFILE_DIR"] == str(expected_profile_dir)
+        return FakeProcess()
+
+    monkeypatch.setattr(agwebui_module.subprocess, "Popen", start_server)
     monkeypatch.setattr(agwebui_module.urllib.request, "urlopen", lambda *args, **kwargs: None)
     monkeypatch.setattr("socket.socket", lambda *args, **kwargs: FakeSocket())
     monkeypatch.setattr(agwebui_module.atexit, "register", lambda fn: None)
@@ -1624,7 +1669,7 @@ def test_webui_marks_only_supplied_function_as_workload(monkeypatch, tmp_path):
     def fn():
         events.append("workload")
 
-    agwebui_module.agwebui.run(fn, run_dir=tmp_path, port=17860, linger=False)
+    agwebui_module.agwebui.run(fn, run_dir=run_dir, port=17860, linger=False)
 
     assert events[:3] == ["profile-start", "workload", "profile-stop"]
 
@@ -1655,3 +1700,80 @@ def test_failed_sampler_start_releases_session_for_retry(monkeypatch, tmp_path, 
         if agprof._sampler is not None and not agprof._sampler.is_alive():
             agprof._sampler = None
         agprof.stop()
+
+
+def _pressure(path, some_us, full_us=0):
+    path.write_text(
+        f"some avg10=0.00 avg60=0.00 avg300=0.00 total={some_us}\n"
+        f"full avg10=0.00 avg60=0.00 avg300=0.00 total={full_us}\n"
+    )
+
+
+def test_host_sampler_records_normalized_cpu_memory_and_interval_psi(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    (proc / "pressure").mkdir(parents=True)
+    sampler = object.__new__(agprof._Sampler)
+    sampler._proc_root = proc
+    monkeypatch.setattr(agprof, "_samples", [])
+
+    def write(user, idle, cpu_us, io_us):
+        (proc / "stat").write_text(f"cpu  {user} 0 0 {idle} 0 0 0 0 0 0\ncpu0 1 0 0 1\n")
+        (proc / "meminfo").write_text("MemTotal: 16777216 kB\nMemAvailable: 12582912 kB\n")
+        _pressure(proc / "pressure" / "cpu", cpu_us, 999)
+        _pressure(proc / "pressure" / "memory", 0)
+        _pressure(proc / "pressure" / "io", io_us, io_us // 2)
+
+    write(100, 900, 1_000_000, 0)
+    sampler._tick_host(1_000_000_000)
+    # The first tick has no interval: no fabricated rates.
+    names = {name for _t, name, _v in agprof._samples}
+    assert "host:cpu_util_pct" not in names and "host:cpu_psi_some_pct" not in names
+    assert (1_000_000_000, "host:mem_used_mb", 4096.0) in agprof._samples
+    agprof._samples.clear()
+
+    write(400, 1600, 1_250_000, 500_000)  # 300 busy of 1000 ticks; 0.25s / 0.5s stalled
+    sampler._tick_host(3_000_000_000)
+    values = {name: value for _t, name, value in agprof._samples}
+    assert values["host:cpu_util_pct"] == pytest.approx(30.0)
+    assert values["host:cpu_psi_some_pct"] == pytest.approx(12.5)
+    assert values["host:io_psi_some_pct"] == pytest.approx(25.0)
+    assert values["host:io_psi_full_pct"] == pytest.approx(12.5)
+    assert values["host:memory_psi_some_pct"] == 0.0
+    # System-wide "full" CPU pressure is undefined and omitted.
+    assert "host:cpu_psi_full_pct" not in values
+
+
+def test_sandbox_pressure_is_read_from_its_own_cgroup_only(tmp_path, monkeypatch):
+    cgroup = tmp_path / "sandbox"
+    cgroup.mkdir()
+    (cgroup / "cpu.stat").write_text("usage_usec 10\n")
+    (cgroup / "memory.current").write_text(str(2**20))
+    sampler = object.__new__(agprof._Sampler)
+    monkeypatch.setattr(agprof, "_samples", [])
+    monkeypatch.setattr(sampler, "_tick_io_net", lambda *a, **k: None)
+    _pressure(cgroup / "cpu.pressure", 0)
+    sampler._sample_container(1_000_000_000, "sb", str(cgroup))
+    _pressure(cgroup / "cpu.pressure", 100_000)
+    sampler._sample_container(2_000_000_000, "sb", str(cgroup))
+    values = {name: value for _t, name, value in agprof._samples}
+    assert values["sandbox:sb:cpu_psi_some_pct"] == pytest.approx(10.0)
+    # A kernel without PSI files simply produces no pressure series.
+    assert not any(name.startswith("sandbox:sb:io_psi") for name in values)
+    assert not any(name.startswith("host:") for name in values)
+
+
+def test_host_and_pressure_series_keep_their_units_in_saved_observations():
+    observations = agprof._resource_observations(
+        [
+            (1, "host:cpu_util_pct", 30.0),
+            (1, "host:mem_used_mb", 4096.0),
+            (1, "sandbox:sb:memory_psi_some_pct", 2.0),
+        ],
+        process_info={},
+    )
+    units = {o["name"]: o["unit"] for o in observations}
+    assert units == {
+        "host:cpu_util_pct": "percent of all host CPUs",
+        "host:mem_used_mb": "MB",
+        "sandbox:sb:memory_psi_some_pct": "percent of wall time stalled",
+    }

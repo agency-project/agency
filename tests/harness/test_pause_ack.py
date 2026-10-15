@@ -26,7 +26,9 @@ def _manager(handle) -> HarnessManager:
 def test_pause_without_a_wait_just_requests_the_stop():
     calls = []
     handle = SimpleNamespace(pause=lambda: calls.append("pause"))
-    assert _manager(handle).control("pause") is None
+    ack = _manager(handle).control("pause")
+    assert "parked" not in ack  # only the control observation, no wait
+    assert ack["action"] == "pause"
     assert calls == ["pause"]
 
 
@@ -40,19 +42,20 @@ def test_synchronous_pause_returns_parked_once_the_harness_is_parked():
 
     ack = manager.control("pause", wait_timeout_s=3)
 
-    assert ack == {"parked": True}
+    assert ack["parked"] is True
+    assert ack["observation"]["action"] == "pause"
     assert order == ["pause", ("wait", 3)]
 
 
 def test_synchronous_pause_reports_a_harness_that_would_not_stop():
     handle = SimpleNamespace(pause=lambda: None, wait_paused=lambda timeout: False)
-    assert _manager(handle).control("pause", wait_timeout_s=0.1) == {"parked": False}
+    assert _manager(handle).control("pause", wait_timeout_s=0.1)["parked"] is False
 
 
 def test_synchronous_pause_with_no_harness_process_is_immediately_parked():
     manager = _manager(None)
     ack = manager.control("pause", wait_timeout_s=5)
-    assert ack == {"parked": True}
+    assert ack["parked"] is True
     assert manager._agent_paused is True  # the next process starts stopped
 
 
@@ -93,7 +96,7 @@ def test_control_route_round_trips_the_ack_and_the_wait_timeout():
 
     def control(action, **kwargs):
         seen[action] = kwargs
-        return {"parked": True} if action == "pause" else None
+        return {"parked": True} if "wait_timeout_s" in kwargs else None
 
     server = HarnessInteractionServer("/unused.sock", lambda request: None, control_handler=control)
     client = TestClient(server.build_app())
@@ -103,7 +106,7 @@ def test_control_route_round_trips_the_ack_and_the_wait_timeout():
     assert seen["pause"] == {"wait_timeout_s": 4.0}
 
     plain = client.post("/control/pause")
-    assert plain.json() == {"ok": True, "parked": True}
+    assert plain.json() == {"ok": True}
     assert seen["pause"] == {}
 
     assert client.post("/control/resume").json() == {"ok": True}

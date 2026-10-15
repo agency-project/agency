@@ -1,98 +1,86 @@
-# Agency tutorial
+# Examples
 
-These examples are a progressive, executable tour of Agency's current
-architecture. They follow the same path as the architecture diagram:
-
-1. a user submits skills and data;
-2. the process-wide orchestrator resolves dependencies and schedules work;
-3. a fresh per-request engine exposes host services and the configured LLM;
-4. the selected harness and sandbox tools execute inside an isolated sandbox.
-
-Run the examples in numeric order. Each script is standalone, writes artifacts
-under `runs/tutorials/`, cleans up its own sandboxes, and exits normally. The
-web UI is optional and does not linger in the automated run.
-
-## Configure a model and harness
-
-The default is the Codex harness routed through Agency to OpenAI Luna:
+Run scripts from the repository root after following
+[installation and credentials](../docs/getting-started.md):
 
 ```bash
-export OPENAI_API_KEY="..."
-export AGENCY_LLM_PROVIDER="openai"
-export AGENCY_LLM_MODEL="gpt-6-luna"
-export AGENCY_HARNESS="codex"
-export AGENCY_REASONING_EFFORT="none"
-```
-
-External CLI harnesses must also be runnable inside the sandbox image. If your
-default image does not include the CLI's interpreter (Node for Codex), select a
-compatible image with `AGENCY_SANDBOX_IMAGE`.
-
-The harness and model are independent. For example, the same tutorials can run
-Agency's native harness against an OpenAI-compatible vLLM endpoint:
-
-```bash
-export AGENCY_HARNESS="native"
-export AGENCY_LLM_PROVIDER="vllm"
-export LLM_BASE_URL="http://localhost:8000/v1"
-export LLM_MODEL="your-served-model"
-export LLM_API_KEY=""
-```
-
-Run everything:
-
-```bash
+export OPENAI_API_KEY="your-api-key"
+uv run python examples/quickstart.py
 uv run python examples/run_all.py
 ```
 
-Run one lesson:
+Each example demonstrates a small workflow and prints the results. The runner
+executes lessons 01–11 and 13 in separate processes, continues after failures, and
+returns a nonzero exit code if any lesson fails. The SWE-bench example requires
+its own prepared inputs and runs separately.
+
+| Example | Demonstrates |
+| --- | --- |
+| [quickstart.py](quickstart.py) | Write a Python function and print sample outputs. |
+| [01_basic_agent.py](01_basic_agent.py) | Run one typed skill and wait for its result. |
+| [02_context_and_lifecycle.py](02_context_and_lifecycle.py) | Chain results, make async calls, pause, resume, and cancel. |
+| [03_tools_and_policy.py](03_tools_and_policy.py) | Call a Python tool directly, on the host, and in a sandbox. |
+| [04_files_images_and_types.py](04_files_images_and_types.py) | Pass files, binary data, paths, raw text, and an image. |
+| [05_parallel_workflows.py](05_parallel_workflows.py) | Map tasks, fork agents, combine results, and use a team. |
+| [06_configuration_and_resources.py](06_configuration_and_resources.py) | Clone configuration, mount a directory, and inspect resources. |
+| [07_sandbox_api.py](07_sandbox_api.py) | Read and write sandbox files and execute a command without a model. |
+| [08_checkpoints.py](08_checkpoints.py) | Save an agent and restore it in a fresh process. |
+| [09_observability.py](09_observability.py) | Record a profile and print orchestrator and timing information. |
+| [10_harnesses_and_webui.py](10_harnesses_and_webui.py) | Run native and Codex agents with a temporary dashboard. |
+| [11_live_trajectory.py](11_live_trajectory.py) | Record real local file edits and subprocess telemetry without a model. |
+| [12_swebench_live.py](12_swebench_live.py) | Run one prepared SWE-bench issue and export its patch. |
+| [13_context_manipulation.py](13_context_manipulation.py) | Rewrite message blocks sent to the model with `patch_history`, between skill runs and at an exact LLM call with `pause`/`resume`. |
+
+Lessons 01–10 share `_common.py`. They default to the included **native harness**,
+OpenAI Chat Completions with `gpt-6-luna`, `reasoning_effort="none"`, and a
+4096-token completion budget. GPU passthrough is disabled, and idle sandboxes use one CPU. Artifact directories
+are printed under `runs/tutorials/`, and sandboxes are cleaned up on exit.
+
+Lesson 03 uses a Python image matching the host interpreter because sandbox
+tools serialize Python functions.
+
+Lessons 03 and 10 also use Codex. Set `AGENCY_CODEX_BINARY` to a compatible
+executable if the one on your PATH differs from the version required by Agency:
 
 ```bash
-uv run python examples/01_basic_agent.py
+export AGENCY_CODEX_BINARY="/absolute/path/to/compatible/codex"
+uv run python examples/run_all.py --only 01 03 07 10
 ```
 
-## Live model smoke test
+Set `AGENCY_HARNESS` to change the default harness. Set `AGENCY_LLM_PROVIDER`,
+`AGENCY_LLM_MODEL`, and `AGENCY_REASONING_EFFORT` to change the tutorial model.
+The helper supports OpenAI, OpenAI Responses, Anthropic, LiteLLM, vLLM, and
+Bedrock; configure the selected provider's credentials and endpoint as described
+in [configuration](../docs/guides/configuration.md).
 
-`smoke_test_models.py` is a developer check, not a lesson: it makes a few tiny,
-real API calls per model to confirm each current OpenAI/Anthropic model is
-visible, answers a streamed request through Agency's backend, and completes a
-tool call round-trip through the harness proxy path. It reads
-`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` from the environment or the repository's
-`.env`, never prints them, and is never collected by `pytest`.
+`AGENCY_SANDBOX_IMAGE` selects a container image. `AGENCY_EXAMPLE_RUN_ROOT`
+changes the artifact directory. `AGENCY_EXAMPLE_WAIT_TIMEOUT_SECONDS` changes
+the result wait timeout. Keep a checkpoint with `AGENCY_KEEP_EXAMPLE_CHECKPOINTS=1`.
+Quickstart uses `OPENAI_API_KEY` and optional `OPENAI_MODEL`; add `--webui` to
+show its dashboard.
+
+Lesson 11 creates a fresh temporary log directory by default. If you supply
+`--run-dir`, choose a fresh directory on every run. Its first subprocess
+intentionally returns a failure code, then the example edits the file and reruns
+it successfully to show both outcomes in the trace.
+
+For SWE-bench, prepare an official task row and a matching instance image, then
+inspect its required arguments:
 
 ```bash
-uv run python examples/smoke_test_models.py
-uv run python examples/smoke_test_models.py --provider anthropic
-uv run python examples/smoke_test_models.py --model gpt-6-sol --skip-e2e
+uv run python examples/12_swebench_live.py --help
 ```
 
-## Lessons
+An instance image needs Agency's Python runtime and the repository's test
+environment. Use `--source-dir` for a prepared host checkout, `--test-python`
+for its test interpreter, and `--harness-python` for the harness interpreter.
+You can also pass these arguments through the runner with
+`--only 12 --example-args ...`.
 
-| Lesson | Public surface demonstrated |
-|---|---|
-| [`01_basic_agent.py`](01_basic_agent.py) | `agent`/`Agent`, `agskill`, `agschema`, `agdata`, pending results, serialization, `agerror`, `agcanceled`, `AgError` |
-| [`02_context_and_lifecycle.py`](02_context_and_lifecycle.py) | `agcontext`, ordered submissions, pending dependencies, `history`, `queue_message`, async execution, completed-result redirect fallback, `pause`, `resume`, `cancel` |
-| [`03_tools_and_policy.py`](03_tools_and_policy.py) | `agtool`, host MCP tools, sandbox MCP tools, `agpolicy`, tool schemas and direct calls |
-| [`04_files_images_and_types.py`](04_files_images_and_types.py) | `agtype`, `agfile`, `agbinary`, `agpath`, `agimage`, `agrawstring` |
-| [`05_parallel_workflows.py`](05_parallel_workflows.py) | `Agent.fork`, scheduler dependency fan-in, `agteam`, `agmap`, `agtask`, `agsync`, `agdata.wait_all` |
-| [`06_configuration_and_resources.py`](06_configuration_and_resources.py) | every `agconfig` namespace, cloning/updating/redaction, `change_config`, mounts, resource tools, `agResourcePool` |
-| [`07_sandbox_api.py`](07_sandbox_api.py) | lazy sandbox creation, `agSandbox`, text/binary I/O, exec, detached processes, commit/restore/fork, runtime detection |
-| [`08_checkpoints.py`](08_checkpoints.py) | `save`, `load`, `save_all`, `load_all`, `all`, checkpointed context and filesystem state |
-| [`09_observability.py`](09_observability.py) | global orchestrator, `ExecutionScheduler`, `OrchestratorSnapshot`, `agDataLogger`, `record_state`, `agprof` |
-| [`10_harnesses_and_webui.py`](10_harnesses_and_webui.py) | interchangeable native/Codex harnesses, `agwebui`, graceful process shutdown |
-| [`11_context_manipulation.py`](11_context_manipulation.py) | `patch_history`, `remove_history_patch`, `clear_history_patches`, patching between skill runs and during one with `pause`/`resume` |
+[smoke_test_models.py](smoke_test_models.py) is a separate model compatibility
+utility. It makes real API calls and reads unset credentials from the repository
+`.env` file. Run a small check with:
 
-Set `AGENCY_KEEP_EXAMPLE_CHECKPOINTS=1` to retain lesson 8's full sandbox
-checkpoint after its restore check. Set `AGENCY_WEBUI_LINGER=1` to keep lesson
-10's dashboard running for interactive inspection; the acceptance runner uses
-the non-lingering default.
-
-`run_all.py` is the acceptance runner used for the EC2 validation. Files with a
-leading underscore are support modules and are deliberately excluded from the
-lesson glob.
-
-## What is intentionally not a tutorial API
-
-The private engine, adapter, daemon, protocol, and syscall-tracer modules are
-implementation seams. Model-compatibility matrices, raw `/v1/messages` probes,
-and full profiler workloads belong in tests or benchmarks rather than here.
+```bash
+uv run python examples/smoke_test_models.py --provider openai --model gpt-6-luna
+```

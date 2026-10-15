@@ -1,20 +1,12 @@
 """Tests for agllm — LLM client wrapper and kwarg building."""
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-import importlib
 from agency.llm.agllm import agllm
 from agency.configs.agconfig import agconfig, llmconfig
-
-
-@pytest.fixture(autouse=True)
-def _rearm_second_system_class_warning(monkeypatch):
-    """The warning is once per process; every test starts with it armed."""
-    # ``agency.llm.agllm`` the attribute is the class, so import the module.
-    module = importlib.import_module("agency.llm.agllm")
-    monkeypatch.setattr(module, "_warned_second_system_class", False)
 
 
 def _cfg(**fields) -> agconfig:
@@ -27,6 +19,13 @@ def _cfg(**fields) -> agconfig:
 
 def build_llm_kwargs(cfg, messages, openai_tools=None):
     return agllm.for_config(cfg).build_kwargs(messages, openai_tools)
+
+
+@pytest.fixture(autouse=True)
+def _reset_warn_once(monkeypatch):
+    # agency.llm re-exports the agllm class over the module's own name, so a
+    # dotted-string target would resolve to the class.
+    monkeypatch.setattr(sys.modules["agency.llm.agllm"], "_WARNED_ONCE", set())
 
 
 LLM_COMPACT_CONFIG = {"api_key": "test", "model": "", "base_url": "http://localhost/v1"}

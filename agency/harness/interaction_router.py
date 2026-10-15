@@ -35,7 +35,16 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             )
         body = await request.json()
         decision = await asyncio.to_thread(
-            bridge.check_tool_policy, token, body.get("tool_name", ""), body.get("tool_input") or {}
+            bridge.check_tool_policy,
+            token,
+            body.get("tool_name", ""),
+            body.get("tool_input") or {},
+            **({"annotation": body["annotation"]} if "annotation" in body else {}),
+            **(
+                {"model_tool_call_id": body["model_tool_call_id"]}
+                if body.get("model_tool_call_id")
+                else {}
+            ),
         )
         return JSONResponse(decision)
 

@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 
 from ..configs.agconfig import (
     agconfig as agconfig_cls,
+    agentconfig,
     harnessadapterconfig,
     ptraceconfig,
     sandboxconfig,
@@ -37,6 +38,7 @@ from . import interaction_router, mcp_proxy, sandbox_mcp
 from .adapters.base import AdapterRuntime, AttemptResult, HarnessAdapter
 from .clients.host_services_client import HostServicesClient
 from .common import extract_bearer_token
+from .control_observation import ControlObservations
 from .executable import prepare_harness_executable_local
 from .protocol import HarnessAttemptRequest, HarnessAttemptResult
 from .servers import HarnessInteractionServer
@@ -452,6 +454,7 @@ class HarnessManager:
         self._control_lock = threading.Lock()
         self._current_control_handle: object = None
         self._current_request_cancelled = False
+        self._current_cancel_force = True
         self._current_request_id: "str | None" = None
         self._redirect_handler: "Callable[[str], bool] | None" = None
         self._live_execution = None
@@ -467,6 +470,7 @@ class HarnessManager:
             sandbox_uds_path,
             self._dispatch_attempt,
             control_handler=self.control,
+            observation_handler=self._control_observation,
             redirect_handler=self.redirect,
             lifecycle_handler=self.lifecycle,
         )
@@ -550,7 +554,7 @@ class HarnessManager:
         with self._control_lock:
             self._current_control_handle = handle
             if self._current_request_cancelled:
-                handle.kill()
+                (handle.kill if self._current_cancel_force else handle.terminate)()
             elif self._agent_paused:
                 try:
                     handle.pause()
@@ -584,11 +588,17 @@ class HarnessManager:
                 print(f"[harness_daemon] WARNING: redirect delivery failed: {exc}")
                 return False
 
+    def _control_observation(self, identifier: str) -> dict:
+        with self._control_lock:
+            registry = getattr(self, "_control_observations", None)
+            return registry.get(identifier) if registry else {"id": identifier, "state": "unknown"}
+
     def control(
         self,
         action: str,
         *,
         request_id: str | None = None,
+        force: bool = True,
         wait_timeout_s: "float | None" = None,
     ) -> "dict | None":
         """Backs HarnessInteractionServer's /control/{action} route.
@@ -603,7 +613,11 @@ class HarnessManager:
             ):
                 return None
             if action == "cancel":
+                self._current_cancel_force = force or (
+                    self._current_request_cancelled and self._current_cancel_force
+                )
                 self._current_request_cancelled = True
+                self._agent_paused = False
             if action == "pause":
                 self._agent_paused = True
             elif action == "resume":
@@ -611,20 +625,29 @@ class HarnessManager:
             handle = self._current_control_handle
             # A pause cannot begin midway through redirect's native input wait:
             # resume would otherwise block on this lock while input stayed frozen.
-            if handle is not None:
-                if action == "pause":
-                    handle.pause()
-                elif action == "resume":
-                    handle.resume()
-                elif action == "cancel":
-                    handle.kill()
-                else:
-                    raise ValueError(f"unknown harness control action {action!r}")
+            if handle is None:
+                pass
+            elif action == "pause":
+                handle.pause()
+            elif action == "resume":
+                handle.resume()
+            elif action == "cancel":
+                (handle.kill if self._current_cancel_force else handle.terminate)()
+            else:
+                raise ValueError(f"unknown harness control action {action!r}")
+            if not hasattr(self, "_control_observations"):
+                self._control_observations = ControlObservations()
+            observation = self._control_observations.add(
+                action,
+                handle,
+                self._current_request_id,
+                getattr(self, "_current_attempt_token", None),
+            )
         if action == "pause" and wait_timeout_s is not None:
             # Outside the control lock: cancel and resume must stay deliverable
             # while this waits.
-            return self._await_pause(handle, wait_timeout_s)
-        return None
+            return {**self._await_pause(handle, wait_timeout_s), "observation": observation}
+        return observation
 
     def _await_pause(self, handle: object, timeout_s: float) -> dict:
         parked = True
@@ -653,6 +676,7 @@ class HarnessManager:
             with self._control_lock:
                 self._current_request_id = request.request_id
                 self._current_request_cancelled = False
+                self._current_cancel_force = True
                 self._redirect_handler = None
             _ping_daemon_lifecycle(
                 getattr(self, "_host_uds_path", ""),
@@ -823,6 +847,7 @@ def main(argv: "list[str] | None" = None) -> None:
         args.engine_name,
         args.harness,
         agconfig=agconfig_cls(
+            agentconfig(**payload.get("agent", {})),
             harnessadapterconfig(**payload.get("harness_adapter", {})),
             ptraceconfig(**payload.get("ptrace", {})),
             sandboxconfig(**payload.get("sandbox", {})),

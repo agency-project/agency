@@ -97,11 +97,13 @@ class AgentEngine:
             # a late redirect never contacts a hibernated persistent daemon.
             return client.redirect_harness(self._request_id, message)
 
-    def cancel(self) -> None:
+    def cancel(self, *, force: bool = True) -> None:
         with self._services_lock:
+            self._last_control_receipt = None
             client = self._sandbox_interaction_client
             if not self._services_closed and client is not None:
-                client.cancel_harness(self._request_id)
+                client.cancel_harness(self._request_id, force=force)
+                self._last_control_receipt = getattr(client, "_last_control_observation", None)
 
     @property
     def host_server_manager(self) -> "HostServerManager":
@@ -236,7 +238,11 @@ class AgentEngine:
         self._agtype_cleanup_paths = set()
         self._agent.data_logger.record_event(
             type="agent_state",
-            payload={"state": "running_harness"},
+            # The label keys this sandbox's sampled resource series (agprof
+            # container registry), so observers can attribute them to the agent.
+            payload={"state": "running_harness", "sandbox": str(sandbox._agname)}
+            if getattr(sandbox, "_agname", None)
+            else {"state": "running_harness"},
             update_latest_snapshot=True,
             flush=True,
         )
@@ -337,6 +343,10 @@ class AgentEngine:
             resume_session_id = prior_session.get("session_id") if prior_session else None
             prior_session_blob_b64 = prior_session.get("blob_b64") if prior_session else None
             while True:
+                # A stop during daemon startup or schema recovery must not
+                # launch another process after its cancellation RPC was a no-op.
+                if is_cancelled():
+                    return self._controlled_error()
                 # Send the request through sandbox interaction server
                 attempt = self._run_attempt(
                     prompt,

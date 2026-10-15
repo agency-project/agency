@@ -103,3 +103,60 @@ def test_concurrent_tracers_do_not_consume_each_others_exit_events():
     finally:
         for handle in handles:
             handle.close()
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize("paused", [False, True])
+def test_terminate_runs_sigterm_handler_even_when_tree_is_paused(paused):
+    script = """import signal,time,sys
+signal.signal(signal.SIGTERM, lambda *_: (print('CLEANUP',flush=True),sys.exit(0)))
+print('READY',flush=True)
+while True: time.sleep(.01)
+"""
+    handle = agProxyPtrace(allow_initial_exec=True).launch(
+        [sys.executable, "-c", script],
+        {},
+        policy=SimpleNamespace(check=lambda *args: True),
+        pty_size=(80, 24),
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while "READY" not in handle.terminal_output() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "READY" in handle.terminal_output()
+        if paused:
+            handle.pause()
+            time.sleep(0.05)
+        handle.terminate()
+        stdout, stderr, code = handle.wait(timeout=5)
+        assert code == 0 and "CLEANUP" in stdout and not stderr
+    finally:
+        handle.close()
+
+
+@pytest.mark.timeout(20)
+def test_sigkill_can_escalate_when_process_ignores_sigterm():
+    import signal
+
+    handle = agProxyPtrace(allow_initial_exec=True).launch(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('READY',flush=True); time.sleep(30)",
+        ],
+        {},
+        policy=SimpleNamespace(check=lambda *args: True),
+        pty_size=(80, 24),
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while "READY" not in handle.terminal_output() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "READY" in handle.terminal_output()
+        handle.terminate()
+        assert handle._loop.join(timeout=0.1) is None
+        handle.kill()
+        assert handle.wait(timeout=5)[2] == -signal.SIGKILL
+        assert not handle.pids()
+    finally:
+        handle.close()

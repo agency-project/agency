@@ -5,7 +5,7 @@ import re
 import httpx
 import openai
 
-from .agllm import agllm
+from .agllm import _RESPONSE_ID_HEADERS, StreamInterruptedError, agllm
 from .message_store import split_tool_schema
 
 _HANDLED_MESSAGE_FIELDS = {"role", "content", "tool_calls", "reasoning_content", "function_call"}
@@ -92,10 +92,26 @@ class _OpenAICompatibleBackend(agllm):
             api_key=self.agconfig.llm.api_key or "EMPTY",
             base_url=self.agconfig.llm.base_url,
             timeout=timeout,
+            max_retries=self.agconfig.llm.sdk_max_retries,
         )
 
     def known_context_limit(self, model: str) -> "int | None":
         return _known_openai_max_input_tokens(model)
+
+    def _response_ids(self, raw_result) -> dict:
+        headers = getattr(getattr(raw_result, "response", None), "headers", None)
+        get = getattr(headers, "get", None)
+        if get is None:
+            return {}
+        ids = {}
+        for name in _RESPONSE_ID_HEADERS:
+            try:
+                value = get(name)
+            except Exception:
+                value = None
+            if isinstance(value, str) and value:
+                ids[name] = value
+        return ids
 
     def tokenize_url(self) -> "str | None":
         base_url: str = self.agconfig.llm.base_url or ""
@@ -222,7 +238,10 @@ class _OpenAICompatibleBackend(agllm):
     def _format_stream_to_agency(self, raw_stream):
         unknown_field_index: "dict[str, int]" = {}
         next_unknown_index = -3
+        chunks = 0
+        terminated = False
         for chunk in raw_stream:
+            chunks += 1
             chunk_usage = getattr(chunk, "usage", None)
             choice = (chunk.choices or [None])[0]
             finish_reason = None
@@ -278,6 +297,9 @@ class _OpenAICompatibleBackend(agllm):
                         }
                 finish_reason = getattr(choice, "finish_reason", None)
             if chunk_usage is not None or finish_reason is not None:
+                # A finish_reason closes the choice; the usage chunk (sent
+                # because of include_usage) only ever follows it.
+                terminated = True
                 usage = _serialize_openai_usage(chunk_usage) if chunk_usage is not None else None
                 # The metadata block is a plain block_delta -- like any other
                 # unknown native field, it flows through the host server's
@@ -300,28 +322,43 @@ class _OpenAICompatibleBackend(agllm):
                     "usage": usage,
                     "stop_reason": finish_reason,
                 }
+        if not terminated and self.agconfig.llm.strict_stream_termination:
+            # The connection closed cleanly, but before the chunk that ends a
+            # response. Whatever arrived is a fragment (possibly half a tool
+            # call), never a finished turn.
+            raise StreamInterruptedError(
+                f"chat completions stream ended without a finish_reason after {chunks} chunk(s)",
+                details={"chunks": chunks},
+            )
+
+
+def _detail(details, name):
+    if details is None:
+        return None
+    return details.get(name) if isinstance(details, dict) else getattr(details, name, None)
 
 
 def _serialize_openai_usage(usage) -> "dict | None":
     """Full copy of the SDK's usage object, not a hand-picked subset."""
     if usage is None:
         return None
-    dumped = _serialize_sdk_object(usage)
-    if not isinstance(dumped, dict):
-        return dumped
-    prompt_tokens = dumped.get("prompt_tokens") or 0
-    completion_tokens = dumped.get("completion_tokens") or 0
-    dumped["prompt_tokens"] = prompt_tokens
-    dumped["completion_tokens"] = completion_tokens
-    dumped["total_tokens"] = dumped.get("total_tokens") or (prompt_tokens + completion_tokens)
-    # Same aliases anthropic.py/bedrock.py add -- one consistent pair of names.
-    details = dumped.get("prompt_tokens_details")
-    cached_tokens = details.get("cached_tokens") if isinstance(details, dict) else None
-    created_cache_tokens = (
-        details.get("created_cache_tokens") if isinstance(details, dict) else None
-    )
-    dumped["cache_read_tokens"] = dumped.get("cache_read_input_tokens") or cached_tokens or 0
-    dumped["cache_write_tokens"] = (
-        dumped.get("cache_creation_input_tokens") or created_cache_tokens or 0
-    )
-    return dumped
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    serialized = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
+    }
+    # Only when the provider reports them: cached prompt tokens are metered
+    # and billed differently, and reasoning tokens are output the harness
+    # never sees. Absent stays absent rather than becoming a false zero.
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    for key, value in (
+        ("cached_tokens", _detail(prompt_details, "cached_tokens")),
+        ("cache_write_tokens", _detail(prompt_details, "cache_write_tokens")),
+        ("reasoning_tokens", _detail(completion_details, "reasoning_tokens")),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool):
+            serialized[key] = value
+    return serialized

@@ -29,6 +29,14 @@ if TYPE_CHECKING:
     from ..agskill import agskill
 
 
+_active_execution: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "agency_active_execution", default=None
+)
+_last_submission: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "agency_last_profiled_submission", default=None
+)
+
+
 @dataclass(frozen=True)
 class OrchestratorSnapshot:
     state: str
@@ -70,6 +78,13 @@ class _ExecutionRequest:
     patch: "dict | None" = None
     dependencies: set[Future] = field(default_factory=set)
     producer_ids: set[str] = field(default_factory=set)
+    # Durable evidence for analysis, distinct from the scheduler's currently
+    # unresolved Future set. Completed results remain causal inputs.
+    recorded_dependencies: dict[tuple[str, str], dict] = field(default_factory=dict)
+    unidentified_dependency_count: int = 0
+    submitted_by_request_id: str | None = None
+    submitted_by_agent_id: str | None = None
+    launcher_span_id: str | None = None
     engine: "AgentEngine | None" = None
     run_span: object = None
     phase_span: object = None
@@ -198,6 +213,47 @@ class GlobalAgentOrchestrator:
         authoritative context chain and scheduler registration therefore have
         one linearization point and cannot be observed in different orders.
         """
+        if not agprof.enabled():
+            return self._submit_skill(ag, skill, skill_input, max_steps)
+        # submit() itself is synchronous: the caller cannot submit its next
+        # request until the scheduler acknowledgement has returned. Record
+        # that launcher serialization rather than linking workers' completion.
+        caller = _active_execution.get()
+        ownership = agprof.current_execution_attributes()
+        if caller is None and ownership.get("agency.run_id"):
+            caller = (ownership["agency.run_id"], ownership.get("agency.agent_id"))
+        scope = (agprof.session_identity(), caller, threading.get_native_id())
+        previous = _last_submission.get()
+        with agprof.span("sync:submission"):
+            launcher_span_id = agprof.current_span_id()
+            agprof.annotate(
+                submitted_agent_id=str(ag.agname),
+                preceding_submission_span_id=previous[1]
+                if previous and previous[0] == scope
+                else None,
+                submission_scope="caller_execution" if scope[1] else "workflow_caller",
+            )
+            try:
+                result = self._submit_skill(
+                    ag, skill, skill_input, max_steps, launcher_span_id=launcher_span_id
+                )
+                agprof.annotate(
+                    submitted_request_id=object.__getattribute__(result, "_execution_id")
+                )
+            finally:
+                if launcher_span_id is not None:
+                    _last_submission.set((scope, launcher_span_id))
+        return result
+
+    def _submit_skill(
+        self,
+        ag: "agent",
+        skill: "agskill",
+        skill_input: object,
+        max_steps: "int | None" = None,
+        *,
+        launcher_span_id: str | None = None,
+    ) -> agdata:
         self._validate_max_steps(max_steps)
         if not isinstance(skill_input, agdata):
             raise TypeError("skill_input must be an agdata")
@@ -222,6 +278,7 @@ class GlobalAgentOrchestrator:
                         result_future=result_future,
                         context_future=context_future,
                         context_dependency=predecessor,
+                        launcher_span_id=launcher_span_id,
                     )
                 except BaseException:
                     if ag.context is new_context:
@@ -253,7 +310,11 @@ class GlobalAgentOrchestrator:
         chain is already guaranteed synchronously here, before this method
         returns, so there is nothing for a caller to hold a handle to.
         """
-        self._submit_context_op(ag, message=message)
+        self._submit_context_message_receipt(ag, message)
+
+    def _submit_context_message_receipt(self, ag: "agent", message: str) -> dict:
+        """Same ordered publication, with private evidence for the profiler relay."""
+        return self._submit_context_op(ag, message=message)
 
     def submit_context_patch(self, ag: "agent", patch: dict) -> None:
         """Edit ``message_patch_lookup`` in the agent's ``agcontext.message_store``.
@@ -281,7 +342,7 @@ class GlobalAgentOrchestrator:
 
     def _submit_context_op(
         self, ag: "agent", *, message: "str | None" = None, patch: "dict | None" = None
-    ) -> None:
+    ) -> dict:
         result_future: "Future[agdata]" = Future()
         context_future: "Future[agcontext]" = Future()
         cycle_ack: Future[None] | None = None
@@ -315,6 +376,8 @@ class GlobalAgentOrchestrator:
         if cycle_ack is not None:
             cycle_ack.result()
 
+        return {"request_id": request.request_id, "future": result_future}
+
     def redirect_request(self, ag: "agent", request_id: str, message: str) -> bool:
         with self._event_cond:
             request = self._requests.get(request_id)
@@ -340,6 +403,18 @@ class GlobalAgentOrchestrator:
                 return None
             request.cancelled = True
             return request.engine if request.state == "running" else None
+
+    def cancel_agent(self, ag: "agent") -> "list[AgentEngine]":
+        """Cancel all currently outstanding work using request-owned engines."""
+        with self._event_cond:
+            engines = []
+            for request_id in list(self._outstanding_by_agent.get(ag, ())):
+                request = self._requests.get(request_id)
+                if request is not None:
+                    engine = self.cancel_request(ag, request.result_future)
+                    if engine is not None:
+                        engines.append(engine)
+            return engines
 
     def _claim_completion(self, request: _ExecutionRequest) -> bool:
         with self._event_cond:
@@ -536,6 +611,7 @@ class GlobalAgentOrchestrator:
         context_future: "Future[agcontext]",
         context_dependency: agcontext,
         message: "str | None" = None,
+        launcher_span_id: str | None = None,
         patch: "dict | None" = None,
     ) -> _ExecutionRequest:
         parent_context = agprof.current_span_context()
@@ -543,6 +619,11 @@ class GlobalAgentOrchestrator:
         submitted_wall_ns = time.time_ns()
         sequence = next(self._request_sequence)
         request_id = f"run{sequence}"
+        submitter = _active_execution.get()
+        if submitter is None:
+            ownership = agprof.current_execution_attributes()
+            if ownership.get("agency.run_id"):
+                submitter = (ownership["agency.run_id"], ownership.get("agency.agent_id"))
         request = _ExecutionRequest(
             request_id=request_id,
             sequence=sequence,
@@ -560,6 +641,9 @@ class GlobalAgentOrchestrator:
             context_dependency=context_dependency,
             state="submitted",
             message=message,
+            submitted_by_request_id=submitter[0] if submitter is not None else None,
+            submitted_by_agent_id=submitter[1] if submitter is not None else None,
+            launcher_span_id=launcher_span_id,
             patch=patch,
         )
         skill_name = skill.name if skill is not None else kind
@@ -577,6 +661,9 @@ class GlobalAgentOrchestrator:
                 "agency.execution_side": "host",
                 "agency.sandbox_id": agprof.sandbox_identity(ag.sandbox),
                 "agency.parent_agent_id": getattr(ag, "_parent_agent_id", None),
+                "submitted_by_request_id": request.submitted_by_request_id,
+                "submitted_by_agent_id": request.submitted_by_agent_id,
+                "launcher_span_id": launcher_span_id,
             },
             parent_context=parent_context,
             data_span_name="request:submission_to_completion",
@@ -586,6 +673,8 @@ class GlobalAgentOrchestrator:
         self._requests[request_id] = request
         self._future_producers[result_future] = request_id
         self._future_producers[context_future] = request_id
+        ag.context._execution_id = request_id
+        ag.context._execution_agent_id = str(ag.agname)
         self._outstanding_by_agent.setdefault(ag, set()).add(request_id)
         self._submitted_total += 1
         self._record_request_event("request_submitted", request, {})
@@ -646,6 +735,7 @@ class GlobalAgentOrchestrator:
                 run_if_accepted,
                 {
                     "agency.agent_id": str(request.agent.agname),
+                    "agency.run_id": request.request_id,
                     "agency.sandbox_id": agprof.sandbox_identity(request.agent.sandbox),
                     "agency.execution_side": "host",
                 },
@@ -670,6 +760,7 @@ class GlobalAgentOrchestrator:
             raise RuntimeError("engine worker received a request without a skill")
         label = f"{request.request_id}:{request.skill.name}:{request.agent.agname}"
         agprof.thread_name(label)
+        execution_token = _active_execution.set((request.request_id, str(request.agent.agname)))
         try:
             with agprof.span("engine:execute", parent_context=request.parent_context):
                 agprof.annotate(
@@ -698,6 +789,7 @@ class GlobalAgentOrchestrator:
                 error_message=message,
             )
         finally:
+            _active_execution.reset(execution_token)
             self._post("engine_done", (request.request_id, completion))
 
     def _perform_execution(self, request: _ExecutionRequest) -> _RunCompletion:
@@ -721,7 +813,11 @@ class GlobalAgentOrchestrator:
             local_skill_input = agdata(**dict(request.skill_input._data))
             logger.record_event(
                 type="skill_start",
-                payload={"skill": skill.name, "ts": request.ts_start},
+                payload={
+                    "skill": skill.name,
+                    "ts": request.ts_start,
+                    "request_id": request.request_id,
+                },
                 term_message=(
                     f"[{ag.agname}] SKILL ▶  {skill.name}  "
                     f"input={list(local_skill_input._data.keys())}"
@@ -782,7 +878,10 @@ class GlobalAgentOrchestrator:
         try:
             request.agent.data_logger.record_event(
                 type="skill_cancelled",
-                payload={"skill": request.skill.name if request.skill is not None else None},
+                payload={
+                    "skill": request.skill.name if request.skill is not None else None,
+                    "request_id": request.request_id,
+                },
                 term_message=f"[{request.agent.agname}] SKILL ■  cancelled",
                 flush=True,
             )
@@ -822,7 +921,11 @@ class GlobalAgentOrchestrator:
             if result_dict.get("error"):
                 logger.record_event(
                     type="skill_error",
-                    payload={"skill": skill.name, "error": str(result_dict["error"])},
+                    payload={
+                        "skill": skill.name,
+                        "error": str(result_dict["error"]),
+                        "request_id": request.request_id,
+                    },
                     term_message=(
                         f"[{ag.agname}] SKILL ✗  {skill.name}  error={result_dict['error']}"
                     ),
@@ -840,6 +943,7 @@ class GlobalAgentOrchestrator:
                 type="skill_call",
                 payload={
                     "skill": skill.name,
+                    "request_id": request.request_id,
                     "ts_start": request.ts_start,
                     "ts_end": ts_end,
                     "input": input_dict,
@@ -1099,9 +1203,46 @@ class GlobalAgentOrchestrator:
                 "skill": self._request_label(request),
                 "agency.run_id": request.request_id,
                 "agency.agent_id": str(request.agent.agname),
+                **self._dependency_metadata(request),
             },
             parent_context=request.parent_context,
         )
+
+    @staticmethod
+    def _dependency_metadata(request: _ExecutionRequest) -> dict:
+        sources = sorted(
+            request.recorded_dependencies.values(),
+            key=lambda source: (source["request_id"], source["kind"]),
+        )
+        return {
+            "dependencies": sources,
+            "dependency_request_ids": sorted({source["request_id"] for source in sources}),
+            "dependency_agent_ids": sorted(
+                {source["agent_id"] for source in sources if source.get("agent_id")}
+            ),
+            "unidentified_dependency_count": request.unidentified_dependency_count,
+        }
+
+    def _record_dependencies_locked(self, request: _ExecutionRequest, sources: list[dict]) -> None:
+        changed = False
+        for source in sources:
+            if source["request_id"] == request.request_id:
+                continue
+            key = (source["request_id"], source["kind"])
+            if key not in request.recorded_dependencies:
+                request.recorded_dependencies[key] = source
+                changed = True
+        if not changed:
+            return
+        metadata = self._dependency_metadata(request)
+        self._record_request_event(
+            "request_dependencies", request, {**metadata, "evidence": "explicit"}
+        )
+        # Spans are stored in the profile database; preserve the same sources
+        # there even when the global scheduler database is unavailable later.
+        for span in (request.run_span, request.phase_span):
+            if span is not None:
+                span.update(**metadata)
 
     def _end_phase_span_locked(self, request: _ExecutionRequest) -> None:
         span = request.phase_span
@@ -1144,6 +1285,9 @@ class GlobalAgentOrchestrator:
                     "submission_sequence": request.sequence,
                     "request_id": request.request_id,
                     "skill": self._request_label(request),
+                    "submitted_by_request_id": request.submitted_by_request_id,
+                    "submitted_by_agent_id": request.submitted_by_agent_id,
+                    "launcher_span_id": request.launcher_span_id,
                     **payload,
                 },
                 name=str(request.agent.agname),

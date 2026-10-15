@@ -4,13 +4,15 @@ __pycache__/
 *.log
 .env
 .venv/
+/.claude/
 *.egg-info/
 .pytest_cache/
 .DS_Store
 agency_runs/
 AGENT_INSTRUCTIONS/
-artifacts/
-benchmarks/checkpoint_size_microbenchmark/results
+/artifacts
+/runs
+/analysis
 
 # Generated embedded Perfetto build
 agency/observability/agwebui/static/perfetto/

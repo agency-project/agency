@@ -12,6 +12,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from agency.agdata import agdata
 from agency.agskill import agskill
 from agency.agtool import agtool
+from agency.agtype import agrawstring
 from agency.engine.host_servers.host_mcp_server import HostMcpServer
 
 _FIXED_TOOL_NAMES = {
@@ -435,6 +436,12 @@ def test_submit_output_with_no_output_schema_returns_an_error():
     server, _, _ = _make_server(output_schema=None)
     result = _call(server, "submit_output", {"field": "x", "value": "y"})
     assert "no output_schema" in result.content[0].text
+
+
+@pytest.mark.parametrize("output_schema", [None, agdata(content=agrawstring)])
+def test_unstructured_output_does_not_allow_an_empty_finish(output_schema):
+    server, _, _ = _make_server(output_schema=output_schema)
+    assert server.has_complete_output() is False
 
 
 def test_submit_output_rejects_an_unknown_field():

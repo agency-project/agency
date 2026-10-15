@@ -180,14 +180,14 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
     external_span = captured[0]
     assert external_span.name == "process:claude"
     assert external_span.fields["parent_context"] is parent_context
-    assert external_span.fields["metadata"] == {
+    assert {
         "agency.run_id": "run9",
         "agency.agent_id": "tester",
         "timing": "exact",
         "provenance": "ptrace",
         "pid": 4321,
         "executable": "<unknown>",
-    }
+    }.items() <= external_span.fields["metadata"].items()
     assert external_span.updates == [
         {"executable": "<redacted>"},
         {"executable": "claude"},
@@ -1114,6 +1114,174 @@ def test_ptrace_ignoring_esrch_swallows_resume_of_an_already_dead_pid():
         os._exit(0)
     os.waitpid(pid, 0)  # reaped -- pid is now guaranteed gone
     _ptrace_ignoring_esrch(pt.PTRACE_CONT, pid, 0, 0)  # must not raise
+
+
+@ptrace
+def test_pause_stops_every_harness_thread_and_resume_restores_activity(tmp_path):
+    script = """import threading, time
+from pathlib import Path
+root = Path(ROOT)
+def work(index):
+    counter = 0
+    while True:
+        counter += 1
+        (root / str(index)).write_text(str(counter))
+        time.sleep(0.01)
+for index in range(5):
+    threading.Thread(target=work, args=(index,), daemon=True).start()
+while True:
+    time.sleep(0.01)
+""".replace("ROOT", repr(str(tmp_path)))
+    handle = agProxyPtrace().launch(
+        [sys.executable, "-u", "-c", script], {}, cwd=str(tmp_path), policy=_AllowPolicy()
+    )
+    tasks = Path(f"/proc/{handle.root_pid}/task")
+
+    def all_stopped():
+        return all(_proc_state(int(task.name)).lower().startswith("t") for task in tasks.iterdir())
+
+    def counters():
+        return [int((tmp_path / str(index)).read_text() or "0") for index in range(5)]
+
+    try:
+        _wait_until(
+            lambda: all((tmp_path / str(index)).exists() for index in range(5)),
+            timeout=5,
+            message="worker threads did not start",
+        )
+        for _ in range(2):
+            handle.pause()
+            _wait_until(all_stopped, timeout=2, message="pause left harness worker threads running")
+            frozen = counters()
+            time.sleep(0.15)
+            assert counters() == frozen
+            handle.resume()
+            _wait_until(
+                lambda: all(now > old for now, old in zip(counters(), frozen)),
+                timeout=5,
+                message="worker threads did not resume",
+            )
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
+
+
+@ptrace
+def test_pause_at_syscall_admission_preserves_completion_on_resume(tmp_path):
+    import threading
+
+    from agency.harness.ptrace import _tracer_loop
+
+    target = tmp_path / "after-resume"
+    paused = threading.Event()
+    completions = []
+
+    def admit(stop):
+        if stop.path == str(target):
+            loop.pause()
+            paused.set()
+        return _tracer_loop.StopDecision(kind="allow", call_id=stop.path)
+
+    loop = _tracer_loop.TracerLoop(
+        syscalls=("execve", "openat"),
+        syscall_hook=admit,
+        syscall_exit_hook=lambda stop, call_id, result: completions.append((call_id, result)),
+    )
+    loop.start(
+        [sys.executable, "-c", f"open({str(target)!r}, 'w').write('resumed')"],
+        {},
+        str(tmp_path),
+    )
+    try:
+        assert paused.wait(5)
+        _wait_until(
+            lambda: loop.root_pid in loop._parked_pids,
+            timeout=5,
+            message="syscall admission did not park the task",
+        )
+        assert not target.exists()
+        assert not any(call_id == str(target) for call_id, _ in completions)
+        loop.resume()
+        assert loop.join(timeout=10) == 0
+        assert target.read_text() == "resumed"
+        assert len([result for call_id, result in completions if call_id == str(target)]) == 1
+    finally:
+        loop.kill()
+        loop.join(timeout=10)
+
+
+@ptrace
+def test_clone_discovered_during_pause_cannot_run_before_resume(monkeypatch):
+    import signal
+
+    from agency.harness.ptrace import _tracer_loop
+
+    pt = _tracer_loop.pt
+    loop = _tracer_loop.TracerLoop((), lambda stop: _tracer_loop.StopDecision(kind="allow"))
+    parent, child = 9901, 9902
+    loop._remember_spawn(parent)
+    loop._options_applied.add(parent)
+    loop._held_pids.add(parent)
+    requests = []
+    monkeypatch.setattr(pt, "get_eventmsg", lambda pid: child)
+    monkeypatch.setattr(pt, "ptrace", lambda *args: requests.append(args))
+    monkeypatch.setattr(_tracer_loop, "_is_thread_group_leader", lambda pid: False)
+
+    loop._dispatch(parent, (pt.PTRACE_EVENT_CLONE << 16) | (signal.SIGTRAP << 8) | 0x7F)
+    loop._dispatch(child, (signal.SIGSTOP << 8) | 0x7F)
+    assert loop._parked_pids == {parent, child}
+    assert all(request[0] == pt.PTRACE_SETOPTIONS for request in requests)
+
+    loop.resume()
+    assert {pid for pid, _, _ in loop._resume_requests} == {parent, child}
+
+
+@ptrace
+@pytest.mark.parametrize("force", [False, True])
+def test_observed_local_control_outcomes_with_real_task_tree(force):
+    """Cost-free local processes validate parking/restart/exit, including children."""
+    from agency.harness.control_observation import ControlObservations
+
+    handle = agProxyPtrace().launch(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess,time; subprocess.Popen(['/bin/sleep','30']); time.sleep(30)",
+        ],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+    )
+    registry = ControlObservations()
+    try:
+        _wait_until(lambda: len(handle.pids()) >= 2, timeout=5, message="child did not start")
+        handle.pause()
+        pause = registry.add("pause", handle, "local-test", "attempt-1")
+        _wait_until(
+            lambda: registry.get(pause["id"])["state"] == "confirmed",
+            timeout=5,
+            message="local parking was not observed",
+        )
+        evidence = registry.get(pause["id"])
+        assert evidence["task_count"] >= 2 and evidence["parked_count"] == evidence["task_count"]
+        for pid in handle.pids():
+            assert _proc_state(pid).lower().startswith("t")
+        handle.resume()
+        resume = registry.add("resume", handle, "local-test", "attempt-1")
+        _wait_until(
+            lambda: registry.get(resume["id"])["state"] == "confirmed",
+            timeout=5,
+            message="local continuation was not observed",
+        )
+        (handle.kill if force else handle.terminate)()
+        stop = registry.add("cancel", handle, "local-test", "attempt-1")
+        handle.wait(timeout=10)
+        result = registry.get(stop["id"])
+        assert result["state"] == "confirmed" and result["local_state"] == "exited"
+        assert result["task_count"] == 0
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
 
 
 @ptrace

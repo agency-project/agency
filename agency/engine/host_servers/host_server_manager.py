@@ -92,6 +92,7 @@ class HostServerManager:
             request_id=request_id,
             skill_name=skill.name,
             context=context,
+            outputs_complete=lambda: self._host_mcp_server.has_complete_output(),
         )
         self._interaction_server = HostInteractionServer(
             skill,
@@ -102,6 +103,7 @@ class HostServerManager:
             parent_context=agprof.current_span_context(),
             profile_attributes={
                 **agprof.current_span_attributes(),
+                "request_id": request_id,
                 "harness": getattr(agent, "harness", "unknown"),
                 "agency.agent_id": str(agent.agname),
                 "agency.sandbox_id": agprof.sandbox_identity(sandbox),

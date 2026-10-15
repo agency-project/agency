@@ -1,26 +1,21 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/theme.css">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Agency Web UI</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/control-confirmation.css">
 </head>
 <body>
   <nav id="view-tabs" aria-label="Views">
-    <button id="view-run" class="active" aria-pressed="true">Run</button>
-    <button id="view-profiler" aria-pressed="false">Profiler</button>
+    <a class="investigator-link" href="/profiler">Profiler</a>
+    <a class="investigator-link" href="/critical-path">Critical Path Profiler</a>
   </nav>
-  <section id="profiler-view" hidden>
-    <div id="profiler-toolbar">
-      <span id="profiler-status" role="status"></span>
-      <button id="profiler-reload">Reload trace</button>
-      <button id="profiler-open">Open trace file</button>
-      <input id="profiler-file" type="file" accept=".json,.pftrace,.perfetto-trace,.gz" hidden>
-    </div>
-    <iframe id="profiler-frame" title="Perfetto profiler" hidden></iframe>
-  </section>
   <div id="app">
     <div id="left">
       <div id="shared-log-container">
@@ -29,13 +24,20 @@
           <span id="timeline-from"></span>
           <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" disabled>
           <span id="timeline-to"></span>
-          <button id="timeline-live-btn" class="tl-live active">LIVE</button>
+          <button id="timeline-live-btn" class="tl-live active">Live</button>
         </div>
         <div id="shared-log"></div>
       </div>
       <div id="interaction">
         <div id="panel-main">
           <div class="panel-title" id="interaction-title">No agents</div>
+          <div id="agent-column-actions" class="agent-column-actions" role="group" aria-label="Selected agent controls">
+            <span class="control-section-label">Agent controls</span>
+            <button id="btn-pause-toggle" disabled>Pause</button>
+            <button id="btn-stop" disabled title="Gracefully stop selected agent with SIGTERM">Stop</button>
+            <button id="btn-kill" disabled title="Force selected agent to exit with SIGKILL">SIGKILL</button>
+            <button id="btn-update-config" disabled>Update Config</button>
+          </div>
           <div id="agent-history"></div>
           <div id="nav-bar">
             <button id="nav-prev" title="Previous agent ([ or Shift+Tab)">&#8592;</button>
@@ -61,11 +63,12 @@
         <input id="agent-search" type="text" placeholder="Search agents…" autocomplete="off" spellcheck="false">
       </div>
       <div id="agent-list"></div>
-      <div id="agent-actions">
-        <button id="btn-pause-toggle" disabled>Pause</button>
+      <div id="agent-actions" role="group" aria-label="All agents controls">
+        <span class="control-section-label">All agents</span>
         <button id="btn-pause-all">Pause All</button>
         <button id="btn-resume-all">Resume All</button>
-        <button id="btn-update-config" disabled>Update Config</button>
+        <button id="btn-stop-all" disabled title="Gracefully stop all agents with SIGTERM">Stop All</button>
+        <button id="btn-kill-all" disabled title="Force all agents to exit with SIGKILL">SIGKILL All</button>
       </div>
     </div>
   </div>
@@ -80,7 +83,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js"></script>
-  <script src="/static/profiler.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>
