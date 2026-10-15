@@ -33,6 +33,40 @@ test('table paging, search and sort retain bounded state and update actual rows'
  send({profSearch:'tools'});const html=renderProfiler(run,'Tools');assert.match(html,/data-prof-operation="305"/);assert.doesNotMatch(html,/data-prof-operation="999">bash/);assert.equal(renders,2);
  resetProfilerTables();
 });
+test('all 420 identical tool executions remain separate across pages, excluding syscalls',()=>{
+ resetProfilerTables();
+ const actions=Array.from({length:420},(_,i)=>({...call(i),id:`true-${i}`,name:'Bash',arguments:{command:'true'}}));
+ const r={...run,actions:[...actions,{...call(421,'syscall'),id:'kernel-exec',name:'execve'},{...call(422,'syscall'),id:'kernel-send',name:'sendto'}]};
+ const seen=[];
+ for(let page=0;page<9;page++){
+  const html=renderProfiler(r,'Tools');
+  const body=html.slice(html.indexOf('aria-label="Search tools"')).match(/<tbody>([\s\S]*?)<\/tbody>/)[1];
+  const ids=[...body.matchAll(/data-prof-operation="(true-\d+)">Bash/g)].map(m=>m[1]);
+  assert.equal(ids.length,page===8?20:50);
+  assert.equal((body.match(/&quot;command&quot;: &quot;true&quot;/g)||[]).length,ids.length);
+  assert.doesNotMatch(body,/kernel-exec|kernel-send|>x ↗/);
+  seen.push(...ids);
+  handleProfilerTableEvent({target:{closest:()=>({dataset:{profPage:'tools',delta:'1'}})}},()=>{});
+ }
+ assert.equal(new Set(seen).size,420);
+ assert.deepEqual(new Set(seen),new Set(actions.map(a=>a.id)));
+ resetProfilerTables();
+});
+test('tool input is searchable beyond its preview and rendered without HTML execution',()=>{
+ resetProfilerTables();
+ const command='printf '+ 'x'.repeat(500)+' <script>needle</script>';
+ const r={...run,actions:[{...call(1),arguments:JSON.stringify({cmd:command,workdir:'/workspace/proxy-case'})},{...call(2),arguments:{command:'true'}}]};
+ const search=value=>handleProfilerTableEvent({target:{closest:()=>({dataset:{profSearch:'tools'},value})}},()=>{});
+ for(const query of ['needle','/workspace/proxy-case']){
+  search(query);
+  const html=renderProfiler(r,'Tools');
+  const body=html.slice(html.indexOf('aria-label="Search tools"')).match(/<tbody>([\s\S]*?)<\/tbody>/)[1];
+  assert.match(body,/data-prof-operation="1"/);
+  assert.doesNotMatch(body,/data-prof-operation="2"|<script>/);
+  assert.ok(body.includes(command.replace('<script>','&lt;script&gt;').replace('</script>','&lt;/script&gt;')));
+ }
+ resetProfilerTables();
+});
 test('agent resource ownership is not inferred from PID or process command',()=>{
  const html=renderProfiler(run,'Systems',{agent:'a'});assert.match(html,/No reliably owned resource series/);assert.doesNotMatch(html,/data-prof-process="12-100"/);
 });

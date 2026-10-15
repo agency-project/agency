@@ -1005,6 +1005,40 @@ test('Profiler hides the summary dashboard and trajectory restores it',()=>{
   assert.equal(p.node('metrics').hidden,false);
 });
 
+test('time cursor keeps freeze labels across live, replay and saved recording states',()=>{
+  assert.doesNotMatch(pageSource(),/replay-speed|Instant batches/);
+  const p=debuggerPage(),button=p.node('display-toggle');
+  const getElementById=p.document.getElementById;
+  p.document.getElementById=id=>id==='replay-speed'?null:getElementById(id);
+  const check=(label,frozen)=>{
+    p.ui.renderSession();
+    assert.equal(button.textContent,label);
+    assert.equal(button['aria-pressed'],String(frozen));
+  };
+  check('Freeze view',false);
+  button.onclick();check('Unfreeze view',true);
+  button.onclick();check('Freeze view',false);
+  // Scrubbing into history opens replay; its stream updates keep the same labels.
+  const run={...p.ui.state.run,id:'saved'};
+  p.ui.seekPlayback(.4);
+  const replay={clock:.4,duration:10,playing:true,speed:1};
+  p.receive({type:'snapshot',run,replay});
+  check('Freeze view',false);
+  button.onclick();assert.equal(p.sent.at(-1).type,'pause');
+  p.receive({type:'updates',patches:[],replay:{...replay,playing:false}});
+  check('Unfreeze view',true);
+  button.onclick();assert.equal(p.sent.at(-1).type,'play');
+  assert.equal(p.sent.at(-1).speed,1);
+  p.receive({type:'updates',patches:[],replay});
+  check('Freeze view',false);
+  p.ui.state.replay=false;p.ui.state.stream=null;
+  check('Unfreeze view',true);
+  assert.match(button.title,/Unfreeze the recording/);
+  button.onclick();
+  p.receive({type:'snapshot',run,replay});
+  check('Freeze view',false);
+});
+
 test('time cursor starts with the wall clock, not with setup before the first agent execution',()=>{
   const p=page(),run=p.ui.state.run;
   Object.assign(run,{duration:30,time_origin:100,execution_started_at:null});

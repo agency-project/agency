@@ -238,8 +238,8 @@ binding is unchanged.
 ## Replay and investigation
 
 Select a live or saved execution, then **Replay recorded events**. Replay starts
-frozen at the beginning; use **Unfreeze view** on the time cursor to play at the
-selected speed (1× by default), **Next event**, or **Restart replay**.
+frozen at the beginning; use **Unfreeze view** on the time cursor to advance at
+normal speed (1×) and **Freeze view** to hold the current time.
 `mode=replay` is preserved in the URL. Actual saved spans supply start/end
 boundaries, and results, usage, context, and final metadata arrive only at the
 recorded end. Reconstructed boundaries are identified as such in raw detail.
