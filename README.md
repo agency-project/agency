@@ -1,11 +1,7 @@
 <div align="center">
 
 <!-- TODO(release): Replace with the final Agency logo. -->
-<img src="docs/assets/agency_wide.png" alt="Agency logo" width="500" />
-
-# Agency
-
-**See. Understand. Control.**
+<img src="docs/assets/agency_light.png" alt="Agency logo" width="500" />
 
 **Live debugging and systems profiling for AI agents.**
 
