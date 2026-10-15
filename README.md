@@ -42,7 +42,7 @@ Trace model requests, tool calls, processes, and dependencies across agents. Ide
 Use the **Critical Path Profiler** after execution to investigate what held the run back.
 
 <!-- TODO(release): Record agent lanes, dependencies, critical path, and timeline zoom. -->
-![Agency Critical Path Profiler](docs/assets/agency-critical-path.gif)
+![Agency Critical Path Profiler](docs/assets/agency-critical.webp)
 
 ### Detailed Profiler — Go deeper
 
@@ -61,7 +61,7 @@ Examine execution trajectories, model and tool activity, latency, resource usage
 Agency compares recorded evidence, without guessing at causes.
 
 <!-- TODO(release): Record two historical runs with trajectory and metric comparisons. -->
-![Agency Compare Runs](docs/assets/agency-compare-runs.gif)
+![Agency Compare Runs](docs/assets/agency-compare.png)
 
 ## Underneath your agent stack
 
