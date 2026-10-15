@@ -54,28 +54,20 @@ For current agent/tool composition, resolve and inspect the reserved `error` pay
 
 Use original handles for controls; reconstructed `agdata` objects are not control handles. Waiting with timeout, cancelling an asyncio waiter and cancelling execution are separate operations. To interrupt execution after a waiting timeout, call `worker.cancel(handle)` while it is still pending, then wait for settlement.
 
-## Source signatures
+## Source reference
 
 [Source: agdata.py](../../agency/agdata.py)
 
-::: agency.agdata.agdata
-    options:
-      members: ["__init__", "is_pending", "wait", "wait_all", "to_dict", "to_json", "from_dict", "from_json", "resolve_input_dependencies"]
+[`agency.agdata.agdata`](../../agency/agdata.py#L53): `__init__`, `is_pending`, `wait`, `wait_all`, `to_dict`, `to_json`, `from_dict`, `from_json`, `resolve_input_dependencies`.
 
 [Source: agdata.py](../../agency/agdata.py)
 
-::: agency.agdata.agerror
-    options:
-      members: ["__init__"]
+[`agency.agdata.agerror`](../../agency/agdata.py#L279): `__init__`.
 
 [Source: agdata.py](../../agency/agdata.py)
 
-::: agency.agdata.agcanceled
-    options:
-      members: ["__init__"]
+[`agency.agdata.agcanceled`](../../agency/agdata.py#L307): `__init__`.
 
 [Source: agdata.py](../../agency/agdata.py)
 
-::: agency.agdata.AgError
-    options:
-      members: []
+[`agency.agdata.AgError`](../../agency/agdata.py#L15)

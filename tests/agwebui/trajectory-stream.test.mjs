@@ -139,6 +139,26 @@ test('late counter samples preserve series identity and temporal ordering',()=>{
   assert.deepEqual(points,[[1,10],[2,20],[3,30]]);
 });
 
+test('replay reconnect keeps the newest seek while older acknowledgements are in flight',()=>{
+  const previousSocket=globalThis.WebSocket,previousLocation=globalThis.location,sockets=[],received=[];
+  class Socket {static OPEN=1;constructor(url){this.url=url;this.readyState=1;sockets.push(this);}send(){}close(){}}
+  globalThis.WebSocket=Socket;globalThis.location={protocol:'http:',host:'localhost'};
+  const stream=new TrajectoryStream({runId:'saved',replay:true,onMessage:m=>received.push(m),onTransport:()=>{}});
+  const frame=(socket,clock,seek_id)=>socket.onmessage({data:JSON.stringify({type:'snapshot',cursor:1,replay:{clock,seek_id,playing:false,speed:1}})});
+  try {
+    frame(sockets[0],5,null);
+    stream.sendReplay('seek',{clock:20,seek_id:1});
+    stream.sendReplay('seek',{clock:70,seek_id:2});
+    frame(sockets[0],20,1);
+    assert.equal(received.length,1);assert.equal(stream.replayClock,70);
+    stream.reconnect();
+    const query=new URL(sockets[1].url).searchParams;
+    assert.equal(query.get('clock'),'70');assert.equal(query.get('seek_id'),'2');
+    frame(sockets[1],70,2);assert.equal(received.length,2);
+    assert.equal(stream.replaySeekId,null);
+  } finally {stream.close();globalThis.WebSocket=previousSocket;globalThis.location=previousLocation;}
+});
+
 test('measurement commands use their own path, stay out of replay and keep the recovery cursor',()=>{
   const previousSocket=globalThis.WebSocket,previousLocation=globalThis.location;
   const sockets=[];

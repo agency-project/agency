@@ -802,6 +802,19 @@ def test_empty_response_fails_before_any_frame_is_sent(blocks):
         next(frames)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stop_reason", [None, "tool_calls"])
+def test_structured_completion_marker_does_not_allow_an_empty_nonfinal_response(
+    streaming, stop_reason
+):
+    response = {**_done([], stop_reason), "structured_output_complete": True}
+    with pytest.raises(ValueError, match="no message and no tool call"):
+        if streaming:
+            next(_backend()._format_agency_stream_to_harness([response], "m"))
+        else:
+            _backend()._format_context_agency_to_harness(response, "m")
+
+
 @pytest.mark.parametrize("arguments", [TRUNCATED_ARGUMENTS, "not json", "[1, 2]"])
 def test_malformed_tool_call_with_a_normal_stop_reason_is_never_emitted(arguments):
     frames = _backend()._format_agency_stream_to_harness(

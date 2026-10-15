@@ -60,16 +60,12 @@ print(payload["summary"])
 
 Saved LLM metadata omits API keys and AWS credentials; the whole configuration is not saved. Transcripts, session blobs and filesystem contents can still contain application data. Host mounts are external to the checkpoint. Image-based Docker/Podman saves require a compatible target runtime/image; chroot saves restore with chroot. No universal cross-host portability guarantee. `cow_zfs` does not support portable agent save/export/fork; see [checkpoint restrictions](sandboxes.md#checkpoint-backends).
 
-## Source signatures
+## Source reference
 
 [Source: agent.py](../../agency/agent.py)
 
-::: agency.agent.agent
-    options:
-      members: ["__init__", "run", "asyncio_run", "queue_message", "patch_history", "remove_history_patch", "clear_history_patches", "redirect", "cancel", "stop", "pause", "resume", "is_paused", "history", "output_path", "container_output_path", "change_config", "get_config_copy", "record_state", "fork", "all", "save", "load", "save_all", "load_all"]
+[`agency.agent.agent`](../../agency/agent.py#L71): `__init__`, `run`, `asyncio_run`, `queue_message`, `patch_history`, `remove_history_patch`, `clear_history_patches`, `redirect`, `cancel`, `stop`, `pause`, `resume`, `is_paused`, `history`, `output_path`, `container_output_path`, `change_config`, `get_config_copy`, `record_state`, `fork`, `all`, `save`, `load`, `save_all`, `load_all`.
 
 [Source: message_store.py](../../agency/llm/message_store.py)
 
-::: agency.llm.message_store.MessageBlock
-    options:
-      members: ["__init__", "from_payload", "role", "type", "hash", "payload", "to_dict"]
+[`agency.llm.message_store.MessageBlock`](../../agency/llm/message_store.py#L115): `__init__`, `from_payload`, `role`, `type`, `hash`, `payload`, `to_dict`.

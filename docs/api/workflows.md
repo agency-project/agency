@@ -58,28 +58,24 @@ assert result.wait().label == "team: hello"
 
 `sigterm_as_exit(label="agency")` yields a threading.Event. On the main thread it temporarily handles SIGTERM by setting the event and raising `SystemExit(0)`, allowing Python finally/atexit cleanup; restores the prior handler on exit. Off the main thread it yields an event without installing a handler. It does not handle SIGKILL. Use around the application entry point as in the [quickstart](../../examples/quickstart.py).
 
-## Source signatures
+## Source reference
 
 [Source: agmap.py](../../agency/utils/agmap.py)
 
-::: agency.utils.agmap.agmap
+[`agency.utils.agmap.agmap`](../../agency/utils/agmap.py#L98)
 
 [Source: agmap.py](../../agency/utils/agmap.py)
 
-::: agency.utils.agmap.agtask
-    options:
-      members: []
+[`agency.utils.agmap.agtask`](../../agency/utils/agmap.py#L53)
 
 [Source: agsync.py](../../agency/utils/agsync.py)
 
-::: agency.utils.agsync.agsync
+[`agency.utils.agsync.agsync`](../../agency/utils/agsync.py#L96)
 
 [Source: agteam.py](../../agency/agteam.py)
 
-::: agency.agteam.agteam
-    options:
-      members: ["__init__", "setup", "run", "change_config", "get_config_copy", "agents", "all"]
+[`agency.agteam.agteam`](../../agency/agteam.py#L20): `__init__`, `setup`, `run`, `change_config`, `get_config_copy`, `agents`, `all`.
 
 [Source: agutil.py](../../agency/utils/agutil.py)
 
-::: agency.utils.agutil.sigterm_as_exit
+[`agency.utils.agutil.sigterm_as_exit`](../../agency/utils/agutil.py#L61)

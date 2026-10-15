@@ -275,12 +275,16 @@ def _responses_usage(usage: "dict | None") -> dict:
     return result
 
 
-def _require_actionable(output: "list[dict]") -> None:
+def _require_actionable(output: "list[dict]", *, structured_output_complete: bool = False) -> None:
     """A completed response must carry something Codex can act on. One with
     no message and no tool call would end the turn -- and the task -- as if
     the model had answered. The host already refuses such a response; this
-    keeps the adapter from ever completing one on its own."""
-    if not any(item.get("type") != "reasoning" for item in output):
+    keeps the adapter from ever completing one on its own. The host may
+    explicitly accept an empty finish after all structured outputs were
+    submitted; that is a completed task even without assistant text."""
+    if not structured_output_complete and not any(
+        item.get("type") != "reasoning" for item in output
+    ):
         raise ValueError("model response has no message and no tool call")
 
 
@@ -690,7 +694,13 @@ class CodexAdapter(HarnessAdapter):
                 "output": [],
             }
         output = _output_items(agency_response["message"], tool_routes)
-        _require_actionable(output)
+        _require_actionable(
+            output,
+            structured_output_complete=(
+                agency_response.get("structured_output_complete") is True
+                and agency_response.get("stop_reason") == "stop"
+            ),
+        )
         return {**response, "status": "completed", "output": output}
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
@@ -706,7 +716,13 @@ class CodexAdapter(HarnessAdapter):
             # Codex raises here, where it still becomes an HTTP error.
             output = [] if reason is not None else _output_items(item["message"], tool_routes)
             if reason is None:
-                _require_actionable(output)
+                _require_actionable(
+                    output,
+                    structured_output_complete=(
+                        item.get("structured_output_complete") is True
+                        and item.get("stop_reason") == "stop"
+                    ),
+                )
             envelope = {"id": request_id, "object": "response", "model": model}
             yield _sse(
                 "response.created",

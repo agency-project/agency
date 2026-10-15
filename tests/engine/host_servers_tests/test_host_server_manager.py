@@ -79,6 +79,19 @@ def test_construction_wires_skill_into_interaction_server(tmp_path):
     assert manager._interaction_server._policy is policy
 
 
+def test_llm_completion_check_uses_the_current_skills_submissions(tmp_path):
+    from agency.agdata import agdata
+    from agency.agschema import agschema
+
+    manager, _, skill = _make_manager(tmp_path)
+    llm = manager.llm_handler_server
+    assert llm._can_finish_empty("stop", None) is False
+    skill.output_schema = agschema(agdata(summary=str))
+    assert llm._can_finish_empty("stop", None) is False
+    manager.host_mcp_server._persistent_vars["submitted_output_store"] = {"summary": "done"}
+    assert llm._can_finish_empty("stop", None) is True
+
+
 def test_construction_captures_run_context_for_llm_requests(tmp_path, monkeypatch):
     parent_context = object()
     monkeypatch.setattr(agprof, "current_span_context", lambda: parent_context)

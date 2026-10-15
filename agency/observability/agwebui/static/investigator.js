@@ -486,6 +486,10 @@ function executionNavigation() {
 }
 
 function render() {
+  // Navigation is page chrome: keep it complete while execution data loads.
+  $('views').innerHTML=executionNavigation();
+  $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
+  $('workspace').dataset.view=state.view;
   const run=state.run;
   if (!run || state.loading) return;
   const content=$('content');
@@ -497,9 +501,6 @@ function render() {
     ? ['#call-stack','.trajectory-scroll'].map(selector=>{
       const region=content.querySelector(selector);return [selector,region?.scrollLeft||0,region?.scrollTop||0];
     }):[];
-  $('views').innerHTML=executionNavigation();
-  $('view-label').textContent=views.find(v=>v[0]===state.view)[1];
-  $('workspace').dataset.view=state.view;
   renderRunChrome();
   timelineViewer?.destroy();timelineViewer=null;
   causalViewer?.destroy();causalViewer=null;
@@ -1200,7 +1201,7 @@ function revealEvent(view) {
   if(!a)return;
   if(!matchesAction(a,state.agent,state.query)){
     if(!window.confirm('This event is excluded by the agent/search filter. Clear those filters to reveal this recorded event?'))return;
-    state.agent='';state.query='';$('search').value='';
+    state.agent='';state.query='';
   }
   if(view==='critical'||view==='timeline'){
     setView('critical');causalViewer?.setSelection(a.id);
@@ -1670,7 +1671,6 @@ document.addEventListener('keydown',event=>{
 });
 $('run-select').onchange=event=>loadRun(event.target.value);
 for(const id of ['model-filter','harness-filter']) $(id).onchange=()=>{const runs=catalogOptions();if(runs.length&&!runs.some(r=>r.id===state.run?.id)) loadRun(runs[0].id);else if(!runs.length){$('status').textContent='No executions match these model and harness filters.';}};
-$('search').oninput=event=>{holdSelection();state.query=event.target.value;render();};
 // Dragging previews the position; releasing seeks, as on a video scrubber.
 $('cursor').addEventListener('pointerdown',()=>{
   playback.scrubRange=wallClockRange();playback.scrubbing=true;
@@ -1751,4 +1751,5 @@ $('inspector-resizer').addEventListener('keydown',event=>{
 });
 window.addEventListener('resize',()=>{if(state.inspectorOpen)setInspectorWidth(state.inspectorExpanded?Math.min(900,inspectorWidthBounds().max):state.inspectorWidth);});
 
+render();
 refresh();

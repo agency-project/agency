@@ -245,3 +245,50 @@ def test_recorded_model_response_is_available_in_action_inspection():
     assert "Inspect the queue" in run["actions"][0]["result"]
     assert "read(" in run["actions"][0]["result"]
     assert "llm.response" not in run["actions"][0]["metadata"]
+
+
+def test_process_counter_generations_and_ownership_survive_saved_projection():
+    def counter(identity, at, value):
+        spec = {
+            "version": 1,
+            "path": [
+                ["agent:worker", "Worker"],
+                ["sandbox:box", "Box"],
+                ["process:" + identity, "Python"],
+                ["counters", "Counters"],
+            ],
+            "label": "rss_mb",
+        }
+        return {
+            "ph": "C",
+            "pid": 12,
+            "ts": at * 1e6,
+            "name": "agency-counter-v1:" + json.dumps(spec),
+            "args": {"value": value},
+        }
+
+    trace = {
+        "traceEvents": [span("tool:Bash", 0, 4), counter("12-100", 1, 20), counter("12-200", 3, 40)]
+    }
+    run = investigator.normalize_trace(trace, {"id": "test", "source": "recorded"})
+    assert run["counters"]["process:12-100:rss_mb"] == [[1, 20]]
+    assert run["counters"]["process:12-200:rss_mb"] == [[3, 40]]
+    assert "rss_mb" not in run["counters"]
+    assert run["sandbox_owners"] == {"box": ["worker"]}
+
+
+def test_process_summary_identity_is_used_only_when_pid_generation_is_unambiguous():
+    counter = {"ph": "C", "pid": 12, "ts": 1e6, "name": "rss_mb", "args": {"value": 20}}
+    trace = {"traceEvents": [span("tool:Bash", 0, 4), counter]}
+    entry = {"id": "test", "source": "recorded"}
+    run = investigator.normalize_trace(
+        trace, entry, {"process_metrics": [{"pid": 12, "identity": "12-100"}]}
+    )
+    assert "process:12-100:rss_mb" in run["counters"]
+    ambiguous = investigator.normalize_trace(
+        trace,
+        entry,
+        {"process_metrics": [{"pid": 12, "identity": "12-100"}, {"pid": 12, "identity": "12-200"}]},
+    )
+    assert "rss_mb" in ambiguous["counters"]
+    assert "process:12-100:rss_mb" not in ambiguous["counters"]

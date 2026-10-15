@@ -11,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import Future
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -357,6 +357,7 @@ class LlmHandlerServer:
         request_id: "str | None" = None,
         skill_name: "str | None" = None,
         context: "agcontext | None" = None,
+        outputs_complete: "Callable[[], bool] | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -395,8 +396,20 @@ class LlmHandlerServer:
         # backend, and the harness's own message dicts (for the usage tracker).
         self._call_messages: "dict[str, dict]" = {}
         self._call_messages_lock = threading.Lock()
+        self._outputs_complete = outputs_complete
 
         self.change_config(agconfig)
+
+    def _can_finish_empty(self, stop_reason, internal_kind) -> bool:
+        # Tool output submission does not itself end a harness turn. Once
+        # every required field is recorded, a normal empty stop is a valid
+        # finish. Internal helper calls still need an answer of their own.
+        return (
+            stop_reason == "stop"
+            and internal_kind is None
+            and self._outputs_complete is not None
+            and self._outputs_complete()
+        )
 
     def get_all_transcripts(self) -> "list[dict]":
         with self._transcript_lock:
@@ -623,10 +636,13 @@ class LlmHandlerServer:
                             ) from error
                     else:
                         ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
+                        output_complete = self._can_finish_empty(
+                            result["stop_reason"], internal_kind
+                        )
                         verdict = inspect_response(
                             result["message"],
                             result["stop_reason"],
-                            empty_is_unusable=policy.fail_on_empty,
+                            empty_is_unusable=policy.fail_on_empty and not output_complete,
                         )
                         deliver = verdict.usable
                         if verdict.reason == TRUNCATED:
@@ -669,6 +685,7 @@ class LlmHandlerServer:
                                 call_label, request, result["message"], internal_kind=internal_kind
                             )
                             finalized = True
+                            result["structured_output_complete"] = output_complete
                             return result
                         _annotate(
                             attempt_span,
@@ -1383,7 +1400,12 @@ class LlmHandlerServer:
                     return ("stop",)
                 message = _blocks_to_message(blocks)
                 verdict = inspect_response(
-                    message, stop_reason, empty_is_unusable=policy.fail_on_empty
+                    message,
+                    stop_reason,
+                    empty_is_unusable=(
+                        policy.fail_on_empty
+                        and not self._can_finish_empty(stop_reason, internal_kind)
+                    ),
                 )
                 _annotate(
                     attempt_span,
@@ -1406,6 +1428,9 @@ class LlmHandlerServer:
                     "message": message,
                     "usage": usage,
                     "stop_reason": stop_reason,
+                    "structured_output_complete": self._can_finish_empty(
+                        stop_reason, internal_kind
+                    ),
                 },
                 request=request,
                 response=message,

@@ -28,7 +28,7 @@ The median `y − x` is **−0.003289**; the mean is **+0.001411**. Eight points
 
 Panel B uses the terminal integrity report's worker wall times: **15/15** matched contended runs are slower, and the median paired ratio is **1.747×**. All **30/30** runs resolved. The sets of files in the final patches match for **15/15** pairs, but **0/15** final patches are byte-identical. Matching file sets and outcomes do not imply identical patches or action paths.
 
-To regenerate the PNG, SVG, and per-pair CSV from saved data:
+To regenerate the PNG and per-pair CSV from saved data:
 
 ```sh
 python -m pip install matplotlib

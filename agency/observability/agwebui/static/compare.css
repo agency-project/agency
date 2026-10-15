@@ -1,6 +1,4 @@
 /* Compare uses the shared Agency typography, surfaces, controls and cards. */
-.compare-main-nav a,.compare-nav-link {display:block;color:var(--text-secondary);text-decoration:none;padding:10px 14px;border-radius:5px;font-size:13px}
-.compare-main-nav a.active,.compare-main-nav a:hover,.compare-nav-link:hover {background:var(--selection-bg);color:var(--text)}
 .compare-selection {display:grid;grid-template-columns:1fr 1fr;gap:20px;padding:16px 24px;border-bottom:1px solid var(--line)}
 .compare-selection>div {min-width:0}.compare-selection label {display:block;margin-bottom:7px;font-weight:600;font-size:12px}
 .compare-selection select {width:100%}.compare-run-meta {margin-top:8px;line-height:1.7;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
@@ -32,8 +30,8 @@
 .compare-timeline .execution-timeline-scroll {height:28vh}.compare-timeline {min-width:0}.compare-timeline [data-lock],.compare-timeline [data-latest] {display:none}.compare-timeline label:has([data-lock]) {display:none}
 .compare-timeline .timeline-controls {display:none}.compare-timeline .notice {font-size:11px;margin:8px;color:var(--muted)}
 .compare-series-select {max-width:500px}.compare-details-pages {display:flex;gap:8px;align-items:center;font-size:11px}.compare-selection details pre {max-height:140px;overflow:auto;font-size:11px;white-space:pre-wrap}
-.compare-workspace a {color:var(--blue)}.compare-workspace .compare-main-nav a {color:var(--text-secondary)}
-@media(max-width:1050px) {.compare-workspace .sidebar {width:155px}.compare-selection,#compare-content {padding:12px}.compare-tabs {padding:8px 12px}.compare-operation summary {display:block}.compare-operation .call-state {display:block;text-align:left;margin-top:4px}.compare-pane-header a {margin-left:0}}
-@media(max-width:720px) {.compare-workspace .sidebar {display:none}.compare-panes,.compare-selection {grid-template-columns:1fr}.compare-feed {height:40vh}}
+.compare-workspace a {color:var(--blue)}
+@media(max-width:1050px) {.compare-selection,#compare-content {padding:12px}.compare-tabs {padding:8px 12px}.compare-operation summary {display:block}.compare-operation .call-state {display:block;text-align:left;margin-top:4px}.compare-pane-header a {margin-left:0}}
+@media(max-width:720px) {.compare-panes,.compare-selection {grid-template-columns:1fr}.compare-feed {height:40vh}}
 .compare-chart .sample-b {fill:none;stroke:var(--text-secondary);stroke-width:1.5px}
 .compare-pane-header input {width:190px;font-size:11px}

@@ -16,12 +16,12 @@
 <aside class="sidebar">
 <a class="brand" href="/profiler"><span class="brand-mark">a</span><span>agency<span class="brand-caption">Execution profiler</span></span></a>
 <div class="side-caption">Views</div>
-<nav id="views" aria-label="Execution views"><a href="/compare" class="compare-nav-link"><span class="view-number">4</span>Compare Runs</a></nav>
+<nav id="views" aria-label="Execution views"><button data-view="trajectory" class="active" aria-current="page"><span class="view-number">1</span>Execution Trajectory</button><button data-view="profiler" aria-current="false"><span class="view-number">2</span>Profiler</button><a href="/critical-path" class="compare-nav-link"><span class="view-number">3</span>Critical Path Profiler</a><a href="/compare" class="compare-nav-link"><span class="view-number">4</span>Compare Runs</a></nav>
 <div class="side-bottom"><button id="demo" class="demo-button">Open recorded example <span>↗</span></button><button id="open-live">Current live execution</button></div>
 </aside>
 <div class="workspace-main">
 <header class="topbar"><h1 id="view-label">Execution Trajectory</h1><div class="top-actions"><button id="refresh" title="Refresh saved run catalog">↻ Refresh</button><button id="export" title="Export the complete recording, including updates beyond a frozen view">↓ Export run</button></div></header>
-<div class="run-controls"><select id="run-select" aria-label="Execution"></select><details class="catalog-filters"><summary>Catalog filters</summary><div><label>Model<select id="model-filter" aria-label="Model filter"><option value="">All models</option></select></label><label>Harness<select id="harness-filter" aria-label="Harness filter"><option value="">All harnesses</option></select></label></div></details><label class="search-wrap"><span>⌕</span><input id="search" placeholder="Find command, intent, file…" aria-label="Search events"></label></div>
+<div class="run-controls"><select id="run-select" aria-label="Execution"></select><details class="catalog-filters"><summary>Catalog filters</summary><div><label>Model<select id="model-filter" aria-label="Model filter"><option value="">All models</option></select></label><label>Harness<select id="harness-filter" aria-label="Harness filter"><option value="">All harnesses</option></select></label></div></details></div>
 <div id="summary-strip" class="summary-strip"><section id="metrics" class="metrics" aria-label="Run summary"></section></div>
 <section id="system-metrics" class="system-metrics" aria-label="System metrics"></section>
 <div class="cursor-bar">

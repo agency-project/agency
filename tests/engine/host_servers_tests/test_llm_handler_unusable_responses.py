@@ -15,18 +15,25 @@ for every provider; the SDK-level shapes are covered at the end.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
 
 from agency.configs.agconfig import agconfig, llmconfig
+from agency.agdata import agdata
+from agency.agskill import agskill
+from agency.engine.host_servers.host_mcp_server import HostMcpServer
 from agency.engine.host_servers import llm_handler_server as mod
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer, _DispatchError
 from agency.llm import StreamInterruptedError, UnusableResponseError
 from agency.llm.agllm import ProviderResponseError, current_dispatch_attempt
+from agency.llm.message_store import with_tool_schema
 from agency.llm.openai import _OpenAICompatibleBackend
 from agency.llm.usage_tracker import LlmUsageTracker
+from agency.harness.adapters.codex import CodexAdapter
 
 METADATA_INDEX = 2**31 - 1
 CUT = '{"cmd":"cat <<\'EOF\' > notes.txt\\n1. Linux scheduling determines which'
@@ -153,16 +160,18 @@ class Logger:
         return [payload for kind, payload, _ in self.events if kind == "llm_retry"]
 
 
-def server_with(scripts, **llm):
+def server_with(scripts, *, outputs_complete=None, **llm):
     llm.setdefault("unusable_response_backoff_s", 0)
     config = agconfig(llmconfig(base_url="http://x/v1", model="gpt-test", **llm))
-    server = LlmHandlerServer(config, Logger(), usage_tracker=LlmUsageTracker())
+    server = LlmHandlerServer(
+        config, Logger(), usage_tracker=LlmUsageTracker(), outputs_complete=outputs_complete
+    )
     server._backend = ScriptedBackend(scripts)
     return server, server._backend
 
 
-def run_stream(server):
-    handle = server.start_stream(dict(REQUEST))
+def run_stream(server, request=None):
+    handle = server.start_stream(dict(REQUEST if request is None else request))
     item = handle.first()
     handle._thread.join(timeout=5.0)
     assert not handle._thread.is_alive()
@@ -203,6 +212,98 @@ def test_empty_200_that_keeps_coming_is_a_reported_failure_not_a_finished_turn()
     assert len(backend.log) == 3  # the first ask plus unusable_response_retries=2
     kind, chain = server._data_logger.finalized[-1]
     assert kind == "llm_stream_error" and "empty_response" in chain[0]["error"]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_submitted_outputs_allow_an_empty_final_turn_through_to_codex(streaming):
+    """A successful MCP submission followed by an empty stop must finish,
+    while a partial or rejected submission must still require an answer."""
+    skill = agskill("summary", "Summarize", output_schema=agdata(summary=str, count=int))
+    mcp = HostMcpServer(SimpleNamespace(), skill, SimpleNamespace(), Logger())
+    mcp.build_app()
+    server, backend = server_with([EMPTY_200], outputs_complete=mcp.has_complete_output)
+
+    def submit(field, value):
+        return asyncio.run(
+            mcp._mcp_server.call_tool("submit_output", {"field": field, "value": value})
+        )
+
+    submit("summary", "Done")
+    submit("count", "not an integer")
+    assert mcp.has_complete_output() is False
+    if streaming:
+        assert run_stream(server)["type"] == "error"
+    else:
+        with pytest.raises(_DispatchError, match="empty_response"):
+            server.dispatch(dict(REQUEST))
+    assert len(backend.log) == 3
+
+    submit("count", 0)
+    assert mcp.has_complete_output() is True
+    result = run_stream(server) if streaming else server.dispatch(dict(REQUEST))
+    assert result["stop_reason"] == "stop"
+    assert result["structured_output_complete"] is True
+    assert content_blocks(result) == []
+    assert len(backend.log) == 4  # the completed output needs only one ask
+    assert len(server._data_logger.retries()) == 2  # no new retries
+    assert server._data_logger.finalized[-1][0] == "llm_block"
+
+    adapter = CodexAdapter(agconfig())
+    if streaming:
+        frames = "".join(adapter._format_agency_stream_to_harness([result], "m"))
+        payload = json.loads(frames.split("event: response.completed\ndata: ")[1].strip())
+        assert payload["response"]["status"] == "completed"
+    else:
+        response = adapter._format_context_agency_to_harness(result, "m")
+        assert response["status"] == "completed" and response["output"] == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_complete_outputs_do_not_allow_empty_internal_helper_responses(streaming):
+    server, backend = server_with([EMPTY_200], outputs_complete=lambda: True)
+    # Harness adapters carry the internal kind in the ``tool_schema`` message.
+    request = {
+        "messages": with_tool_schema(
+            REQUEST["messages"], extra={"agency_internal_kind": "example_worker"}
+        )
+    }
+    if streaming:
+        assert run_stream(server, request)["type"] == "error"
+    else:
+        with pytest.raises(_DispatchError, match="empty_response"):
+            server.dispatch(request)
+    assert len(backend.log) == 3
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stop_reason", [None, "tool_calls", "content_filter"])
+def test_complete_outputs_only_allow_a_normal_empty_stop(streaming, stop_reason):
+    server, backend = server_with([end(stop_reason)], outputs_complete=lambda: True)
+    if streaming:
+        assert run_stream(server)["type"] == "error"
+    else:
+        with pytest.raises(_DispatchError, match="empty_response"):
+            server.dispatch(dict(REQUEST))
+    assert len(backend.log) == 3
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_complete_outputs_do_not_hide_truncated_tool_calls(streaming):
+    server, backend = server_with([TRUNCATED_TOOL], outputs_complete=lambda: True)
+    result = run_stream(server) if streaming else server.dispatch(dict(REQUEST))
+    assert result["stop_reason"] == "length"
+    assert result["structured_output_complete"] is False
+    assert content_blocks(result)[0]["incomplete"] is True
+    assert len(backend.log) == 1
+
+
+def test_submitting_outputs_does_not_preempt_further_model_tool_calls():
+    server, backend = server_with([GOOD_TOOL], outputs_complete=lambda: True)
+    result = run_stream(server)
+    assert result["stop_reason"] == "tool_calls"
+    assert result["structured_output_complete"] is False
+    assert content_blocks(result)[0]["name"] == "exec_command"
+    assert len(backend.log) == 1
 
 
 def test_reasoning_with_no_answer_is_empty():

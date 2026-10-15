@@ -125,78 +125,60 @@ def workload():
 # agwebui.run(workload, linger=False)
 ```
 
-## Source signatures
+## Source reference
 
 [Source: agcontext.py](../../agency/agcontext.py)
 
-::: agency.agcontext.agcontext
-    options:
-      members: ["__init__", "is_pending", "resolve_prev_dependencies", "get_resolved_transcript", "set_transcript", "from_messages", "message_state", "message_state_fields", "append_retained_message", "pending_retained_messages", "advance_retained_cursor", "copy"]
+[`agency.agcontext.agcontext`](../../agency/agcontext.py#L11): `__init__`, `is_pending`, `resolve_prev_dependencies`, `get_resolved_transcript`, `set_transcript`, `from_messages`, `message_state`, `message_state_fields`, `append_retained_message`, `pending_retained_messages`, `advance_retained_cursor`, `copy`.
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
-::: agency.orchestrator.orchestrator.GlobalAgentOrchestrator
-    options:
-      members: ["__init__", "change_config", "submit", "submit_context_message", "submit_context_patch", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown"]
+[`agency.orchestrator.orchestrator.GlobalAgentOrchestrator`](../../agency/orchestrator/orchestrator.py#L109): `__init__`, `change_config`, `submit`, `submit_context_message`, `submit_context_patch`, `redirect_request`, `cancel_request`, `cancel_agent`, `snapshot`, `flush`, `shutdown`.
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
-::: agency.orchestrator.orchestrator.OrchestratorSnapshot
-    options:
-      members: []
+[`agency.orchestrator.orchestrator.OrchestratorSnapshot`](../../agency/orchestrator/orchestrator.py#L41)
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
-::: agency.orchestrator.orchestrator.get_orchestrator
+[`agency.orchestrator.orchestrator.get_orchestrator`](../../agency/orchestrator/orchestrator.py#L1425)
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
-::: agency.orchestrator.orchestrator.peek_orchestrator
+[`agency.orchestrator.orchestrator.peek_orchestrator`](../../agency/orchestrator/orchestrator.py#L1440)
 
 [Source: scheduler.py](../../agency/orchestrator/scheduler.py)
 
-::: agency.orchestrator.scheduler.ExecutionScheduler
-    options:
-      members: ["__init__", "execute", "default_schedule", "materialize_dependencies"]
+[`agency.orchestrator.scheduler.ExecutionScheduler`](../../agency/orchestrator/scheduler.py#L15): `__init__`, `execute`, `default_schedule`, `materialize_dependencies`.
 
 [Source: agresources.py](../../agency/orchestrator/agresources.py)
 
-::: agency.orchestrator.agresources.agResourcePool
-    options:
-      members: ["__init__", "change_config", "get_config_copy", "acquire_gpus", "release_gpus", "acquire_cpu_mem", "release_cpu_mem"]
+[`agency.orchestrator.agresources.agResourcePool`](../../agency/orchestrator/agresources.py#L48): `__init__`, `change_config`, `get_config_copy`, `acquire_gpus`, `release_gpus`, `acquire_cpu_mem`, `release_cpu_mem`.
 
 [Source: agresources.py](../../agency/orchestrator/agresources.py)
 
-::: agency.orchestrator.agresources.GpuWaitCancelled
-    options:
-      members: []
+[`agency.orchestrator.agresources.GpuWaitCancelled`](../../agency/orchestrator/agresources.py#L22)
 
 [Source: agdatalogger.py](../../agency/observability/agdatalogger.py)
 
-::: agency.observability.agdatalogger.agDataLogger
-    options:
-      members: ["__init__", "db_path", "change_config", "start", "stop", "flush", "read_profile_records", "record_event", "record_stream_delta", "record_llm_exchange", "record_span"]
+[`agency.observability.agdatalogger.agDataLogger`](../../agency/observability/agdatalogger.py#L28): `__init__`, `db_path`, `change_config`, `start`, `stop`, `flush`, `read_profile_records`, `record_event`, `record_stream_delta`, `record_llm_exchange`, `record_span`.
 
 [Source: agdatalogger.py](../../agency/observability/agdatalogger.py)
 
-::: agency.observability.agdatalogger.read_llm_exchanges
+[`agency.observability.agdatalogger.read_llm_exchanges`](../../agency/observability/agdatalogger.py#L825)
 
 [Source: agdatalogger.py](../../agency/observability/agdatalogger.py)
 
-::: agency.observability.agdatalogger.reconstruct_llm_exchanges
+[`agency.observability.agdatalogger.reconstruct_llm_exchanges`](../../agency/observability/agdatalogger.py#L715)
 
 [Source: agdatalogger.py](../../agency/observability/agdatalogger.py)
 
-::: agency.observability.agdatalogger.resolve_global_db_path
+[`agency.observability.agdatalogger.resolve_global_db_path`](../../agency/observability/agdatalogger.py#L837)
 
 [Source: agprof.py](../../agency/observability/profiler/agprof.py)
 
-::: agency.observability.profiler.agprof
-    options:
-      members: ["start", "stop", "session", "workload", "profile_scope", "enabled", "span", "annotate", "thread_name", "spawn_traced", "bind_execution", "execution_context", "current_span_context", "current_span_attributes", "next_index", "summary_metrics", "profile_records", "summary_table"]
+[`agency.observability.profiler.agprof`](../../agency/observability/profiler/agprof.py): `start`, `stop`, `session`, `workload`, `profile_scope`, `enabled`, `span`, `annotate`, `thread_name`, `spawn_traced`, `bind_execution`, `execution_context`, `current_span_context`, `current_span_attributes`, `next_index`, `summary_metrics`, `profile_records`, `summary_table`.
 
 [Source: __init__.py](../../agency/observability/agwebui/__init__.py)
 
-::: agency.observability.agwebui.agwebui
-    options:
-      members: ["run"]
+[`agency.observability.agwebui.agwebui`](../../agency/observability/agwebui/__init__.py#L215): `run`.

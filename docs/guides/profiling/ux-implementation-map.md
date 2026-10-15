@@ -210,6 +210,8 @@ These are code-resolved constraints; no product decision blocks this audit.
 
 ## Baseline verification
 
+These historical results include documentation tools that have since been removed.
+
 Before this document, with existing untracked `live_profiler_demo.py`, `runs/`,
 `swebench_live.py`, `swebench_three_agents.py` untouched and nothing staged:
 

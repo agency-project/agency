@@ -325,6 +325,9 @@ def test_index_returns_html(server):
     assert "text/html" in resp.headers["content-type"]
     assert "<title>Agency · Execution profiler</title>".encode() in resp.content
     assert b'src="/static/investigator.js"' in resp.content
+    assert b'<h1 id="view-label">Execution Trajectory</h1>' in resp.content
+    assert b'id="view-run"' not in resp.content
+    assert resp.content == client.get("/profiler").content
 
 
 def test_static_css_served(server):

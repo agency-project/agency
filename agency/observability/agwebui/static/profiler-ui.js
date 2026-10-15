@@ -89,15 +89,6 @@ function overview(run, data, options, resources) {
   html += section('Where execution time went', timeBreakdown(data), 'Each row covers the same selected wall interval. Same-category overlaps are unioned; conflicting simultaneous categories and unobserved intervals are unknown. Agent lifecycle boundaries are unavailable; this is coverage of the execution window, not agent lifetime.');
   const findings = performanceFindings(data, run, resources);
   html += section('Performance findings', findings.length ? `<div class="prof-findings">${findings.map(f => `<article><strong>${esc(f.title)}</strong><p>${esc(f.evidence)}</p><button data-prof-finding="${f.tab}" data-agent="${esc(f.agent || '')}" data-tool="${esc(f.tool || '')}" data-operation="${esc(f.action || '')}" ${f.range ? `data-from="${f.range[0]}" data-to="${f.range[1]}"` : ''}>Inspect evidence →</button></article>`).join('')}</div>` : empty('No significant findings in the available observations.'));
-  const processes = processResources(run, resources, options.range);
-  const agents = data.agents.map(a => ({...a, llmTime:a.llm.samples ? a.llm.total : null, toolTime:a.tool.samples ? a.tool.total : null,
-    peak:largestKnown(processes.filter(p => p.agent === a.id).map(p => p.peak))}));
-  html += section('Agent comparison', table('agents', agents, [
-    {key:'label', label:'Agent', render:a => `<button data-prof-agent="${esc(a.id)}">${esc(a.label || a.id)} ↗</button>`}, {key:'status', label:'Status'},
-    {key:'elapsed', label:'Observed span', render:a => sec(a.elapsed), note:'First to last reliably completed operation. Lower bound; agent lifecycle elapsed time is not projected.'},
-    {key:'llmTime', label:'LLM sum', render:a => sec(a.llmTime)}, {key:'toolTime', label:'Tool sum', render:a => sec(a.toolTime)},
-    {key:'peak', label:'Peak process RSS', render:a => byte(a.peak)}, {key:'errors', label:'Errors'}
-  ], {defaultSort:'elapsed'}), 'LLM and tool times sum completed operations and can overlap. Observed span is a lower bound from completed operations. Peak RSS is the largest explicitly attributed process sample, not combined memory.');
   const health = [];
   if (options.transport && options.transport !== 'connected') health.push(`Live updates ${options.transport}; last received evidence cannot establish current call liveness.`);
   if (run.coverage?.gaps?.length) health.push(...run.coverage.gaps.map(String));

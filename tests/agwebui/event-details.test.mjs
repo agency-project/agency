@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source=await readFile(new URL('../../agency/observability/agwebui/static/event-details.js',import.meta.url),'utf8');
-const {eventCard,actionState,eventRelationships,eventMeasurements,payloadValue,payloadWindow,renderPayloadWindow,renderEventCard}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {eventCard,activitySummary,activityClock,actionState,eventRelationships,eventMeasurements,payloadValue,payloadWindow,renderPayloadWindow,renderEventCard}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
 test('system telemetry inspection never labels syscalls as model tool calls',()=>{
   const card=eventCard({kind:'syscall',name:'execve',outcome:'success',duration:.01});
@@ -197,4 +197,32 @@ test('cards expose the call type and format a JSON command while leaving text co
   const text=eventCard({kind:'tool',name:'bash',arguments:'{"command":"pytest -q"}',outcome:'success'});
   assert.equal(text.json,false);assert.equal(text.primary,'pytest -q');
   assert.match(renderEventCard({kind:'tool',name:'search',arguments:'{"pattern":"<b>"}',outcome:'success'}),/call-meaning json-label">\{\n  <span class="json-key">&quot;pattern&quot;:<\/span> <span class="json-string">&quot;&lt;b&gt;&quot;<\/span>/);
+});
+
+
+test('activity summaries use declared intent or reliable commands with safe fallbacks',()=>{
+ for(const command of ['pytest tests/auth.py -q','python -m pytest tests/auth.py'])assert.equal(activitySummary({name:'Bash',arguments:{command}}).text,'Run tests');
+ assert.equal(activitySummary({name:'Bash',arguments:{command:'git diff -- src'}}).text,'Inspect changes');
+ assert.equal(activitySummary({name:'Bash',intent:'Inspect proxy headers',arguments:{command:'curl -I localhost'}}).text,'Inspect proxy headers');
+ const compound='git diff && rm cache';assert.equal(activitySummary({name:'Bash',arguments:{command:compound}}).text,compound);
+ const multiline='python -c "print(1)"\nprintf done';assert.equal(activitySummary({name:'Bash',arguments:{command:multiline}}).text,'python -c "print(1)" printf done');
+ assert.equal(activitySummary({kind:'model',model:'gpt-6-luna'}).text,'gpt-6-luna');
+ assert.equal(activitySummary({name:'Bash',arguments:{unusual:'raw object'}}).text,'Arguments available in details');
+ assert.equal(activitySummary({name:'Bash',arguments:{command:'x'.repeat(500)}}).text.length,120);
+});
+
+test('activity timing explains trace and execution references without changing intervals',()=>{
+ const action={start:7,duration:4,execution_duration:2};
+ assert.deepEqual(activityClock(action,{time_origin:100,execution_started_at:105}),{trace:7,execution:2});
+ assert.deepEqual(activityClock({start:2},{time_origin:100,execution_started_at:105}),{trace:2,execution:-3});
+ assert.deepEqual(activityClock(action,{}),{trace:7,execution:null});
+ assert.equal(activityClock({...action,missing_start:true},{}),null);
+ assert.equal(eventCard(action).elapsed,4);
+});
+
+
+test('explicit pending and waiting records have a clear waiting presentation',()=>{
+ for(const outcome of ['pending','waiting']){
+  const state=actionState({kind:'tool',outcome});assert.equal(state.semantic,'queue');assert.equal(state.label,`Tool ${outcome}`);
+ }
 });

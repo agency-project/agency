@@ -138,6 +138,14 @@ class HostMcpServer:
     def collected_output(self) -> dict:
         return dict(self._persistent_vars.get("submitted_output_store", {}))
 
+    def has_complete_output(self) -> bool:
+        """Only validated structured submissions can justify an empty final turn."""
+        schema = self._skill.output_schema
+        if schema is None or schema.raw_key() is not None:
+            return False
+        required = set(schema._data)
+        return bool(required) and required.issubset(self.collected_output())
+
     def build_app(self) -> "Starlette":
         server = MCPServer(name="agency-host-mcp-server")
 

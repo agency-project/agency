@@ -5,10 +5,21 @@
 <title>Agency · Critical Path Profiler</title>
 <link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/critical-path.css">
+<link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/investigator.css"><link rel="stylesheet" href="/static/critical-path.css">
 </head>
-<body>
-<header class="cp-header"><a class="cp-brand" href="/profiler">a<span>agency</span></a><nav aria-label="Execution views"><a id="trajectory-link" href="/profiler">Execution trajectory</a><a id="profiler-link" href="/profiler?view=profiler">Detailed profiler</a><a href="/critical-path" aria-current="page">Critical path</a><a href="/compare">Compare runs</a></nav></header>
+<body class="profiler-workspace">
+<div id="workspace">
+<aside class="sidebar">
+<a class="brand" href="/profiler"><span class="brand-mark">a</span><span>agency<span class="brand-caption">Execution profiler</span></span></a>
+<div class="side-caption">Views</div>
+<nav id="views" aria-label="Execution views">
+<a id="trajectory-link" class="compare-nav-link" href="/profiler"><span class="view-number">1</span>Execution Trajectory</a>
+<a id="profiler-link" class="compare-nav-link" href="/profiler?view=profiler"><span class="view-number">2</span>Profiler</a>
+<a class="compare-nav-link" href="/critical-path" aria-current="page"><span class="view-number">3</span>Critical Path Profiler</a>
+<a class="compare-nav-link" href="/compare"><span class="view-number">4</span>Compare Runs</a>
+</nav>
+</aside>
+<div class="workspace-main">
 <main class="cp-page">
 <div class="cp-title"><div><h1>Critical Path Profiler</h1><p>Follow the recorded dependencies that constrained execution time.</p></div><div class="cp-recording-controls"><label>Historical execution<select id="cp-run" aria-label="Historical execution"><option>Reading recordings…</option></select></label><button id="cp-refresh" title="Refresh historical catalog">Refresh</button></div></div>
 <p id="cp-status" class="cp-status" role="status" aria-live="polite">Reading historical execution catalog…</p>
@@ -28,6 +39,7 @@
 </section>
 </main>
 <footer class="cp-footer">Agency · historical dependency analysis · no raw syscall stream is loaded by this view</footer>
+</div></div>
 <script type="module" src="/static/critical-path.js"></script>
 </body>
 </html>

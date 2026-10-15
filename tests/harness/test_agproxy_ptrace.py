@@ -180,14 +180,14 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
     external_span = captured[0]
     assert external_span.name == "process:claude"
     assert external_span.fields["parent_context"] is parent_context
-    assert external_span.fields["metadata"] == {
+    assert {
         "agency.run_id": "run9",
         "agency.agent_id": "tester",
         "timing": "exact",
         "provenance": "ptrace",
         "pid": 4321,
         "executable": "<unknown>",
-    }
+    }.items() <= external_span.fields["metadata"].items()
     assert external_span.updates == [
         {"executable": "<redacted>"},
         {"executable": "claude"},

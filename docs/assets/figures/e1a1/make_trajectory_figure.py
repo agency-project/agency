@@ -214,7 +214,6 @@ def make_figure(pairs: list[dict], output_dir: Path) -> None:
         {
             "font.family": "DejaVu Sans",
             "font.size": 11,
-            "svg.fonttype": "none",
             "axes.edgecolor": "#B9C4CC",
             "axes.labelcolor": dark,
             "xtick.color": muted,
@@ -432,14 +431,13 @@ def make_figure(pairs: list[dict], output_dir: Path) -> None:
         fontsize=10.2,
     )
 
-    for ext in ("png", "svg"):
-        fig.savefig(
-            output_dir / f"trajectory_invariance.{ext}",
-            dpi=240,
-            facecolor="white",
-            bbox_inches="tight",
-            pad_inches=0.20,
-        )
+    fig.savefig(
+        output_dir / "trajectory_invariance.png",
+        dpi=240,
+        facecolor="white",
+        bbox_inches="tight",
+        pad_inches=0.20,
+    )
     plt.close(fig)
 
 
@@ -451,7 +449,7 @@ def main() -> None:
     pairs, _report = load_pairs(args.root.resolve())
     write_metrics(pairs, output_dir / "pair_metrics.csv")
     make_figure(pairs, output_dir)
-    print(f"Wrote {output_dir / 'trajectory_invariance.png'} and .svg")
+    print(f"Wrote {output_dir / 'trajectory_invariance.png'}")
     print(
         f"Median similarity difference: {statistics.median(p['similarity_delta'] for p in pairs):+.6f}"
     )

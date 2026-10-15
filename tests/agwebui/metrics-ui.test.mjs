@@ -7,14 +7,16 @@ const model=asURL(await readFile(new URL('metrics-model.js',root),'utf8'));
 const existing=asURL(await readFile(new URL('investigator-model.js',root),'utf8'));
 let stored=null;
 globalThis.localStorage={getItem:()=>stored,setItem:(k,v)=>{stored=v;}};
-const source=(await readFile(new URL('metrics-ui.js',root),'utf8')).replace('./metrics-model.js',model).replace('./investigator-model.js',existing);
+const {moduleURL}=await import('./module-loader.mjs');
+const profiler=await moduleURL('profiler-ui.js');
+const source=(await readFile(new URL('metrics-ui.js',root),'utf8')).replace('./metrics-model.js',model).replace('./investigator-model.js',existing).replace('./profiler-ui.js',profiler);
 const {metricsSummary,renderMetricsSummary,profilerView,handleMetricEvent}=await import(asURL(source));
 const {measurementView}=await import(model);
 const run={id:'test',title:'Fixture',duration:5,status:'running',actions:[{id:'a',agent:'worker',name:'bash',kind:'tool',start:0,duration:5,outcome:'running'}],agents:[{id:'worker',label:'Worker',status:'running'}],counters:{},coverage:{}};
 function click(dataset){let target;const el={dataset,hasAttribute:key=>key==='data-metric-toggle'&&dataset.toggle};handleMetricEvent({target:{closest:()=>el}},{render:()=>{},navigate:id=>{target=id;},reveal:id=>{target=id;}});return target;}
-test('six defaults, expansion, category selection and persistence',()=>{assert.match(metricsSummary(run),/Metrics \+/);click({toggle:true});assert.match(metricsSummary(run),/View detailed Activity profiler/);click({metricCategory:'LLM'});assert.match(metricsSummary(run),/View detailed LLM profiler/);assert.equal(JSON.parse(stored).category,'LLM');click({metricPin:'tools'});assert.equal(JSON.parse(stored).pins.length,5);click({metricPin:'oldest'});assert.equal(JSON.parse(stored).pins.length,6);});
+test('six defaults, expansion, category selection and persistence',()=>{assert.match(metricsSummary(run),/Additional Metrics/);click({toggle:true});assert.match(metricsSummary(run),/View detailed Activity profiler/);click({metricCategory:'LLM'});assert.match(metricsSummary(run),/View detailed LLM profiler/);assert.equal(JSON.parse(stored).category,'LLM');click({metricPin:'tools'});assert.equal(JSON.parse(stored).pins.length,5);click({metricPin:'oldest'});assert.equal(JSON.parse(stored).pins.length,6);});
 test('category and event navigation use exact existing identifiers',()=>{assert.equal(click({metricView:'tools',metricKey:'errors'}),'tools');assert.equal(click({metricEvent:'a'}),'a');});
-test('all dedicated views render with missing telemetry and no invented charts',()=>{for(const category of ['Activity','LLM','Tools','Systems'])assert.match(profilerView(run,category),new RegExp(category+' profiler'));assert.doesNotMatch(profilerView(run,'Systems'),/<svg/);assert.match(profilerView(run,'LLM'),/First-token boundary is not projected/);});
+test('all dedicated views render with missing telemetry and no invented charts',()=>{for(const category of ['Overview','LLM','Tools','Systems'])assert.match(profilerView(run,category),new RegExp(category+' profiler'));assert.doesNotMatch(profilerView(run,'Systems'),/<svg/);assert.match(profilerView(run,'LLM'),/First-token boundary is not projected/);});
 test('agent elapsed clock takes precedence over program duration',()=>{
   const html=metricsSummary({...run,duration:120,execution_started_at:100,execution_wall_time:20});
   assert.match(html,/20s · running/);assert.doesNotMatch(html,/120s · running/);
@@ -25,13 +27,13 @@ test('latency has both units, charts expose axes and a useful explanation',()=>{
   const html=profilerView(observed,'LLM');
   assert.match(html,/1,250 ms \/ 1.25 s/);
   assert.match(html,/Time since recording start \(s\)/);
-  assert.match(html,/Latency \(ms \/ s\)/);
+  assert.match(html,/Latency \(s\)/);
   assert.match(html,/Sorted observation index/);
   assert.match(html,/Spikes show when request latency increased/);
 });
-test('systems memory cards identify each process and distinguish RAM',()=>{
+test('systems process explorer identifies independent RSS observations and workload RAM',()=>{
   const html=profilerView({...run,counters:{'workload:memory_mb':[[1,100]],'proc:12:rss_mb':[[1,20]],'proc:34:rss_mb':[[1,30]]}},'Systems');
-  assert.match(html,/RAM · Workload/);assert.match(html,/RSS · Process 12/);assert.match(html,/RSS · Process 34/);
+  assert.match(html,/Workload memory/);assert.match(html,/data-prof-process="12"/);assert.match(html,/data-prof-process="34"/);assert.match(html,/20 MiB/);assert.match(html,/30 MiB/);
 });
 test('compact Systems selects curated measurements and only one process RSS',()=>{
   click({metricCategory:'Systems'});
@@ -48,7 +50,7 @@ test('live metric updates preserve pressed toggle and category controls',()=>{
     querySelectorAll(){return this.cards;},querySelector(key){if(!this.parts.has(key))this.parts.set(key,makeNode());return this.parts.get(key);},
     setAttribute(name,value){this[name]=value;},removeAttribute(name){delete this.dataset[name.replace('data-','').replace(/-([a-z])/g,(_,letter)=>letter.toUpperCase())];}});
   let mounts=0,nodes,tabs;
-  const root={set innerHTML(value){mounts++;nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-detail-link','.prof-summary-note'].map(k=>[k,makeNode()]));tabs=['Activity','LLM','Tools','Systems'].map(metricCategory=>({...makeNode(),dataset:{metricCategory}}));nodes.get('.prof-expanded').querySelector=k=>nodes.get(k);},querySelector:k=>nodes?.get(k),querySelectorAll:()=>tabs};
+  const root={set innerHTML(value){mounts++;nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-pinned','.prof-detail-link','.prof-summary-note'].map(k=>[k,makeNode()]));tabs=['Activity','LLM','Tools','Systems'].map(metricCategory=>({...makeNode(),dataset:{metricCategory}}));nodes.get('.prof-expanded').querySelector=k=>nodes.get(k);},querySelector:k=>nodes?.get(k),querySelectorAll:()=>tabs};
   click({metricCategory:'Activity'});
   renderMetricsSummary(root,run);
   const pressed=root.querySelector('[data-metric-toggle]'),pressedTab=tabs[0],metric=root.querySelector('.prof-cards').cards[0],pressedPin=metric.querySelector('.prof-pin');
@@ -128,7 +130,7 @@ test('the measurement menu is live-only, stays mounted and reflects the current 
     querySelectorAll(){return this.cards;},querySelector(key){if(!this.parts.has(key))this.parts.set(key,makeNode());return this.parts.get(key);},
     setAttribute(name,value){this[name]=value;},removeAttribute(){}});
   let nodes;
-  const root={set innerHTML(value){nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-detail-link','.prof-summary-note'].map(k=>[k,makeNode()]));nodes.get('.prof-expanded').querySelector=k=>nodes.get(k);},querySelector:k=>nodes?.get(k),querySelectorAll:()=>[]};
+  const root={set innerHTML(value){nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-pinned','.prof-detail-link','.prof-summary-note'].map(k=>[k,makeNode()]));nodes.get('.prof-expanded').querySelector=k=>nodes.get(k);},querySelector:k=>nodes?.get(k),querySelectorAll:()=>[]};
   const reset={dataset:{},hasAttribute:key=>key==='data-metric-reset'};handleMetricEvent({target:{closest:()=>reset}},{render:()=>{},navigate:()=>{},reveal:()=>{}});
   renderMetricsSummary(root,measured({}));
   const wall=root.querySelector('.prof-summary-slots').cards.find(card=>card.dataset.metricCard==='wall'),menu=wall.querySelector('.measure-menu');
@@ -175,14 +177,14 @@ function scopeFixture(){
     querySelectorAll(selector){return selector==='[data-scope-agent]'?this.boxes:this.cards;},querySelector(key){if(!this.parts.has(key))this.parts.set(key,makeNode());return this.parts.get(key);},
     setAttribute(name,value){this[name]=value;},removeAttribute(){}});
   let nodes,mounts=0;
-  const root={set innerHTML(value){mounts++;nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-detail-link','.prof-summary-note','.metric-scope'].map(key=>[key,makeNode()]));nodes.get('.prof-expanded').querySelector=key=>nodes.get(key);},querySelector:key=>nodes?.get(key),querySelectorAll:()=>[]};
+  const root={set innerHTML(value){mounts++;nodes=new Map(['[data-metric-toggle]','.prof-summary-slots','.prof-expanded','.prof-cards','.prof-pinned','.prof-detail-link','.prof-summary-note','.metric-scope'].map(key=>[key,makeNode()]));nodes.get('.prof-expanded').querySelector=key=>nodes.get(key);},querySelector:key=>nodes?.get(key),querySelectorAll:()=>[]};
   const draw=run=>{renderMetricsSummary(root,run);renderMetricsSummary(root,run);};
   const menu=()=>nodes.get('.metric-scope'),list=()=>menu().querySelector('.metric-scope-agents');
   return {draw,list,mounts:()=>mounts,label:()=>menu().querySelector('.metric-scope-label').textContent,all:()=>menu().querySelector('[data-scope-all]').checked,
     checked:()=>list().boxes.filter(box=>box.checked).map(box=>box.dataset.scopeAgent),
     status:id=>list().boxes.find(box=>box.dataset.scopeAgent===id).parentElement.querySelector('small').textContent,
-    value:key=>nodes.get('.prof-summary-slots').cards.find(card=>card.dataset.metricCard===key).querySelector('.prof-value').querySelector('strong').textContent,
-    card:key=>nodes.get('.prof-summary-slots').cards.find(card=>card.dataset.metricCard===key),
+    value:key=>[...nodes.get('.prof-summary-slots').cards,...nodes.get('.prof-pinned').cards].find(card=>card.dataset.metricCard===key).querySelector('.prof-value').querySelector('strong').textContent,
+    card:key=>[...nodes.get('.prof-summary-slots').cards,...nodes.get('.prof-pinned').cards].find(card=>card.dataset.metricCard===key),
     slotsHtml:()=>nodes.get('.prof-summary-slots').html,slotsBuilt:()=>nodes.get('.prof-summary-slots').rebuilt,note:()=>nodes.get('.prof-summary-note').textContent};
 }
 test('scope defaults to all agents and the same cards filter to one agent or any subset',()=>{
@@ -293,5 +295,16 @@ test('system cards keep entire-system meaning while agent sandbox cards follow t
 test('Systems profiler aggregates syscall instrumentation without turning it into tool calls',()=>{
   const html=profilerView({...run,actions:[...(run.actions||[]),{id:'syscall',agent:'a',kind:'syscall',name:'futex',start:1,duration:2,outcome:'success',metadata:{}}]},'Systems');
   assert.match(html,/Syscall instrumentation · aggregated/);assert.match(html,/futex/);
-  assert.match(html,/1 events · 1 without recorded ownership/);assert.match(html,/may overlap/);
+  assert.match(html,/1 events/);assert.match(html,/1 without recorded ownership/);assert.match(html,/may overlap/);
+});
+
+test('custom pins never displace the six essential status counters',()=>{
+ setMetricScope(null);press([],{metricCategory:'Activity'});press(['data-metric-reset']);
+ press([],{metricPin:'tools'});press([],{metricPin:'oldest'});
+ const html=metricsSummary(run),strip=html.split('<section class="prof-expanded"')[0];
+ for(const key of ['wall','agents','tools','models','tokens','errors'])assert.match(strip,new RegExp(`data-metric-card="${key}"`));
+ assert.doesNotMatch(strip,/data-metric-card="oldest"/);
+ if(!html.includes('View detailed Activity'))press(['data-metric-toggle']);
+ assert.match(metricsSummary(run),/class="prof-pinned"[\s\S]*data-metric-card="oldest"/);
+ press(['data-metric-reset']);
 });

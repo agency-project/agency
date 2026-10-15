@@ -69,7 +69,8 @@ test('legacy GPU counters remain readable without fabricating process identities
 test('summary renders unsupported GPU gauges as unavailable with a reason',async()=>{
   globalThis.localStorage={getItem:()=>null,setItem:()=>{}};
   const metricsURL=asURL(await readFile(new URL('metrics-model.js',root),'utf8'));
-  const source=(await readFile(new URL('metrics-ui.js',root),'utf8')).replace('./metrics-model.js',metricsURL).replace('./investigator-model.js',modelURL);
+  const {moduleURL}=await import('./module-loader.mjs');
+  const source=(await readFile(new URL('metrics-ui.js',root),'utf8')).replace('./metrics-model.js',metricsURL).replace('./investigator-model.js',modelURL).replace('./profiler-ui.js',await moduleURL('profiler-ui.js'));
   const {metricsSummary,handleMetricEvent}=await import(asURL(source));
   const target={dataset:{toggle:true},hasAttribute:key=>key==='data-metric-toggle'&&target.dataset.toggle};
   handleMetricEvent({target:{closest:()=>target}},{render:()=>{}});
