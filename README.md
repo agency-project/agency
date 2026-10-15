@@ -1,7 +1,7 @@
 <div align="center">
 
 <!-- TODO(release): Replace with the final Agency logo. -->
-<img src="docs/assets/agency-logo-placeholder.png" alt="Agency logo" width="120" />
+<img src="docs/assets/agency.png" alt="Agency logo" width="120" />
 
 # Agency
 
