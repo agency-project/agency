@@ -3,7 +3,7 @@
 <!-- TODO(release): Replace with the final Agency logo. -->
 <img src="docs/assets/agency_light.png" alt="Agency logo" width="500" />
 
-**Live debugging and systems profiling for AI agents.**
+**Live debugging and systems profiling for AI agents**
 
 [Getting started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
 
