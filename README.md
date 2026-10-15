@@ -19,7 +19,7 @@ As agents tackle longer tasks, invoke tools, and work in parallel, understanding
 Agency connects **LLM requests, tool calls, and system activity** in one place, giving you the visibility to investigate execution, find bottlenecks, and understand what changed.
 
 <!-- TODO(release): Record multi-agent live execution, invocation inspection, and runtime control. -->
-![Agency Live Execution](docs/assets/agency-demo.gif)
+![Agency Live Execution](docs/assets/agency-demo.webp)
 
 ## What you can do with Agency
 
