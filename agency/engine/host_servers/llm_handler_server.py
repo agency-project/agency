@@ -393,10 +393,18 @@ class LlmHandlerServer:
         self._message_store = context.message_store if context is not None else MessageStore()
         # Per call_label, from the request's arrival until the reply: the hashes of
         # the messages the harness sent and of the patched messages sent to the LLM
-        # backend, and the harness's own message dicts (for the usage tracker).
+        # backend, the harness's own message dicts (for the usage tracker), and the
+        # keys of the patches that replaced a block.
         self._call_messages: "dict[str, dict]" = {}
         self._call_messages_lock = threading.Lock()
         self._outputs_complete = outputs_complete
+        # The call_label of the latest request the harness itself made. Requests
+        # Agency makes on its own behalf carry an ``agency_internal_kind`` (a
+        # tool-policy check, the native harness's compaction summary) and are
+        # skipped, so latest_request() -- what the context tools list and edit --
+        # is always the harness's conversation.
+        self._latest_call_label: "str | None" = None
+        self._request_seq = itertools.count(1)
 
         self.change_config(agconfig)
 
@@ -543,6 +551,7 @@ class LlmHandlerServer:
             request,
             abort_event=abort_event,
             call_label=call_label,
+            internal_kind=internal_kind,
         )
         self._data_logger.record_event(
             type="agent_state",
@@ -762,6 +771,7 @@ class LlmHandlerServer:
             request,
             abort_event=handle._cancel_event,
             call_label=call_label,
+            internal_kind=internal_kind,
         )
         self._data_logger.record_event(
             type="agent_state",
@@ -1017,6 +1027,7 @@ class LlmHandlerServer:
         *,
         abort_event: "threading.Event | None" = None,
         call_label: "str | None" = None,
+        internal_kind: "str | None" = None,
     ) -> dict:
         prepared = copy.deepcopy(request)
         if abort_event is not None and abort_event.is_set():
@@ -1024,22 +1035,27 @@ class LlmHandlerServer:
         if call_label is not None:
             # Hash once, right after translation; everything below (the patches,
             # the record, the committed history) reuses these hashes.
-            self._stage_request(prepared, call_label)
+            self._stage_request(prepared, call_label, internal_kind=internal_kind)
         return prepared
 
     # ------------------------------------------------------------------
     # Message hashing and the persistent message_patch_lookup (llm/message_store.py)
     # ------------------------------------------------------------------
 
-    def _stage_request(self, prepared: dict, call_label: str) -> None:
+    def _stage_request(
+        self, prepared: dict, call_label: str, *, internal_kind: "str | None" = None
+    ) -> None:
         """Hash the harness's (translated) messages, then replace the request's
         messages with the same messages rebuilt through ``message_patch_lookup``."""
         harness_messages = prepared.get("messages")
         if not isinstance(harness_messages, list):
             return
+        applied_patch_keys: "set[str]" = set()
         with self._message_store:
             harness_message_hashes = self._message_store.add_messages(harness_messages)
-            patched_messages = self._message_store.materialize(harness_message_hashes)
+            patched_messages = self._message_store.materialize(
+                harness_message_hashes, applied_patch_keys
+            )
             patched_message_hashes = self._message_store.add_messages(patched_messages)
         prepared["messages"] = patched_messages
         with self._call_messages_lock:
@@ -1047,7 +1063,31 @@ class LlmHandlerServer:
                 "harness_message_hashes": harness_message_hashes,
                 "patched_message_hashes": patched_message_hashes,
                 "harness_messages": harness_messages,
+                "applied_patch_keys": frozenset(applied_patch_keys),
+                "seq": next(self._request_seq),
             }
+            if internal_kind is None:  # not one of Agency's own calls
+                self._latest_call_label = call_label
+
+    def latest_request(self) -> "dict | None":
+        """The latest request a harness itself made, as staged:
+        ``harness_message_hashes`` (resolving against ``message_store``),
+        ``applied_patch_keys`` (the patches that replaced a block of it) and ``seq``
+        (requests are numbered from 1 in arrival order). ``None`` before the first."""
+        with self._call_messages_lock:
+            call = self._call_messages.get(self._latest_call_label)
+            if call is None:
+                return None
+            return {
+                "harness_message_hashes": list(call["harness_message_hashes"]),
+                "applied_patch_keys": call["applied_patch_keys"],
+                "seq": call["seq"],
+            }
+
+    @property
+    def message_store(self) -> MessageStore:
+        """The skill run's ``MessageStore``, whose patches every request goes through."""
+        return self._message_store
 
     def _call_messages_of(self, call_label: "str | None") -> "dict | None":
         with self._call_messages_lock:

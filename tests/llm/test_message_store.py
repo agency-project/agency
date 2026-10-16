@@ -414,3 +414,113 @@ def test_the_lock_is_reentrant_and_with_store_holds_it():
         digest = store.add_message({"role": "user", "blocks": [block("x")]})
         assert store._message(digest)["blocks"][0]["text"] == "x"
         assert len(store) == 1
+
+
+# -- matching a block at another index, and who made a patch ------------------------
+
+
+def _add_patch(store, role, old_fields, new_fields_list, **kwargs):
+    old = MessageBlock(role, old_fields)
+    with store:
+        store.add_block(old)
+        return store.add_patch(
+            old.hash, [store.add_block(MessageBlock(role, f)) for f in new_fields_list], **kwargs
+        )
+
+
+def _two_blocks(first, second):
+    return {
+        "role": "user",
+        "blocks": [
+            {"type": "text", "index": 0, "text": first},
+            {"type": "text", "index": 1, "text": second},
+        ],
+    }
+
+
+def test_a_patch_still_matches_when_a_block_in_front_shifts_its_index():
+    store = MessageStore()
+    _add_patch(
+        store,
+        "user",
+        {"type": "text", "index": 0, "text": "Alice has a blue car."},
+        [{"type": "text", "index": 0, "text": "Alice has a red car."}],
+    )
+    # The harness put a reminder in front, so the fact is now at index 1.
+    digest = store.add_message(
+        _two_blocks("<system-reminder>x</system-reminder>", "Alice has a blue car.")
+    )
+
+    (message,) = store.materialize([digest])
+    assert [b["text"] for b in message["blocks"]] == [
+        "<system-reminder>x</system-reminder>",
+        "Alice has a red car.",
+    ]
+    assert [b["index"] for b in message["blocks"]] == [0, 1]
+
+
+def test_an_exact_match_wins_over_a_position_free_one():
+    store = MessageStore()
+    _add_patch(
+        store,
+        "user",
+        {"type": "text", "index": 1, "text": "x"},
+        [{"type": "text", "text": "exact"}],
+    )
+    _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "x"}, [{"type": "text", "text": "free"}]
+    )
+    digest = store.add_message(_two_blocks("y", "x"))
+    (message,) = store.materialize([digest])
+    assert message["blocks"][1]["text"] == "exact"
+
+
+def test_a_patch_whose_original_is_not_stored_only_matches_exactly():
+    store = MessageStore()
+    old = MessageBlock("user", {"type": "text", "index": 0, "text": "x"})
+    with store:
+        store.add_patch(
+            old.hash, [store.add_block(MessageBlock("user", {"type": "text", "text": "y"}))]
+        )
+    shifted = store.add_message(_two_blocks("z", "x"))
+    assert [b["text"] for b in store.materialize([shifted])[0]["blocks"]] == ["z", "x"]
+    exact = store.add_message(text("user", "x"))
+    assert store.materialize([exact])[0]["blocks"][0]["text"] == "y"
+
+
+def test_materialize_reports_the_patches_it_applied_and_patch_keys_for_finds_them():
+    store = MessageStore()
+    used = _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "a"}, [{"type": "text", "text": "A"}]
+    )
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "never sent"}, [])
+    digest = store.add_message(_two_blocks("q", "a"))
+    applied: set = set()
+    store.materialize([digest], applied)
+    assert applied == {used}
+    block_hashes = store.message_structure_lookup[digest]["blocks"]
+    assert store.patch_keys_for(block_hashes) == {block_hashes[1]: used}
+
+
+def test_a_patch_records_its_origin_and_removing_or_clearing_forgets_it():
+    store = MessageStore()
+    by_model = _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "m"}, [], origin="model"
+    )
+    by_operator = _add_patch(store, "user", {"type": "text", "index": 0, "text": "o"}, [])
+    assert store.patch_origin(by_model) == "model"
+    assert store.patch_origin(by_operator) == "operator"
+    assert store.message_patch_origin == {by_model: "model"}
+
+    copied = store.copy()
+    assert copied.patch_origin(by_model) == "model"
+    copied.remove_patch(by_model)
+    assert copied.message_patch_origin == {}
+    assert store.message_patch_origin == {by_model: "model"}  # the copy is independent
+
+    # The operator re-patching the same block takes it over.
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "m"}, [])
+    assert store.patch_origin(by_model) == "operator"
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "m"}, [], origin="model")
+    store.clear_patches()
+    assert store.message_patch_origin == {}
