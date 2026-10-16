@@ -79,5 +79,5 @@ Claude Code, Codex and Grok against a local mock API and reads where they
 compact; CI installs the latest Claude Code and Grok and the pinned Codex, so
 a release that changes the rule fails it.
 After moving a harness pin, re-check its `_threshold` function in the first
-file against the new release, and rerun `benchmarks/context_window/run.py`
-(real models, a Linux host) for each harness.
+file against the new release, and check where the harness compacts against a
+real model on a Linux host (PR #69 describes the run).
