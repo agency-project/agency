@@ -25,6 +25,7 @@ from agency.llm.message_store import (
     split_tool_schema,
     with_tool_schema,
 )
+from agency.llm.context_fit import CLEARED
 from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
@@ -2097,3 +2098,183 @@ def test_cached_routes_do_not_retain_server_after_app_is_released():
     gc.collect()
     assert reference() is None, "cached endpoints must not retain completed requests"
     assert cached_endpoints
+
+
+def test_a_request_over_the_context_limit_reaches_the_backend_fitted():
+    """agency/llm/context_fit.py: the backend would reject it; the oldest tool
+    output is cleared instead, and the event is recorded."""
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs["messages"])
+        return _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")],
+            usage=_FakeUsage(5, 1),
+        )
+
+    server, _client = _make_server(create_fn=create, context_limit=2_000)
+    messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+    for i in range(4):
+        messages.append(
+            {
+                "role": "assistant",
+                "blocks": [
+                    {
+                        "type": "tool_use",
+                        "index": 0,
+                        "id": f"c{i}",
+                        "name": "bash",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "blocks": [
+                    {
+                        "type": "tool_result",
+                        "index": 0,
+                        "tool_call_id": f"c{i}",
+                        "text": "x" * 2_000,
+                    }
+                ],
+            }
+        )
+    server.dispatch({"messages": messages})
+    tool_texts = [m["content"] for m in sent[0] if m["role"] == "tool"]
+    assert tool_texts[0] == CLEARED and tool_texts[-1] == "x" * 2_000
+    assert any(event[0] == "context_fit" for event in server._data_logger.events)
+
+    server2, _ = _make_server(create_fn=create, context_limit=2_000, fit_to_context_limit=False)
+    sent.clear()
+    server2.dispatch({"messages": messages})
+    assert all(m["content"] == "x" * 2_000 for m in sent[0] if m["role"] == "tool")
+
+
+def test_the_next_request_after_a_fitted_one_is_fitted_too():
+    """The harness never learns what was cleared: its next request carries the
+    full history again plus a little more. The estimate must be calibrated on
+    what was sent, not on what the harness sent."""
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs["messages"])
+        size = sum(len(m.get("content") or "") for m in kwargs["messages"])
+        return _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")],
+            usage=_FakeUsage(size, 1),  # one token per character
+        )
+
+    server, _client = _make_server(create_fn=create, context_limit=5_000)
+
+    def history(rounds):
+        messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+        for i in range(rounds):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "tool_use",
+                            "index": 0,
+                            "id": f"c{i}",
+                            "name": "b",
+                            "arguments": "{}",
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": f"c{i}",
+                            "text": "x" * 1_800,
+                        }
+                    ],
+                }
+            )
+        return messages
+
+    for rounds in (2, 3, 4, 5):
+        server.dispatch({"messages": history(rounds)})
+    for request in sent:
+        assert sum(len(m.get("content") or "") for m in request) <= 5_000
+
+
+class _WindowBackend(_RecordingBackend):
+    """Rejects any request whose tool output exceeds `window` characters, the
+    way a provider rejects a prompt over its context window."""
+
+    def __init__(self, window: int) -> None:
+        super().__init__(final=True)
+        self.window = window
+
+    def _check(self, request: dict) -> None:
+        size = sum(
+            len(b.get("text") or "")
+            for m in request.get("messages", [])
+            for b in m.get("blocks") or []
+            if b.get("type") == "tool_result"
+        )
+        if size > self.window:
+            raise RuntimeError(
+                f"Error code: 400 - This model's maximum context length is {self.window} "
+                f"tokens. However, your messages resulted in {size} tokens."
+            )
+
+    def dispatch(self, request: dict) -> dict:
+        self._check(request)
+        return super().dispatch(request)
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        self._check(request)
+        yield from super().dispatch_stream(request, on_client=on_client)
+
+
+def _history_of(results: int, size: int) -> "list[dict]":
+    messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+    for i in range(results):
+        messages.append(
+            {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "tool_use", "index": 0, "id": f"c{i}", "name": "b", "arguments": "{}"}
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "blocks": [
+                    {"type": "tool_result", "index": 0, "tool_call_id": f"c{i}", "text": "x" * size}
+                ],
+            }
+        )
+    return messages
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_a_request_the_backend_rejects_for_size_is_cut_and_sent_again(streaming):
+    """The estimate let it through (here: no limit known at all), the backend
+    said it is too long: the harness gets an answer, not that error."""
+    backend = _WindowBackend(window=3_000)
+    server = _controlled_server(backend)
+    request = {"messages": _history_of(5, 1_000)}
+    if streaming:
+        items = _drain(server.start_stream(request))
+        assert items[-1]["type"] == "done"
+    else:
+        result = server.dispatch(request)
+        assert result["stop_reason"] == "stop"
+    sizes = [
+        sum(len(b.get("text") or "") for m in r["messages"] for b in m.get("blocks") or [])
+        for _kind, r in backend.requests
+    ]
+    assert len(sizes) >= 1 and sizes[-1] <= 3_000 + 100
+    assert any(event[0] == "context_fit" for event in server._data_logger.events)

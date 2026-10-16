@@ -8,11 +8,13 @@ import os
 import shutil
 import uuid
 from functools import partial
+from pathlib import Path
 
 from fastapi import Request
 
 from ...llm.response_check import tool_arguments_complete
 from ...llm.message_store import with_tool_schema
+from ...native_harness.usage import prompt_tokens
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
@@ -248,17 +250,70 @@ def _output_items(message: dict, tool_routes) -> "list[dict]":
     return output
 
 
+# models-manager/src/model_info.rs: model_info_from_slug's max_context_window.
+CODEX_UNKNOWN_MODEL_MAX_WINDOW = 272_000
+# The instructions Codex 0.147.0 gives a model it does not know
+# (codex-rs/models-manager/prompt.md at rust-v0.147.0; Codex is Apache-2.0).
+_CODEX_PROMPT = Path(__file__).with_name("codex_prompt.md")
+
+
+def codex_model_catalog(model: str, context_window: int) -> dict:
+    """A one-model `model_catalog_json`: what Codex 0.147.0 builds for a model
+    it does not know (model_info_from_slug), with the real context window.
+    tests/harness/test_context_window_live.py checks that Codex sends the same
+    request with it as without it."""
+    return {
+        "models": [
+            {
+                "slug": model,
+                "display_name": model,
+                "description": None,
+                "supported_reasoning_levels": [],
+                "shell_type": "default",
+                "visibility": "none",
+                "supported_in_api": True,
+                "priority": 99,
+                "additional_speed_tiers": [],
+                "service_tiers": [],
+                "availability_nux": None,
+                "upgrade": None,
+                "model_messages": {"instructions_template": _CODEX_PROMPT.read_text()},
+                "include_skills_usage_instructions": False,
+                "include_plugin_usage_instructions": False,
+                "include_apps_usage_instructions": False,
+                "default_reasoning_summary": "auto",
+                "support_verbosity": False,
+                "default_verbosity": None,
+                "apply_patch_tool_type": None,
+                "web_search_tool_type": "text",
+                "truncation_policy": {"mode": "bytes", "limit": 10_000},
+                "supports_parallel_tool_calls": False,
+                "supports_image_detail_original": False,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "supports_search_tool": False,
+                "use_responses_lite": False,
+            }
+        ]
+    }
+
+
 def _responses_usage(usage: "dict | None") -> dict:
+    """Responses-format usage. Codex compacts on `total_tokens` and takes
+    `cached_tokens` as a part of `input_tokens` (OpenAI's convention), so
+    `input_tokens` is the whole prompt whichever way the backend counted."""
     usage = usage or {}
-    input_tokens = usage.get("prompt_tokens", 0)
+    prompt = prompt_tokens(usage)
     output_tokens = usage.get("completion_tokens", 0)
     result = {
-        "input_tokens": input_tokens,
+        "input_tokens": prompt.total,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": prompt.total + output_tokens,
     }
-    if usage.get("cached_tokens") is not None:
-        result["input_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+    if prompt.cache_read or usage.get("cached_tokens") is not None:
+        result["input_tokens_details"] = {"cached_tokens": prompt.cache_read}
     if usage.get("reasoning_tokens") is not None:
         result["output_tokens_details"] = {"reasoning_tokens": usage["reasoning_tokens"]}
     return result
@@ -442,6 +497,13 @@ class CodexAdapter(HarnessAdapter):
             # agency), it silently assumes some default that can be far off
             # from what the actual backend supports. This is the real number.
             toml_text += f"model_context_window = {int(context_limit)}\n"
+            if context_limit > CODEX_UNKNOWN_MODEL_MAX_WINDOW:
+                # ...which Codex 0.147.0 caps at the unknown model's
+                # max_context_window (272K). A catalog entry for the model
+                # lifts the cap; it is the same fallback metadata otherwise.
+                catalog = Path(config_home) / "model_catalog.json"
+                catalog.write_text(json.dumps(codex_model_catalog(model, int(context_limit))))
+                toml_text += f"model_catalog_json = {json.dumps(str(catalog.resolve()))}\n"
         retry_settings = ""
         for name in ("request_max_retries", "stream_max_retries"):
             value = getattr(self.agconfig.llm, "codex_" + name, None)

@@ -125,6 +125,9 @@ class llmconfig(confignamespace):
     rate_limit_max_backoff_s: float = 80.0
     rate_limit_retry_after_jitter_s: float = 5.0
     default_context_limit: int = 200_000
+    # Clear the oldest tool output from a request that would exceed the
+    # context limit instead of sending it to be rejected (llm/context_fit.py).
+    fit_to_context_limit: bool = True
 
     # What the host does with a provider response it cannot hand to a harness
     # as a finished turn (see agency/llm/response_check.py).

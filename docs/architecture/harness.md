@@ -18,7 +18,7 @@
 
 The host controls the daemon over a sandbox socket. Harness model, tool and policy traffic travels through the daemon's gateway to the host service socket. An attempt carries its prompt, request identity, fresh token and optional session state; host Python tool closures and provider credentials stay with host services. Explicit sandbox tools are serialized and reconstructed in the sandbox.
 
-The adapters currently include native, Claude Code, Codex, opencode, Grok and Kimi. Each adapter configures its harness to use the gateway and translates its model-facing protocol. Shared configuration-home helpers isolate per-launch settings; CLI command dialects and session formats stay in the concrete adapters. This is what allows harness choice and model-backend choice to vary independently.
+The adapters currently include native, Claude Code, Codex, opencode, Grok and Kimi. Each adapter configures its harness to use the gateway and translates its model-facing protocol. Shared configuration-home helpers isolate per-launch settings; CLI command dialects and session formats stay in the concrete adapters. This is what allows harness choice and model-backend choice to vary independently. How each harness is told the model's context limit, and given token usage it can compact on, is in [Context_Window.md](../Context_Window.md).
 
 The ptrace supervisor observes and controls the launched process tree. External adapters use PTY drivers, while the native adapter launches the [standalone native loop](native_harness.md) with pipe output and additional semantic activity hooks. The process tracing implementation depends on local Linux x86-64 facilities.
 
