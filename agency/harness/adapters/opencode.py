@@ -96,6 +96,11 @@ class OpencodeDriver(PtyDriver):
             temporary.unlink()
 
 
+# OpenCode's OUTPUT_TOKEN_MAX (provider/transform.ts): the most of limit.output
+# it keeps free.
+OPENCODE_MAX_RESERVE = 32_000
+
+
 class OpenCodeAdapter(ChatCompletionsProtocol, HarnessAdapter):
     _DEFAULT_BINARY = "opencode"
     _PTY_DRIVER = OpencodeDriver
@@ -133,22 +138,17 @@ class OpenCodeAdapter(ChatCompletionsProtocol, HarnessAdapter):
         model_entry = {"name": model}
         if context_limit is not None:
             # Without this, OpenCode has no idea how much context an
-            # unrecognized (agency-proxied) model actually has -- per
-            # opencode.ai/docs/providers, `limit.context` is exactly the
-            # field its own compaction reasons about "how much context you
-            # have left" against. `limit.output` is a separate concept
-            # (max generated tokens, not context window) that OpenCode
-            # nonetheless requires alongside `limit.context` -- config
-            # validation rejects one without the other and the CLI refuses
-            # to start at all. A flat default_max_tokens reservation is too
-            # small a share of a genuinely large context window (leaves
-            # compaction too little headroom relative to how much history
-            # such a model can actually hold), so scale it with the window,
-            # floored at the same default agllm.py falls back to elsewhere.
-            output_reservation = max(self.agconfig.llm.default_max_tokens, int(0.1 * context_limit))
+            # unrecognized (agency-proxied) model actually has. OpenCode 1.18.15
+            # compacts once a step's tokens reach
+            #   limit.context - min(limit.output, 32_000)
+            # (session/overflow.ts) and requires limit.output alongside
+            # limit.context. Both are set so that this lands on 90% of the
+            # real limit, as in the native harness: limit.output is OpenCode's
+            # reserve, not what Agency asks the backend for.
+            reserve = max(1, min(int(context_limit * 0.1), OPENCODE_MAX_RESERVE))
             model_entry["limit"] = {
-                "context": int(context_limit),
-                "output": output_reservation,
+                "context": int(context_limit * 0.9) + reserve,
+                "output": reserve,
             }
         config = {
             "provider": {

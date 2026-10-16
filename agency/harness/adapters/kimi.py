@@ -309,6 +309,11 @@ class KimiDriver(PtyDriver):
         return snapshot_session(self.root, self.name, self.session_id)
 
 
+# DEFAULT_COMPACTION_CONFIG.reservedContextSize in Kimi Code 0.42.0.
+_KIMI_DEFAULT_RESERVE = 50_000
+_KIMI_TRIGGER_RATIO = 0.85
+
+
 class KimiAdapter(ChatCompletionsProtocol, HarnessAdapter):
     _DEFAULT_BINARY = "kimi"
     _PTY_DRIVER = KimiDriver
@@ -364,8 +369,24 @@ class KimiAdapter(ChatCompletionsProtocol, HarnessAdapter):
             f"max_context_size = {int(context_limit) if context_limit is not None else 200000}",
             'capabilities = ["tool_use"]',
         ]
+        loop_control = []
         if max_steps is not None:
-            lines += ["", "[loop_control]", f"max_steps_per_turn = {int(max_steps)}"]
+            loop_control.append(f"max_steps_per_turn = {int(max_steps)}")
+        if context_limit is not None:
+            # Kimi Code 0.42.0 compacts at min(ratio * max, max - reserved),
+            # 0.85 and 50K by default: 61% of a 128K window. It checks before
+            # each step, on the last reply's count plus a 4-chars-per-token
+            # guess at what came since, so it lands up to a step late; at
+            # 0.85 it compacts at about 90% (measured). A ratio below 0.85
+            # would add a check after each reply, but that compaction runs in
+            # the background and cancels the turn it overlaps.
+            reserve = min(int(context_limit * 0.1), _KIMI_DEFAULT_RESERVE)
+            loop_control += [
+                f"reserved_context_size = {reserve}",
+                f"compaction_trigger_ratio = {_KIMI_TRIGGER_RATIO}",
+            ]
+        if loop_control:
+            lines += ["", "[loop_control]", *loop_control]
         for event, command in hooks:
             lines += [
                 "",

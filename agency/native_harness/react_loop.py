@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Callable
 from . import tools
 from .profiling import profile_run, span as profile_span, tool_execution
 from .compaction import maybe_compact
+from .usage import prompt_tokens
 from .annotations import augment_schemas, extract, instruction, event_id, redact
 
 if TYPE_CHECKING:
@@ -131,12 +132,15 @@ def run_react_loop(
             },
         )
 
+    measured = None
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
             before_compaction = messages
             messages, previous_summary = maybe_compact(
-                messages, context_limit, llm, model, previous_summary
+                messages, context_limit, llm, model, previous_summary, measured
             )
+            if messages is not before_compaction:
+                measured = None
             if observer is not None and messages != before_compaction:
                 observer("compaction", {"exchange": step, "messages": messages})
 
@@ -163,6 +167,10 @@ def run_react_loop(
             message = resp["message"]
             tool_calls = message.get("tool_calls") or []
             messages.append(message)
+            measured = (
+                prompt_tokens(usage).total + (usage.get("completion_tokens", 0) or 0),
+                len(messages),
+            )
             if not tool_calls:
                 return ReactLoopResult(
                     status="done",
