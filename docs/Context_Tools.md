@@ -54,7 +54,7 @@ Each patch records its origin, `operator` or `model`, in
 
 ## Wiring
 
-`HostServerManager` makes one `ContextView` (`agency/context_tools.py`) per skill run
+`HostServerManager` makes one `ContextView` (`agency/tools/context_tools.py`) per skill run
 and `HostMcpServer` passes it as `context_view=` to the host tools whose function
 takes it. The view reads `LlmHandlerServer.latest_request()`, the harness's latest
 request that is not `agency_internal_kind`, with its hashes and the patches applied

@@ -398,8 +398,11 @@ class LlmHandlerServer:
         self._call_messages: "dict[str, dict]" = {}
         self._call_messages_lock = threading.Lock()
         self._outputs_complete = outputs_complete
-        # The call_label of the latest request a harness itself made (not an
-        # ``agency_internal_kind`` one, like a tool-policy check).
+        # The call_label of the latest request the harness itself made. Requests
+        # Agency makes on its own behalf carry an ``agency_internal_kind`` (a
+        # tool-policy check, the native harness's compaction summary) and are
+        # skipped, so latest_request() -- what the context tools list and edit --
+        # is always the harness's conversation.
         self._latest_call_label: "str | None" = None
         self._request_seq = itertools.count(1)
 
@@ -1063,7 +1066,7 @@ class LlmHandlerServer:
                 "applied_patch_keys": frozenset(applied_patch_keys),
                 "seq": next(self._request_seq),
             }
-            if internal_kind is None:
+            if internal_kind is None:  # not one of Agency's own calls
                 self._latest_call_label = call_label
 
     def latest_request(self) -> "dict | None":

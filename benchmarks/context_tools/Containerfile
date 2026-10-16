@@ -1,6 +1,0 @@
-# Sandbox image for the context-tools benchmarks: Agency's harness daemon and native
-# harness dependencies preinstalled, so sandboxes can run with --network=none.
-#   sudo podman build -t localhost/agency-bench:py312 benchmarks/context_tools
-FROM docker.io/library/python:3.12-slim
-RUN pip install --no-cache-dir --root-user-action=ignore \
-    fastapi uvicorn openai httpx mcp pyseccomp cloudpickle pyte httpx2 html2text

@@ -112,9 +112,9 @@ class HostServerManager:
         self._llm_handler_server._profile_context_provider = (
             self._interaction_server.current_open_context
         )
-        from ...context_tools import ContextView
+        from ...tools.context_tools import ContextView
 
-        # What the context tools (agency/context_tools.py) read and edit.
+        # What the context tools (agency/tools/context_tools.py) read and edit.
         self._context_view = ContextView(self._llm_handler_server)
         self._host_mcp_server = HostMcpServer(
             sandbox,

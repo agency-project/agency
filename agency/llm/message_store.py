@@ -23,7 +23,10 @@ of what the harness sent and a patch can be dropped again.
 A patch matches a block by its hash, and failing that by its hash with
 ``index`` left out (``position_free_hash``): a harness that inserts a block in
 front of a patched one (Claude Code's ``<system-reminder>`` blocks, say) shifts
-its ``index`` without changing the block, and the patch still applies.
+its ``index`` without changing the block, and the patch still applies. This is
+for every harness and only for patch lookup; stored hashes keep ``index``, so
+existing records are unchanged and two identical blocks of one message stay
+apart where an exact match exists.
 """
 
 from __future__ import annotations

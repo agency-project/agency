@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ...orchestrator.agresources import agResourcePool
     from ...agskill import agskill
     from ...agtool import agtool
-    from ...context_tools import ContextView
+    from ...tools.context_tools import ContextView
     from ...sandbox.agsandbox import agSandbox
 
 _current_data_logger = threading.local()
@@ -89,7 +89,7 @@ class HostMcpServer:
     ) -> None:
         self._live_session = live_session
         # The skill run's own LLM context, for tools that ask for it
-        # (agency/context_tools.py).
+        # (agency/tools/context_tools.py).
         self._context_view = context_view
         self._sandbox = sandbox
         self._skill = skill

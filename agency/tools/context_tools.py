@@ -18,9 +18,9 @@ import json
 import threading
 from typing import TYPE_CHECKING
 
-from .agdata import agdata, agerror
-from .agtool import agtool
-from .llm.message_store import (
+from ..agdata import agdata, agerror
+from ..agtool import agtool
+from ..llm.message_store import (
     MODEL_ORIGIN,
     TOOL_SCHEMA_ROLE,
     MessageBlock,
@@ -28,7 +28,7 @@ from .llm.message_store import (
 )
 
 if TYPE_CHECKING:
-    from .engine.host_servers.llm_handler_server import LlmHandlerServer
+    from ..engine.host_servers.llm_handler_server import LlmHandlerServer
 
 LIST_CONTEXT = "list_context"
 READ_CONTEXT_BLOCK = "read_context_block"

@@ -1,5 +1,5 @@
 # The context tools: the model listing, reading and editing its own LLM context
-# through message_patch_lookup (agency/context_tools.py, docs/Context_Tools.md).
+# through message_patch_lookup (agency/tools/context_tools.py, docs/Context_Tools.md).
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from agency.agdata import agdata
 from agency.agpolicy import agpolicy
 from agency.agskill import agskill
 from agency.configs.agconfig import agconfig, dataloggerconfig, hostserverconfig, llmconfig
-from agency.context_tools import REMOVED_TEXT, ContextView, context_tools
+from agency.tools.context_tools import REMOVED_TEXT, ContextView, context_tools
 from agency.engine.host_servers.host_mcp_server import HostMcpServer
 from agency.engine.host_servers.host_server_manager import HostServerManager
 from agency.engine.host_servers.llm_handler_server import LlmHandlerServer
