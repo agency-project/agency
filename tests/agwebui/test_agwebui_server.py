@@ -965,7 +965,7 @@ def test_agent_detail_endpoint_reads_selected_agent_database(server):
             "role": "assistant",
             "blocks": [
                 {"type": "metadata", "new_prompt_tokens": 15, "usage": {"completion_tokens": 5}},
-                {"type": "text", "index": 0, "text": "hi"},
+                {"type": "text", "text": "hi"},
             ],
         },
     ]
@@ -1187,8 +1187,8 @@ def test_agent_detail_reconstructs_in_progress_content_from_llm_block_events(ser
         {
             "role": "assistant",
             "blocks": [
-                {"type": "text", "index": 0, "text": "working on it"},
-                {"type": "tool_use", "index": 1, "name": "write", "arguments": "{}"},
+                {"type": "text", "text": "working on it"},
+                {"type": "tool_use", "name": "write", "arguments": "{}"},
             ],
         }
     ]

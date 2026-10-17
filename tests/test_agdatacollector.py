@@ -502,13 +502,11 @@ def test_record_llm_exchange_deletes_flushed_deltas_and_writes_chains(tmp_path):
     assert blocks[_block_hash("user", "hey")] == {
         "role": "user",
         "type": "text",
-        "index": 0,
         "text": "hey",
     }
     assert blocks[_block_hash("assistant", "hi")] == {
         "role": "assistant",
         "type": "text",
-        "index": 0,
         "text": "hi",
     }
     dc.stop()
@@ -649,10 +647,9 @@ def test_reconstruct_llm_exchanges_splits_prompt_and_response_per_exchange(tmp_p
     assert len(exchanges) == 1
     assert exchanges[0]["call_label"] == "c1"
     assert exchanges[0]["type"] == "llm_block"
-    assert exchanges[0]["prompt"] == [{"role": "user", "type": "text", "index": 0, "text": "hi"}]
-    assert exchanges[0]["response"] == [
-        {"role": "assistant", "type": "text", "index": 0, "text": "hello"}
-    ]
+    # Chains list stored blocks, which have no ``index`` (message records keep it).
+    assert exchanges[0]["prompt"] == [{"role": "user", "type": "text", "text": "hi"}]
+    assert exchanges[0]["response"] == [{"role": "assistant", "type": "text", "text": "hello"}]
 
 
 def test_reconstruct_llm_exchanges_orders_exchanges_and_filters_by_type(tmp_path):
@@ -709,7 +706,7 @@ def test_reconstruct_llm_exchanges_handles_exchange_with_empty_prompt(tmp_path):
 
     exchanges = read_llm_exchanges(db_path)
     assert exchanges[0]["prompt"] == []
-    assert exchanges[0]["response"] == [{"role": "assistant", "type": "cancelled", "index": 0}]
+    assert exchanges[0]["response"] == [{"role": "assistant", "type": "cancelled"}]
 
 
 # ---------------------------------------------------------------------------

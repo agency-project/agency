@@ -237,6 +237,20 @@ def test_deleting_a_block_removes_it_but_never_empties_a_message(run):
     assert sent[2] == [REMOVED_TEXT]  # the only block of its message
 
 
+def test_deleting_a_repeated_block_never_empties_a_message_it_is_alone_in(run):
+    reminder = "<system-reminder>r</system-reminder>"
+    # The same block twice: beside another block, and alone in a later message.
+    history = [*_history()[:2], _text("user", reminder, "task"), _text("user", reminder)]
+    run.server.dispatch({"messages": history})
+    listing = run.tools.list_context()["context"]
+    (block_id,) = {line[1 : line.index("]")] for line in listing.splitlines() if reminder in line}
+    run.tools.edit_context(id=block_id, delete=True)
+
+    run.server.dispatch({"messages": history})
+    sent = _sent(run.backend)
+    assert sent[-2] == [REMOVED_TEXT, "task"] and sent[-1] == [REMOVED_TEXT]
+
+
 def test_a_tool_result_keeps_its_pairing_when_edited_or_deleted(run):
     run.server.dispatch({"messages": _history()})
     block_id = _id_of(run.tools.list_context()["context"], "tool/tool_result")

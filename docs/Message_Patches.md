@@ -23,9 +23,9 @@ A runnable walkthrough is `examples/13_context_manipulation.py`.
 * `MessageBlock(role, fields)` is one content block (`fields` is a mapping in the
   agency block format, for example `{"type": "text", "index": 0, "text": "..."}`)
   together with the role of the message that carries it. It is immutable and copies
-  `fields`. `.hash` is the SHA-256 of the whole payload, which is the key of its row
-  in `message_block_lookup`; `.role`, `.type`, `.to_dict()` (the block without its
-  role) and `.payload` (the stored row) read it back. Two `MessageBlock`s are equal
+  `fields`. `.hash` is the SHA-256 of the payload without `index`, which is the key
+  of its row in `message_block_lookup`; `.role`, `.type`, `.to_dict()` (the block
+  without its role) and `.payload` (the stored row) read it back. Two `MessageBlock`s are equal
   when their hashes are. A `tool_use` block has `id`, `name` and `arguments`; a
   `tool_result` block has `tool_call_id` and `text`. `agent.history` still returns
   plain message dicts; build the block to patch from one with
@@ -43,10 +43,11 @@ A runnable walkthrough is `examples/13_context_manipulation.py`.
   all of them.
 
 Calling `patch_history` again with the same `old_block` replaces the earlier link.
-A patch matches the block as the harness sends it: by its hash, or failing that by
-its hash with `index` left out, so a block the harness inserts in front of it (a
+A patch matches the block as the harness sends it, wherever it is in its message:
+`index` is not part of the hash, so a block the harness inserts in front of it (a
 Claude Code `<system-reminder>`, say) does not break the match. It replaces every
-such block (a tool call or result is unique by id). Patches are not applied
+such block, two identical blocks of one message included (a tool call or result is
+unique by id). Patches are not applied
 recursively.
 
 The model can make patches too, from inside a skill run, with the context tools:
@@ -70,12 +71,14 @@ A request that reached the host server before the patch was made is not patched.
 
 `agency/llm/message_store.py` is shared by the SQLite data collector and `agcontext`:
 
-* a **block** is `{"role", **block}`, keyed by the SHA-256 of its complete canonical
-  JSON. Nothing is left out of the key (tool-call arguments, tool-result content,
-  `citations`, `index`, ...), so blocks that differ in any field are different rows
-  and a stored payload is exactly what was seen.
-* a **message** is `{"role", "blocks": [block hashes], "extra"?}`, keyed the same
-  way. This keeps message boundaries. A message that is not in the agency shape is
+* a **block** is `{"role", **block}` without `index`, keyed by the SHA-256 of its
+  canonical JSON. Every other field is in the key (tool-call arguments, tool-result
+  content, `citations`, ...), so blocks that differ in any of them are different
+  rows. `index` is the block's position in its message, so the same block at any
+  position is one row.
+* a **message** is `{"role", "blocks": [block hashes], "indexes"?, "extra"?}`, keyed
+  the same way. This keeps message boundaries and each block's `index` (`indexes`),
+  so a rebuilt message is exactly what was seen. A message that is not in the agency shape is
   stored whole as `{"opaque": message}`.
 
 `agcontext` holds:
@@ -217,7 +220,7 @@ and without the `tool_schema` message (the tools of one conversation can change)
 
 ## Limits
 
-* A patch matches the block as the harness sends it (up to its `index`). If the
+* A patch matches the block as the harness sends it (at any `index`). If the
   harness rewrites it (compaction, a changed tool result) the patch matches nothing.
   The SQLite record and `latest_request()["applied_patch_keys"]` show which patches
   each request used; the context tools warn the model about its own edits that

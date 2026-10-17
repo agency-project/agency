@@ -25,7 +25,9 @@ instructions on when to edit; the skill prompt or input has to say.
 | `revert_context_edit` | `id` | Withdraws the model's edit of that block |
 
 An `id` is the first 8 characters of the block's hash; a block keeps it from request
-to request. An edit applies from the model's next LLM call.
+to request, also when the harness puts another block in front of it. The same block
+twice has one `id`, and an edit changes both. An edit applies from the model's next
+LLM call.
 
 `context_tools(*, max_edits=50, allow_self_edit=False, persist=False)`:
 
@@ -44,9 +46,9 @@ The host refuses to edit the system prompt, the `tool_schema` message (not liste
 plain text, and any block the operator patched.
 
 A `tool_result` keeps its block and only loses its text, so it stays paired with its
-`tool_use`; deleting it, or the only block of a message, leaves
-`[removed by context edit]`. Replacing a non-text block puts a text block in its
-place.
+`tool_use`; deleting it, or a block that is the only block of a message it appears
+in, leaves `[removed by context edit]`. Replacing a non-text block puts a text block
+in its place.
 
 Each patch records its origin, `operator` or `model`, in
 `MessageStore.message_patch_origin` (saved in `state.json`) and in the SQLite
@@ -69,7 +71,10 @@ its tools' calls under every harness's MCP prefix (`mcp__agency__edit_context`,
   return a `warning` naming it.
 * With several conversations in one skill run (subagents), "the latest request" is
   whichever called the LLM last.
-* The harness counts tokens and schedules compaction on its own unedited copy.
+* The harness keeps its own unedited copy. A harness that schedules compaction from
+  the backend's token count of its last request (Claude Code, Codex) sees the edited
+  size, so edits postpone its compaction; one that estimates from its own copy does
+  not.
 * Edits replace or remove whole blocks; there is no free-text edit across blocks.
 * On Claude models with preserved thinking, an edit invalidates the signed thinking
   blocks after it; the API drops them (see the Limits of

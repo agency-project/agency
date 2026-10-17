@@ -276,7 +276,7 @@ class agDataLogger:
         `message_block_lookup` table (keyed by content hash), and `exchange_chain`
         lists the blocks of the prompt and of the response in order. A block of
         *harness_message_hashes* (what the harness sent) that is a key of the
-        store's `message_patch_lookup` matches (by hash, or position-free) was
+        store's `message_patch_lookup` matches was
         replaced in the prompt; the replacement is kept in this database's
         `message_patch_lookup`, one row per replacement block (a removed block is one
         row with a NULL `replacement_hash`), with the blocks on both sides in

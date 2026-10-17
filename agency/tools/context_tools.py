@@ -137,6 +137,9 @@ class ContextView:
             message_sizes: "dict[str, int]" = {}
             for message_hash, *_ in rows:
                 message_sizes[message_hash] = message_sizes.get(message_hash, 0) + 1
+            # One edit changes every copy of a block, so a block is "only" if it is
+            # the only block of any message it appears in.
+            sole = {h for m, _r, h, _b in rows if message_sizes[m] == 1}
             entries = []
             for message_hash, role, block_hash, block in rows:
                 key = patch_keys.get(block_hash)
@@ -168,7 +171,7 @@ class ContextView:
                         patch_key=key,
                         status=status,
                         protected=protected,
-                        only_block=message_sizes[message_hash] == 1,
+                        only_block=block_hash in sole,
                     )
                 )
         return entries
@@ -267,11 +270,11 @@ class ContextView:
             # A message left with no blocks would be dropped, which can break the
             # provider's turn order; leave a marker instead.
             if entry.only_block:
-                return [{"type": "text", "index": block.get("index", 0), "text": REMOVED_TEXT}]
+                return [{"type": "text", "text": REMOVED_TEXT}]
             return []
         if kind == "text":
             return [{**block, "text": text}]
-        return [{"type": "text", "index": block.get("index", 0), "text": text}]
+        return [{"type": "text", "text": text}]
 
     def revert(self, block_id: str, *, max_edits: "int | None" = None) -> "_Entry":
         """Withdraw the model's edit of a block."""

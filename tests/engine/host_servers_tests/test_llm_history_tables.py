@@ -82,6 +82,11 @@ def _block(value):
     return {"type": "text", "index": 0, "text": value}
 
 
+def _stored(value):
+    """``_block`` as stored in ``message_block_lookup``, without its index."""
+    return {"type": "text", "text": value}
+
+
 def _texts(messages):
     return [m["blocks"][0]["text"] for m in messages if m["blocks"]]
 
@@ -436,16 +441,17 @@ def test_the_collector_keeps_the_patch_table_as_hash_to_hash_links(tmp_path):
     assert {r for _, r in by_original[key_split]} <= stored
 
     rebuilt = {p["original_hash"]: p for p in reconstruct_llm_patches(connection, first)}
+    # Stored blocks have no ``index``: it is a position, which message records keep.
     assert rebuilt == {
         key_split: {
             "original_hash": key_split,
-            "original": _block("secret"),
-            "replacement": [_block("part one"), _block("part two")],
+            "original": _stored("secret"),
+            "replacement": [_stored("part one"), _stored("part two")],
             "origin": "operator",
         },
         key_gone: {
             "original_hash": key_gone,
-            "original": _block("noise"),
+            "original": _stored("noise"),
             "replacement": [],
             "origin": "operator",
         },
@@ -461,7 +467,7 @@ def test_the_collector_keeps_the_patch_table_as_hash_to_hash_links(tmp_path):
     logger.stop()
 
 
-# -- position-free matching, patch origin, and the latest request ------------------
+# -- matching at another index, patch origin, and the latest request ---------------
 
 
 def test_a_patch_lands_although_the_harness_put_a_block_in_front_of_the_original(tmp_path):
@@ -512,9 +518,9 @@ def test_the_collector_records_who_made_each_patch_and_the_block_it_replaced(tmp
     connection = sqlite3.connect(db_path)
     (call_label,) = [row[0] for row in connection.execute("SELECT call_label FROM exchanges")]
     (entry,) = reconstruct_llm_patches(connection, call_label)
-    # The original recorded is the block the harness actually sent, at index 1.
-    assert entry["original"] == {"type": "text", "index": 1, "text": "stale"}
-    assert entry["replacement"] == [_block("fresh")]
+    # The original recorded is the block the harness sent (at index 1).
+    assert entry["original"] == _stored("stale")
+    assert entry["replacement"] == [_stored("fresh")]
     assert entry["origin"] == "model"
 
 

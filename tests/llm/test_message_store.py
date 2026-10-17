@@ -416,7 +416,7 @@ def test_the_lock_is_reentrant_and_with_store_holds_it():
         assert len(store) == 1
 
 
-# -- matching a block at another index, and who made a patch ------------------------
+# -- a block at another index, and who made a patch ---------------------------------
 
 
 def _add_patch(store, role, old_fields, new_fields_list, **kwargs):
@@ -459,33 +459,77 @@ def test_a_patch_still_matches_when_a_block_in_front_shifts_its_index():
     assert [b["index"] for b in message["blocks"]] == [0, 1]
 
 
-def test_an_exact_match_wins_over_a_position_free_one():
+def test_the_same_block_at_another_index_has_the_same_hash_and_one_row():
+    store = MessageStore()
+    first = MessageBlock("user", {"type": "text", "index": 0, "text": "x"})
+    shifted = MessageBlock("user", {"type": "text", "index": 1, "text": "x"})
+    assert first.hash == shifted.hash
+    assert "index" not in first.payload
+    store.add_messages([text("user", "x"), _two_blocks("y", "x")])
+    assert [p for p in store.message_block_lookup.values() if p.get("text") == "x"] == [
+        {"role": "user", "type": "text", "text": "x"}
+    ]
+
+
+def test_a_rebuilt_message_keeps_every_block_s_index():
+    store = MessageStore()
+    message = {
+        "role": "assistant",
+        "blocks": [
+            {"type": "text", "index": 0, "text": "same"},
+            {"type": "text", "index": 1, "text": "same"},
+            {"type": "metadata", "index": 2**31 - 1, "usage": {}},
+        ],
+    }
+    digest = store.add_message(message)
+    assert store.message_structure_lookup[digest]["indexes"] == [0, 1, 2**31 - 1]
+    assert store.materialize([digest]) == [message]
+    # The index is part of the message's key, though not of its blocks'.
+    reordered = {
+        **message,
+        "blocks": [dict(b, index=i + 5) for i, b in enumerate(message["blocks"])],
+    }
+    assert store.add_message(reordered) != digest
+    # Blocks without an index rebuild without one.
+    bare = store.add_message({"role": "user", "blocks": [{"type": "text", "text": "a"}]})
+    assert "indexes" not in store.message_structure_lookup[bare]
+    assert store.materialize([bare]) == [
+        {"role": "user", "blocks": [{"type": "text", "text": "a"}]}
+    ]
+
+
+def test_a_patch_replaces_both_of_two_identical_blocks_and_renumbers_them():
     store = MessageStore()
     _add_patch(
-        store,
-        "user",
-        {"type": "text", "index": 1, "text": "x"},
-        [{"type": "text", "text": "exact"}],
+        store, "user", {"type": "text", "index": 0, "text": "x"}, [{"type": "text", "text": "X"}]
     )
-    _add_patch(
-        store, "user", {"type": "text", "index": 0, "text": "x"}, [{"type": "text", "text": "free"}]
+    digest = store.add_message(
+        {
+            "role": "user",
+            "blocks": [
+                {"type": "text", "index": 0, "text": "x"},
+                {"type": "text", "index": 1, "text": "y"},
+                {"type": "text", "index": 2, "text": "x"},
+            ],
+        }
     )
-    digest = store.add_message(_two_blocks("y", "x"))
     (message,) = store.materialize([digest])
-    assert message["blocks"][1]["text"] == "exact"
+    assert [(b["index"], b["text"]) for b in message["blocks"]] == [(0, "X"), (1, "y"), (2, "X")]
 
 
-def test_a_patch_whose_original_is_not_stored_only_matches_exactly():
+def test_a_record_stored_with_indexed_payloads_still_rebuilds():
+    # Records saved before blocks lost their index carry it in the payloads.
     store = MessageStore()
-    old = MessageBlock("user", {"type": "text", "index": 0, "text": "x"})
+    store.message_block_lookup["old"] = {"role": "user", "type": "text", "index": 0, "text": "a"}
+    store.message_structure_lookup["m"] = {"role": "user", "blocks": ["old"]}
+    assert store.materialize(["m"]) == [
+        {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "a"}]}
+    ]
     with store:
         store.add_patch(
-            old.hash, [store.add_block(MessageBlock("user", {"type": "text", "text": "y"}))]
+            "old", [store.add_block(MessageBlock("user", {"type": "text", "text": "b"}))]
         )
-    shifted = store.add_message(_two_blocks("z", "x"))
-    assert [b["text"] for b in store.materialize([shifted])[0]["blocks"]] == ["z", "x"]
-    exact = store.add_message(text("user", "x"))
-    assert store.materialize([exact])[0]["blocks"][0]["text"] == "y"
+    assert store.materialize(["m"])[0]["blocks"] == [{"type": "text", "text": "b"}]
 
 
 def test_materialize_reports_the_patches_it_applied_and_patch_keys_for_finds_them():
