@@ -106,6 +106,23 @@ def _stringify_anthropic_content(content) -> str:
     return "" if content is None else str(content)
 
 
+# Without raw_content support (every backend but Anthropic's), a tool result reaches the LLM as text
+# only; an image in it would vanish silently, so it becomes a placeholder the model can see.
+_NON_TEXT_RESULT_PLACEHOLDER = "[{kind} omitted: tool output is passed to the model as text only]"
+
+
+def _tool_result_text_from_anthropic(content) -> str:
+    if not isinstance(content, list):
+        return _stringify_anthropic_content(content)
+    return "".join(
+        b.get("text", "")
+        if b.get("type") == "text"
+        else _NON_TEXT_RESULT_PLACEHOLDER.format(kind=b.get("type") or "non-text part")
+        for b in content
+        if isinstance(b, dict)
+    )
+
+
 def _text_block_from_anthropic(block: dict, index: int) -> dict:
     agency_block = {"type": "text", "index": index, "text": block.get("text", "")}
     if block.get("citations"):
@@ -730,7 +747,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                             "type": "tool_result",
                             "index": 0,
                             "tool_call_id": block.get("tool_use_id", ""),
-                            "text": _stringify_anthropic_content(result_content),
+                            "text": _tool_result_text_from_anthropic(result_content),
                         }
                         if isinstance(result_content, list) and any(
                             not (isinstance(c, dict) and c.get("type") == "text")
