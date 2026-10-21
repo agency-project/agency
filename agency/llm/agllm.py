@@ -293,6 +293,12 @@ class agllm:
         wire_messages: list[dict] = []
         conversation_started = False
         system_class_used = False
+        # Tool calls of the last assistant turn still waiting for their results, and converted
+        # system-class messages held back until they arrive: Anthropic/Bedrock reject anything
+        # between a tool_use and its tool_result (Codex sends a PostToolUse hook's
+        # additionalContext as a developer message right after the call, before its output).
+        pending_tool_calls: set = set()
+        held: list[dict] = []
         for m in messages:
             role = m["role"]
             blocks = m.get("blocks") or []
@@ -365,12 +371,28 @@ class agllm:
                     "than one"
                 )
                 wire_msg = {"role": "user", "content": text}
+                if pending_tool_calls:
+                    held.append(wire_msg)
+                    continue
             else:
                 if is_system_class:
                     system_class_used = True
                 text = "".join(b["text"] for b in blocks if b["type"] == "text")
                 wire_msg = {"role": role, "content": text}
+            if role == "assistant":
+                pending_tool_calls = {c["id"] for c in wire_msg.get("tool_calls") or []}
+            elif role == "tool":
+                pending_tool_calls.discard(wire_msg["tool_call_id"])
+            else:
+                pending_tool_calls = set()
+            if held and role != "tool":
+                wire_messages.extend(held)  # the results never arrived; keep the original order
+                held = []
             wire_messages.append(wire_msg)
+            if held and not pending_tool_calls:
+                wire_messages.extend(held)
+                held = []
+        wire_messages.extend(held)
         kwargs: dict = dict(
             model=self.agconfig.llm.model or "",
             messages=wire_messages,

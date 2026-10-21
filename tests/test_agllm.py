@@ -250,6 +250,72 @@ def test_build_llm_kwargs_leading_developer_after_system_becomes_user(capsys):
     assert "second system-class" in capsys.readouterr().out
 
 
+def test_build_llm_kwargs_developer_message_waits_for_pending_tool_results(capsys):
+    """Codex sends a PostToolUse hook's additionalContext as a developer message right after
+    the tool call, before the call's output. Sent as a `user` message at that position it
+    sits between a tool_use and its tool_result, which Anthropic/Bedrock reject; it is held
+    until every result of that assistant turn is in."""
+
+    def _call(*ids):
+        return {
+            "role": "assistant",
+            "blocks": [
+                {"type": "tool_use", "id": i, "name": "shell", "arguments": "{}"} for i in ids
+            ],
+        }
+
+    def _result(i, text):
+        return {
+            "role": "tool",
+            "blocks": [{"type": "tool_result", "tool_call_id": i, "text": text}],
+        }
+
+    kw = build_llm_kwargs(
+        _cfg(),
+        [
+            _sys_msg("You are Codex."),
+            _msg("user", "do X"),
+            _call("a", "b"),
+            _msg("developer", "[system] during this command: busy 90%"),
+            _result("a", "out a"),
+            _result("b", "out b"),
+            _msg("assistant", "done"),
+        ],
+        None,
+    )
+    assert [(m["role"], m.get("content")) for m in kw["messages"]] == [
+        ("system", "You are Codex."),
+        ("user", "do X"),
+        ("assistant", None),
+        ("tool", "out a"),
+        ("tool", "out b"),
+        ("user", "[system] during this command: busy 90%"),
+        ("assistant", "done"),
+    ]
+    assert "second system-class" in capsys.readouterr().out
+
+
+def test_build_llm_kwargs_held_developer_message_kept_when_results_never_arrive():
+    kw = build_llm_kwargs(
+        _cfg(),
+        [
+            _msg("user", "do X"),
+            {
+                "role": "assistant",
+                "blocks": [{"type": "tool_use", "id": "a", "name": "shell", "arguments": "{}"}],
+            },
+            _msg("developer", "note"),
+            _msg("user", "next"),
+        ],
+        None,
+    )
+    assert [(m["role"], m.get("content")) for m in kw["messages"]][1:] == [
+        ("assistant", None),
+        ("user", "note"),
+        ("user", "next"),
+    ]
+
+
 def test_build_llm_kwargs_unknown_params_not_forwarded():
     """build_kwargs only forwards the known OpenAI-style generation params --
     other agconfig fields (provider selection, transport config, ...) don't
