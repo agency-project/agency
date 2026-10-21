@@ -169,6 +169,30 @@ def test_posttooluse_reads_call_id_and_posts_completion(monkeypatch, capsys, tmp
     assert not (tmp_path / ".agpolicy_call_tool-1.json").exists()
 
 
+def test_posttooluse_returns_system_context_as_additional_context(monkeypatch, capsys, tmp_path):
+    (tmp_path / ".agpolicy_call_tool-1.json").write_text(json.dumps({"call_id": "call-abc"}))
+    payload = _payload("PostToolUse")
+    payload["tool_response"] = {"stdout": "ok"}
+
+    def urlopen(request, timeout):
+        return _Response({"ok": True, "context": "[system] during this command (2.0 s) ..."})
+
+    monkeypatch.setenv("AGPOLICY_BASE_URL", "http://gateway")
+    monkeypatch.setenv("AGPOLICY_TOKEN", "policy-token")
+    monkeypatch.setenv("AGPOLICY_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(hook.sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(hook.urllib.request, "urlopen", urlopen)
+
+    assert hook.main() == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "[system] during this command (2.0 s) ...",
+        }
+    }
+
+
 def test_posttoolusefailure_forwards_the_error_field(monkeypatch, tmp_path):
     (tmp_path / ".agpolicy_call_tool-1.json").write_text(json.dumps({"call_id": "call-abc"}))
     requests = []

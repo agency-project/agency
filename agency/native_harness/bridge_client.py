@@ -49,13 +49,14 @@ class BridgeClient:
         duration_ns: int | None = None,
         started_wall_ns: int | None = None,
         error: str | None = None,
-    ) -> None:
+    ) -> "str | None":
         """Report a tool call's completion for telemetry. Best-effort: no
         call_id (an unreachable bridge at admission time, or a denied call
         that never ran) or a failed post never blocks/affects the tool
-        result already returned to the model."""
+        result. Returns system context to append to the result (sysinfo
+        expose "context" / "both"), or None."""
         if not call_id:
-            return
+            return None
         try:
             response = self._client.post(
                 "/agpolicy/complete_tool",
@@ -69,11 +70,14 @@ class BridgeClient:
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             response.raise_for_status()
+            context = response.json().get("context")
+            return context if isinstance(context, str) else None
         except Exception as exc:
             profiler = getattr(self, "_profiler", None)
             if profiler is not None:
                 profiler.dropped += 1
             print(f"[bridge_client] complete_tool_policy request failed: {exc!r}")
+            return None
 
     def context_limit(self) -> "int | None":
         try:

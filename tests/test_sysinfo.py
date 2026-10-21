@@ -8,6 +8,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
 from agency.agskill import agskill
 from agency.configs.agconfig import agconfig, sysinfoconfig
@@ -197,6 +198,26 @@ def test_a_broken_tracker_never_breaks_a_tool_call():
     admitted = server.admit_tool_call("Bash", {})
     assert admitted["allowed"] is True
     server.complete_tool_call(admitted["call_id"], result="ok")
+
+
+@pytest.mark.parametrize(
+    "expose,pushed", [("none", False), ("tool", False), ("context", True), ("both", True)]
+)
+def test_completion_returns_system_context_only_when_exposed_as_context(host, expose, pushed):
+    tracker = SysInfoTracker(lambda: str(host.cg), record=True, expose=expose)
+    server = HostInteractionServer(
+        agskill(name="s", prompt="p"), _Logger(), "a", sandbox=_sandbox_with(tracker)
+    )
+    client = TestClient(server.build_app())
+    call_id = server.admit_tool_call("Bash", {"command": "python w.py"})["call_id"]
+    host.advance(seconds=1, own_cpu_s=0.5, other_cpu_s=1.0)
+    body = client.post("/complete_tool", json={"call_id": call_id, "result": "ok"}).json()
+    assert body["ok"] is True
+    if pushed:
+        assert body["context"].startswith("[system] during this command (")
+        assert "busy 75%" in body["context"]
+    else:
+        assert "context" not in body
 
 
 @pytest.mark.parametrize("expose,served", [("none", False), ("tool", True), ("both", True)])

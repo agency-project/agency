@@ -48,7 +48,7 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
         call_id = body.get("call_id")
         if not isinstance(call_id, str) or not call_id:
             return JSONResponse({"error": "invalid call_id"}, status_code=400)
-        await asyncio.to_thread(
+        context = await asyncio.to_thread(
             bridge.complete_tool_policy,
             token,
             call_id,
@@ -57,7 +57,7 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             **({"duration_ns": body["duration_ns"]} if "duration_ns" in body else {}),
             **({"started_wall_ns": body["started_wall_ns"]} if "started_wall_ns" in body else {}),
         )
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, **({"context": context} if context else {})})
 
     @router.get("/agprof/status")
     async def agprof_status(request: Request):

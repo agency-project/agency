@@ -174,7 +174,8 @@ class HostServicesClient:
         error: "str | None" = None,
         duration_ns: int | None = None,
         started_wall_ns: int | None = None,
-    ) -> None:
+    ) -> "str | None":
+        """Report completion; returns system context to append to the tool result, if any."""
         response = self.client.post(
             "/interaction/complete_tool",
             json={
@@ -187,6 +188,8 @@ class HostServicesClient:
             headers=self._attempt_headers(token),
         )
         response.raise_for_status()
+        context = response.json().get("context")
+        return context if isinstance(context, str) else None
 
     def check_syscall_policy(
         self, token: str, syscall: "agsyscallevent"

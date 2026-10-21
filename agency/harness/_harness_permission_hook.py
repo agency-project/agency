@@ -19,7 +19,9 @@ bearer token, so that's the auth.
 For ``PreToolUse`` it posts to `/agpolicy/check_tool`, which both decides
 allow/deny AND opens a host-side pending span, returning a `call_id`. For
 ``PostToolUse``/``PostToolUseFailure`` it posts to `/agpolicy/complete_tool`
-to close that span and record the tool's result. Since each hook firing is
+to close that span and record the tool's result; when the reply carries system
+context (sysinfo expose "context"), it is printed as the hook's ``additionalContext``
+so the harness hands it to the model with the tool result. Since each hook firing is
 a fresh subprocess with no memory of the last one, the `call_id` returned
 by PreToolUse is persisted to a small per-`tool_use_id` file under
 `AGPOLICY_STATE_DIR` (each adapter points this at its own per-launch
@@ -220,7 +222,21 @@ def _report_completion(payload: dict, hook_event_name: str) -> None:
         # A gateway outage must add a small bounded hiccup, never block the
         # harness's own PostToolUse handling on Agency's telemetry.
         with urllib.request.urlopen(req, timeout=_COMPLETION_TIMEOUT_S) as resp:
-            resp.read()
+            reply = json.loads(resp.read() or b"{}")
+        # System context (sysinfo expose "context" / "both") rides back to the model as the
+        # hook's additionalContext, next to this tool's result.
+        context = reply.get("context") if isinstance(reply, dict) else None
+        if isinstance(context, str) and context:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": hook_event_name,
+                            "additionalContext": context,
+                        }
+                    }
+                )
+            )
     except Exception as exc:
         # DATACOLLECTOR: append, correlate (tool_use_id) -- this subprocess has no transport
         # to agDataCollector today; folding needs a new HTTP call here, not just a type name.

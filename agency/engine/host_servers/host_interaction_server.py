@@ -370,18 +370,28 @@ class HostInteractionServer:
         except Exception:  # noqa: BLE001 - counters are best-effort
             return None
 
-    def _record_sysinfo_window(self, call_id: str) -> None:
+    def _record_sysinfo_window(self, call_id: str) -> "str | None":
+        """Close the call's sysinfo window; return the fact block to attach to the tool
+        result when the sandbox exposes system context ("context" / "both"), else None."""
+
         def _complete(tracker):
             done = tracker.tool_completed(call_id)
-            if done is not None and tracker.record:
-                window, tool_name = done
+            if done is None:
+                return None
+            window, tool_name = done
+            if tracker.record:
                 self._data_logger.record_event(
                     "sysinfo_window",
                     {"call_id": call_id, "tool": tool_name, **window.to_event()},
                     print_to_terminal=False,
                 )
+            if tracker.expose in ("context", "both"):
+                from ...observability.sysinfo import render
 
-        self._sysinfo_call(_complete)
+                return render(window)
+            return None
+
+        return self._sysinfo_call(_complete)
 
     def complete_tool_call(
         self,
@@ -390,8 +400,10 @@ class HostInteractionServer:
         error: "str | None" = None,
         duration_ns: int | None = None,
         started_wall_ns: int | None = None,
-    ) -> None:
-        self._record_sysinfo_window(call_id)
+    ) -> "str | None":
+        """Record a tool call's completion. Returns system context to append to the tool
+        result (sysinfo expose "context" / "both"), or None."""
+        context = self._record_sysinfo_window(call_id)
         self._record_completion(
             "tool",
             call_id,
@@ -402,6 +414,7 @@ class HostInteractionServer:
                 **({"started_wall_ns": started_wall_ns} if started_wall_ns is not None else {}),
             },
         )
+        return context
 
     def admit_syscall(self, syscall: "agsyscallevent") -> dict:
         """Admission + telemetry entry point for a syscall"""
@@ -540,14 +553,14 @@ class HostInteractionServer:
 
         @app.post("/complete_tool")
         def _complete_tool(request: dict, http_request: Request) -> JSONResponse:
-            http_request.app.state.interaction_server.complete_tool_call(
+            context = http_request.app.state.interaction_server.complete_tool_call(
                 request["call_id"],
                 request.get("result"),
                 request.get("error"),
                 request.get("duration_ns"),
                 request.get("started_wall_ns"),
             )
-            return JSONResponse({"ok": True})
+            return JSONResponse({"ok": True, **({"context": context} if context else {})})
 
         @app.post("/check_syscall")
         def _check_syscall(request: dict, http_request: Request) -> JSONResponse:

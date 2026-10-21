@@ -177,7 +177,7 @@ def run_react_loop(
                 )
                 if bridge is not None:
                     if tool_duration_ns is not None:
-                        bridge.complete_tool_policy(
+                        context = bridge.complete_tool_policy(
                             call_id,
                             result_content,
                             duration_ns=tool_duration_ns,
@@ -185,7 +185,9 @@ def run_react_loop(
                             error=str(result_error) if result_error is not None else None,
                         )
                     else:
-                        bridge.complete_tool_policy(call_id, result_content)
+                        context = bridge.complete_tool_policy(call_id, result_content)
+                    if isinstance(context, str) and context:
+                        result_content = f"{result_content}\n\n{context}"
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )

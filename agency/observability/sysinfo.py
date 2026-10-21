@@ -16,7 +16,9 @@ Facts only: rendered text reports numbers and never judges whether a measurement
 
 Config: ``agconfig.sysinfo`` (sysinfoconfig). ``record`` logs one ``sysinfo_window`` event per
 tool call; ``expose`` decides what the agent sees ("none", "tool": the ``get_system_state``
-host MCP tool, "context": appended to tool results -- not wired yet, "both").
+host MCP tool, "context": the call's window is rendered and appended to that tool's result --
+HostInteractionServer.complete_tool_call returns it, the native harness appends it, and the CLI
+harnesses' PostToolUse hook hands it over as ``additionalContext`` -- "both").
 """
 
 from __future__ import annotations
