@@ -2,14 +2,19 @@
 
 One scheme serves both the SQLite data collector and ``agcontext``:
 
-* a **block** is one ``{"role": role, **block}`` payload, keyed by the SHA-256
-  of its *complete* canonical JSON. Nothing is left out of the key (tool-call
-  arguments, tool-result content, ``citations``, ``index``, ...), so two
-  blocks that differ in any field are two entries, and a stored payload is
-  always exactly what was seen;
-* a **message** is a record ``{"role", "blocks": [block hashes], "extra"?}``
-  keyed the same way, which keeps message boundaries and any message-level
-  fields (a flat chain of blocks cannot tell two messages from one);
+* a **block** is one ``{"role": role, **block}`` payload without its
+  ``index``, keyed by the SHA-256 of its canonical JSON. Every other field is in
+  the key (tool-call arguments, tool-result content, ``citations``, ...), so two
+  blocks that differ in any of them are two entries. ``index`` is only the
+  block's position in its message, so the same block anywhere has one key: a
+  harness that inserts a block in front of another (Claude Code's
+  ``<system-reminder>`` blocks, say) does not change it, and a patch still
+  applies. Two identical blocks are one entry, and a patch replaces both;
+* a **message** is a record ``{"role", "blocks": [block hashes], "indexes"?,
+  "extra"?}`` keyed the same way. It keeps message boundaries, each block's
+  ``index`` (``indexes``, when the blocks have one) and any message-level
+  fields (a flat chain of blocks cannot tell two messages from one), so a
+  rebuilt message is exactly what was seen;
 * a **history** is just an ordered list of message hashes.
 
 The patch lookup sits on top: it maps the hash of an original block to the
@@ -45,17 +50,25 @@ def content_hash(payload) -> str:
 
 
 def block_payload(role, block: dict) -> dict:
-    """The stored form of one block: the message role plus the whole block."""
-    if "role" in block:
-        return {"role": role, _NESTED: block}
-    return {"role": role, **block}
+    """The stored form of one block: the message role plus the block without its
+    ``index`` (which the message record keeps)."""
+    fields = {key: value for key, value in block.items() if key != "index"}
+    if "role" in fields:
+        return {"role": role, _NESTED: fields}
+    return {"role": role, **fields}
 
 
 def block_of(payload: dict) -> dict:
-    """Inverse of ``block_payload``: the block, without its role."""
+    """Inverse of ``block_payload``: the block, without its role (or ``index``)."""
     if _NESTED in payload:
         return payload[_NESTED]
     return {key: value for key, value in payload.items() if key != "role"}
+
+
+# Who made a patch (``MessageStore.message_patch_origin``). A patch with no entry
+# was made by the operator, through ``agent.patch_history``.
+OPERATOR_ORIGIN = "operator"
+MODEL_ORIGIN = "model"
 
 
 def with_tool_schema(
@@ -117,8 +130,9 @@ class MessageBlock:
     the role of the message that carries it. Immutable.
 
     ``hash`` is the key of the block's row in ``message_block_lookup``: the SHA-256
-    of the whole payload ``{"role", **fields}``, so blocks that differ in any field,
-    or in role, are different blocks. ``MessageBlock("user", {...})`` copies its
+    of the payload ``{"role", **fields}`` without ``index``, so blocks that differ
+    in any other field, or in role, are different blocks, and the same block at
+    another position is the same one. ``MessageBlock("user", {...})`` copies its
     fields, so later changes to the dict passed in do not reach the block."""
 
     __slots__ = ("_role", "_fields", "_hash")
@@ -156,7 +170,7 @@ class MessageBlock:
 
     @property
     def payload(self) -> dict:
-        """The row stored in ``message_block_lookup`` (a copy)."""
+        """The row stored in ``message_block_lookup`` (a copy, without ``index``)."""
         return copy.deepcopy(block_payload(self._role, self._fields))
 
     def to_dict(self) -> dict:
@@ -171,13 +185,6 @@ class MessageBlock:
 
     def __repr__(self) -> str:
         return f"MessageBlock({self._role!r}, {self._fields!r})"
-
-
-def _renumber(blocks: "list[dict]") -> None:
-    """Keep ``index`` consistent with position after blocks were swapped."""
-    for position, block in enumerate(blocks):
-        if "index" in block:
-            block["index"] = position
 
 
 def _exclusive(method):
@@ -200,6 +207,9 @@ class MessageStore:
     * ``message_patch_lookup``: original block hash -> ordered list of the
       hashes of the blocks that replace it (an empty list removes the block).
 
+    ``message_patch_origin`` says who made a patch (patch key -> ``"model"``);
+    a key it does not name was made by the operator.
+
     The dicts are shared, not copied, when passed in. Stored payloads are never
     mutated; every read hands out a copy.
 
@@ -213,6 +223,7 @@ class MessageStore:
         message_block_lookup: "dict | None" = None,
         message_structure_lookup: "dict | None" = None,
         message_patch_lookup: "dict | None" = None,
+        message_patch_origin: "dict | None" = None,
     ) -> None:
         self.message_block_lookup: "dict[str, dict]" = (
             message_block_lookup if message_block_lookup is not None else {}
@@ -222,6 +233,9 @@ class MessageStore:
         )
         self.message_patch_lookup: "dict[str, list[str]]" = (
             message_patch_lookup if message_patch_lookup is not None else {}
+        )
+        self.message_patch_origin: "dict[str, str]" = (
+            message_patch_origin if message_patch_origin is not None else {}
         )
         self._lock = threading.RLock()
 
@@ -262,6 +276,8 @@ class MessageStore:
                 "role": role,
                 "blocks": [self.add_block(MessageBlock(role, b)) for b in blocks],
             }
+            if any("index" in b for b in blocks):
+                record["indexes"] = [b.get("index") for b in blocks]
             extra = {k: v for k, v in message.items() if k not in ("role", "blocks")}
             if extra:
                 record["extra"] = extra
@@ -278,26 +294,45 @@ class MessageStore:
     # -- patches -----------------------------------------------------------
 
     @_exclusive
-    def add_patch(self, old_hash: str, new_hashes: "list[str]") -> str:
+    def add_patch(
+        self, old_hash: str, new_hashes: "list[str]", *, origin: str = OPERATOR_ORIGIN
+    ) -> str:
         """Replace every block whose hash is *old_hash* with the blocks *new_hashes*,
         in order (none removes it). Both sides are rows of ``message_block_lookup``;
         *old_hash* need not be there yet, but every hash in *new_hashes* must be
-        (``add_block`` stores a new one). Returns *old_hash*, the key."""
+        (``add_block`` stores a new one). *origin* records who made the patch.
+        Returns *old_hash*, the key."""
         if not isinstance(old_hash, str) or not all(isinstance(h, str) for h in new_hashes):
             raise TypeError("a patch links a block hash to a list of block hashes")
         missing = [h for h in new_hashes if h not in self.message_block_lookup]
         if missing:
             raise KeyError(f"not in message_block_lookup (add_block them first): {missing}")
         self.message_patch_lookup[old_hash] = list(new_hashes)
+        if origin == OPERATOR_ORIGIN:
+            self.message_patch_origin.pop(old_hash, None)
+        else:
+            self.message_patch_origin[old_hash] = origin
         return old_hash
 
     @_exclusive
     def remove_patch(self, key: str) -> bool:
+        self.message_patch_origin.pop(key, None)
         return self.message_patch_lookup.pop(key, None) is not None
 
     @_exclusive
     def clear_patches(self) -> None:
         self.message_patch_lookup.clear()
+        self.message_patch_origin.clear()
+
+    @_exclusive
+    def patch_origin(self, key: str) -> str:
+        return self.message_patch_origin.get(key, OPERATOR_ORIGIN)
+
+    @_exclusive
+    def patch_keys_for(self, block_hashes: "Iterable[str]") -> "dict[str, str]":
+        """block hash -> the key of the patch that replaces it, for each of
+        *block_hashes* that some patch matches."""
+        return {h: h for h in block_hashes if h in self.message_patch_lookup}
 
     # -- reading -----------------------------------------------------------
 
@@ -319,34 +354,45 @@ class MessageStore:
         return [(h, self.message_block_lookup[h]) for h in self._block_hashes(digest)]
 
     @_exclusive
-    def _message(self, digest: str) -> "dict | None":
+    def _message(self, digest: str, applied: "set[str] | None" = None) -> "dict | None":
         """The message as a dict, with the patch lookup applied. ``None`` if the
         patches removed every block it had."""
         record = self.message_structure_lookup[digest]
         if "opaque" in record:
             return copy.deepcopy(record["opaque"])
         blocks: "list[dict]" = []
+        indexes = record.get("indexes")
         patched = False
-        for block_hash in record["blocks"]:
+        for position, block_hash in enumerate(record["blocks"]):
             replacement = self.message_patch_lookup.get(block_hash)
             if replacement is None:
-                blocks.append(block_of(self.message_block_lookup[block_hash]))
+                block = block_of(self.message_block_lookup[block_hash])
+                if indexes is not None and indexes[position] is not None:
+                    block["index"] = indexes[position]
+                blocks.append(block)
             else:
                 patched = True
+                if applied is not None:
+                    applied.add(block_hash)
                 blocks.extend(block_of(self.message_block_lookup[h]) for h in replacement)
         if patched:
             if not blocks and record["blocks"]:
                 return None
-            _renumber(blocks)
+            # Blocks were swapped: number them by position again (a record stored
+            # before blocks lost their ``index`` keeps it in the payloads).
+            for position, block in enumerate(blocks):
+                if indexes is not None or "index" in block:
+                    block["index"] = position
         message = {"role": record["role"], **record.get("extra", {}), "blocks": blocks}
         return copy.deepcopy(message)
 
     @_exclusive
-    def materialize(self, digests: "Iterable[str]") -> list:
-        """Rebuild the message list, patched blocks superseding the originals."""
+    def materialize(self, digests: "Iterable[str]", applied: "set[str] | None" = None) -> list:
+        """Rebuild the message list, patched blocks superseding the originals. The
+        key of every patch that replaced a block is added to *applied*, if given."""
         out = []
         for digest in digests:
-            message = self._message(digest)
+            message = self._message(digest, applied)
             if message is not None:
                 out.append(message)
         return out
@@ -358,4 +404,5 @@ class MessageStore:
             dict(self.message_block_lookup),
             dict(self.message_structure_lookup),
             {key: list(value) for key, value in self.message_patch_lookup.items()},
+            dict(self.message_patch_origin),
         )

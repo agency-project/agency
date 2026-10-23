@@ -558,10 +558,9 @@ def test_exchange_records_tool_definitions_and_tool_choice_as_the_tool_schema_me
     assert {
         "role": "tool_schema",
         "type": "tool_definition",
-        "index": 0,
         "tool": _WEATHER_TOOL,
     } in payloads
-    assert {"role": "tool_schema", "type": "tool_choice", "index": 1, "value": "auto"} in payloads
+    assert {"role": "tool_schema", "type": "tool_choice", "value": "auto"} in payloads
 
 
 def test_exchange_gives_each_tool_its_own_block_hash():
@@ -592,7 +591,7 @@ def test_exchange_records_extra_request_fields_in_the_tool_schema_message():
     server.dispatch({"messages": with_tool_schema([], extra=extra)})
 
     payloads = _chain_payloads(server._data_logger.finalized[0][2])
-    assert {"role": "tool_schema", "type": "request_extra", "index": 0, "value": extra} in payloads
+    assert {"role": "tool_schema", "type": "request_extra", "value": extra} in payloads
 
 
 def test_exchange_records_the_full_prompt_every_call_not_a_diff():
@@ -619,7 +618,8 @@ def test_exchange_response_blocks_carry_the_response_role():
     server = _ok_server()
     server.dispatch({"messages": []})
     payloads = _chain_payloads(server._data_logger.finalized[0][3])
-    assert payloads[0] == {"role": "assistant", "type": "text", "index": 0, "text": "ok"}
+    # Stored blocks have no ``index``: the message records keep it.
+    assert payloads[0] == {"role": "assistant", "type": "text", "text": "ok"}
 
 
 def test_resent_history_is_confined_to_the_prompt_never_the_response():
@@ -673,11 +673,11 @@ def test_resent_history_is_confined_to_the_prompt_never_the_response():
 
     # The resent text lives in the prompt...
     assert any(
-        p["role"] == "assistant" and p.get("index") == 0 and p["type"] == "text"
+        p["role"] == "assistant" and p["type"] == "text" and p["text"] == "Let me look."
         for p in prompt_payloads
     )
     # ...and never in the response: exactly turn 2's own blocks, with an
-    # uncorrupted tool_use at index 0.
+    # uncorrupted tool_use.
     assert [p["type"] for p in response_payloads] == ["text", "tool_use"]
     assert response_payloads[0]["text"] == "Found it."
     assert response_payloads[1]["id"] == "call_2"
@@ -1354,7 +1354,7 @@ def test_dispatch_tags_recorded_text_response_from_internal_kind():
 
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
-    assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "[Worker] done"}]
+    assert payloads == [{"role": "assistant", "type": "text", "text": "[Worker] done"}]
 
 
 def test_dispatch_tags_recorded_tool_use_name_from_internal_kind():
@@ -1376,7 +1376,7 @@ def test_dispatch_without_internal_kind_leaves_response_untagged():
 
     response_chain = server._data_logger.finalized[-1][3]
     payloads = _chain_payloads(response_chain)
-    assert payloads == [{"role": "assistant", "type": "text", "index": 0, "text": "done"}]
+    assert payloads == [{"role": "assistant", "type": "text", "text": "done"}]
 
 
 def test_start_stream_tags_recorded_response_from_internal_kind():

@@ -414,3 +414,157 @@ def test_the_lock_is_reentrant_and_with_store_holds_it():
         digest = store.add_message({"role": "user", "blocks": [block("x")]})
         assert store._message(digest)["blocks"][0]["text"] == "x"
         assert len(store) == 1
+
+
+# -- a block at another index, and who made a patch ---------------------------------
+
+
+def _add_patch(store, role, old_fields, new_fields_list, **kwargs):
+    old = MessageBlock(role, old_fields)
+    with store:
+        store.add_block(old)
+        return store.add_patch(
+            old.hash, [store.add_block(MessageBlock(role, f)) for f in new_fields_list], **kwargs
+        )
+
+
+def _two_blocks(first, second):
+    return {
+        "role": "user",
+        "blocks": [
+            {"type": "text", "index": 0, "text": first},
+            {"type": "text", "index": 1, "text": second},
+        ],
+    }
+
+
+def test_a_patch_still_matches_when_a_block_in_front_shifts_its_index():
+    store = MessageStore()
+    _add_patch(
+        store,
+        "user",
+        {"type": "text", "index": 0, "text": "Alice has a blue car."},
+        [{"type": "text", "index": 0, "text": "Alice has a red car."}],
+    )
+    # The harness put a reminder in front, so the fact is now at index 1.
+    digest = store.add_message(
+        _two_blocks("<system-reminder>x</system-reminder>", "Alice has a blue car.")
+    )
+
+    (message,) = store.materialize([digest])
+    assert [b["text"] for b in message["blocks"]] == [
+        "<system-reminder>x</system-reminder>",
+        "Alice has a red car.",
+    ]
+    assert [b["index"] for b in message["blocks"]] == [0, 1]
+
+
+def test_the_same_block_at_another_index_has_the_same_hash_and_one_row():
+    store = MessageStore()
+    first = MessageBlock("user", {"type": "text", "index": 0, "text": "x"})
+    shifted = MessageBlock("user", {"type": "text", "index": 1, "text": "x"})
+    assert first.hash == shifted.hash
+    assert "index" not in first.payload
+    store.add_messages([text("user", "x"), _two_blocks("y", "x")])
+    assert [p for p in store.message_block_lookup.values() if p.get("text") == "x"] == [
+        {"role": "user", "type": "text", "text": "x"}
+    ]
+
+
+def test_a_rebuilt_message_keeps_every_block_s_index():
+    store = MessageStore()
+    message = {
+        "role": "assistant",
+        "blocks": [
+            {"type": "text", "index": 0, "text": "same"},
+            {"type": "text", "index": 1, "text": "same"},
+            {"type": "metadata", "index": 2**31 - 1, "usage": {}},
+        ],
+    }
+    digest = store.add_message(message)
+    assert store.message_structure_lookup[digest]["indexes"] == [0, 1, 2**31 - 1]
+    assert store.materialize([digest]) == [message]
+    # The index is part of the message's key, though not of its blocks'.
+    reordered = {
+        **message,
+        "blocks": [dict(b, index=i + 5) for i, b in enumerate(message["blocks"])],
+    }
+    assert store.add_message(reordered) != digest
+    # Blocks without an index rebuild without one.
+    bare = store.add_message({"role": "user", "blocks": [{"type": "text", "text": "a"}]})
+    assert "indexes" not in store.message_structure_lookup[bare]
+    assert store.materialize([bare]) == [
+        {"role": "user", "blocks": [{"type": "text", "text": "a"}]}
+    ]
+
+
+def test_a_patch_replaces_both_of_two_identical_blocks_and_renumbers_them():
+    store = MessageStore()
+    _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "x"}, [{"type": "text", "text": "X"}]
+    )
+    digest = store.add_message(
+        {
+            "role": "user",
+            "blocks": [
+                {"type": "text", "index": 0, "text": "x"},
+                {"type": "text", "index": 1, "text": "y"},
+                {"type": "text", "index": 2, "text": "x"},
+            ],
+        }
+    )
+    (message,) = store.materialize([digest])
+    assert [(b["index"], b["text"]) for b in message["blocks"]] == [(0, "X"), (1, "y"), (2, "X")]
+
+
+def test_a_record_stored_with_indexed_payloads_still_rebuilds():
+    # Records saved before blocks lost their index carry it in the payloads.
+    store = MessageStore()
+    store.message_block_lookup["old"] = {"role": "user", "type": "text", "index": 0, "text": "a"}
+    store.message_structure_lookup["m"] = {"role": "user", "blocks": ["old"]}
+    assert store.materialize(["m"]) == [
+        {"role": "user", "blocks": [{"type": "text", "index": 0, "text": "a"}]}
+    ]
+    with store:
+        store.add_patch(
+            "old", [store.add_block(MessageBlock("user", {"type": "text", "text": "b"}))]
+        )
+    assert store.materialize(["m"])[0]["blocks"] == [{"type": "text", "text": "b"}]
+
+
+def test_materialize_reports_the_patches_it_applied_and_patch_keys_for_finds_them():
+    store = MessageStore()
+    used = _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "a"}, [{"type": "text", "text": "A"}]
+    )
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "never sent"}, [])
+    digest = store.add_message(_two_blocks("q", "a"))
+    applied: set = set()
+    store.materialize([digest], applied)
+    assert applied == {used}
+    block_hashes = store.message_structure_lookup[digest]["blocks"]
+    assert store.patch_keys_for(block_hashes) == {block_hashes[1]: used}
+
+
+def test_a_patch_records_its_origin_and_removing_or_clearing_forgets_it():
+    store = MessageStore()
+    by_model = _add_patch(
+        store, "user", {"type": "text", "index": 0, "text": "m"}, [], origin="model"
+    )
+    by_operator = _add_patch(store, "user", {"type": "text", "index": 0, "text": "o"}, [])
+    assert store.patch_origin(by_model) == "model"
+    assert store.patch_origin(by_operator) == "operator"
+    assert store.message_patch_origin == {by_model: "model"}
+
+    copied = store.copy()
+    assert copied.patch_origin(by_model) == "model"
+    copied.remove_patch(by_model)
+    assert copied.message_patch_origin == {}
+    assert store.message_patch_origin == {by_model: "model"}  # the copy is independent
+
+    # The operator re-patching the same block takes it over.
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "m"}, [])
+    assert store.patch_origin(by_model) == "operator"
+    _add_patch(store, "user", {"type": "text", "index": 0, "text": "m"}, [], origin="model")
+    store.clear_patches()
+    assert store.message_patch_origin == {}

@@ -1033,6 +1033,8 @@ class GlobalAgentOrchestrator:
         store = context.message_store
         if op == "add":
             with store:
+                # The original is stored too, so the patch also matches it at another index.
+                store.add_block(patch["old"])
                 store.add_patch(patch["old"].hash, [store.add_block(b) for b in patch["new"]])
         elif op == "remove":
             store.remove_patch(patch["key"])

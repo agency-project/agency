@@ -66,6 +66,10 @@ class _AnthropicModelInfo:
     # now: mid-conversation system-class messages are still sent as `user`
     # on every model (the native form has placement rules of its own).
     mid_conversation_system: "bool | None" = None
+    # True: a thinking block is bound to the conversation before it, and
+    # replaying it after that prefix changed is a 400 on enforced accounts
+    # ("preserved thinking"). Omitting `thinking` runs adaptive on these.
+    preserved_thinking: "bool | None" = None
 
 
 # Keyed by the bare model name, after stripping the region and "anthropic."
@@ -76,12 +80,12 @@ class _AnthropicModelInfo:
 # against the live API on 2026-09-29 (Mythos entries: Anthropic's docs, same
 # surface as their Fable counterparts). Update when new models ship.
 _ANTHROPIC_MODELS: "dict[str, _AnthropicModelInfo]" = {
-    "claude-fable-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-fable-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True, True),
     "claude-mythos-5-1": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
     "claude-fable-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
     "claude-mythos-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
     "claude-mythos-preview": _AnthropicModelInfo(1_000_000),
-    "claude-opus-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-opus-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True, True),
     "claude-opus-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
     "claude-opus-4-8": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
     "claude-opus-4-7": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, False),
@@ -89,12 +93,13 @@ _ANTHROPIC_MODELS: "dict[str, _AnthropicModelInfo]" = {
     "claude-opus-4-5": _AnthropicModelInfo(200_000, True, "exclusive", _EFFORT_BASIC, False),
     "claude-opus-4-1": _AnthropicModelInfo(1_000_000),
     "claude-opus-4-0": _AnthropicModelInfo(1_000_000),
-    "claude-sonnet-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True),
+    "claude-sonnet-5-5": _AnthropicModelInfo(1_000_000, False, "none", _EFFORT_ALL, True, True),
     "claude-sonnet-5": _AnthropicModelInfo(1_000_000, True, "none", _EFFORT_ALL, True),
     "claude-sonnet-4-6": _AnthropicModelInfo(1_000_000, True, "exclusive", _EFFORT_NO_XHIGH, False),
     "claude-sonnet-4-5": _AnthropicModelInfo(1_000_000, True, "exclusive", frozenset(), False),
     "claude-sonnet-4-0": _AnthropicModelInfo(1_000_000),
     "claude-haiku-4-5": _AnthropicModelInfo(200_000, True, "exclusive", frozenset(), False),
+    "claude-haiku-5-5": _AnthropicModelInfo(1_000_000, preserved_thinking=True),
 }
 
 # What may follow a known bare model name and still be that same model: a
@@ -124,6 +129,16 @@ def _known_anthropic_context_window(model: str) -> "int | None":
 
 
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
+
+# Asks the API to drop a replayed thinking block whose conversation changed
+# since it was produced (and every thinking block after it), instead of
+# rejecting the request. Message patches (llm/message_store.py) and harnesses
+# that rewrite their own history both change it.
+_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+_DROP_MISMATCHED_THINKING = {
+    "type": "adaptive",
+    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+}
 
 
 def _serialize_sdk_object(obj):
@@ -600,6 +615,20 @@ class _AnthropicBackend(agllm):
         )
         if anthropic_tool_choice is not None:
             kwargs["tool_choice"] = anthropic_tool_choice
+        if (
+            info is not None
+            and info.preserved_thinking
+            and any(
+                isinstance(m["content"], list)
+                and any(b.get("type") == "thinking" for b in m["content"])
+                for m in anthropic_messages
+                if m["role"] == "assistant"
+            )
+        ):
+            # Not typed by the SDK yet, hence extra_*. Bedrock's client moves
+            # the header into the body's anthropic_beta.
+            kwargs["extra_headers"] = {"anthropic-beta": _THINKING_BINDING_BETA}
+            kwargs["extra_body"] = {"thinking": _DROP_MISMATCHED_THINKING}
         if anthropic_messages:
             # Second breakpoint on the latest turn. messages grows across
             # calls in an agent loop, so this lets the *next* call read
