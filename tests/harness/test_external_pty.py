@@ -96,15 +96,13 @@ def test_context_limit_is_written_into_config_when_lookup_succeeds(
     else:
         config = json.loads((tmp_path / "opencode.json").read_text())
         assert config["provider"]["agency-proxy"]["models"][runtime.model]["limit"] == {
-            "context": 42_000,
-            # 42_000 is too small a window for the 10% share to beat the
-            # flat default floor -- see the dedicated large-window test for
-            # the branch where it actually scales.
-            "output": runtime.agconfig.llm.default_max_tokens,
+            # OpenCode compacts at context - min(output, 32K): 90% of 42_000.
+            "context": 37_800 + 4_200,
+            "output": 4_200,
         }
 
 
-def test_opencode_output_reservation_scales_with_a_large_context_window(
+def test_opencode_reserve_stops_at_its_32k_cap_for_a_large_context_window(
     runtime, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -115,8 +113,9 @@ def test_opencode_output_reservation_scales_with_a_large_context_window(
     )
     config = json.loads((tmp_path / "opencode.json").read_text())
     limit = config["provider"]["agency-proxy"]["models"][runtime.model]["limit"]
-    assert limit["context"] == 500_000
-    assert limit["output"] == max(runtime.agconfig.llm.default_max_tokens, 50_000)
+    # OpenCode never keeps more than 32K free, so context carries the rest of
+    # the 10% margin: it compacts at 450_000.
+    assert limit == {"context": 450_000 + 32_000, "output": 32_000}
 
 
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])

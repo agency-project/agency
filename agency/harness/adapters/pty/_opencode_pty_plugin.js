@@ -55,7 +55,13 @@ export const AgencyPlugin = async ({ client }) => {
         return
       }
       const messages = response.data || []
-      const replies = messages.filter(m => m.info.role === "assistant" && m.info.parentID === turn.turn_id)
+      // Everything the agent answered since the turn's prompt. When OpenCode
+      // compacts mid-turn it continues under a synthetic user message, so the
+      // final answer's parent is not the prompt; its summaries are not answers.
+      const start = messages.findIndex(m => m.info.id === turn.turn_id)
+      const replies = start < 0
+        ? messages.filter(m => m.info.role === "assistant" && m.info.parentID === turn.turn_id)
+        : messages.slice(start + 1).filter(m => m.info.role === "assistant" && !m.info.summary)
       const reply = replies.at(-1)
       if (!reply) return
       if (reply.info.error) {

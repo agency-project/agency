@@ -308,12 +308,30 @@ class agllm:
            one model under a served-model-name that may differ from ours. A
            multi-model listing never lends another model's window.
         5. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
-           which has no model-listing API at all)
+           which has no model-listing API at all); also caps 2-4
         6. ``self.agconfig.llm.default_context_limit`` — safe fallback so compaction always runs
         """
         if self.agconfig.llm.context_limit is not None:
             return int(self.agconfig.llm.context_limit)
         model_id = self.agconfig.llm.model or ""
+        listed = self._listed_context_limit(model_id)
+        known = self.known_context_limit(model_id)
+        if listed is not None and known is not None:
+            # A proxy's listing can carry the model's total window where the
+            # known value is its input cap (LiteLLM lists gpt-6-luna at
+            # 1,050,000 for a 922,000-token input cap); it never raises it.
+            return min(listed, known)
+        if listed is not None:
+            return listed
+        if known is not None:
+            return known
+        print(
+            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.llm.default_context_limit}"
+        )
+        return self.agconfig.llm.default_context_limit
+
+    def _listed_context_limit(self, model_id: str) -> "int | None":
+        """Steps 2-4 of `fetch_context_limit`: the window the API reports."""
         all_models: list = []
         try:
             all_models = self.list_models()
@@ -332,16 +350,8 @@ class agllm:
         except Exception as _e:
             print(f"[agllm] WARNING: failed to retrieve model {model_id!r} from API: {_e}")
         if len(all_models) == 1:
-            limit = self._context_limit_of(all_models[0])
-            if limit is not None:
-                return limit
-        known = self.known_context_limit(model_id)
-        if known is not None:
-            return known
-        print(
-            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.llm.default_context_limit}"
-        )
-        return self.agconfig.llm.default_context_limit
+            return self._context_limit_of(all_models[0])
+        return None
 
     def _client_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(

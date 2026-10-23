@@ -20,6 +20,7 @@ from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_l
 from .pty.driver import PtyDriver, run_pty_attempt
 from .streaming import start_streaming_response, stream_response, upstream_error
 from ...llm.message_store import with_tool_schema
+from ...native_harness.usage import prompt_tokens
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -48,21 +49,47 @@ def _anthropic_error_frame(exc: BaseException) -> str:
     return f"event: error\ndata: {json.dumps({'type': 'error', 'error': error})}\n\n"
 
 
-# --autocompact only accepts this range (per `claude --help`); a model with a
-# real window outside it can't be told via this flag at all, so Claude Code
-# is left on its own "auto" default for those rather than passed a value it
-# would reject.
+# How Claude Code 2.1.251 sizes auto-compaction (read from its bundle and
+# measured against a mock backend):
+#
+#   window    = min(model window, --autocompact)
+#   threshold = window - min(max output, 20_000) - 13_000
+#
+# "model window" is 200K for a model name it does not recognise, whatever
+# --autocompact says, unless CLAUDE_CODE_MAX_CONTEXT_TOKENS gives it (honoured
+# only for names not starting with "claude-") or the name ends in "[1m]"
+# (1M; the suffix is stripped from the API request). --autocompact takes
+# 100K-1M; CLAUDE_CODE_AUTO_COMPACT_WINDOW is the same setting, raised to 100K
+# when lower. The window is passed with the reserve added back, so that
+# Claude Code compacts at the same fraction of the real limit as the native
+# harness (native_harness/compaction.py's COMPACT_THRESHOLD).
+_CLAUDE_CODE_DEFAULT_WINDOW = 200_000
+_CLAUDE_CODE_RESERVE = 20_000 + 13_000
 _AUTOCOMPACT_MIN_TOKENS = 100_000
 _AUTOCOMPACT_MAX_TOKENS = 1_000_000
-# --autocompact directly sets Claude Code's *effective* window (confirmed
-# against the CLI's own bundled strings: it feeds straight into the
-# used-tokens-vs-window comparison, not a separate trigger threshold below a
-# still-real max the way codex's model_context_window/
-# model_auto_compact_token_limit split works). Compacting at the exact real
-# limit would leave no headroom for the compaction call itself plus the next
-# turn's overhead, so shave the same margin native_harness/compaction.py's
-# own COMPACT_THRESHOLD already uses before handing the number over.
-_AUTOCOMPACT_SAFETY_MARGIN = 0.9
+_COMPACT_AT = 0.9
+
+
+def claude_code_window_settings(model: str, context_limit: int) -> "tuple[str, list[str], dict]":
+    """(--model value, extra argv, extra env) so that Claude Code compacts at
+    90% of `context_limit` (or as close as its limits allow)."""
+    window = int(context_limit * _COMPACT_AT) + _CLAUDE_CODE_RESERVE
+    argv: list[str] = []
+    env: dict[str, str] = {}
+    if model.startswith("claude-"):
+        if window > _CLAUDE_CODE_DEFAULT_WINDOW and "[" not in model:
+            model += "[1m]"
+    else:
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
+    if window > _AUTOCOMPACT_MAX_TOKENS:
+        window = _AUTOCOMPACT_MAX_TOKENS
+    if window >= _AUTOCOMPACT_MIN_TOKENS:
+        argv += ["--autocompact", str(window)]
+    else:
+        # Too small for --autocompact. The env form is raised to 100K, and
+        # the model window above (non-Claude names) then sets the threshold.
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(_AUTOCOMPACT_MIN_TOKENS)
+    return model, argv, env
 
 
 # -- Native session continuity ----------------------------------------------
@@ -282,20 +309,22 @@ def _sse(event_type: str, data: dict) -> str:
 def _forward_usage_to_anthropic(
     usage: "dict | None", *, output_tokens: "int | None" = None
 ) -> dict:
-    """Full copy, plus Anthropic's own field names layered on top."""
+    """Full copy, plus Anthropic's own field names layered on top.
+
+    Claude Code sizes the conversation as input + cache_read + cache_creation,
+    Anthropic's convention, in which the three never overlap. Agency's usage
+    may follow OpenAI's instead (cache counts inside prompt_tokens), so the
+    split comes from `prompt_tokens()` rather than a field-by-field copy."""
+    prompt = prompt_tokens(usage)
     usage = dict(usage or {})
-    usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    usage["input_tokens"] = prompt.uncached
     usage["output_tokens"] = (
         output_tokens
         if output_tokens is not None
         else usage.get("completion_tokens", usage.get("output_tokens", 0))
     )
-    usage["cache_read_input_tokens"] = usage.get(
-        "cache_read_tokens", usage.get("cache_read_input_tokens", 0)
-    )
-    usage["cache_creation_input_tokens"] = usage.get(
-        "cache_write_tokens", usage.get("cache_creation_input_tokens", 0)
-    )
+    usage["cache_read_input_tokens"] = prompt.cache_read
+    usage["cache_creation_input_tokens"] = prompt.cache_write
     return usage
 
 
@@ -343,13 +372,14 @@ class ClaudeDriver(PtyDriver):
             self.argv += ["--max-turns", str(max_steps)]
         context_limit = fetch_context_limit(runtime.harness_base_url, runtime.token)
         if context_limit is not None:
-            # Otherwise Claude Code's own auto-compaction is sized for
-            # whatever model name it thinks it's talking to, not the real
-            # (possibly much smaller) window of the model actually proxied
-            # behind agency.
-            autocompact_window = int(context_limit * _AUTOCOMPACT_SAFETY_MARGIN)
-            if _AUTOCOMPACT_MIN_TOKENS <= autocompact_window <= _AUTOCOMPACT_MAX_TOKENS:
-                self.argv += ["--autocompact", str(autocompact_window)]
+            # Otherwise Claude Code sizes auto-compaction for whatever it
+            # thinks the model name is (200K when it doesn't know it), not
+            # for the model actually proxied behind Agency.
+            model, argv, env = claude_code_window_settings(runtime.model, context_limit)
+            if model != runtime.model:
+                self.argv[self.argv.index("--model") + 1] = model
+            self.argv += argv
+            self.env.update(env)
 
     def _transcript(self):
         if self.session_id is None:
