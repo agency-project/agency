@@ -19,6 +19,7 @@ from fastapi import Request
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from .pty.driver import PtyDriver, run_pty_attempt
 from .streaming import start_streaming_response, stream_response, upstream_error
+from .. import mcp_proxy
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -353,6 +354,8 @@ class ClaudeDriver(PtyDriver):
         self._interrupt_offset = 0
         self._interrupt_generation = None
         self._draft_cleared = False
+        self._token = runtime.token
+        self._tools_listed_at_launch = mcp_proxy.tools_listed(runtime.token)
         super().__init__(adapter, runtime, root, session_id, blob, max_steps)
 
     def _restore(self, session_id, blob):
@@ -418,7 +421,15 @@ class ClaudeDriver(PtyDriver):
         return draft, generation
 
     def ready(self, handle):
-        return self.started and (self._editable_input(handle) or (None,))[0] == ""
+        # Claude connects to Agency's MCP server in the background. Typing the
+        # prompt before it has the tool list sends request 0 without
+        # always-loaded tools; their arrival then changes the tool list and
+        # request 1 misses the prompt cache.
+        return (
+            self.started
+            and mcp_proxy.tools_listed(self._token) > self._tools_listed_at_launch
+            and (self._editable_input(handle) or (None,))[0] == ""
+        )
 
     def submission_marker(self, label):
         # This driver fences turns by identity, so the marker needs no nonce.

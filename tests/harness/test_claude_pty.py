@@ -5,12 +5,14 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from agency.configs.agconfig import agconfig
+from agency.harness import mcp_proxy
 from agency.harness.adapters.base import AdapterRuntime
 from agency.harness.adapters.claude_code import ClaudeDriver
 from agency.harness.adapters.pty.execution import PtyExecution
@@ -58,7 +60,10 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
         SimpleNamespace(check=lambda *args: True),
         register_control_handle=register_handle,
     )
+    monkeypatch.setattr(mcp_proxy, "_tools_listed", Counter())
     driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
+    # The scripted CLI has no MCP client; stand in for its tools/list.
+    mcp_proxy._tools_listed[runtime.token] += 1
     execution = PtyExecution(driver, runtime)
     execution.INPUT_TIMEOUT = 1
     if mode == "paused":
@@ -176,3 +181,31 @@ def test_no_autocompact_flag_when_context_limit_lookup_fails(tmp_path, monkeypat
     )
     driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
     assert "--autocompact" not in driver.argv
+
+
+def test_claude_ready_waits_for_this_launchs_tools_list(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_proxy, "_tools_listed", Counter({"token": 1}))
+    adapter = SimpleNamespace(
+        agconfig=agconfig(), prepare_pty=lambda *args, **kwargs: (["claude"], {})
+    )
+    runtime = AdapterRuntime(
+        agconfig(), "model", "engine", "", "token", SimpleNamespace(check=lambda *args: True)
+    )
+    monkeypatch.setattr(
+        "agency.harness.adapters.claude_code.fetch_context_limit", lambda *args: None
+    )
+    driver = ClaudeDriver(adapter, runtime, tmp_path, None, None, None)
+    driver.started = True
+    screen = ["─" * 10, "❯ ", "─" * 10]
+    handle = SimpleNamespace(terminal_screen=lambda: (screen, 0, 1, 1))
+    # A tools/list from an earlier launch with the same token does not count.
+    assert not driver.ready(handle)
+    mcp_proxy._tools_listed["token"] += 1
+    assert driver.ready(handle)
+
+
+def test_mcp_proxy_recognizes_tools_list_requests():
+    assert mcp_proxy._lists_tools(b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}')
+    assert mcp_proxy._lists_tools(b'[{"method": "initialize"}, {"method": "tools/list"}]')
+    assert not mcp_proxy._lists_tools(b'{"method": "tools/call"}')
+    assert not mcp_proxy._lists_tools(b"")

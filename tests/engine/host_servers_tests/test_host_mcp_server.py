@@ -155,6 +155,15 @@ def test_build_app_registers_the_default_host_tools_with_no_extras():
     assert _tool_names(server) == _FIXED_TOOL_NAMES
 
 
+def test_every_host_tool_is_listed_as_always_loaded():
+    # Claude Code defers MCP tools behind ToolSearch unless they carry this
+    # hint; a mid-run load changes the tool list and breaks the prompt cache.
+    server, _, _ = _make_server(add_host_mcp_tools=None)
+    tools = asyncio.run(server._mcp_server.list_tools())
+    assert {t.name for t in tools} == _FIXED_TOOL_NAMES
+    assert all((t.meta or {}).get("anthropic/alwaysLoad") is True for t in tools)
+
+
 def test_build_app_registers_add_host_mcp_tools_alongside_the_defaults():
     echo = agtool(
         name="echo",

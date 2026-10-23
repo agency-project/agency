@@ -22,6 +22,9 @@ surfaces as an error -- it just looks like the tool call failed."""
 
 from __future__ import annotations
 
+import json
+import threading
+from collections import Counter
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING
 
@@ -34,18 +37,42 @@ if TYPE_CHECKING:
     from .clients.host_services_client import HostServicesClient
 
 
+# Completed `tools/list` responses per bearer token. A client that builds its
+# first prompt from the tool list (Claude Code with always-loaded tools) must
+# not be given that prompt before this count rises; see `ClaudeDriver.ready`.
+_tools_listed: "Counter[str]" = Counter()
+_tools_listed_lock = threading.Lock()
+
+
+def tools_listed(token: str) -> int:
+    with _tools_listed_lock:
+        return _tools_listed[token]
+
+
+def _lists_tools(body: bytes) -> bool:
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return False
+    messages = message if isinstance(message, list) else [message]
+    return any(isinstance(m, dict) and m.get("method") == "tools/list" for m in messages)
+
+
 class _ClosingStreamingResponse(StreamingResponse):
     """Close the upstream HTTP context on completion or client disconnect."""
 
-    def __init__(self, *args, upstream_stack: AsyncExitStack, **kwargs) -> None:
+    def __init__(self, *args, upstream_stack: AsyncExitStack, on_sent=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._upstream_stack = upstream_stack
+        self._on_sent = on_sent
 
     async def __call__(self, scope, receive, send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
             await self._upstream_stack.aclose()
+        if self._on_sent is not None:
+            self._on_sent()
 
 
 def build_router(bridge: "HostServicesClient") -> APIRouter:
@@ -94,15 +121,23 @@ def build_router(bridge: "HostServicesClient") -> APIRouter:
             for k, v in resp.headers.items()
             if k.lower() not in ("content-length", "transfer-encoding", "connection")
         }
+        on_sent = None
+        if resp.status_code == 200 and _lists_tools(body):
+
+            def on_sent():
+                with _tools_listed_lock:
+                    _tools_listed[token] += 1
+
         return _ClosingStreamingResponse(
             resp.aiter_raw(),
             status_code=resp.status_code,
             headers=response_headers,
             media_type=resp.headers.get("content-type"),
             upstream_stack=upstream_stack,
+            on_sent=on_sent,
         )
 
     return router
 
 
-__all__ = ["build_router"]
+__all__ = ["build_router", "tools_listed"]

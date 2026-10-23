@@ -74,6 +74,13 @@ for _noisy_logger_name in (
     logging.getLogger(_noisy_logger_name).setLevel(logging.WARNING)
 
 
+# Claude Code includes these tools in every prompt instead of deferring them
+# behind ToolSearch. Loading a tool mid-run changes the tool list, and the next
+# request misses the prompt cache. A keyword search for one Agency tool loads
+# every match, so all of them are listed up front, not just submit_output.
+_ALWAYS_LOAD_META = {"anthropic/alwaysLoad": True}
+
+
 class HostMcpServer:
     def __init__(
         self,
@@ -133,7 +140,12 @@ class HostMcpServer:
                 for key, schema in properties.items()
             ]
         )
-        server.add_tool(call_tool, name=tool.name, description=tool.description)
+        server.add_tool(
+            call_tool,
+            name=tool.name,
+            description=tool.description,
+            meta=_ALWAYS_LOAD_META,
+        )
 
     def collected_output(self) -> dict:
         return dict(self._persistent_vars.get("submitted_output_store", {}))
