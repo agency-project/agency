@@ -80,12 +80,33 @@ def _unknown_block_to_responses(b: dict) -> dict:
 
 
 def _forward_usage_to_responses(usage: "dict | None") -> dict:
-    """Full copy, plus the Responses API's own field names layered on top."""
+    """Full copy, plus the Responses API's own field names layered on top.
+
+    Codex parses input_tokens_details / output_tokens_details strictly
+    (cached_tokens, reasoning_tokens), so they are always set in that shape.
+    An Anthropic usage record (Claude on Bedrock) counts only uncached input in
+    prompt_tokens, with cache reads and writes separate, and its
+    output_tokens_details holds thinking_tokens: passed through as-is it fails
+    Codex's parse of response.completed, and Codex retries the request with its
+    partial output appended, which Anthropic rejects as assistant prefill."""
     usage = dict(usage or {})
-    input_tokens = usage.get("prompt_tokens", 0)
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        cached = usage.get("cache_read_input_tokens") or 0
+        input_tokens = (
+            (usage.get("input_tokens") or 0)
+            + cached
+            + (usage.get("cache_creation_input_tokens") or 0)
+        )
+        reasoning = (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0
+    else:
+        input_tokens = usage.get("prompt_tokens", 0)
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
     output_tokens = usage.get("completion_tokens", 0)
     usage["input_tokens"] = input_tokens
     usage["output_tokens"] = output_tokens
+    usage["input_tokens_details"] = {"cached_tokens": cached}
+    usage["output_tokens_details"] = {"reasoning_tokens": reasoning}
     usage["total_tokens"] = usage.get("total_tokens") or (input_tokens + output_tokens)
     return usage
 

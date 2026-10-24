@@ -709,3 +709,41 @@ def test_tool_wire_name_truncates_from_the_front_when_over_64_chars():
     assert len(name) == 64
     # The tail -- the actual tool name -- survives the truncation intact.
     assert name.endswith("__exec")
+
+
+def test_forwarded_usage_has_the_responses_shape_for_anthropic_usage():
+    # Claude on Bedrock: input_tokens excludes cache reads/writes, and
+    # output_tokens_details holds thinking_tokens. Codex needs reasoning_tokens.
+    from agency.harness.adapters.codex import _forward_usage_to_responses
+
+    usage = _forward_usage_to_responses(
+        {
+            "input_tokens": 4,
+            "cache_read_input_tokens": 13155,
+            "cache_creation_input_tokens": 19,
+            "output_tokens": 3,
+            "output_tokens_details": {"thinking_tokens": 2},
+            "prompt_tokens": 4,
+            "completion_tokens": 3,
+        }
+    )
+    assert usage["input_tokens"] == 13178
+    assert usage["input_tokens_details"] == {"cached_tokens": 13155}
+    assert usage["output_tokens_details"] == {"reasoning_tokens": 2}
+    assert usage["output_tokens"] == 3
+
+
+def test_forwarded_usage_keeps_openai_usage_values():
+    from agency.harness.adapters.codex import _forward_usage_to_responses
+
+    usage = _forward_usage_to_responses(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        }
+    )
+    assert (usage["input_tokens"], usage["output_tokens"]) == (100, 7)
+    assert usage["input_tokens_details"] == {"cached_tokens": 80}
+    assert usage["output_tokens_details"] == {"reasoning_tokens": 5}
