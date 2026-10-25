@@ -88,9 +88,15 @@ def _forward_usage_to_responses(usage: "dict | None") -> dict:
     prompt_tokens, with cache reads and writes separate, and its
     output_tokens_details holds thinking_tokens: passed through as-is it fails
     Codex's parse of response.completed, and Codex retries the request with its
-    partial output appended, which Anthropic rejects as assistant prefill."""
+    partial output appended, which Anthropic rejects as assistant prefill.
+    An OpenAI-shaped record (prompt_tokens_details present) can carry the same
+    cache fields too -- LiteLLM adds them for Claude on chat completions -- and
+    its prompt_tokens already includes cached input, so it is read as OpenAI."""
     usage = dict(usage or {})
-    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+    anthropic_shape = (
+        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    ) and "prompt_tokens_details" not in usage
+    if anthropic_shape:
         cached = usage.get("cache_read_input_tokens") or 0
         input_tokens = (
             (usage.get("input_tokens") or 0)

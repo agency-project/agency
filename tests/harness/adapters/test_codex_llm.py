@@ -747,3 +747,24 @@ def test_forwarded_usage_keeps_openai_usage_values():
     assert (usage["input_tokens"], usage["output_tokens"]) == (100, 7)
     assert usage["input_tokens_details"] == {"cached_tokens": 80}
     assert usage["output_tokens_details"] == {"reasoning_tokens": 5}
+
+
+def test_forwarded_usage_reads_openai_shape_with_cache_fields_as_openai():
+    # Claude on the gateway's chat completions: LiteLLM's OpenAI-shaped record
+    # also carries the Anthropic cache fields, but prompt_tokens already
+    # includes cached input and reasoning is in completion_tokens_details.
+    from agency.harness.adapters.codex import _forward_usage_to_responses
+
+    usage = _forward_usage_to_responses(
+        {
+            "prompt_tokens": 19057,
+            "completion_tokens": 236,
+            "prompt_tokens_details": {"cached_tokens": 17074, "cache_write_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 80},
+            "cache_read_input_tokens": 17074,
+            "cache_creation_input_tokens": 0,
+        }
+    )
+    assert (usage["input_tokens"], usage["output_tokens"]) == (19057, 236)
+    assert usage["input_tokens_details"] == {"cached_tokens": 17074}
+    assert usage["output_tokens_details"] == {"reasoning_tokens": 80}
