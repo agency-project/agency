@@ -262,16 +262,39 @@ def _stop_reason(response) -> "str | None":
 
 def _serialize_responses_usage(usage) -> "dict | None":
     # Same keys as the Chat Completions backend's usage, so the usage
-    # tracker and web UI read both paths identically.
+    # tracker, the web UI and the harness proxies read both paths identically:
+    # prompt_tokens includes cached input, with the cache split out in
+    # prompt_tokens_details / cache_read_tokens / cache_write_tokens, and the
+    # reasoning share of completion_tokens in completion_tokens_details. No
+    # input_tokens key: the Claude Code proxy reads that as Anthropic's
+    # uncached-only count.
     if usage is None:
         return None
-    prompt_tokens = getattr(usage, "input_tokens", 0) or 0
-    completion_tokens = getattr(usage, "output_tokens", 0) or 0
-    return {
+    dumped = _serialize_sdk_object(usage)
+    if not isinstance(dumped, dict):
+        return None
+    input_details = dumped.get("input_tokens_details") or {}
+    output_details = dumped.get("output_tokens_details") or {}
+    prompt_tokens = dumped.get("input_tokens") or 0
+    completion_tokens = dumped.get("output_tokens") or 0
+    cached_tokens = input_details.get("cached_tokens") or 0
+    out = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": getattr(usage, "total_tokens", None) or (prompt_tokens + completion_tokens),
+        "total_tokens": dumped.get("total_tokens") or (prompt_tokens + completion_tokens),
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+        "completion_tokens_details": {
+            "reasoning_tokens": output_details.get("reasoning_tokens") or 0
+        },
+        "cache_read_tokens": cached_tokens,
+        # LiteLLM reports cache writes (for models it serves through Bedrock) inside input_tokens_details.
+        "cache_write_tokens": input_details.get("cache_write_tokens")
+        or input_details.get("cache_creation_tokens")
+        or 0,
     }
+    if dumped.get("cost") is not None:
+        out["cost"] = dumped["cost"]
+    return out
 
 
 # ---------------------------------------------------------------------------

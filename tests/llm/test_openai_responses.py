@@ -340,7 +340,15 @@ def test_response_output_items_become_agency_blocks():
     ]
     assert blocks[5]["type"] == "metadata"
     assert result["stop_reason"] == "tool_calls"
-    assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert result["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 0},
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -424,7 +432,15 @@ def test_stream_emits_thinking_signature_and_one_complete_tool_call():
     ]
     assert deltas[-1] == {
         "type": "usage",
-        "usage": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27},
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 7,
+            "total_tokens": 27,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0},
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
         "stop_reason": "tool_calls",
     }
 
@@ -612,3 +628,58 @@ def test_openai_encrypted_reasoning_never_becomes_anthropic_signature():
         if block.get("type") == "tool_result"
     ]
     assert tool_results == ["toolu_1", "call_2"]
+
+
+def test_usage_keeps_cache_reasoning_and_cost_details():
+    # The shape LiteLLM returns on the Responses API (GPT models served through Bedrock): cache reads and writes
+    # inside input_tokens_details, reasoning inside output_tokens_details, and the request's cost.
+    from agency.llm.openai_responses import _serialize_responses_usage
+
+    usage = _SdkObj(
+        input_tokens=10021,
+        output_tokens=113,
+        total_tokens=10134,
+        cost=0.000190795,
+        input_tokens_details=_SdkObj(cached_tokens=9875, cache_write_tokens=144),
+        output_tokens_details=_SdkObj(reasoning_tokens=40),
+    )
+    assert _serialize_responses_usage(usage) == {
+        "prompt_tokens": 10021,
+        "completion_tokens": 113,
+        "total_tokens": 10134,
+        "prompt_tokens_details": {"cached_tokens": 9875},
+        "completion_tokens_details": {"reasoning_tokens": 40},
+        "cache_read_tokens": 9875,
+        "cache_write_tokens": 144,
+        "cost": 0.000190795,
+    }
+
+
+def test_usage_reaches_both_harness_proxies_with_its_cache_and_reasoning():
+    # What Codex and Claude Code receive for a GPT request on the Responses API: Codex gets the cached and reasoning
+    # counts in its own field names; Claude Code gets uncached input with reads and writes split out, adding up to the
+    # whole prompt (it sizes its context from that sum).
+    from agency.harness.adapters.claude_code import _forward_usage_to_anthropic
+    from agency.harness.adapters.codex import _forward_usage_to_responses
+    from agency.llm.openai_responses import _serialize_responses_usage
+
+    usage = _serialize_responses_usage(
+        _SdkObj(
+            input_tokens=10021,
+            output_tokens=113,
+            total_tokens=10134,
+            input_tokens_details=_SdkObj(cached_tokens=9875, cache_write_tokens=144),
+            output_tokens_details=_SdkObj(reasoning_tokens=40),
+        )
+    )
+    codex = _forward_usage_to_responses(usage)
+    assert (codex["input_tokens"], codex["output_tokens"]) == (10021, 113)
+    assert codex["input_tokens_details"] == {"cached_tokens": 9875}
+    assert codex["output_tokens_details"] == {"reasoning_tokens": 40}
+    claude = _forward_usage_to_anthropic(usage)
+    assert (
+        claude["input_tokens"],
+        claude["cache_read_input_tokens"],
+        claude["cache_creation_input_tokens"],
+    ) == (2, 9875, 144)
+    assert claude["output_tokens"] == 113
