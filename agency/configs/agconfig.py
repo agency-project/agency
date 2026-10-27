@@ -211,7 +211,9 @@ class sandboxconfig(confignamespace):
     docker_rm_timeout_s: float = 120
     file_io_timeout_s: float = 120
     image_timeout_s: float = 120
-    commit_timeout_s: float = 120
+    # Model weights and installed toolchains can make filesystem snapshots
+    # exceed the short command budget even after the harness has finished.
+    commit_timeout_s: float = 600
     keyring_wait_timeout_s: float = 120
     unkillable_child_grace_s: float = 10
     container_limit_floor: int = 4
