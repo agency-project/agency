@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sqlite3
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,8 +47,8 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
     }
     commands = {entry["hooks"][0]["command"] for entries in hooks.values() for entry in entries}
     assert commands == {
-        f"python3 {config_home}/agpolicy_hook.py",
-        f"python3 {config_home}/claude_lifecycle_hook.py",
+        shlex.join([sys.executable, f"{config_home}/agpolicy_hook.py"]),
+        shlex.join([sys.executable, f"{config_home}/claude_lifecycle_hook.py"]),
     }
     assert not (config_home / "agency_lifecycle.py").exists()
     assert (config_home / "agency-turn.json").exists()

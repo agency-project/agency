@@ -95,6 +95,7 @@ def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
     config = {
+        "llm_provider": agconfig.llm.provider,
         "harness_adapter": agconfig.harness_adapter.safe_snapshot(),
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),

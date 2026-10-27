@@ -38,7 +38,8 @@ def test_every_engine_implements_daemon_attempt_seam(name):
 
 
 @pytest.mark.parametrize("backend_cls", [CodexAdapter, GrokAdapter, OpenCodeAdapter])
-def test_external_adapters_use_the_shared_pty_runner(monkeypatch, backend_cls):
+def test_external_adapters_use_the_shared_pty_runner(monkeypatch, backend_cls, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     from agency.harness.adapters.base import AttemptResult
     from agency.harness.adapters.pty.execution import PtyExecution
 

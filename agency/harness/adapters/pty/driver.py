@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import sys
 import uuid
 from pathlib import Path
 
@@ -39,7 +40,12 @@ def run_pty_attempt(adapter, runtime, *, prompt, resume_session_id, prior_sessio
     )
 
     def factory():
-        root = materialize_config_home(runtime.engine_name)
+        home_options = {}
+        if getattr(adapter, "_CONFIG_HOME_IN_USER_DATA", False):
+            # Codex refuses executable helper aliases beneath the OS temp
+            # directory. The isolated home still has ordinary session cleanup.
+            home_options["parent"] = Path.home() / ".local/share/agency/codex-config-homes"
+        root = materialize_config_home(runtime.engine_name, **home_options)
         bridge = BridgeClient(
             runtime.harness_base_url, runtime.token, timeout_s=_PROFILER_BRIDGE_TIMEOUT_S
         )
@@ -117,6 +123,9 @@ class PtyDriver:
         # Unique content also fences two submissions with identical user text,
         # which is what a CLI-assigned turn identity is matched against.
         return f"[Agency {label} {uuid.uuid4().hex}]"
+
+    def pasted(self, handle, wait_until, previous_generation):
+        """Optional native composer acknowledgment before pressing Enter."""
 
     def begin_turn(self, prompt):
         """Return a turn identity this driver commits itself, else None."""
@@ -200,7 +209,11 @@ class _HookPtyDriver(PtyDriver):
 
         def command(script):
             return [
-                {"hooks": [{"type": "command", "command": "python3 " + shlex.quote(str(script))}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": shlex.join([sys.executable, str(script)])}
+                    ]
+                }
             ]
 
         hooks = {event: command(lifecycle) for event in self._HOOK_EVENTS}

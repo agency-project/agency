@@ -299,7 +299,7 @@ def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials(
         harnessadapterconfig(
             binary_path="/bin/claude", stream_keepalive_s=7.5, allow_subagents=True
         ),
-        llmconfig(api_key="secret"),
+        llmconfig(provider="anthropic", api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
@@ -309,8 +309,8 @@ def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials(
     assert result["sandbox"]["harness_python_path"] is None
     assert result["harness_adapter"]["allow_subagents"] is True
     assert result["ptrace"]["syscalls"] == list(config.ptrace.syscalls)
-    # llmconfig isn't one of the three namespaces this function forwards at
-    # all -- its secret never has a chance to leak through here.
+    assert result["llm_provider"] == "anthropic"
+    # Only the provider identifier crosses this boundary, never credentials.
     assert "llm" not in result
     assert not any("secret" in json.dumps(section) for section in result.values())
 

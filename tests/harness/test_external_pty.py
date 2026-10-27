@@ -1091,3 +1091,70 @@ def test_stream_response_still_raises_errors_before_any_frame():
 
     with pytest.raises(RuntimeError, match="bad request"):
         asyncio.run(run())
+
+
+def test_codex_idle_without_native_stop_is_failure(execution, monkeypatch):
+    execution.driver.require_completion_signal = CodexDriver.require_completion_signal
+    execution._launched = True
+    execution.driver.ready = lambda handle: True
+    monkeypatch.setattr(execution, "_wait_until", lambda *args: None)
+    monkeypatch.setattr(execution, "_submit", lambda *args: setattr(execution, "_deadline", 0))
+    monkeypatch.setattr(execution, "close", Mock())
+    with pytest.raises(TimeoutError, match="without a native completion signal"):
+        execution.run("work")
+
+
+def test_codex_config_sets_native_reasoning_and_subagent_preferences(runtime, tmp_path):
+    from agency.harness.adapters.codex import CodexAdapter
+
+    runtime.agconfig.llm.reasoning_effort = "medium"
+    runtime.agconfig.harness_adapter.allow_subagents = False
+    adapter = CodexAdapter(runtime.agconfig)
+    adapter._write_codex_config(tmp_path, "http://localhost:1", "gpt-6.1-sol")
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["model_reasoning_effort"] == "medium"
+    assert config["features"]["multi_agent"] is False
+
+
+def test_codex_waits_for_model_settings_before_accepting_composer():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver._model_label = "gpt-6.1-sol"
+    driver._reasoning_effort = "medium"
+    lines = ["› Ask Codex to do anything", "GPT-6.1-Sol default · /workspace"]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 0, 1))
+    assert not driver.ready(handle)
+    lines[1] = "GPT-6.1-Sol medium · /workspace"
+    assert driver.ready(handle)
+
+
+def test_codex_accepts_current_native_trust_dialog():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver.cwd = "/workspace"
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            ["Folder access /workspace", "Trust this folder?", "› 1. Trust and continue"],
+            1,
+            2,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    handle.write_terminal.assert_called_once_with(b"\r")
+
+
+def test_codex_waits_until_paste_is_rendered():
+    driver = CodexDriver.__new__(CodexDriver)
+    screen = ["› Ask Codex to do anything"]
+    generation = [1]
+    handle = SimpleNamespace(terminal_screen=lambda: (screen, 0, 0, generation[0]))
+
+    def wait(predicate, description):
+        assert not predicate()
+        screen[0] = "› [Pasted Content 2000 chars]"
+        generation[0] += 1
+        assert predicate()
+
+    driver.pasted(handle, wait, 1)

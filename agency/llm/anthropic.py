@@ -126,8 +126,13 @@ def _known_anthropic_context_window(model: str) -> "int | None":
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
 
 
-def _serialize_sdk_object(obj):
+def _serialize_sdk_object(obj, *, exclude_unset=False):
     dump = getattr(obj, "model_dump", None)
+    if dump is not None and exclude_unset:
+        try:
+            return dump(exclude_unset=True)
+        except TypeError:
+            pass  # Older SDK/test objects need only the original dump API.
     return dump() if dump is not None else obj
 
 
@@ -495,6 +500,10 @@ def _with_cache_control(content):
     return content
 
 
+class _NativeBackendRequest(dict):
+    """Transport marker, kept out of the provider's JSON/keyword arguments."""
+
+
 class _AnthropicBackend(agllm):
     """Claude models via the first-party Anthropic API (api.anthropic.com) —
     the anthropic SDK's plain Anthropic client (Messages API shape).
@@ -509,6 +518,8 @@ class _AnthropicBackend(agllm):
             api_key=self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_API_KEY"),
             timeout=_anthropic_sdk_timeout(timeout),
         )
+        if self.agconfig.llm.base_url:
+            kwargs["base_url"] = self.agconfig.llm.base_url
         workspace_id = self.agconfig.llm.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
@@ -560,6 +571,14 @@ class _AnthropicBackend(agllm):
         model = self.agconfig.llm.model or ""
         info = _anthropic_model_info(model)
         messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        from .anthropic_native import NATIVE_REQUEST, request_from_agency
+
+        if NATIVE_REQUEST in _extra:
+            return _NativeBackendRequest(
+                request_from_agency(
+                    messages, tools, tool_choice, _extra[NATIVE_REQUEST], self.agconfig.llm
+                )
+            )
         system, anthropic_messages = _agency_messages_to_anthropic(messages)
         kwargs: dict = dict(
             model=model,
@@ -614,6 +633,10 @@ class _AnthropicBackend(agllm):
 
     def _call_backend(self, backend_request: dict):
         client = self.make_client(self._client_timeout())
+        if isinstance(backend_request, _NativeBackendRequest):
+            # The CLI already owns retries. An SDK retry here multiplies its
+            # attempts and hides upstream errors from its own backoff policy.
+            client.max_retries = 0
         try:
             return client.messages.create(**backend_request)
         finally:
@@ -664,7 +687,7 @@ class _AnthropicBackend(agllm):
                 "index": len(blocks),
                 "usage": usage_dict,
                 "stop_reason": stop_reason,
-                "data": _serialize_sdk_object(raw_result),
+                "data": _serialize_sdk_object(raw_result, exclude_unset=True),
             }
         )
         return {
@@ -675,6 +698,8 @@ class _AnthropicBackend(agllm):
 
     def _call_backend_stream(self, backend_request: dict, on_client=None):
         client = self.make_client(self._client_timeout())
+        if isinstance(backend_request, _NativeBackendRequest):
+            client.max_retries = 0
         if on_client is not None:
             on_client(client)
         raw_stream = client.messages.create(stream=True, **backend_request)
@@ -696,11 +721,16 @@ class _AnthropicBackend(agllm):
         for event in raw_stream:
             etype = getattr(event, "type", None)
             if etype == "message_start":
+                metadata_events.append(
+                    {
+                        "event": "message_start",
+                        "data": _serialize_sdk_object(event, exclude_unset=True),
+                    }
+                )
                 usage = getattr(event.message, "usage", None)
                 if usage is not None:
                     usage_dump = _usage_to_dict(usage)
                     _merge_usage(usage_acc, usage_dump)
-                    metadata_events.append({"event": "message_start", "usage": usage_dump})
             elif etype == "content_block_start":
                 block = event.content_block
                 if block.type == "tool_use":
@@ -780,7 +810,10 @@ class _AnthropicBackend(agllm):
                 if delta_stop_reason is not None:
                     stop_reason = delta_stop_reason
                 metadata_events.append(
-                    {"event": "message_delta", "data": _serialize_sdk_object(event)}
+                    {
+                        "event": "message_delta",
+                        "data": _serialize_sdk_object(event, exclude_unset=True),
+                    }
                 )
 
         # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use

@@ -16,7 +16,7 @@ from ...llm.message_store import with_tool_schema
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 
 
 def codex_available() -> bool:
@@ -304,13 +304,29 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _provider_error_response(exc):
+    from fastapi.responses import JSONResponse, Response
+
+    body = getattr(exc, "provider_error", None)
+    _message, status, _transient = upstream_error(exc)
+    headers = getattr(exc, "provider_headers", None)
+    if isinstance(body, str):
+        return Response(body, status_code=status, headers=headers)
+    if isinstance(body, dict):
+        return JSONResponse(body, status_code=status, headers=headers)
+    return None
+
+
 class CodexDriver(_HookPtyDriver):
     name = "codex"
+    require_completion_signal = True
     _HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
     _HOOK_PATH = ("hooks.json",)
 
     def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
         self._trusted_directory = False
+        self._model_label = (runtime.model or "").lower()
+        self._reasoning_effort = adapter.agconfig.llm.reasoning_effort
         super().__init__(adapter, runtime, root, session_id, blob, max_steps)
 
     def prompt_matches(self, prompt, expected):
@@ -345,19 +361,37 @@ class CodexDriver(_HookPtyDriver):
 
     def ready(self, handle):
         lines, x, y, _generation = handle.terminal_screen()
-        if not self._trusted_directory and any(
-            "Do you trust the contents of this directory?" in line for line in lines
-        ):
-            # check both the real and symbolic path on where codex was launched
+        trust_prompt = any(
+            "Do you trust the contents of this directory?" in line or "Trust this folder?" in line
+            for line in lines
+        )
+        if not self._trusted_directory and trust_prompt:
             cwd_variants = {self.cwd, os.path.realpath(self.cwd)}
             if any(any(variant in line for variant in cwd_variants) for line in lines) and any(
-                "1. Yes, continue" in line for line in lines
+                "1. Yes, continue" in line or "1. Trust and continue" in line for line in lines
             ):
                 self._trusted_directory = True
                 handle.write_terminal(b"\r")
             return False
-        # Require the actual composer, never silence or an old message in history.
-        return lines[y].strip().startswith("›") and x <= 3
+        # The loading composer is painted before config initialization. New
+        # sessions defer SessionStart until submission, so wait for the native
+        # model/settings footer rather than a lifecycle event that needs input.
+        model = getattr(self, "_model_label", "")
+        effort = getattr(self, "_reasoning_effort", None)
+        configured = any(
+            model in line.lower() and "·" in line and (not effort or effort in line.lower())
+            for line in lines
+        )
+        return configured and lines[y].strip().startswith("›") and x <= 3
+
+    def pasted(self, handle, wait_until, previous_generation):
+        def rendered():
+            lines, _x, _y, generation = handle.terminal_screen()
+            return generation != previous_generation and any(
+                "[Pasted Content" in line or "[Agency " in line for line in lines
+            )
+
+        wait_until(rendered, "native pasted input")
 
     def _stop_event(self, event, payload):
         event = super()._stop_event(event, payload)
@@ -403,6 +437,7 @@ class CodexDriver(_HookPtyDriver):
 
 
 class CodexAdapter(HarnessAdapter):
+    _CONFIG_HOME_IN_USER_DATA = True
     _DEFAULT_BINARY = "codex"
     _PTY_DRIVER = CodexDriver
     _PROVIDER_NAME = "agency-proxy"
@@ -436,6 +471,15 @@ class CodexAdapter(HarnessAdapter):
         context_limit: "int | None" = None,
     ) -> None:
         toml_text = f'model = "{model}"\nmodel_provider = "{self._PROVIDER_NAME}"\n'
+        for config_name, field in (
+            ("model_reasoning_effort", "reasoning_effort"),
+            ("model_reasoning_summary", "reasoning_summary"),
+        ):
+            value = getattr(self.agconfig.llm, field, None)
+            if value is not None:
+                toml_text += f"{config_name} = {json.dumps(value)}\n"
+        if not self.agconfig.harness_adapter.allow_subagents:
+            toml_text += "features.multi_agent = false\n"
         if context_limit is not None:
             # Codex only knows the context window for its own house models --
             # for a name it doesn't recognize (any model proxied behind
@@ -488,8 +532,12 @@ class CodexAdapter(HarnessAdapter):
                 return _auth_error()
             body = await request.json()
             model = router.resolve_model(token)
-            await self._report_untranslated_fields(router, token, body)
-            agency_context = self._format_context_harness_to_agency(body)
+            native = self.agconfig.llm.provider == "openai_responses"
+            if not native:
+                await self._report_untranslated_fields(router, token, body)
+            agency_context = self._format_context_harness_to_agency(
+                body, request.headers, request.query_params
+            )
             # Keep routing request-local: one adapter serves multiple tokens.
             tool_routes = _responses_tool_routes(body)
             if body.get("stream"):
@@ -504,8 +552,18 @@ class CodexAdapter(HarnessAdapter):
                 )
                 # This adapter already buffers through `done`; see
                 # start_streaming_response for why the first frame comes first.
-                return await start_streaming_response(request, frames)
-            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
+                return await start_streaming_response(
+                    request, frames, error_response=_provider_error_response
+                )
+            try:
+                agency_response = await anyio.to_thread.run_sync(
+                    router.dispatch, token, agency_context
+                )
+            except Exception as exc:
+                response = _provider_error_response(exc)
+                if response is not None:
+                    return response
+                raise
             try:
                 payload = self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes
@@ -543,7 +601,13 @@ class CodexAdapter(HarnessAdapter):
         except Exception:  # noqa: S110 - a diagnostic must never fail a model request
             pass
 
-    def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
+    def _format_context_harness_to_agency(
+        self, raw_request: dict, headers=None, query_params=None
+    ) -> dict:
+        if self.agconfig.llm.provider == "openai_responses":
+            from ...llm.responses_native import context_from_request
+
+            return context_from_request(raw_request, headers, query_params)
         messages: "list[dict]" = []
 
         instructions = raw_request.get("instructions")
@@ -666,6 +730,11 @@ class CodexAdapter(HarnessAdapter):
     def _format_context_agency_to_harness(
         self, agency_response: dict, model: str, *, tool_routes=None
     ) -> dict:
+        from ...llm.responses_native import response_fields
+
+        native = response_fields(agency_response["message"])
+        if native is not None and "response" in native:
+            return native["response"]
         response = {
             "id": f"resp_{uuid.uuid4().hex}",
             "object": "response",
@@ -693,6 +762,8 @@ class CodexAdapter(HarnessAdapter):
         return {**response, "status": "completed", "output": output}
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
+        from ...llm.responses_native import response_fields
+
         request_id = f"resp_{uuid.uuid4().hex}"
         for item in agency_stream:
             if item["type"] == "delta":
@@ -700,6 +771,15 @@ class CodexAdapter(HarnessAdapter):
                 # retract them, so wait for the authoritative host checkpoint.
                 continue
 
+            native = response_fields(item["message"])
+            if native is not None and "events" in native:
+                if not native["events"]:
+                    # Commit the original HTTP 200, then close the empty stream.
+                    # Otherwise first-frame validation synthesizes an HTTP 502.
+                    yield ""
+                for event in native["events"]:
+                    yield _sse(event.get("type", "message"), event)
+                return
             reason = _incomplete_reason(item.get("stop_reason"))
             # Built before the first frame: anything that cannot be sent to
             # Codex raises here, where it still becomes an HTTP error.

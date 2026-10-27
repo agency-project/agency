@@ -29,6 +29,8 @@ class HostDispatchError(RuntimeError):
         super().__init__(item["message"])
         self.status_code = item.get("status_code", 500)
         self.transient = item.get("transient", False)
+        self.provider_error = item.get("provider_error")
+        self.provider_headers = item.get("provider_headers")
 
 
 class HostServicesClient:
@@ -245,7 +247,23 @@ class HostServicesClient:
             headers=self._dispatch_headers(token),
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
+            try:
+                error = resp.json()["error"]
+            except (ValueError, KeyError, TypeError):
+                error = {}
+            if not isinstance(error, dict):
+                error = {}
+            raise HostDispatchError(
+                {
+                    "message": error.get(
+                        "message", f"host dispatch failed: {resp.status_code} {resp.text}"
+                    ),
+                    "status_code": resp.status_code,
+                    "transient": error.get("transient", resp.status_code >= 500),
+                    "provider_error": error.get("provider_error"),
+                    "provider_headers": error.get("provider_headers"),
+                }
+            )
         return resp.json()
 
     def dispatch_stream(self, token: str, agency_context: dict, *, mount: str = "llm"):
@@ -291,6 +309,8 @@ class HostServicesClient:
                             "message": error.get("message", "host dispatch failed"),
                             "status_code": response.status_code,
                             "transient": error.get("transient", response.status_code >= 500),
+                            "provider_error": error.get("provider_error"),
+                            "provider_headers": error.get("provider_headers"),
                         }
                     )
                 async for line in response.aiter_lines():

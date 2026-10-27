@@ -18,6 +18,7 @@ from agency.llm.anthropic import (
     _agency_messages_to_anthropic,
     _agency_tool_choice_to_anthropic,
     _agency_tools_to_anthropic,
+    _anthropic_sdk_timeout,
     _known_anthropic_context_window,
 )
 
@@ -80,7 +81,7 @@ class TestAnthropicBackend:
         with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
             client = backend.make_client(httpx.Timeout(30.0))
         mock_sdk.Anthropic.assert_called_once_with(
-            api_key="sk-ant-from-config", timeout=httpx.Timeout(30.0)
+            api_key="sk-ant-from-config", timeout=_anthropic_sdk_timeout(httpx.Timeout(30.0))
         )
         assert client is mock_sdk.Anthropic.return_value
 
@@ -92,7 +93,7 @@ class TestAnthropicBackend:
         with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
         mock_sdk.Anthropic.assert_called_once_with(
-            api_key="sk-ant-from-env", timeout=httpx.Timeout(5.0)
+            api_key="sk-ant-from-env", timeout=_anthropic_sdk_timeout(httpx.Timeout(5.0))
         )
 
     def test_config_api_key_takes_priority_over_env_var(self, monkeypatch):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -143,16 +144,10 @@ def prepare_harness_executable_local(harness: str, config) -> "str | None":
             "Its complete installation must provide its system interpreter and shared "
             f"libraries. Output: {out[-2000:]}"
         )
-    if harness == "codex" and "0.147.0" not in out:
-        # 0.154.0 hangs waiting for native prompt acknowledgment on large
-        # (>1000 char) bracketed pastes -- the PTY driver's normal submission
-        # path -- because codex routes those through a placeholder/expand-on-
-        # submit pipeline that was heavily refactored between the two
-        # versions. Only 0.147.0 is verified working; fail closed instead of
-        # a confusing mid-run submit timeout.
+    if harness == "codex" and not re.search(r"\bcodex-cli (?:0\.147\.0|0\.162\.1)\b", out):
         raise RuntimeError(
-            f"codex executable {resolved!r} reports version {out.strip()!r}, expected "
-            "0.147.0. Untested/newer codex builds have hung waiting for native prompt "
-            "acknowledgment on real (large) task prompts -- install/pin 0.147.0."
+            f"codex executable {resolved!r} reports version {out.strip()!r}; "
+            "supported versions are 0.147.0 and 0.162.1. Other builds require "
+            "validation of interactive prompt acknowledgment and completion."
         )
     return resolved

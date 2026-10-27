@@ -950,6 +950,21 @@ def test_route_answers_an_empty_response_with_a_retryable_http_error_not_a_200()
     assert "no message and no tool call" in response.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("events", [[], [{"error": {"message": "native server error"}}]])
+def test_route_keeps_native_nonterminal_stream_http_200_and_original_events(events):
+    from agency.llm.responses_native import native_result
+
+    client, _ = _route_client({"type": "done", **native_result({}, events)})
+    with client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer t"},
+            json={"input": "hi", "stream": True},
+        )
+    assert response.status_code == 200
+    assert [value for _, value in _parse_sse(response.text)] == events
+
+
 def test_route_streams_response_incomplete_for_a_truncated_turn():
     client, _ = _route_client(_done([_tool_block(TRUNCATED_ARGUMENTS)], "length"))
     with client:
@@ -985,3 +1000,55 @@ def test_route_reports_untranslated_request_fields_once():
     assert len(warnings) == 1
     assert "prompt_cache_key" in warnings[0] and "reasoning" in warnings[0]
     assert "include" not in warnings[0]  # empty values are not worth a warning
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "body,content_type",
+    [
+        (
+            {"error": {"message": "native", "type": "rate_limit_error"}, "request_id": "real"},
+            "application/json",
+        ),
+        ("<html>upstream unavailable</html>", "text/html"),
+    ],
+)
+def test_native_http_error_status_body_and_retry_headers_survive_daemon(stream, body, content_type):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    class Router:
+        def validate_token(self, token):
+            return True
+
+        def resolve_model(self, token):
+            return "gpt-6.1-sol"
+
+        def dispatch(self, token, request):
+            raise HostDispatchError(
+                {
+                    "message": "native",
+                    "status_code": 429,
+                    "transient": True,
+                    "provider_error": body,
+                    "provider_headers": {"retry-after": "7", "content-type": content_type},
+                }
+            )
+
+        async def dispatch_stream_async(self, token, request):
+            self.dispatch(token, request)
+            yield
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer fake"},
+            json={"input": "hi", "stream": stream},
+        )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "7"
+    assert response.headers["content-type"] == content_type
+    assert (response.json() if isinstance(body, dict) else response.text) == body

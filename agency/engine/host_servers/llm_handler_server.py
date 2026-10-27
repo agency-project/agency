@@ -29,6 +29,7 @@ from ...llm.agllm import agllm, dispatch_attempt
 from ...llm.response_check import (
     EMPTY,
     TRUNCATED,
+    ResponseVerdict,
     inspect_response,
     mark_incomplete_tool_calls,
 )
@@ -112,9 +113,15 @@ def _tag_response_message_for_display(response_message: "dict | None", tag: str)
     return tagged
 
 
-def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
+def _classify_dispatch_exception(
+    error: BaseException, *, native: bool = False
+) -> "tuple[int, bool] | None":
     """(status_code, transient) for a known LLM-backend failure category, or
     None if *error* isn't one of them (caller re-raises it unmodified)."""
+    if native:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if isinstance(status, int) and 400 <= status <= 599:
+            return status, status in {408, 409, 425, 429} or status >= 500
     if isinstance(error, BAD_REQUEST_EXCS):
         return 400, False
     if isinstance(error, UnusableResponseError):
@@ -143,13 +150,28 @@ def _retry_in_place(error: BaseException) -> bool:
 class _ResponsePolicy:
     """llmconfig's handling of unusable responses, read once per request."""
 
-    def __init__(self, llm) -> None:
+    def __init__(self, llm, *, native: bool = False) -> None:
+        self.native = native
         self.unusable_retries = max(0, int(getattr(llm, "unusable_response_retries", 0) or 0))
         self.backoff_s = max(0.0, float(getattr(llm, "unusable_response_backoff_s", 0.0) or 0.0))
         self.fail_on_empty = bool(getattr(llm, "fail_on_empty_response", True))
         self.truncation_retries = max(0, int(getattr(llm, "truncation_retries", 0) or 0))
         self.multiplier = float(getattr(llm, "truncation_output_multiplier", 2.0) or 2.0)
         self.ceiling = getattr(llm, "truncation_max_output_tokens", None)
+        if native:
+            # A native CLI must see the original response and decide whether
+            # to retry. Host regeneration would silently change its attempt
+            # count, output budget, and handling of empty responses.
+            self.unusable_retries = 0
+            self.truncation_retries = 0
+            self.fail_on_empty = False
+
+    def inspect(self, message, stop_reason, *, empty_is_unusable=True):
+        # The native CLI owns malformed/truncated output handling too. Never
+        # turn the provider's original response into a host-generated error.
+        if self.native:
+            return ResponseVerdict(True)
+        return inspect_response(message, stop_reason, empty_is_unusable=empty_is_unusable)
 
     def next_output_cap(self, current: int) -> "int | None":
         """The larger limit to re-ask with after a cut-off response, or None
@@ -191,14 +213,57 @@ def _response_ids_of(message: "dict | None") -> dict:
     return {}
 
 
+def _provider_error_fields(error: BaseException) -> dict:
+    body = getattr(error, "provider_error", None)
+    if body is None:
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                body = response.json()
+            except (ValueError, AttributeError):
+                body = getattr(response, "text", None)
+        if body is None:
+            body = getattr(error, "body", None)
+    fields = {"provider_error": copy.deepcopy(body)} if isinstance(body, (dict, str)) else {}
+    headers = getattr(error, "provider_headers", None)
+    if headers is None:
+        headers = getattr(getattr(error, "response", None), "headers", {})
+    safe = {
+        key.lower(): value
+        for key, value in (headers or {}).items()
+        if key.lower()
+        in {
+            "content-type",
+            "retry-after",
+            "retry-after-ms",
+            "x-should-retry",
+            "request-id",
+            "x-request-id",
+        }
+    }
+    if safe:
+        fields["provider_headers"] = safe
+    return fields
+
+
 class _DispatchError(Exception):
     """Raised by the non-streaming path; carries what build_app()'s route
     needs to translate this into an HTTP response."""
 
-    def __init__(self, message: str, *, status_code: int, transient: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        transient: bool,
+        provider_error=None,
+        provider_headers=None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.transient = transient
+        self.provider_error = provider_error
+        self.provider_headers = provider_headers
 
 
 class _RequestAborted(Exception):
@@ -577,7 +642,13 @@ class LlmHandlerServer:
         def aborted() -> bool:
             return abort_event is not None and abort_event.is_set()
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         backend = self._backend
         unusable_left = policy.unusable_retries
         truncation_left = policy.truncation_retries
@@ -627,19 +698,22 @@ class LlmHandlerServer:
                             retry = (error.reason, f"{type(error).__name__}: {error}")
                         else:
                             complete_failure(error)
-                            classified = _classify_dispatch_exception(error)
+                            classified = _classify_dispatch_exception(error, native=policy.native)
                             if classified is None:
                                 raise
                             status_code, transient = classified
                             raise _DispatchError(
-                                str(error), status_code=status_code, transient=transient
+                                str(error),
+                                status_code=status_code,
+                                transient=transient,
+                                **_provider_error_fields(error),
                             ) from error
                     else:
                         ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                         output_complete = self._can_finish_empty(
                             result["stop_reason"], internal_kind
                         )
-                        verdict = inspect_response(
+                        verdict = policy.inspect(
                             result["message"],
                             result["stop_reason"],
                             empty_is_unusable=policy.fail_on_empty and not output_complete,
@@ -965,6 +1039,11 @@ class LlmHandlerServer:
                                 "error": {
                                     "message": item["message"],
                                     "transient": item["transient"],
+                                    **{
+                                        key: item[key]
+                                        for key in ("provider_error", "provider_headers")
+                                        if key in item
+                                    },
                                 }
                             },
                             status_code=item["status_code"],
@@ -989,7 +1068,13 @@ class LlmHandlerServer:
                 return JSONResponse(result.result())
             except _DispatchError as e:
                 return JSONResponse(
-                    {"error": {"message": str(e), "transient": e.transient}},
+                    {
+                        "error": {
+                            "message": str(e),
+                            "transient": e.transient,
+                            **_provider_error_fields(e),
+                        }
+                    },
                     status_code=e.status_code,
                 )
             except _RequestAborted as error:
@@ -1214,6 +1299,7 @@ class LlmHandlerServer:
                     "message": str(exception),
                     "transient": getattr(exception, "transient", transient),
                     "status_code": getattr(exception, "status_code", status_code),
+                    **_provider_error_fields(exception),
                 },
                 **entry_fields,
             )
@@ -1223,7 +1309,13 @@ class LlmHandlerServer:
                 finalize_cancelled()
             return enqueued
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         retries: "list[dict]" = []
 
         def run_attempt(attempt: int, backend) -> tuple:
@@ -1290,7 +1382,7 @@ class LlmHandlerServer:
                         # a transport failure before any answer is left to the
                         # SDK's own retries and to the harness.
                         return ("retry", e.reason, f"{type(e).__name__}: {e}", e)
-                    classified = _classify_dispatch_exception(e)
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(e, status_code=status_code, transient=transient)
                     return ("stop",)
@@ -1384,7 +1476,7 @@ class LlmHandlerServer:
                             f"{type(e).__name__}: {e}",
                             e,
                         )
-                    classified = _classify_dispatch_exception(e)
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(
                         e,
@@ -1399,7 +1491,7 @@ class LlmHandlerServer:
                     finalize_cancelled()
                     return ("stop",)
                 message = _blocks_to_message(blocks)
-                verdict = inspect_response(
+                verdict = policy.inspect(
                     message,
                     stop_reason,
                     empty_is_unusable=(

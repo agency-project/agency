@@ -45,3 +45,11 @@ def test_materialize_config_home_creates_isolated_directory():
 def test_cleanup_config_home_is_idempotent(tmp_path):
     d = tmp_path / "nonexistent"
     agharness.cleanup_config_home(d)  # must not raise
+
+
+def test_config_home_can_use_user_data_parent_and_still_clean_up(tmp_path):
+    parent = tmp_path / "user-data" / "config-homes"
+    root = agharness.materialize_config_home("codex", parent=parent)
+    assert root.parent == parent and root.is_dir()
+    agharness.cleanup_config_home(root)
+    assert not root.exists()

@@ -863,6 +863,29 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_provider_error_body_survives_host_dispatch(monkeypatch, stream):
+    monkeypatch.setattr(mod, "BAD_REQUEST_EXCS", (ValueError,))
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.1.output_config: unsupported",
+        },
+    }
+    error = ValueError("wrapped error")
+    error.body = body
+
+    def create(**kwargs):
+        raise error
+
+    server, _ = _make_server(create_fn=create)
+    with TestClient(server.build_app()) as client:
+        response = client.post("/dispatch", json={"messages": [], "stream": stream})
+    assert response.status_code == 400
+    assert response.json()["error"]["provider_error"] == body
+
+
 def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
     def create(**kwargs):
         raise RuntimeError("boom")
@@ -1141,6 +1164,48 @@ def test_start_stream_no_chunks_at_all_is_an_error_not_a_finished_turn():
     assert len(calls) == 3  # the first ask plus unusable_response_retries
     handle._thread.join(timeout=2.0)
     assert client.closed is True
+
+
+def test_native_stream_interruption_is_returned_without_host_regeneration():
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return iter([])
+
+    server, client = _make_server(create_fn=create)
+    handle = server.start_stream(
+        {"messages": with_tool_schema([], extra={"anthropic_native_request": {}})}
+    )
+    items = _drain(handle)
+    assert [item["type"] for item in items] == ["error"]
+    assert "attempts=1" in items[0]["message"]
+    assert len(calls) == 1
+    handle._thread.join(timeout=2.0)
+    assert client.closed is True
+
+
+def test_provider_retry_headers_are_preserved_without_secret_headers():
+    error = RuntimeError("rate limited")
+    error.response = SimpleNamespace(
+        headers={
+            "Retry-After": "2",
+            "retry-after-ms": "2000",
+            "x-should-retry": "true",
+            "request-id": "req_fixture",
+            "set-cookie": "secret",
+            "authorization": "secret",
+        }
+    )
+    fields = mod._provider_error_fields(error)
+    assert fields == {
+        "provider_headers": {
+            "retry-after": "2",
+            "retry-after-ms": "2000",
+            "x-should-retry": "true",
+            "request-id": "req_fixture",
+        }
+    }
 
 
 def test_start_stream_no_chunks_passes_through_when_empty_is_allowed():
@@ -2097,3 +2162,79 @@ def test_cached_routes_do_not_retain_server_after_app_is_released():
     gc.collect()
     assert reference() is None, "cached endpoints must not retain completed requests"
     assert cached_endpoints
+
+
+@pytest.mark.parametrize(
+    "native_key", ["openai_responses_native_request", "anthropic_native_request"]
+)
+@pytest.mark.parametrize("stop_reason", ["tool_calls", "length"])
+def test_native_cli_receives_malformed_and_truncated_output_without_host_rewrite(
+    native_key, stop_reason
+):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return iter(
+            [
+                _FakeChunk(
+                    [
+                        _FakeChoice(
+                            delta=_FakeDelta(
+                                tool_calls=[_FakeToolCall(0, "call_1", "bash", '{"cut')]
+                            )
+                        )
+                    ]
+                ),
+                _finish(stop_reason),
+            ]
+        )
+
+    server, client = _make_server(create_fn=create)
+    handle = server.start_stream({"messages": with_tool_schema([], extra={native_key: {}})})
+    items = _drain(handle)
+    assert items[-1]["type"] == "done"
+    assert items[-1]["stop_reason"] == stop_reason
+    tool = next(b for b in items[-1]["message"]["blocks"] if b["type"] == "tool_use")
+    assert tool["arguments"] == '{"cut'
+    assert len(calls) == 1
+    handle._thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 529])
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_preserves_actual_provider_http_status_and_full_error_body(status, stream):
+    import httpx
+    import openai
+
+    body = {"error": {"message": "synthetic", "type": "native_error"}, "request_id": "real"}
+    response = httpx.Response(
+        status,
+        json=body,
+        headers={"retry-after": "7"},
+        request=httpx.Request("POST", "https://mock/v1/responses"),
+    )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        # The SDK's .body can contain only the inner error; the original HTTP
+        # response remains authoritative for the complete native envelope.
+        raise openai.APIStatusError("synthetic", response=response, body=body["error"])
+
+    server, _ = _make_server(create_fn=create)
+    request = {"messages": with_tool_schema([], extra={"openai_responses_native_request": {}})}
+    if stream:
+        handle = server.start_stream(request)
+        items = _drain(handle)
+        assert items[-1]["type"] == "error"
+        error = items[-1]
+        handle._thread.join(timeout=2)
+    else:
+        with pytest.raises(mod._DispatchError) as caught:
+            server.dispatch(request)
+        error = vars(caught.value)
+    assert error["status_code"] == status
+    assert error["provider_error"] == body
+    assert error["provider_headers"]["retry-after"] == "7"
+    assert len(calls) == 1
