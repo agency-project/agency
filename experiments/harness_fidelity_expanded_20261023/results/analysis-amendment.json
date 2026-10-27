@@ -1,0 +1,7 @@
+{
+  "reason": "The frozen audit compared every identical JSON body with every beta-header variant, causing false positives during native compatibility retries. Final analysis matches the multiset of complete body/header pairs and preserves occurrence counts.",
+  "controls": "Reordered identical-body header variants pass; changed headers and duplicate SDK attempts fail",
+  "model_source_unchanged": true,
+  "no_model_reruns": true,
+  "checked_unix_s": 1792862343.4923944
+}

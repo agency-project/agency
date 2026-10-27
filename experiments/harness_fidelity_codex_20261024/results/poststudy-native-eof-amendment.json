@@ -1,0 +1,36 @@
+{
+  "kind": "post-collection production correction; paired benchmark source unchanged",
+  "collected_variant": "src-v7",
+  "corrected_variant": "src-poststudy-native-eof",
+  "reason": "Four upstream HTTP200 SSE responses ended with an untyped server_error and DONE, without a terminal response event. Frozen v7 converted these to host HTTP errors; native Codex retried and completed. Completed-response audits intentionally exclude these four streams; raw recordings remain included.",
+  "correction": "Replay partial or empty native EOF streams and untyped error JSON without fabricating a completion or HTTP error, so the native CLI owns its original stream-retry path.",
+  "full_matched_cohorts_rerun": false,
+  "benchmark_outcomes_changed": false,
+  "offline_replays": "All four retained error streams now replay exact JSON with one upstream request; a retained completed-stream control remains exact.",
+  "ec2_regressions": {
+    "passed": 400
+  },
+  "local_regressions": {
+    "passed": 382,
+    "skipped": 18
+  },
+  "before_after_files": {
+    "agency/llm/openai_responses.py": {
+      "frozen_sha256": "3325344d02cd72b68a2a27236bea0fd7a81280c705d957a43ceedf75c91ec382",
+      "corrected_sha256": "561e42cae6632710dc3bfa5d07df91b88fd15215aec4d125f46f4c4132a61d98"
+    },
+    "agency/harness/adapters/codex.py": {
+      "frozen_sha256": "96e2c670602ea68e4ed9984fe44927bb2a23860d3150cc92d966b80201cef337",
+      "corrected_sha256": "1d32588f506acda4968a536daacccdd67c11c08c7bd165e07c3c7c850da75fc2"
+    },
+    "tests/llm/test_responses_native.py": {
+      "frozen_sha256": "22133e8cf176c89ac3cb5353b75bad3b0458578a8ee4855a79c167f9dd503aa4",
+      "corrected_sha256": "271f2b0c9929cda6fe7e753f949d26241e67ffc037beb1f0093e3a3bd062f3e2"
+    },
+    "tests/harness/adapters/test_codex_llm.py": {
+      "frozen_sha256": "1b69ef84fed58ee7c87eddbab1a37d4234cba2c5dc71bf1ac12d7831d5e23abc",
+      "corrected_sha256": "1c6b4a73542a482e4d364639050e0caa7704a637a84cd93869e65e7b5592f757"
+    }
+  },
+  "documented_unix_s": 1792905862.4553583
+}

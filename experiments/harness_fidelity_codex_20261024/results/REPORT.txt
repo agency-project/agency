@@ -1,0 +1,55 @@
+Codex / GPT 6.1 Sol matched validation
+
+Both arms use interactive Codex 0.162.1, medium reasoning, through the authorized LiteLLM Responses endpoint.
+
+smoke-swe-v7
+Standalone 4/5 solved; Agency 5/5 solved.
+Completion: standalone {'completed': 5}; Agency {'completed': 5}.
+Paired delta +20.0 pp; paired bootstrap 95% interval [0, 60.0] pp.
+Native Stop runtime ratio: {'n': 5, 'median': 1.26702402489647, 'mean': 1.326988558455114, 'sd': 0.09275362828528401, 'min': 1.2578736765232428, 'p25': 1.260870722152361, 'p75': 1.3884086118274193, 'max': 1.4607657568760775}
+Native Stop paired difference seconds: {'n': 5, 'median': 14.562678730115294, 'mean': 16.17066398989409, 'sd': 8.714881082191857, 'min': 7.6057748140301555, 'p25': 9.565470305038616, 'p75': 19.897440154338256, 'max': 29.22195594594814}
+Requests preserved: True; completed-response event streams preserved: True; initial settings matched: True; resources/images matched: True/True.
+
+smoke-tb-v7
+Standalone 5/5 solved; Agency 5/5 solved.
+Completion: standalone {'completed': 5}; Agency {'completed': 5}.
+Paired delta +0.0 pp; paired bootstrap 95% interval [0, 0] pp.
+Native Stop runtime ratio: {'n': 5, 'median': 1.0776031783194593, 'mean': 1.322312465700411, 'sd': 0.6918770291707007, 'min': 0.6843502684972359, 'p25': 0.8538143928289773, 'p75': 1.6006713245765731, 'max': 2.395123164279809}
+Native Stop paired difference seconds: {'n': 5, 'median': 5.484911608276889, 'mean': 0.42613607803359627, 'sd': 27.76406436846535, 'min': -28.30156199983321, 'p25': -23.07079602102749, 'p75': 7.1554807857610285, 'max': 40.862646016990766}
+Requests preserved: True; completed-response event streams preserved: True; initial settings matched: True; resources/images matched: True/True.
+
+swe50-v7
+Standalone 30/50 solved; Agency 29/50 solved.
+Completion: standalone {'completed': 50}; Agency {'completed': 50}.
+Paired delta -2.0 pp; paired bootstrap 95% interval [-8.0, 4.0] pp.
+Native Stop runtime ratio: {'n': 50, 'median': 1.3334349880231153, 'mean': 1.3636054736444279, 'sd': 0.528169087454745, 'min': 0.48592283464036096, 'p25': 1.080255898556422, 'p75': 1.498321484034698, 'max': 3.4167139541432006}
+Native Stop paired difference seconds: {'n': 50, 'median': 10.953157437266782, 'mean': 14.479577126139775, 'sd': 27.745432010138565, 'min': -68.84032393689267, 'p25': 3.4066329046618193, 'p75': 20.808349370548967, 'max': 77.9353161402978}
+Requests preserved: True; completed-response event streams preserved: True; initial settings matched: False; resources/images matched: True/True.
+
+tb50-v7
+Standalone 40/50 solved; Agency 39/50 solved.
+Completion: standalone {'completed': 49, 'timeout': 1}; Agency {'completed': 50}.
+Paired delta -2.0 pp; paired bootstrap 95% interval [-16.0, 10.0] pp.
+Native Stop runtime ratio: {'n': 49, 'median': 1.1316156843789542, 'mean': 1.1991407295447278, 'sd': 0.43879606300696933, 'min': 0.47414900611310185, 'p25': 0.9186685891156142, 'p75': 1.430681991916201, 'max': 2.414627601155855}
+Native Stop paired difference seconds: {'n': 49, 'median': 6.0289377509616315, 'mean': -30.962407346805367, 'sd': 254.12911000561303, 'min': -1749.8470484921709, 'p25': -7.369954094057903, 'p75': 18.329291716916487, 'max': 112.0162013110239}
+Requests preserved: True; completed-response event streams preserved: True; initial settings matched: True; resources/images matched: True/True.
+
+Scope: Terminal grading occurs at native Stop before cleanup and does not establish post-return background-service lifecycle parity.
+Grading coverage across smoke and final cohorts: 214 verifier result records, 5 verifier deadline timeouts, 1 missing native completions. Raw reports and zero outcomes are retained; see grading-coverage.json.
+Agency buffers native response events: event JSON sequence/content is audited, delivery timing is not identical.
+Observed timing includes model and tool variation and shared-host load. Paired task outcomes are supporting evidence, not proof of equivalence.
+The final 50-task sets and paired order were frozen before results. Terminal smoke uses the first five final selections, with fresh executions in the final cohort. Failed/time-out invocations are retained.
+API usage is in per-arm provider summaries. Router billing is not inferred from published prices. EC2 cost is separate.
+
+
+Recorded API cost: final 200 runs USD 36.5557; 20 smoke runs USD 2.9331; withdrawn diagnostics USD 2.1688; total USD 41.6576. Router-reported, not independently verified billing; 19 final calls have no recorded cost, and EC2 is excluded.
+
+Final fidelity scope: all 1,411 Agency requests in the two final cohorts match native inputs and semantic headers exactly. All 1,401 completed Responses event streams and six original HTTP errors match. Four additional upstream streams ended in untyped server errors without a terminal event; their raw recordings are retained and excluded from the completed-stream equality metric.
+
+Post-collection correction: those four interrupted streams exposed a native error-path difference in frozen v7. The production path now replays their partial SSE JSON/EOF, including empty streams, so Codex applies its native stream retry policy. Offline replay on EC2 preserves all four recordings with one upstream request, and an ordinary completed-stream control is unchanged. EC2 regressions: 400 passed; local: 382 passed, 18 skipped. The complete matched benchmark cohorts were NOT rerun after this correction; the tables measure frozen src-v7. See poststudy-native-eof-amendment.json and replay controls. Do not describe these results as full error-path or behavioral equivalence.
+
+
+Supplementary strict initial-request audit:
+swe50-v7: 14 strict initial comparisons differ; 14 independently reviewed as optional native Git metadata availability. Strict failures remain in comparison.json; requests are not normalized within arms.
+tb50-v7: 0 strict initial comparisons differ; 0 independently reviewed as optional native Git metadata availability. Strict failures remain in comparison.json; requests are not normalized within arms.
+See completed-pair-audit.json for every difference and its independent checkout/follow-up evidence.

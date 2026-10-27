@@ -1,0 +1,80 @@
+{
+  "frozen_v7": [
+    {
+      "recorded_request": "000",
+      "original_events": 30,
+      "events_exact": false,
+      "error": "StreamInterruptedError",
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "003",
+      "original_events": 5,
+      "events_exact": false,
+      "error": "StreamInterruptedError",
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "004",
+      "original_events": 5,
+      "events_exact": false,
+      "error": "StreamInterruptedError",
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "007",
+      "original_events": 18,
+      "events_exact": false,
+      "error": "StreamInterruptedError",
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "002",
+      "original_events": 118,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    }
+  ],
+  "poststudy_fix": [
+    {
+      "recorded_request": "000",
+      "original_events": 30,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "003",
+      "original_events": 5,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "004",
+      "original_events": 5,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "007",
+      "original_events": 18,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    },
+    {
+      "recorded_request": "002",
+      "original_events": 118,
+      "events_exact": true,
+      "upstream_attempts": 1,
+      "request_exact": true
+    }
+  ]
+}

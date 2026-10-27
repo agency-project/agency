@@ -1,0 +1,7 @@
+{
+  "actual_retained_pair": true,
+  "early_timeout": true,
+  "different_error": true,
+  "tests_not_started": true,
+  "missing_native_stop": true
+}

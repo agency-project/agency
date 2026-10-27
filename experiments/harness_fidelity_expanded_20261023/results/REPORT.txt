@@ -1,0 +1,67 @@
+Agency / interactive Claude Code validation
+Task model: claude-sonnet-5-5 through the authorized LiteLLM router; Claude Code 2.1.299; medium effort.
+Final source: src-v6, identical for both final benchmarks. Each benchmark uses 50 unique tasks, one fresh attempt per arm, with 25 pairs in each order.
+Success below requires official task reward AND a completed framework invocation. Native rewards are recorded separately in the CSV/JSON.
+
+smoke-v6
+  Tasks: 5; complete pairs: 5
+  Standalone: 4/5 solved; statuses {'completed': 5}
+  Agency: 5/5 solved; statuses {'completed': 5}
+  Native official rewards: standalone 4; Agency 5
+  Both solved 4; neither solved 0; Agency-only 1; standalone-only 0
+  Agency minus standalone success: 20.00 percentage points; paired bootstrap interval [0, 60.0]
+  Native requests: 30 incoming, 30 outgoing; contents/headers/count audit=True; first-task settings matched=True; resources matched=True; images matched=True
+  Native response control envelopes preserved: True (message_start/message_delta; content fragmentation and delivery timing excluded).
+  Paired execution ratio, Agency/standalone: median 1.23x; IQR 1.14-1.42x; range 1.05-1.61x (n=5). Verification and checkpoint time excluded.
+  Paired time to native Stop: median 1.21x; IQR 1.11-1.40x; range 1.03-1.57x (n=5). Verification/checkpoint/cleanup excluded; includes native completion followed by a later invocation failure.
+  Invocation failures after native Stop: {'agency': [], 'standalone': []}
+  Agency checkpoint time: median 13.10s; IQR 8.99-13.85s.
+  Grading errors: standalone 0; Agency 0. Evaluation timeouts: standalone 0; Agency 0.
+
+swe50-v6
+  Tasks: 50; complete pairs: 50
+  Standalone: 30/50 solved; statuses {'completed': 50}
+  Agency: 28/50 solved; statuses {'completed': 50}
+  Native official rewards: standalone 30; Agency 28
+  Both solved 27; neither solved 19; Agency-only 1; standalone-only 3
+  Agency minus standalone success: -4.00 percentage points; paired bootstrap interval [-12.0, 4.0]
+  Native requests: 372 incoming, 372 outgoing; contents/headers/count audit=True; first-task settings matched=True; resources matched=True; images matched=True
+  Native response control envelopes preserved: True (message_start/message_delta; content fragmentation and delivery timing excluded).
+  Paired execution ratio, Agency/standalone: median 1.28x; IQR 1.04-1.65x; range 0.49-16.99x (n=50). Verification and checkpoint time excluded.
+  Paired time to native Stop: median 1.25x; IQR 1.04-1.62x; range 0.49-16.91x (n=50). Verification/checkpoint/cleanup excluded; includes native completion followed by a later invocation failure.
+  Invocation failures after native Stop: {'agency': [], 'standalone': []}
+  Agency checkpoint time: median 9.25s; IQR 8.27-14.52s.
+  Grading errors: standalone 0; Agency 0. Evaluation timeouts: standalone 2; Agency 2.
+
+tb50-v6
+  Tasks: 50; complete pairs: 44
+  Standalone: 34/50 solved; statuses {'completed': 48, 'failed': 2}
+  Agency: 34/50 solved; statuses {'completed': 44, 'failed': 5, 'timeout': 1}
+  Native official rewards: standalone 34; Agency 35
+  Both solved 29; neither solved 11; Agency-only 5; standalone-only 5
+  Agency minus standalone success: 0.00 percentage points; paired bootstrap interval [-12.0, 12.0]
+  Native requests: 457 incoming, 457 outgoing; contents/headers/count audit=True; first-task settings matched=True; resources matched=True; images matched=True
+  Native response control envelopes preserved: True (message_start/message_delta; content fragmentation and delivery timing excluded).
+  Paired execution ratio, Agency/standalone: median 1.43x; IQR 1.11-1.68x; range 0.13-11.83x (n=44). Verification and checkpoint time excluded.
+  Paired time to native Stop: median 1.40x; IQR 1.11-1.67x; range 0.12-11.81x (n=47). Verification/checkpoint/cleanup excluded; includes native completion followed by a later invocation failure.
+  Invocation failures after native Stop: {'agency': ['sam-cell-seg', 'mteb-retrieve', 'torch-pipeline-parallelism'], 'standalone': []}
+  Agency checkpoint time: median 7.98s; IQR 4.22-12.54s.
+  Grading errors: standalone 0; Agency 0. Evaluation timeouts: standalone 0; Agency 0.
+
+Scope and interpretation:
+Terminal-Bench verification runs at native Claude Stop, while task services are alive, before Agency process cleanup. Agency normally terminates traced background processes during cleanup; this measurement does not establish post-return lifecycle parity.
+Terminal-Bench checkpoint timings include verifier filesystem changes and are diagnostic. The shared EC2 host also runs other work; latency includes model/tool variability and host contention, so paired runtime differences are not a pure estimate of wrapper overhead.
+Session IDs and isolated state-directory paths differ naturally. Initial request matching normalizes only those identities/paths; native Agency request preservation compares actual request contents, Anthropic beta/version headers, and exact attempt counts. Other transport headers are not claimed byte-identical.
+These samples provide a supporting measurement, not proof of statistical equivalence. All failures and timeouts remain in the denominator; no final tasks were replaced based on outcomes.
+Earlier cohorts were withdrawn in full after discovering missing SYS_PTRACE capability, a scoring setup problem, nested SDK retries during a provider outage, or lost refusal response metadata and fallback model remapping. Original outputs remain on EC2 and are listed in discovery-cohorts.json; they are not pooled with final results.
+Fixes: native request/HTTP-error preservation; tab-aware prompt acknowledgment and turn fencing; explicit hook interpreter; robust usage accounting; cgroup-v2 CPU quota detection; SYS_PTRACE for credential-changing children; native response/control fields and per-request fallback model preservation; native CLI retry ownership and safe retry response headers.
+Regression checks: native response/request correction 503 passed, 1 skipped; three response/fallback regressions fail on the previous source and pass after correction. Retry correction 177 passed, 1 skipped; the previous source fails all eight native retry cases while the corrected source passes. Capability checks: 171 passed, 7 skipped for the final capability/native-process suite; prior focused native-request suite 204 passed, 11 skipped. The credential-change reproduction fails without the capability and succeeds with it.
+Final request auditing matches occurrences of complete JSON-body/header pairs, including beta-header variants used by native recovery. The frozen analyzer and an analysis amendment are retained; no model attempts changed.
+Observed Agency Docker checkpoint failures occurred after native Stop when docker commit exceeded its 120-second per-attempt timeout; these remain invocation failures and are separate from native task rewards.
+Original and grading patches plus baseline inventories are retained. Project patch scoring excludes files already untracked in the initial image, including generated build files; genuinely new source files and tracked edits remain.
+
+Post-study checkpoint budget correction (excluded from the frozen benchmark results):
+Changed the production default commit_timeout_s from 120 to 600 seconds. Four existing commit cleanup tests passed. A controlled 125-second transport delay caused the old budget to time out; the new default completed a real Docker snapshot in 134.40 seconds and restored its sentinel file.
+The control uses one attempt and disabled squashing to isolate the budget. It simulates delayed storage; it is not a rerun of the three large benchmark snapshots. All original scores and failures remain unchanged.
+
+Recorded token usage at Sonnet 5.5 list prices: final 200 runs $17.62; final 200 plus five-pair smoke $18.17; all expanded-study cohorts including withdrawn diagnostics $36.31. These are usage-based list-price estimates, not verified router bills; EC2 excluded and incomplete upstream responses can omit usage.

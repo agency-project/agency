@@ -1,0 +1,1291 @@
+{
+  "generated_unix_s": 1792865785.7396977,
+  "suites": {
+    "smoke-v6": {
+      "tasks": 5,
+      "completed_pairs": 5,
+      "outage_free_completed_pairs": 5,
+      "both_solved": 4,
+      "neither_solved": 0,
+      "only_agency_solved": 1,
+      "only_standalone_solved": 0,
+      "exact_mcnemar_two_sided_p": 1,
+      "identical_patches": 1,
+      "all_native_requests_preserved": true,
+      "all_native_response_control_preserved": true,
+      "all_resources_matched": true,
+      "all_image_ids_matched": true,
+      "all_first_task_settings_matched": true,
+      "incoming_native_requests": 30,
+      "outgoing_agency_requests": 30,
+      "standalone": {
+        "resolved": 4,
+        "statuses": {
+          "completed": 5
+        },
+        "native_official_resolved": 4,
+        "total_cost_usd": 0.2332054,
+        "http_error_attempts": 5,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 0,
+        "native_completions": 5,
+        "provider_stream_error_events": 5,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 5,
+          "mean": 23.71828100476414,
+          "median": 21.85723054409027,
+          "sd": 10.751249990137559,
+          "min": 11.548998207086697,
+          "p25": 16.9173657738138,
+          "p75": 29.256423932965845,
+          "max": 39.011386565864086
+        },
+        "grader_s": null,
+        "execution_s": {
+          "n": 5,
+          "mean": 23.659133502375333,
+          "median": 21.819450818235055,
+          "sd": 10.739565062382988,
+          "min": 11.50205934792757,
+          "p25": 16.854547715978697,
+          "p75": 29.185185275040567,
+          "max": 38.934424354694784
+        },
+        "checkpoint_s": {
+          "n": 5,
+          "mean": 0,
+          "median": 0,
+          "sd": 0.0,
+          "min": 0,
+          "p25": 0.0,
+          "p75": 0.0,
+          "max": 0
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 5,
+          "mean": 23.659133502375333,
+          "median": 21.819450818235055,
+          "sd": 10.739565062382988,
+          "min": 11.50205934792757,
+          "p25": 16.854547715978697,
+          "p75": 29.185185275040567,
+          "max": 38.934424354694784
+        },
+        "invocation_s": {
+          "n": 5,
+          "mean": 23.919079116545618,
+          "median": 22.058063238160685,
+          "sd": 10.751256059977967,
+          "min": 11.74977394612506,
+          "p25": 17.1181578557007,
+          "p75": 29.45721111400053,
+          "max": 39.21218942874111
+        },
+        "cost_usd": {
+          "n": 5,
+          "mean": 0.04664108,
+          "median": 0.0455991,
+          "sd": 0.01614123754338558,
+          "min": 0.0315775,
+          "p25": 0.032592,
+          "p75": 0.052714699999999996,
+          "max": 0.07072210000000001
+        },
+        "output_tokens": {
+          "n": 5,
+          "mean": 1482.4,
+          "median": 1688,
+          "sd": 643.0375572235264,
+          "min": 619,
+          "p25": 1008.0,
+          "p75": 2037.0,
+          "max": 2060
+        },
+        "model_requests": {
+          "n": 5,
+          "mean": 7,
+          "median": 7,
+          "sd": 2.1213203435596424,
+          "min": 5,
+          "p25": 5.0,
+          "p75": 8.0,
+          "max": 10
+        },
+        "provider_active_s": {
+          "n": 5,
+          "mean": 13.861847027484327,
+          "median": 14.446574379922822,
+          "sd": 6.25790037658442,
+          "min": 6.361625644145533,
+          "p25": 8.875046618049964,
+          "p75": 18.338281254982576,
+          "max": 21.287707240320742
+        }
+      },
+      "agency": {
+        "resolved": 5,
+        "statuses": {
+          "completed": 5
+        },
+        "native_official_resolved": 5,
+        "total_cost_usd": 0.32219949999999997,
+        "http_error_attempts": 5,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 0,
+        "native_completions": 5,
+        "provider_stream_error_events": 5,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 5,
+          "mean": 28.65189904589206,
+          "median": 30.53040506504476,
+          "sd": 9.909259854323546,
+          "min": 18.138226790120825,
+          "p25": 18.842674091923982,
+          "p75": 35.38522372418083,
+          "max": 40.3629655581899
+        },
+        "grader_s": null,
+        "execution_s": {
+          "n": 5,
+          "mean": 29.07806297726929,
+          "median": 30.956366369035095,
+          "sd": 9.940207693360119,
+          "min": 18.5307990021538,
+          "p25": 19.24990169191733,
+          "p75": 35.797434121137485,
+          "max": 40.85581370210275
+        },
+        "checkpoint_s": {
+          "n": 5,
+          "mean": 11.875793770467862,
+          "median": 13.096536978147924,
+          "sd": 3.0832703954055822,
+          "min": 8.238554301206023,
+          "p25": 8.989334783982486,
+          "p75": 13.851184223080054,
+          "max": 15.203358565922827
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 5,
+          "mean": 40.953856747737156,
+          "median": 39.19492067024112,
+          "sd": 9.167547495480278,
+          "min": 31.627335980301723,
+          "p25": 34.45326025784016,
+          "p75": 44.78676890511997,
+          "max": 54.706997925182804
+        },
+        "invocation_s": {
+          "n": 5,
+          "mean": 41.2159398260992,
+          "median": 39.371007666923106,
+          "sd": 9.194672233674169,
+          "min": 31.96868164022453,
+          "p25": 34.66777038993314,
+          "p75": 44.997133621247485,
+          "max": 55.07510581216775
+        },
+        "cost_usd": {
+          "n": 5,
+          "mean": 0.0644399,
+          "median": 0.0565177,
+          "sd": 0.02930062543914378,
+          "min": 0.0341588,
+          "p25": 0.045839,
+          "p75": 0.0771091,
+          "max": 0.10857489999999999
+        },
+        "output_tokens": {
+          "n": 5,
+          "mean": 1279.2,
+          "median": 1380,
+          "sd": 600.2301225363485,
+          "min": 481,
+          "p25": 951.0,
+          "p75": 1509.0,
+          "max": 2075
+        },
+        "model_requests": {
+          "n": 5,
+          "mean": 6,
+          "median": 6,
+          "sd": 2.1213203435596424,
+          "min": 4,
+          "p25": 4.0,
+          "p75": 7.0,
+          "max": 9
+        },
+        "provider_active_s": {
+          "n": 5,
+          "mean": 12.931975305173546,
+          "median": 12.728633127408102,
+          "sd": 5.6828842029529145,
+          "min": 6.343314574100077,
+          "p25": 8.429970670957118,
+          "p75": 17.661497668595985,
+          "max": 19.496460484806448
+        }
+      },
+      "completed_pairs_timing": {
+        "ratio": {
+          "n": 5,
+          "mean": 1.2895733217360295,
+          "median": 1.2265618252474064,
+          "sd": 0.22554243094588375,
+          "min": 1.049349370878172,
+          "p25": 1.1421191488673264,
+          "p75": 1.418750940475738,
+          "max": 1.6110853232115048
+        },
+        "checkpoint_included_ratio": {
+          "n": 5,
+          "mean": 1.9059740853862426,
+          "median": 1.7963293850404773,
+          "sd": 0.5319339416663851,
+          "min": 1.4051061196333352,
+          "p25": 1.5345720262883518,
+          "p75": 2.0441521682113883,
+          "max": 2.7497107277576607
+        },
+        "invocation_ratio": {
+          "n": 5,
+          "mean": 1.8925917806696628,
+          "median": 1.7848805328842672,
+          "sd": 0.5211903277399554,
+          "min": 1.4045404404733313,
+          "p25": 1.5275422186814245,
+          "p75": 2.025204504022496,
+          "max": 2.720791207286795
+        },
+        "difference_s": {
+          "n": 5,
+          "mean": 5.418929474893957,
+          "median": 6.612248846096918,
+          "sd": 3.131042803007458,
+          "min": 1.9213893474079669,
+          "p25": 2.395353975938633,
+          "p75": 7.028739654226229,
+          "max": 9.13691555080004
+        }
+      },
+      "outage_free_pairs_timing": {
+        "ratio": {
+          "n": 5,
+          "mean": 1.2895733217360295,
+          "median": 1.2265618252474064,
+          "sd": 0.22554243094588375,
+          "min": 1.049349370878172,
+          "p25": 1.1421191488673264,
+          "p75": 1.418750940475738,
+          "max": 1.6110853232115048
+        },
+        "checkpoint_included_ratio": {
+          "n": 5,
+          "mean": 1.9059740853862426,
+          "median": 1.7963293850404773,
+          "sd": 0.5319339416663851,
+          "min": 1.4051061196333352,
+          "p25": 1.5345720262883518,
+          "p75": 2.0441521682113883,
+          "max": 2.7497107277576607
+        },
+        "invocation_ratio": {
+          "n": 5,
+          "mean": 1.8925917806696628,
+          "median": 1.7848805328842672,
+          "sd": 0.5211903277399554,
+          "min": 1.4045404404733313,
+          "p25": 1.5275422186814245,
+          "p75": 2.025204504022496,
+          "max": 2.720791207286795
+        },
+        "difference_s": {
+          "n": 5,
+          "mean": 5.418929474893957,
+          "median": 6.612248846096918,
+          "sd": 3.131042803007458,
+          "min": 1.9213893474079669,
+          "p25": 2.395353975938633,
+          "p75": 7.028739654226229,
+          "max": 9.13691555080004
+        }
+      },
+      "paired_median_runtime_ratio_bootstrap_95ci": [
+        1.049349370878172,
+        1.6110853232115048
+      ],
+      "success_difference_percentage_points": 20.0,
+      "success_difference_paired_bootstrap_95ci_pp": [
+        0,
+        60.0
+      ],
+      "native_completion_pair_timing": {
+        "ratio": {
+          "n": 5,
+          "mean": 1.2650587546721777,
+          "median": 1.2094856092206512,
+          "sd": 0.21779367301715705,
+          "min": 1.0346457563112734,
+          "p25": 1.113806625916332,
+          "p75": 1.3968103142554595,
+          "max": 1.5705454676571726
+        },
+        "difference_s": {
+          "n": 5,
+          "mean": 4.93361804112792,
+          "median": 6.128799791214988,
+          "sd": 3.163649770627716,
+          "min": 1.3515789923258126,
+          "p25": 1.9253083181101829,
+          "p75": 6.589228583034128,
+          "max": 8.67317452095449
+        },
+        "scope": "Invocation to native Stop; verification, checkpointing and later cleanup excluded"
+      },
+      "post_native_invocation_failures": {
+        "agency": [],
+        "standalone": []
+      }
+    },
+    "swe50-v6": {
+      "tasks": 50,
+      "completed_pairs": 50,
+      "outage_free_completed_pairs": 50,
+      "both_solved": 27,
+      "neither_solved": 19,
+      "only_agency_solved": 1,
+      "only_standalone_solved": 3,
+      "exact_mcnemar_two_sided_p": 0.625,
+      "identical_patches": 13,
+      "all_native_requests_preserved": true,
+      "all_native_response_control_preserved": true,
+      "all_resources_matched": true,
+      "all_image_ids_matched": true,
+      "all_first_task_settings_matched": true,
+      "incoming_native_requests": 372,
+      "outgoing_agency_requests": 372,
+      "standalone": {
+        "resolved": 30,
+        "statuses": {
+          "completed": 50
+        },
+        "native_official_resolved": 30,
+        "total_cost_usd": 3.4799389,
+        "http_error_attempts": 50,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 2,
+        "native_completions": 50,
+        "provider_stream_error_events": 50,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 50,
+          "mean": 49.69478853070177,
+          "median": 29.301923341932707,
+          "sd": 59.2683763820987,
+          "min": 9.486519852885976,
+          "p25": 16.80481946130749,
+          "p75": 53.96517423825571,
+          "max": 350.18858523108065
+        },
+        "grader_s": null,
+        "execution_s": {
+          "n": 50,
+          "mean": 49.624827159005214,
+          "median": 29.240591719397344,
+          "sd": 59.27019355831922,
+          "min": 9.38612360181287,
+          "p25": 16.748238100728486,
+          "p75": 53.83314797759522,
+          "max": 350.12407608982176
+        },
+        "checkpoint_s": {
+          "n": 50,
+          "mean": 0,
+          "median": 0.0,
+          "sd": 0.0,
+          "min": 0,
+          "p25": 0.0,
+          "p75": 0.0,
+          "max": 0
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 50,
+          "mean": 49.624827159005214,
+          "median": 29.240591719397344,
+          "sd": 59.27019355831922,
+          "min": 9.38612360181287,
+          "p25": 16.748238100728486,
+          "p75": 53.83314797759522,
+          "max": 350.12407608982176
+        },
+        "invocation_s": {
+          "n": 50,
+          "mean": 49.89960344637744,
+          "median": 29.5027157937875,
+          "sd": 59.27807828746682,
+          "min": 9.687261333689094,
+          "p25": 17.005708266689908,
+          "p75": 54.16592736361781,
+          "max": 350.4895449250471
+        },
+        "cost_usd": {
+          "n": 50,
+          "mean": 0.069598778,
+          "median": 0.04925725,
+          "sd": 0.05832488659633049,
+          "min": 0.0308139,
+          "p25": 0.0392924,
+          "p75": 0.07362162500000001,
+          "max": 0.383186
+        },
+        "output_tokens": {
+          "n": 50,
+          "mean": 2515.46,
+          "median": 1575.5,
+          "sd": 3401.7092414951444,
+          "min": 749,
+          "p25": 1069.25,
+          "p75": 2479.25,
+          "max": 23477
+        },
+        "model_requests": {
+          "n": 50,
+          "mean": 8.72,
+          "median": 7.0,
+          "sd": 4.356744712488433,
+          "min": 5,
+          "p25": 6.0,
+          "p75": 9.75,
+          "max": 28
+        },
+        "provider_active_s": {
+          "n": 50,
+          "mean": 23.082389147123322,
+          "median": 14.296971451840363,
+          "sd": 29.693821009718526,
+          "min": 7.507418908877298,
+          "p25": 10.86718523077434,
+          "p75": 23.330644154222682,
+          "max": 206.8351893054787
+        }
+      },
+      "agency": {
+        "resolved": 28,
+        "statuses": {
+          "completed": 50
+        },
+        "native_official_resolved": 28,
+        "total_cost_usd": 3.2992424,
+        "http_error_attempts": 50,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 2,
+        "native_completions": 50,
+        "provider_stream_error_events": 50,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 50,
+          "mean": 58.85167301385663,
+          "median": 39.076426449464634,
+          "sd": 55.489239318408025,
+          "min": 15.462214721133932,
+          "p25": 22.51008623553207,
+          "p75": 68.3795183027396,
+          "max": 250.39902739296667
+        },
+        "grader_s": null,
+        "execution_s": {
+          "n": 50,
+          "mean": 59.26528939394746,
+          "median": 39.46349887200631,
+          "sd": 55.480247875956586,
+          "min": 15.756995564093813,
+          "p25": 22.807331722870003,
+          "p75": 68.7426109770895,
+          "max": 250.80876099993475
+        },
+        "checkpoint_s": {
+          "n": 50,
+          "mean": 13.861620023790747,
+          "median": 9.248857303988189,
+          "sd": 9.921184976005613,
+          "min": 5.690181149868295,
+          "p25": 8.271435712871607,
+          "p75": 14.516769422392827,
+          "max": 42.3153644320555
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 50,
+          "mean": 73.1269094177382,
+          "median": 53.56335023406427,
+          "sd": 56.543378725988546,
+          "min": 23.343436317984015,
+          "p25": 31.86675881280098,
+          "p75": 86.31549970788183,
+          "max": 256.8613680668641
+        },
+        "invocation_s": {
+          "n": 50,
+          "mean": 73.52507401728536,
+          "median": 54.11776043695863,
+          "sd": 56.54427510898464,
+          "min": 23.530717239249498,
+          "p25": 32.210030077490956,
+          "p75": 86.61564360634657,
+          "max": 257.06454529007897
+        },
+        "cost_usd": {
+          "n": 50,
+          "mean": 0.065984848,
+          "median": 0.050724450000000004,
+          "sd": 0.041197453059155516,
+          "min": 0.028490400000000003,
+          "p25": 0.03976545,
+          "p75": 0.07048309999999999,
+          "max": 0.2165457
+        },
+        "output_tokens": {
+          "n": 50,
+          "mean": 2219.54,
+          "median": 1601.0,
+          "sd": 2119.9475658706315,
+          "min": 567,
+          "p25": 1031.5,
+          "p75": 1983.0,
+          "max": 9934
+        },
+        "model_requests": {
+          "n": 50,
+          "mean": 7.44,
+          "median": 6.0,
+          "sd": 3.6653924811425482,
+          "min": 4,
+          "p25": 5.0,
+          "p75": 8.0,
+          "max": 20
+        },
+        "provider_active_s": {
+          "n": 50,
+          "mean": 20.60017793431878,
+          "median": 14.348527483642101,
+          "sd": 18.28658119981797,
+          "min": 6.170130098238587,
+          "p25": 10.383420729660429,
+          "p75": 18.633399903716054,
+          "max": 85.46690860530362
+        }
+      },
+      "completed_pairs_timing": {
+        "ratio": {
+          "n": 50,
+          "mean": 1.6825105395684334,
+          "median": 1.2772008903070353,
+          "sd": 2.2903290296874124,
+          "min": 0.490759617621852,
+          "p25": 1.0434821822565121,
+          "p75": 1.6498361103237345,
+          "max": 16.994087631300623
+        },
+        "checkpoint_included_ratio": {
+          "n": 50,
+          "mean": 2.1728032388065697,
+          "median": 1.80703231246678,
+          "sd": 2.329584331640852,
+          "min": 0.5195170348021342,
+          "p25": 1.3100358698290238,
+          "p75": 2.328315139861482,
+          "max": 17.404195055312233
+        },
+        "invocation_ratio": {
+          "n": 50,
+          "mean": 2.1574043775534992,
+          "median": 1.7949019441514198,
+          "sd": 2.290211241168003,
+          "min": 0.5199469627517594,
+          "p25": 1.3090507458795333,
+          "p75": 2.318854958639782,
+          "max": 17.128589370986933
+        },
+        "difference_s": {
+          "n": 50,
+          "mean": 9.640462234942243,
+          "median": 6.158980952925049,
+          "sd": 49.15395454948829,
+          "min": -178.2973183877766,
+          "p25": 1.9967802973114885,
+          "p75": 13.220588035532273,
+          "max": 236.0501716339495
+        }
+      },
+      "outage_free_pairs_timing": {
+        "ratio": {
+          "n": 50,
+          "mean": 1.6825105395684334,
+          "median": 1.2772008903070353,
+          "sd": 2.2903290296874124,
+          "min": 0.490759617621852,
+          "p25": 1.0434821822565121,
+          "p75": 1.6498361103237345,
+          "max": 16.994087631300623
+        },
+        "checkpoint_included_ratio": {
+          "n": 50,
+          "mean": 2.1728032388065697,
+          "median": 1.80703231246678,
+          "sd": 2.329584331640852,
+          "min": 0.5195170348021342,
+          "p25": 1.3100358698290238,
+          "p75": 2.328315139861482,
+          "max": 17.404195055312233
+        },
+        "invocation_ratio": {
+          "n": 50,
+          "mean": 2.1574043775534992,
+          "median": 1.7949019441514198,
+          "sd": 2.290211241168003,
+          "min": 0.5199469627517594,
+          "p25": 1.3090507458795333,
+          "p75": 2.318854958639782,
+          "max": 17.128589370986933
+        },
+        "difference_s": {
+          "n": 50,
+          "mean": 9.640462234942243,
+          "median": 6.158980952925049,
+          "sd": 49.15395454948829,
+          "min": -178.2973183877766,
+          "p25": 1.9967802973114885,
+          "p75": 13.220588035532273,
+          "max": 236.0501716339495
+        }
+      },
+      "paired_median_runtime_ratio_bootstrap_95ci": [
+        1.163148285006511,
+        1.4229898116278437
+      ],
+      "success_difference_percentage_points": -4.0,
+      "success_difference_paired_bootstrap_95ci_pp": [
+        -12.0,
+        4.0
+      ],
+      "native_completion_pair_timing": {
+        "ratio": {
+          "n": 50,
+          "mean": 1.6603706516171337,
+          "median": 1.2506869163778598,
+          "sd": 2.2800533788644963,
+          "min": 0.4895856895756357,
+          "p25": 1.0391623632476663,
+          "p75": 1.6155524976616245,
+          "max": 16.910737440017627
+        },
+        "difference_s": {
+          "n": 50,
+          "mean": 9.156884483154863,
+          "median": 5.698022000025958,
+          "sd": 49.15087192032302,
+          "min": -178.74126524920575,
+          "p25": 1.4661547960713506,
+          "p75": 12.792524812335614,
+          "max": 235.59192461101338
+        },
+        "scope": "Invocation to native Stop; verification, checkpointing and later cleanup excluded"
+      },
+      "post_native_invocation_failures": {
+        "agency": [],
+        "standalone": []
+      }
+    },
+    "tb50-v6": {
+      "tasks": 50,
+      "completed_pairs": 44,
+      "outage_free_completed_pairs": 44,
+      "both_solved": 29,
+      "neither_solved": 11,
+      "only_agency_solved": 5,
+      "only_standalone_solved": 5,
+      "exact_mcnemar_two_sided_p": 1,
+      "identical_patches": 0,
+      "all_native_requests_preserved": true,
+      "all_native_response_control_preserved": true,
+      "all_resources_matched": true,
+      "all_image_ids_matched": true,
+      "all_first_task_settings_matched": true,
+      "incoming_native_requests": 457,
+      "outgoing_agency_requests": 457,
+      "standalone": {
+        "resolved": 34,
+        "statuses": {
+          "completed": 48,
+          "failed": 2
+        },
+        "native_official_resolved": 34,
+        "total_cost_usd": 4.9525826,
+        "http_error_attempts": 53,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 0,
+        "native_completions": 48,
+        "provider_stream_error_events": 53,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 48,
+          "mean": 206.1213612012798,
+          "median": 46.10431536647957,
+          "sd": 475.00590299165395,
+          "min": 7.712678330950439,
+          "p25": 23.26365892594913,
+          "p75": 118.1087551562814,
+          "max": 2626.648085524095
+        },
+        "grader_s": {
+          "n": 50,
+          "mean": 30.250446179974823,
+          "median": 10.581549594528042,
+          "sd": 91.98178883780643,
+          "min": 0,
+          "p25": 6.359698557353113,
+          "p75": 13.437530957278796,
+          "max": 636.4653796111234
+        },
+        "execution_s": {
+          "n": 50,
+          "mean": 202.0297211485682,
+          "median": 46.03754481358919,
+          "sd": 466.08965601306915,
+          "min": 4.497381306020543,
+          "p25": 21.751060490729287,
+          "p75": 119.12059351149946,
+          "max": 2626.652349430835
+        },
+        "checkpoint_s": {
+          "n": 50,
+          "mean": 0,
+          "median": 0.0,
+          "sd": 0.0,
+          "min": 0,
+          "p25": 0.0,
+          "p75": 0.0,
+          "max": 0
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 50,
+          "mean": 202.0297211485682,
+          "median": 46.03754481358919,
+          "sd": 466.08965601306915,
+          "min": 4.497381306020543,
+          "p25": 21.751060490729287,
+          "p75": 119.12059351149946,
+          "max": 2626.652349430835
+        },
+        "invocation_s": {
+          "n": 50,
+          "mean": 202.3264114127774,
+          "median": 46.305079518584535,
+          "sd": 466.12424262589735,
+          "min": 4.913689804961905,
+          "p25": 22.044117909506895,
+          "p75": 119.38799985084916,
+          "max": 2627.249865784077
+        },
+        "cost_usd": {
+          "n": 50,
+          "mean": 0.099051652,
+          "median": 0.07472645,
+          "sd": 0.09100787827957252,
+          "min": 0.021084400000000003,
+          "p25": 0.0396089,
+          "p75": 0.126764825,
+          "max": 0.5589213000000001
+        },
+        "output_tokens": {
+          "n": 50,
+          "mean": 4061.38,
+          "median": 2175.0,
+          "sd": 4540.718512279208,
+          "min": 0,
+          "p25": 1465.75,
+          "p75": 4943.25,
+          "max": 24764
+        },
+        "model_requests": {
+          "n": 50,
+          "mean": 9.08,
+          "median": 8.0,
+          "sd": 4.1346717166035845,
+          "min": 4,
+          "p25": 6.0,
+          "p75": 11.0,
+          "max": 23
+        },
+        "provider_active_s": {
+          "n": 50,
+          "mean": 36.350620038113554,
+          "median": 22.26897837454453,
+          "sd": 37.90207351377055,
+          "min": 3.257647482212633,
+          "p25": 12.998443012475036,
+          "p75": 46.838684867543634,
+          "max": 214.91248403768986
+        }
+      },
+      "agency": {
+        "resolved": 34,
+        "statuses": {
+          "completed": 44,
+          "failed": 5,
+          "timeout": 1
+        },
+        "native_official_resolved": 35,
+        "total_cost_usd": 5.8870818,
+        "http_error_attempts": 53,
+        "router_outage_attempts": 0,
+        "grading_errors": 0,
+        "evaluation_timeouts": 0,
+        "native_completions": 47,
+        "provider_stream_error_events": 53,
+        "response_model_ids": [
+          "claude-sonnet-5-5"
+        ],
+        "native_completion_s": {
+          "n": 47,
+          "mean": 208.5378794397049,
+          "median": 72.85233637993224,
+          "sd": 377.4049179042171,
+          "min": 12.940793473040685,
+          "p25": 27.02927526808344,
+          "p75": 187.53693508449942,
+          "max": 1784.099889039062
+        },
+        "grader_s": {
+          "n": 50,
+          "mean": 29.31915623205248,
+          "median": 10.442275932990015,
+          "sd": 93.868033769755,
+          "min": 0,
+          "p25": 5.9315054618055,
+          "p75": 13.462988803396001,
+          "max": 663.9304963750765
+        },
+        "execution_s": {
+          "n": 50,
+          "mean": 237.03933663973584,
+          "median": 74.28071172896307,
+          "sd": 430.59142912091687,
+          "min": 9.786508569959551,
+          "p25": 27.07087225926807,
+          "p75": 197.475205857947,
+          "max": 1800.5092357830144
+        },
+        "checkpoint_s": {
+          "n": 50,
+          "mean": 32.506094622318635,
+          "median": 7.981173831387423,
+          "sd": 85.28995156248199,
+          "min": 0,
+          "p25": 4.219841370824724,
+          "p75": 12.539268902153708,
+          "max": 362.36618139012717
+        },
+        "execution_plus_checkpoint_s": {
+          "n": 50,
+          "mean": 269.5454312620545,
+          "median": 85.20407337555662,
+          "sd": 439.23844325885204,
+          "min": 9.786508569959551,
+          "p25": 34.60845501977019,
+          "p75": 263.50047322682803,
+          "max": 1800.5092357830144
+        },
+        "invocation_s": {
+          "n": 50,
+          "mean": 271.00159200688825,
+          "median": 86.36330163141247,
+          "sd": 439.9791161276829,
+          "min": 10.061968696070835,
+          "p25": 34.94390472327359,
+          "p75": 263.8463426262606,
+          "max": 1801.790108344052
+        },
+        "cost_usd": {
+          "n": 50,
+          "mean": 0.117741636,
+          "median": 0.07010435000000001,
+          "sd": 0.11540204652440406,
+          "min": 0.0251087,
+          "p25": 0.041870375,
+          "p75": 0.130502675,
+          "max": 0.4989555
+        },
+        "output_tokens": {
+          "n": 50,
+          "mean": 5193.14,
+          "median": 2109.0,
+          "sd": 7218.406483682771,
+          "min": 0,
+          "p25": 1447.0,
+          "p75": 5514.75,
+          "max": 33484
+        },
+        "model_requests": {
+          "n": 50,
+          "mean": 9.14,
+          "median": 7.5,
+          "sd": 5.9419298727134855,
+          "min": 3,
+          "p25": 5.0,
+          "p75": 11.0,
+          "max": 38
+        },
+        "provider_active_s": {
+          "n": 50,
+          "mean": 46.05442209869623,
+          "median": 19.495139289065264,
+          "sd": 62.54266000025751,
+          "min": 2.556638516485691,
+          "p25": 12.974835930508561,
+          "p75": 48.55217704299139,
+          "max": 298.8589332208503
+        }
+      },
+      "completed_pairs_timing": {
+        "ratio": {
+          "n": 44,
+          "mean": 1.6571888062123852,
+          "median": 1.4347718576434394,
+          "sd": 1.6485809757283894,
+          "min": 0.12513387749345073,
+          "p25": 1.108695177132914,
+          "p75": 1.6827544566642707,
+          "max": 11.825445346922313
+        },
+        "checkpoint_included_ratio": {
+          "n": 44,
+          "mean": 1.9462926673829055,
+          "median": 1.7032288477663267,
+          "sd": 1.680228067548413,
+          "min": 0.1381418394173907,
+          "p25": 1.2411296903405373,
+          "p75": 2.024711101923365,
+          "max": 11.898344165250162
+        },
+        "invocation_ratio": {
+          "n": 44,
+          "mean": 1.9480589652583926,
+          "median": 1.7018100665885014,
+          "sd": 1.6728718143142332,
+          "min": 0.13862768077882706,
+          "p25": 1.245318314906894,
+          "p75": 2.0291781152685884,
+          "max": 11.835040419577734
+        },
+        "difference_s": {
+          "n": 44,
+          "mean": 5.775249664888675,
+          "median": 7.542545767733827,
+          "sd": 188.5532492984841,
+          "min": -842.0686413357034,
+          "p25": 5.255331734195352,
+          "p75": 37.88813308742829,
+          "max": 620.9382203312125
+        }
+      },
+      "outage_free_pairs_timing": {
+        "ratio": {
+          "n": 44,
+          "mean": 1.6571888062123852,
+          "median": 1.4347718576434394,
+          "sd": 1.6485809757283894,
+          "min": 0.12513387749345073,
+          "p25": 1.108695177132914,
+          "p75": 1.6827544566642707,
+          "max": 11.825445346922313
+        },
+        "checkpoint_included_ratio": {
+          "n": 44,
+          "mean": 1.9462926673829055,
+          "median": 1.7032288477663267,
+          "sd": 1.680228067548413,
+          "min": 0.1381418394173907,
+          "p25": 1.2411296903405373,
+          "p75": 2.024711101923365,
+          "max": 11.898344165250162
+        },
+        "invocation_ratio": {
+          "n": 44,
+          "mean": 1.9480589652583926,
+          "median": 1.7018100665885014,
+          "sd": 1.6728718143142332,
+          "min": 0.13862768077882706,
+          "p25": 1.245318314906894,
+          "p75": 2.0291781152685884,
+          "max": 11.835040419577734
+        },
+        "difference_s": {
+          "n": 44,
+          "mean": 5.775249664888675,
+          "median": 7.542545767733827,
+          "sd": 188.5532492984841,
+          "min": -842.0686413357034,
+          "p25": 5.255331734195352,
+          "p75": 37.88813308742829,
+          "max": 620.9382203312125
+        }
+      },
+      "paired_median_runtime_ratio_bootstrap_95ci": [
+        1.2093024556751995,
+        1.6002695725355829
+      ],
+      "success_difference_percentage_points": 0,
+      "success_difference_paired_bootstrap_95ci_pp": [
+        -12.0,
+        12.0
+      ],
+      "native_completion_pair_timing": {
+        "ratio": {
+          "n": 47,
+          "mean": 1.6835381273338985,
+          "median": 1.4014754727978986,
+          "sd": 1.6457301861443054,
+          "min": 0.12435784998798412,
+          "p25": 1.1143940462091022,
+          "p75": 1.6706824762148749,
+          "max": 11.813685443750623
+        },
+        "difference_s": {
+          "n": 47,
+          "mean": 15.62510919197403,
+          "median": 7.097052721772343,
+          "sd": 195.4164382187105,
+          "min": -842.5481964850333,
+          "p25": 5.018731264513917,
+          "p75": 37.60551205195952,
+          "max": 620.5499127192888
+        },
+        "scope": "Invocation to native Stop; verification, checkpointing and later cleanup excluded"
+      },
+      "post_native_invocation_failures": {
+        "agency": [
+          "sam-cell-seg",
+          "mteb-retrieve",
+          "torch-pipeline-parallelism"
+        ],
+        "standalone": []
+      }
+    }
+  },
+  "post_study_checkpoint_fix": {
+    "before": {
+      "case": "old-120s",
+      "timeout_s": 120,
+      "injected_delay_s": 125,
+      "retries": 1,
+      "uses_real_docker_commit": true,
+      "model_calls": 0,
+      "committed": false,
+      "error_type": "TimeoutExpired",
+      "wall_s": 120.14494782197289
+    },
+    "after": {
+      "case": "new-default",
+      "timeout_s": 600,
+      "injected_delay_s": 125,
+      "retries": 1,
+      "uses_real_docker_commit": true,
+      "model_calls": 0,
+      "committed": true,
+      "wall_s": 134.3972807629034,
+      "restored_sentinel": true
+    },
+    "original_benchmark_attempts_unchanged": true,
+    "scope": "Artificial transport delay plus real Docker snapshot/restore; not a rerun of the three benchmark failures"
+  },
+  "api_costs": {
+    "checked_unix_s": 1792865785.6945379,
+    "primary_200_list_price_usd": 17.618845699999994,
+    "primary_plus_smoke_list_price_usd": 18.174250599999993,
+    "all_expanded_cohorts_list_price_usd": 36.305120699999996,
+    "cohorts": {
+      "smoke-v1": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.5592431,
+        "usage": {
+          "input_tokens": 333,
+          "output_tokens": 14143,
+          "cache_creation_input_tokens": 117437,
+          "cache_read_input_tokens": 1235546
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "smoke-v2": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.5902627,
+        "usage": {
+          "input_tokens": 349,
+          "output_tokens": 13993,
+          "cache_creation_input_tokens": 121314,
+          "cache_read_input_tokens": 1463497
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "smoke-v3": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.5734416999999999,
+        "usage": {
+          "input_tokens": 343,
+          "output_tokens": 14528,
+          "cache_creation_input_tokens": 116052,
+          "cache_read_input_tokens": 1373457
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "smoke-v4": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.42149889999999995,
+        "usage": {
+          "input_tokens": 331,
+          "output_tokens": 11951,
+          "cache_creation_input_tokens": 70701,
+          "cache_read_input_tokens": 1245744
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "swe50": {
+        "executions_with_provider_logs": 100,
+        "list_price_usd": 6.607483099999999,
+        "usage": {
+          "input_tokens": 3672,
+          "output_tokens": 221659,
+          "cache_creation_input_tokens": 1001202,
+          "cache_read_input_tokens": 18805441
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "tb50": {
+        "executions_with_provider_logs": 64,
+        "list_price_usd": 5.6041187,
+        "usage": {
+          "input_tokens": 2304,
+          "output_tokens": 217369,
+          "cache_creation_input_tokens": 929984,
+          "cache_read_input_tokens": 11008607
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "swe50-final": {
+        "executions_with_provider_logs": 3,
+        "list_price_usd": 0.0078523,
+        "usage": {
+          "input_tokens": 94,
+          "output_tokens": 49,
+          "cache_creation_input_tokens": 2833,
+          "cache_read_input_tokens": 918
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "tb50-final": {
+        "executions_with_provider_logs": 3,
+        "list_price_usd": 0.0015458,
+        "usage": {
+          "input_tokens": 47,
+          "output_tokens": 24,
+          "cache_creation_input_tokens": 448,
+          "cache_read_input_tokens": 918
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "smoke-v5": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.592702,
+        "usage": {
+          "input_tokens": 347,
+          "output_tokens": 14706,
+          "cache_creation_input_tokens": 120518,
+          "cache_read_input_tokens": 1436530
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "swe50-v5": {
+        "executions_with_provider_logs": 29,
+        "list_price_usd": 1.7226291,
+        "usage": {
+          "input_tokens": 992,
+          "output_tokens": 53424,
+          "cache_creation_input_tokens": 289276,
+          "cache_read_input_tokens": 4632151
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "tb50-v5": {
+        "executions_with_provider_logs": 23,
+        "list_price_usd": 1.4500927,
+        "usage": {
+          "input_tokens": 779,
+          "output_tokens": 53038,
+          "cache_creation_input_tokens": 228865,
+          "cache_read_input_tokens": 3459922
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "smoke-v6": {
+        "executions_with_provider_logs": 10,
+        "list_price_usd": 0.5554049,
+        "usage": {
+          "input_tokens": 335,
+          "output_tokens": 13808,
+          "cache_creation_input_tokens": 116651,
+          "cache_read_input_tokens": 1250274
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "swe50-v6": {
+        "executions_with_provider_logs": 100,
+        "list_price_usd": 6.779181299999997,
+        "usage": {
+          "input_tokens": 3666,
+          "output_tokens": 236750,
+          "cache_creation_input_tokens": 1011929,
+          "cache_read_input_tokens": 18745268
+        },
+        "one_hour_cache_write_tokens": 0
+      },
+      "tb50-v6": {
+        "executions_with_provider_logs": 100,
+        "list_price_usd": 10.839664399999998,
+        "usage": {
+          "input_tokens": 3860,
+          "output_tokens": 462726,
+          "cache_creation_input_tokens": 1584943,
+          "cache_read_input_tokens": 22423269
+        },
+        "one_hour_cache_write_tokens": 0
+      }
+    },
+    "actual_billing_verified": false,
+    "excludes_ec2": true,
+    "pricing_source": "https://claude.com/pricing",
+    "rates_per_million": {
+      "input": 2,
+      "output": 10,
+      "cache_read": 0.1,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4
+    },
+    "limitation": "Incomplete upstream responses may omit billable usage; router billing not independently verified"
+  }
+}
