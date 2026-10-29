@@ -46,14 +46,14 @@ def main(root):
         "manifest_hash_matches_freeze": digest(root / "task_manifest.json")
         == frozen["manifest_sha256"]
         == config["manifest_sha256"],
-        "exactly_100_unique_raw_and_normalized_runs": len(rows)
+        "expected_unique_raw_and_normalized_runs": len(rows)
         == len({r["run_id"] for r in raw})
         == len({r["run_id"] for r in rows})
-        == 100,
-        "ten_runs_per_frozen_task_arm": counts
+        == config["executions"],
+        "configured_runs_per_frozen_task_arm": counts
         == Counter(
             {
-                (t["instance_id"], arm): 10
+                (t["instance_id"], arm): config["repetitions"]
                 for t in manifest["tasks"]
                 for arm in ("standalone", "agency")
             }
@@ -61,7 +61,7 @@ def main(root):
         "all_attempt_records_preserved": len(raw)
         == len({(r["run_id"], r["attempt"]) for r in raw})
         == len(list(root.glob("attempts/*/*/summary.json"))),
-        "every_run_officially_graded": len(latest) == 100
+        "every_run_officially_graded": len(latest) == config["executions"]
         and all(
             isinstance(read(root / r["directory"] / "official-report.json").get("resolved"), bool)
             and not read(root / r["directory"] / "official-report.json").get("grading_error")
@@ -73,7 +73,7 @@ def main(root):
             for r in latest.values()
         ),
         "execution_concurrency_within_budget": len(starts) == len(raw)
-        and len({e["run_id"] for e in starts}) == 100
+        and len({e["run_id"] for e in starts}) == config["executions"]
         and all(
             e["active_total"] <= 4 and e["active_agency"] <= 2 and e["active_standalone"] <= 2
             for e in starts
@@ -133,7 +133,7 @@ def main(root):
                 "export_manifest.json",
             )
         },
-        "usage_policy": "Unknown forwarded-request usage is not imputed; all 100 outcomes retained; exploratory cost analysis uses complete records only",
+        "usage_policy": "Unknown forwarded-request usage is not imputed; all cohort outcomes retained; exploratory cost analysis uses complete records only",
     }
     (root / "analysis_runtime.json").write_text(json.dumps(runtime, indent=2) + "\n")
     print(json.dumps(output, indent=2))

@@ -17,7 +17,7 @@ def run(script, *arguments):
     subprocess.run([sys.executable, str(ROOT / script), *arguments], cwd=ROOT, check=True)
 
 
-def main(cohort=None, diagnostics_only=False):
+def main(cohort=None, diagnostics_only=False, skip_analysis=False):
     validate_host(ROOT)
     config = ROOT / "configuration.json"
     if not config.exists():
@@ -59,27 +59,49 @@ def main(cohort=None, diagnostics_only=False):
             or result["attempt"] > latest[result["run_id"]]["attempt"]
         ):
             latest[result["run_id"]] = result
-    if len(latest) != 100:
+    if len(latest) != json.loads(config.read_text())["executions"]:
         raise RuntimeError("Measured cohort is incomplete; no final report will be claimed")
     for result in latest.values():
         report = json.loads((ROOT / result["directory"] / "official-report.json").read_text())
         if not isinstance(report.get("resolved"), bool) or report.get("grading_error"):
             raise RuntimeError("Evaluator failure requires an audit; preserve the original report")
     (ROOT / "grading_complete.json").write_text(json.dumps({"unix_s": time.time()}) + "\n")
-    for script in (
-        "analysis.py",
-        "audit_results.py",
-        "report.py",
-        "analysis_secondary.py",
-        "export_results.py",
-        "validate_results.py",
-    ):
+    scripts = (
+        (
+            "analysis.py",
+            "audit_results.py",
+            "report.py",
+            "analysis_secondary.py",
+            "export_results.py",
+            "validate_results.py",
+        )
+        if not skip_analysis
+        else ("export_results.py",)
+    )
+    for script in scripts:
         run(script)
+    (ROOT / "pipeline_complete.json").write_text(
+        json.dumps(
+            {
+                "unix_s": time.time(),
+                "executions": len(latest),
+                "analysis_complete": not skip_analysis,
+                "evidence_archive_ready": True,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cohort", help="Fresh diagnostic label after an infrastructure change")
     parser.add_argument("--diagnostics-only", action="store_true")
+    parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="Export after grading; analyze later in a pinned local environment",
+    )
     arguments = parser.parse_args()
-    main(arguments.cohort, arguments.diagnostics_only)
+    main(arguments.cohort, arguments.diagnostics_only, arguments.skip_analysis)

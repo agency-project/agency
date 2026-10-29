@@ -201,7 +201,7 @@ def bootstrap(groups, seed, count):
     return task_rows, aggregate
 
 
-def power_planning(task_rows):
+def power_planning(task_rows, baseline_repetitions=10):
     from scipy.stats import norm, t
 
     n = len(task_rows)
@@ -235,7 +235,7 @@ def power_planning(task_rows):
 
     rows = []
     for margin in (0.02, 0.05, 0.10):
-        for reps in (10, 20, 50):
+        for reps in (baseline_repetitions, 2 * baseline_repetitions, 5 * baseline_repetitions):
             lower, upper = 5, 100000
             if power(upper, reps, margin) < 0.8:
                 required = None
@@ -253,7 +253,9 @@ def power_planning(task_rows):
                     "repetitions_per_arm": reps,
                     "required_tasks": required,
                     "additional_tasks": max(0, required - n) if required else None,
-                    "additional_repetitions_per_existing_task_arm": max(0, reps - 10),
+                    "additional_repetitions_per_existing_task_arm": max(
+                        0, reps - baseline_repetitions
+                    ),
                     "approx_power_zero_true_effect": power(required, reps, margin)
                     if required
                     else None,
@@ -267,14 +269,15 @@ def power_planning(task_rows):
     fixed_task = []
     for margin in (0.02, 0.05, 0.10):
         required_reps = max(
-            10, math.ceil(within * (norm.ppf(0.95) + norm.ppf(0.90)) ** 2 / (n * margin**2))
+            baseline_repetitions,
+            math.ceil(within * (norm.ppf(0.95) + norm.ppf(0.90)) ** 2 / (n * margin**2)),
         )
         fixed_task.append(
             {
                 "margin_pct": margin * 100,
                 "tasks": n,
                 "repetitions_per_arm_task": required_reps,
-                "additional_repetitions_per_arm_task": required_reps - 10,
+                "additional_repetitions_per_arm_task": required_reps - baseline_repetitions,
             }
         )
     return {
@@ -312,7 +315,7 @@ def figures(root, groups, tasks, rows):
         f"{label} (n={t['n_standalone']}/{t['n_agency']} S/A)" for label, t in zip(labels, tasks)
     ]
     observed_n = sum(t["n_standalone"] + t["n_agency"] for t in tasks)
-    cost_scope = f"complete usage, {observed_n}/100 runs"
+    cost_scope = f"complete usage, {observed_n}/{len(rows)} runs"
     colors = {"standalone": "#31688e", "agency": "#b63679"}
 
     def save(fig, name):
@@ -437,7 +440,7 @@ def figures(root, groups, tasks, rows):
         ax.set_ylabel("Mean " + metric.replace("_", " "))
         ax.set_ylim(0, ax.get_ylim()[1] * 1.25)
         ax.legend()
-    fig.suptitle("PILOT · Supporting tool and LLM request counts · all 100 runs")
+    fig.suptitle(f"PILOT · Supporting tool and LLM request counts · all {len(rows)} runs")
     save(fig, "05_call_counts")
 
 
@@ -458,9 +461,9 @@ def main(root):
         report = read(report_path) if report_path.exists() else {"grading_error": "Not graded"}
         rows.append(metrics(result, pricing, report))
     write_csv(root / "metrics.csv", rows)
-    if len(rows) != 100:
+    if len(rows) != config["executions"]:
         raise SystemExit(
-            f"Recorded {len(rows)}/100 unique executions; refusing complete-study analysis"
+            f"Recorded {len(rows)}/{config['executions']} unique executions; refusing complete-study analysis"
         )
     tasks = read(root / "task_manifest.json")["tasks"]
     groups = {
@@ -480,7 +483,7 @@ def main(root):
     }
     summary, aggregate = bootstrap(groups, config["bootstrap_seed"], config["bootstrap_resamples"])
     write_csv(root / "task_summary.csv", summary)
-    planning = power_planning(summary)
+    planning = power_planning(summary, config["repetitions"])
     (root / "sample_size_planning.json").write_text(json.dumps(planning, indent=2) + "\n")
     (root / "analysis_results.json").write_text(
         json.dumps({"aggregate": aggregate, "task_summary": summary}, indent=2) + "\n"

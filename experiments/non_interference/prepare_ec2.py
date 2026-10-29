@@ -27,7 +27,9 @@ def catalog(route):
         return json.load(response)
 
 
-def main(pull_images=False):
+def main(pull_images=False, repetitions=10, repetition_start=1, schedule_seed=2026102801):
+    if repetitions < 1 or repetition_start < 1:
+        raise ValueError("Repetitions and starting index must be positive")
     if (ROOT / "configuration.json").exists():
         raise SystemExit("Study already prepared; refusing to change its execution pins")
     execution_host, identity = validate_host(ROOT)
@@ -181,9 +183,10 @@ def main(pull_images=False):
         "execution_host": execution_host,
         "manifest_sha256": freeze["manifest_sha256"],
         "freeze_commit": freeze["freeze_commit"],
-        "repetitions": 10,
-        "tasks": 5,
-        "executions": 100,
+        "repetitions": repetitions,
+        "repetition_start": repetition_start,
+        "tasks": len(manifest["tasks"]),
+        "executions": len(manifest["tasks"]) * 2 * repetitions,
         "max_concurrency": 4,
         "workers_per_arm": 2,
         "cpu_per_execution": 2,
@@ -192,7 +195,7 @@ def main(pull_images=False):
         "memory_headroom_required_bytes": 20 * 1024**3,
         "timeout_s": 900,
         "max_turns": None,
-        "schedule_seed": 2026102801,
+        "schedule_seed": schedule_seed,
         "bootstrap_seed": 2026102802,
         "bootstrap_resamples": 20000,
         "model_settings": {
@@ -245,4 +248,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pull-images", action="store_true", help="Pull immutable image digests before preparation"
     )
-    main(parser.parse_args().pull_images)
+    parser.add_argument("--repetitions", type=int, default=10)
+    parser.add_argument("--repetition-start", type=int, default=1)
+    parser.add_argument("--schedule-seed", type=int, default=2026102801)
+    args = parser.parse_args()
+    main(args.pull_images, args.repetitions, args.repetition_start, args.schedule_seed)

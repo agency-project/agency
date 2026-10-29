@@ -16,6 +16,8 @@ def main(root):
     tasks = read(root / "analysis_results.json")["task_summary"]
     rows = list(csv.DictReader((root / "metrics.csv").open()))
     config = read(root / "configuration.json")
+    planned = config["executions"]
+    repetitions = config["repetitions"]
     environment = read(root / "ec2_environment.json")
     freeze = read(root / "freeze_metadata.json")
     planning = read(root / "sample_size_planning.json")
@@ -58,14 +60,14 @@ def main(root):
         f"Equal-task mean Agency − standalone cost: **${aggregate['difference_usd']:.6f}** (95% CI ${cost_ci[0]:.6f} to ${cost_ci[1]:.6f}). Equal-task relative difference: **{aggregate['equal_task_relative_difference_pct']:+.2f}%** (95% CI {aggregate['relative_difference_pct_95ci'][0]:+.2f}% to {aggregate['relative_difference_pct_95ci'][1]:+.2f}%).",
         f"Geometric mean task-level variance ratio: **{aggregate['geometric_variance_ratio']:.3f}** (95% CI {variance_ci[0]:.3f} to {variance_ci[1]:.3f}).",
         "",
-        f"Recorded unique measured executions: {len(rows)}/100. Execution outcomes: {dict(outcomes)}. Official resolved outcomes: {dict(resolved)}. Executions with incomplete usage: {missing}.",
+        f"Recorded unique measured executions: {len(rows)}/{planned}. Execution outcomes: {dict(outcomes)}. Official resolved outcomes: {dict(resolved)}. Executions with incomplete usage: {missing}.",
         f"Raw worker attempt records retained: {len(records)}; attempt statuses: {dict(Counter(r['status'] for r in records))}. The normalized table uses the latest allowed attempt for each logical execution.",
         "",
     ]
     if missing:
         missing_ids = [r["run_id"] for r in rows if r["usage_complete"] != "True"]
         lines += [
-            f"**Measurement limitation:** the numerical comparisons above use only {len(rows) - missing} executions with complete observed usage. Incomplete run(s): {', '.join('`' + x + '`' for x in missing_ids)}. One or more forwarded requests lack authoritative usage; full costs for those runs remain unknown. The normalizer checks raw per-request records rather than trusting the recorder's optimistic completeness flag. Missing usage was not imputed. This is an exploratory complete-case comparison, not an unbiased estimate for all 100 executions; provider failures can cause informative missingness. The planned full-sample cost endpoint is unavailable.",
+            f"**Measurement limitation:** the numerical comparisons above use only {len(rows) - missing} executions with complete observed usage. Incomplete run(s): {', '.join('`' + x + '`' for x in missing_ids)}. One or more forwarded requests lack authoritative usage; full costs for those runs remain unknown. The normalizer checks raw per-request records rather than trusting the recorder's optimistic completeness flag. Missing usage was not imputed. This is an exploratory complete-case comparison, not an unbiased estimate for all {planned} executions; provider failures can cause informative missingness. The planned full-sample cost endpoint is unavailable.",
             "",
         ]
     if cost_ci[0] <= 0 <= cost_ci[1]:
@@ -80,12 +82,12 @@ def main(root):
         ]
     if variance_ci[0] <= 1 <= variance_ci[1]:
         lines += [
-            "The variance interval includes one. Ten repetitions per arm yield noisy variance estimates and do not establish equal variability.",
+            f"The variance interval includes one. With {repetitions} planned repetitions per arm/task, the estimates do not establish equal variability.",
             "",
         ]
     else:
         lines += [
-            "The observed variance interval excludes one for this fixed task set. This is preliminary, and variance estimates at ten repetitions remain sensitive to outliers and provider failures.",
+            f"The observed variance interval excludes one for this fixed task set. Estimates at {repetitions} planned repetitions per arm/task remain sensitive to outliers and provider failures.",
             "",
         ]
     lines += [
@@ -104,7 +106,7 @@ def main(root):
         "",
         "## Execution and benchmark outcomes",
         "",
-        "Every cell contains ten measured executions. A completed execution means the harness finished; resolution is determined independently by the official SWE-bench evaluator.",
+        f"Every cell contains {repetitions} measured executions. A completed execution means the harness finished; resolution is determined independently by the official SWE-bench evaluator.",
         "",
         "| Task | Completed S/A | Timed out S/A | Resolved S/A | Unresolved S/A | Grading unknown S/A |",
         "|---|---:|---:|---:|---:|---:|",
@@ -143,7 +145,7 @@ def main(root):
         )
     lines += [
         "",
-        "These means give each task equal weight. Cost means use complete usage records; call counts and wall times retain all 100 executions.",
+        f"These means give each task equal weight. Cost means use complete usage records; call counts and wall times retain all {planned} executions.",
         "",
         "## Reproducibility pins",
         "",
@@ -233,7 +235,7 @@ def main(root):
     lines += [
         "## Statistical method and limitations",
         "",
-        "The bootstrap independently resamples observed runs within each fixed task and arm, preserving the repeated-run structure and equal task weights. It never treats 100 executions as 100 benchmark tasks. Mean intervals are percentile bootstrap intervals. Variance intervals resample within task/arm; degenerate variance resamples are counted in the analysis JSON. Aggregation averages task log-variance ratios before exponentiation. These intervals are conditional on the five frozen tasks and do not justify generalization to all SWE-bench tasks. Stochastic harness behavior, shared-host load, rate-admission waiting, shared caches and provider faults may induce temporal dependence; timestamps and resource traces support follow-up audits. No trajectory identity or statistical equivalence is claimed.",
+        "The bootstrap independently resamples observed runs within each fixed task and arm, preserving the repeated-run structure and equal task weights. Executions are not treated as independently sampled benchmark tasks. Mean intervals are percentile bootstrap intervals. Variance intervals resample within task/arm; degenerate variance resamples are counted in the analysis JSON. Aggregation averages task log-variance ratios before exponentiation. These intervals are conditional on the five frozen tasks and do not justify generalization to all SWE-bench tasks. Stochastic harness behavior, shared-host load, rate-admission waiting, shared caches and provider faults may induce temporal dependence; timestamps and resource traces support follow-up audits. No trajectory identity or statistical equivalence is claimed.",
         "",
         "## Larger-study planning",
         "",

@@ -118,7 +118,7 @@ def test_pipeline_keeps_failed_setup_attempt_but_grades_latest_allowed_attempt(
 
     monkeypatch.setattr(pipeline, "ROOT", tmp_path)
     monkeypatch.setattr(pipeline, "validate_host", lambda _: None)
-    (tmp_path / "configuration.json").write_text("{}")
+    (tmp_path / "configuration.json").write_text('{"executions":100}')
     (tmp_path / "diagnostic_gate.json").write_text('{"passed":true,"script_sha256":{}}')
     calls = []
     monkeypatch.setattr(pipeline, "run", lambda script, *args: calls.append((script, args)))
@@ -148,3 +148,44 @@ def test_pipeline_keeps_failed_setup_attempt_but_grades_latest_allowed_attempt(
     assert len(list(tmp_path.glob("attempts/*/*/summary.json"))) == 101
     assert calls[0] == ("run_experiment.py", ("measured",))
     assert calls[-1] == ("validate_results.py", ())
+
+
+def test_additional_forty_schedule_has_400_unique_runs_and_disjoint_repetition_range():
+    from collections import Counter
+    from run_experiment import build_schedule
+
+    tasks = [{"instance_id": f"synthetic-task-{i}"} for i in range(5)]
+    config = {
+        "schedule_seed": 2026102901,
+        "repetitions": 40,
+        "repetition_start": 11,
+        "executions": 400,
+    }
+    plan = build_schedule(tasks, config)
+    jobs = [job for lane in plan["lanes"].values() for job in lane]
+    assert len(jobs) == len({job["run_id"] for job in jobs}) == 400
+    assert {job["repetition"] for job in jobs} == set(range(11, 51))
+    assert Counter((job["instance_id"], job["arm"]) for job in jobs) == Counter(
+        {(task["instance_id"], arm): 40 for task in tasks for arm in ("standalone", "agency")}
+    )
+    assert plan == build_schedule(tasks, config)
+    original = build_schedule(
+        tasks, {"schedule_seed": 2026102801, "repetitions": 10, "executions": 100}
+    )
+    assert not {job["run_id"] for job in jobs} & {
+        job["run_id"] for lane in original["lanes"].values() for job in lane
+    }
+
+
+def test_schedule_rejects_inconsistent_frozen_sample_size():
+    from run_experiment import build_schedule
+
+    with pytest.raises(ValueError, match="dimensions"):
+        build_schedule(
+            [{"instance_id": "synthetic"}],
+            {
+                "schedule_seed": 1,
+                "repetitions": 40,
+                "executions": 100,
+            },
+        )

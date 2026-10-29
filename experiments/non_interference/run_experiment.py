@@ -28,11 +28,33 @@ def append(path, value):
 
 
 def schedule():
+    config = read(ROOT / "configuration.json")
+    tasks = read(ROOT / "task_manifest.json")["tasks"]
+    value = build_schedule(tasks, config)
     destination = ROOT / "run_schedule.json"
     if destination.exists():
-        return read(destination)
-    tasks = read(ROOT / "task_manifest.json")["tasks"]
-    seed = read(ROOT / "configuration.json")["schedule_seed"]
+        existing = read(destination)
+        if existing != value:
+            raise RuntimeError("Existing schedule differs from the frozen cohort configuration")
+        return existing
+    destination.write_text(json.dumps(value, indent=2) + "\n")
+    return value
+
+
+def build_schedule(tasks, config):
+    seed = config["schedule_seed"]
+    repetitions = config.get("repetitions", 10)
+    first = config.get("repetition_start", 1)
+    if (
+        not isinstance(repetitions, int)
+        or repetitions < 1
+        or not isinstance(first, int)
+        or first < 1
+    ):
+        raise ValueError("Repetition count and starting index must be positive integers")
+    expected = len(tasks) * 2 * repetitions
+    if config.get("executions", expected) != expected:
+        raise ValueError("Configured execution count differs from task/arm/repetition dimensions")
     rng = random.Random(seed)
     lanes = {}
     for arm in ("standalone", "agency"):
@@ -45,7 +67,7 @@ def schedule():
                 "diagnostic": False,
             }
             for t, task in enumerate(tasks)
-            for r in range(1, 11)
+            for r in range(first, first + repetitions)
         ]
         rng.shuffle(jobs)
         lanes[arm] = jobs
@@ -54,7 +76,6 @@ def schedule():
         "lanes": lanes,
         "policy": "Two continuously replenished workers per arm; independent seeded random order in each queue",
     }
-    destination.write_text(json.dumps(value, indent=2) + "\n")
     return value
 
 
@@ -274,7 +295,8 @@ async def main(mode):
 
     await asyncio.gather(*(worker(arm) for arm in queues for _ in range(workers)))
     (ROOT / "batch_complete.json").write_text(
-        json.dumps({"unix_s": time.time(), "planned_executions": 100}) + "\n"
+        json.dumps({"unix_s": time.time(), "planned_executions": configuration["executions"]})
+        + "\n"
     )
 
 
