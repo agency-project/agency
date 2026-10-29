@@ -1,0 +1,3 @@
+#!/bin/sh
+export PYTHONPATH="/study-capture${PYTHONPATH:+:$PYTHONPATH}"
+exec /opt/agency-harness-venv/bin/python "$@"

@@ -1,0 +1,8 @@
+{
+  "freeze_commit": "8f1939b6b02df0f41afa1a5e602d82150d9ed95d",
+  "manifest_sha256": "4d9158fd7d62019d9e2a74c2a29ea82a3d78de7f0b5a661cbe737fbcd67fb76d",
+  "agency_source_commit": "a8bc606ac4a449407b43919551fbc878a8bd4b09",
+  "branch": "codex/non-interference-haiku-litellm-20261028",
+  "frozen_at": "2026-10-29T01:27:47.828174+00:00",
+  "git_hook_note": "Skipped end-of-file-fixer only: canonical JSON intentionally has no trailing newline; all other manifest commit hooks passed."
+}

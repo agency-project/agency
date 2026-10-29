@@ -1,0 +1,54 @@
+#!/opt/agency-harness-venv/bin/python
+"""Study-only matching settings and native-completion measurement barrier."""
+
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+
+args = sys.argv[1:]
+if "--mcp-config" in args:
+    args[args.index("--mcp-config") + 1] = '{"mcpServers":{}}'
+control = Path("/study-control/config.json")
+if control.exists() and "--settings" in args:
+    config = json.loads(control.read_text())
+    protected = {
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "DISABLE_AUTOUPDATER",
+        "IS_SANDBOX",
+        "TERM",
+    }
+    for name, value in config.get("task_environment", {}).items():
+        if name not in protected and not name.startswith(("AGENCY_", "AGPOLICY_")):
+            os.environ[name] = value
+    index = args.index("--settings") + 1
+    settings = json.loads(args[index])
+    for entries in settings.get("hooks", {}).values():
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                hook["command"] = (
+                    "env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH " + hook["command"]
+                )
+    for entry in settings.get("hooks", {}).get("Stop", []):
+        for hook in entry.get("hooks", []):
+            hook["command"] = "env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH " + shlex.join(
+                [
+                    "/opt/agency-harness-venv/bin/python",
+                    "/smoke-driver/stop_gate.py",
+                    hook["command"],
+                ]
+            )
+            hook["timeout"] = config["gate_timeout_s"] + 30
+    args[index] = json.dumps(settings)
+os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "32000"
+for family in ("HAIKU", "SONNET", "OPUS"):
+    os.environ["ANTHROPIC_DEFAULT_" + family + "_MODEL"] = "claude-haiku-5-5"
+binary = "/study-binary/2.1.299"
+os.execv(binary, [binary, "--effort", "medium", *args])

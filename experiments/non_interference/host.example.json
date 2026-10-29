@@ -1,0 +1,10 @@
+{
+  "host_kind": "ec2",
+  "expected_instance_id": "REPLACE_WITH_TARGET_INSTANCE_ID",
+  "expected_hostname": null,
+  "runtime": "/srv/agency-runtime",
+  "grader": "/srv/swe-bench-evaluator",
+  "claude_binary": "/srv/claude/2.1.299",
+  "credentials_file": "/srv/private/litellm.env",
+  "router": "https://router.js-park.info"
+}

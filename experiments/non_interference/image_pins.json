@@ -1,0 +1,17 @@
+{
+  "matplotlib__matplotlib-25960": {
+    "reference": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-25960@sha256:396c621f3067dc1f1d4928494d8b6a0b68975d3e88d83ea6d2b43573c64a1b8e"
+  },
+  "pydata__xarray-3305": {
+    "reference": "swebench/sweb.eval.x86_64.pydata_1776_xarray-3305@sha256:dac8706a05650ffb4ce61ad8de6a7338f1b8a144a8cb4567c674c97b9462949a"
+  },
+  "django__django-15563": {
+    "reference": "swebench/sweb.eval.x86_64.django_1776_django-15563@sha256:8ad1a52cd8c746541f87d77df6e56e3ad1fe17742494153ec4215c86108a641a"
+  },
+  "sphinx-doc__sphinx-7748": {
+    "reference": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7748@sha256:572d11650dea6831a1c81bb31ed468c49370f607b9af7dd762b16283c47bbd27"
+  },
+  "sympy__sympy-13615": {
+    "reference": "swebench/sweb.eval.x86_64.sympy_1776_sympy-13615@sha256:b71f0f3e41f7d5f64028c13703a3563c09b6cbd84ee43103e5925ebc52fda263"
+  }
+}
