@@ -126,6 +126,67 @@ class TestPaginateText:
         assert result["truncated"] is False
 
 
+class TestReadUnderOffloadThreshold:
+    """A read page that crossed the offload threshold went to a file holding
+    only its text: the model lost offset/total_lines/truncated and took the
+    first page for the whole file (a 117 kB task read as its first 48 kB)."""
+
+    @staticmethod
+    def _task(lines: int) -> str:
+        # Quotes, backslashes and non-ASCII grow under json.dumps.
+        return "".join(
+            f'line {n}: "quoted" \\path\\ caf\u00e9 \u2014 {"x" * (n % 60)}\n'
+            for n in range(1, lines + 1)
+        )
+
+    def _read(self, path, offset=1):
+        raw = tools.TOOL_DISPATCH["read"](json.dumps({"file_path": str(path), "offset": offset}))
+        return raw, json.loads(raw)
+
+    def test_a_page_is_never_offloaded_and_paging_covers_the_whole_file(self, tmp_path):
+        task = self._task(2400)
+        path = tmp_path / "task.txt"
+        path.write_text(task, encoding="utf-8")
+        seen, offset = [], 1
+        while True:
+            raw, page = self._read(path, offset)
+            assert len(raw) <= tools._TOOL_OUTPUT_OFFLOAD_CHARS
+            assert tools.offload_if_oversized("read", "call", raw, str(tmp_path / "o")) == raw
+            assert page["total_lines"] == 2400
+            seen += [line.split(": ", 1)[1] for line in page["content"].split("\n")]
+            if not page["truncated"]:
+                break
+            offset += page["lines_shown"]
+        assert seen == task.splitlines()
+
+    def test_a_short_file_is_still_one_page(self, tmp_path):
+        path = tmp_path / "short.txt"
+        path.write_text("a\nb\n", encoding="utf-8")
+        _, page = self._read(path)
+        assert page["content"] == "1: a\n2: b"
+        assert page["truncated"] is False
+
+    def test_an_offloaded_page_keeps_its_pagination_fields(self, tmp_path):
+        result = json.dumps(
+            {
+                "type": "file",
+                "content": "x" * (tools._TOOL_OUTPUT_OFFLOAD_CHARS + 1),
+                "offset": 1,
+                "lines_shown": 646,
+                "total_lines": 1641,
+                "truncated": True,
+                "path": "/workspace/inputs/task.txt",
+            }
+        )
+        note = json.loads(tools.offload_if_oversized("read", "c1", result, str(tmp_path)))
+        assert note["truncated"] is True
+        assert note["total_lines"] == 1641
+        assert note["lines_shown"] == 646
+        assert note["path"] == "/workspace/inputs/task.txt"
+        saved = note["note"].split("saved to ", 1)[1].split(". Use", 1)[0]
+        assert open(saved, encoding="utf-8").read() == "x" * (tools._TOOL_OUTPUT_OFFLOAD_CHARS + 1)
+
+
 def test_missing_ripgrep_still_finds_nested_files_and_regex_matches(tmp_path, monkeypatch):
     import json
 
