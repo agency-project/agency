@@ -222,6 +222,12 @@ def parse_grep_json_output(output: str) -> dict:
 READ_DEFAULT_LIMIT = 2000
 READ_MAX_BYTES = 50 * 1024
 READ_MAX_LINE_LEN = 2000
+# A read result longer than _TOOL_OUTPUT_OFFLOAD_CHARS is offloaded to a file
+# whose body is the page's text alone, so the model never sees that the page
+# was truncated and takes it for the whole file. A page therefore stops before
+# its JSON-serialized content reaches this budget (the margin covers the other
+# fields and the path); the model continues with `offset`.
+READ_MAX_SERIALIZED_CHARS = _TOOL_OUTPUT_OFFLOAD_CHARS - 2_000
 
 
 def paginate_text(content: str, offset: int, limit: int) -> dict:
@@ -235,17 +241,23 @@ def paginate_text(content: str, offset: int, limit: int) -> dict:
 
     raw: list[str] = []
     bytes_used = 0
+    chars_used = 0
     cut = False
     for i, line in enumerate(page_lines):
         text = line.rstrip("\n")
         if len(text) > READ_MAX_LINE_LEN:
             text = text[:READ_MAX_LINE_LEN] + "... (truncated)"
+        numbered = f"{start + i + 1}: {text}"
         size = len(text.encode()) + 1
-        if bytes_used + size > READ_MAX_BYTES:
+        # As json.dumps writes it; its two quotes stand in for the escaped
+        # newline that joins it to the next line.
+        chars = len(json.dumps(numbered))
+        if bytes_used + size > READ_MAX_BYTES or chars_used + chars > READ_MAX_SERIALIZED_CHARS:
             cut = True
             break
-        raw.append(f"{start + i + 1}: {text}")
+        raw.append(numbered)
         bytes_used += size
+        chars_used += chars
 
     more = cut or (start + len(page_lines) < total)
     return {
@@ -813,11 +825,26 @@ def offload_if_oversized(fn_name: str, tc_id: str, result_content: str, offload_
     subsequent turn's context."""
     if len(result_content) <= _TOOL_OUTPUT_OFFLOAD_CHARS:
         return result_content
+    # Only a dict's "content" goes to the file; its other short scalar fields
+    # (a read page's offset, total_lines and truncated, say) stay in the note,
+    # or the model takes a truncated page for the whole output.
+    kept: dict = {}
     try:
         parsed = json.loads(result_content)
         file_body = (
             parsed.get("content", result_content) if isinstance(parsed, dict) else result_content
         )
+        if isinstance(parsed, dict) and "content" in parsed:
+            kept = {
+                k: v
+                for k, v in parsed.items()
+                if k != "content"
+                and (
+                    v is None
+                    or isinstance(v, (bool, int, float))
+                    or (isinstance(v, str) and len(v) <= 500)
+                )
+            }
     except json.JSONDecodeError:
         file_body = result_content
     if not isinstance(file_body, str):
@@ -831,7 +858,8 @@ def offload_if_oversized(fn_name: str, tc_id: str, result_content: str, offload_
         return json.dumps(
             {
                 "note": f"Output was too large and has been saved to {offload_path}. "
-                "Use the read tool to access it."
+                "Use the read tool to access it.",
+                **kept,
             }
         )
     except Exception as e:
