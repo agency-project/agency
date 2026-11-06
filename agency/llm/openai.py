@@ -6,6 +6,7 @@ import httpx
 import openai
 
 from .agllm import _RESPONSE_ID_HEADERS, StreamInterruptedError, agllm
+from .message_store import split_tool_schema
 
 _HANDLED_MESSAGE_FIELDS = {"role", "content", "tool_calls", "reasoning_content", "function_call"}
 _HANDLED_DELTA_FIELDS = {"role", "content", "reasoning_content", "tool_calls", "function_call"}
@@ -51,6 +52,14 @@ def _serialize_sdk_object(obj):
 
 def _chatcompletions_native_block_type(native_type: str) -> str:
     return f"{_CHATCOMPLETIONS_TYPE_PREFIX}{native_type}"
+
+
+def _thinking_blocks_signature(thinking_blocks) -> str:
+    return "".join(
+        b.get("signature") or ""
+        for b in thinking_blocks or []
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    )
 
 
 def _is_chatcompletions_tool_choice(tool_choice) -> bool:
@@ -112,8 +121,8 @@ class _OpenAICompatibleBackend(agllm):
         return root or None
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
-        kwargs = self.build_kwargs(request["messages"], request.get("tools"))
-        tool_choice = request.get("tool_choice")
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        kwargs = self.build_kwargs(messages, tools)
         # Responses-style clients such as Codex may send tool_choice="auto"
         # even after their hosted tools were filtered from a Chat Completions
         # request. OpenAI rejects tool_choice when no tools are present.
@@ -179,8 +188,12 @@ class _OpenAICompatibleBackend(agllm):
                 }
             )
         reasoning = getattr(message, "reasoning_content", None)
-        if reasoning:
-            blocks.append({"type": "thinking", "index": len(blocks), "text": reasoning})
+        signature = _thinking_blocks_signature(getattr(message, "thinking_blocks", None))
+        if reasoning or signature:
+            thinking = {"type": "thinking", "index": len(blocks), "text": reasoning or ""}
+            if signature:
+                thinking["signature"] = signature
+            blocks.append(thinking)
         message_dump = _serialize_sdk_object(message)
         if isinstance(message_dump, dict):
             for field, value in message_dump.items():
@@ -250,6 +263,14 @@ class _OpenAICompatibleBackend(agllm):
                         "block_type": "thinking",
                         "text": reasoning,
                     }
+                signature = _thinking_blocks_signature(getattr(delta, "thinking_blocks", None))
+                if signature:
+                    yield {
+                        "type": "block_delta",
+                        "index": -2,
+                        "block_type": "thinking",
+                        "signature": signature,
+                    }
                 for tc in getattr(delta, "tool_calls", None) or []:
                     fn = getattr(tc, "function", None)
                     yield {
@@ -318,6 +339,7 @@ def _detail(details, name):
 
 
 def _serialize_openai_usage(usage) -> "dict | None":
+    """Full copy of the SDK's usage object, not a hand-picked subset."""
     if usage is None:
         return None
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0

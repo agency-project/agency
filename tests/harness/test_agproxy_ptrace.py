@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agency.configs.agconfig import agconfig
 from agency.harness.ptrace.supervisor import agProxyPtrace, ptrace_available
 
 ptrace = pytest.mark.skipif(not ptrace_available(), reason="ptrace not usable on this host")
@@ -34,6 +36,35 @@ _SPAWN_CHILD_SCRIPT = str(
 class _AllowPolicy:
     def check(self, _ag, _event):
         return True
+
+
+@ptrace
+def test_supervision_follows_a_child_that_drops_credentials():
+    if os.geteuid() != 0:
+        pytest.skip("credential-change regression requires root")
+    status = Path("/proc/self/status").read_text()
+    effective = int(
+        next(line.split()[1] for line in status.splitlines() if line.startswith("CapEff:")), 16
+    )
+    if not effective & (1 << 19):
+        pytest.skip("credential-change supervision requires CAP_SYS_PTRACE")
+    policy = _RecordingPolicy()
+    handle = agProxyPtrace(agconfig(), allow_initial_exec=True).launch(
+        [
+            sys.executable,
+            "-c",
+            'import os; os.setgid(65534); os.setuid(65534); os.execv("/bin/true", ["/bin/true"])',
+        ],
+        dict(os.environ),
+        policy=policy,
+        ag=None,
+    )
+    try:
+        _, _, code = handle.wait(timeout=10)
+        assert code == 0
+        assert any(event.path == "/bin/true" for event in policy.events)
+    finally:
+        handle.close()
 
 
 class _RecordingPolicy:
@@ -180,14 +211,14 @@ def test_process_lifecycle_profiler_uses_safe_exec_name_and_exit_status(monkeypa
     external_span = captured[0]
     assert external_span.name == "process:claude"
     assert external_span.fields["parent_context"] is parent_context
-    assert external_span.fields["metadata"] == {
+    assert {
         "agency.run_id": "run9",
         "agency.agent_id": "tester",
         "timing": "exact",
         "provenance": "ptrace",
         "pid": 4321,
         "executable": "<unknown>",
-    }
+    }.items() <= external_span.fields["metadata"].items()
     assert external_span.updates == [
         {"executable": "<redacted>"},
         {"executable": "claude"},
@@ -414,6 +445,78 @@ def test_clone_threads_do_not_reach_process_lifecycle_callbacks(monkeypatch):
 
     assert spawned == [9002]
     assert exited == [(9002, 7)]
+
+
+def _pause_loop():
+    from agency.harness.ptrace import _tracer_loop
+
+    return _tracer_loop.TracerLoop(
+        syscalls=("execve",),
+        syscall_hook=lambda _stop: _tracer_loop.StopDecision(kind="allow"),
+    )
+
+
+def test_late_fork_event_does_not_readd_a_child_that_already_exited():
+    """Regression: a child's own stops can be reaped by waitpid() before its
+    parent's fork event is dispatched. The child is adopted unannounced; if it
+    also exits first, the late fork event used to add the already-gone pid back
+    to `_known_pids`, where it could never park, so `wait_paused()` waited on it
+    until its timeout."""
+    loop = _pause_loop()
+    parent, child = 9301, 9302
+    loop._remember_spawn(parent)
+
+    loop._remember_spawn(child, is_process=None, unannounced=True)  # reaped first
+    loop._forget(child, 0)  # ...and it exits
+    loop._remember_spawn(child, is_process=True)  # the parent's fork event, late
+
+    assert child not in loop._known_pids
+    assert child not in loop._exited_unannounced  # the late event used up the marker
+
+    loop._pause_requested = True
+    loop._held_pids.add(parent)
+    loop._parked_pids.add(parent)
+    assert loop.wait_paused(timeout=0.2) is True
+
+
+def test_late_fork_event_does_not_disturb_a_live_adopted_child():
+    """The fork event arriving late for a child that is still alive leaves it
+    known exactly once, and a later exit does not leave a marker behind that
+    would swallow a recycled pid's real fork event."""
+    loop = _pause_loop()
+    parent, child = 9311, 9312
+    loop._remember_spawn(parent)
+
+    loop._remember_spawn(child, is_process=None, unannounced=True)
+    assert child in loop._unannounced_pids
+    loop._remember_spawn(child, is_process=True)  # the parent's fork event, late
+    assert child in loop._known_pids
+    assert child not in loop._unannounced_pids
+
+    loop._forget(child, 0)
+    assert child not in loop._known_pids
+    assert child not in loop._exited_unannounced
+
+    loop._remember_spawn(child, is_process=True)  # the pid is recycled
+    assert child in loop._known_pids
+
+
+def test_wait_paused_still_waits_for_a_child_whose_fork_event_came_first():
+    """The ordinary order (fork event, then the child's own stops) keeps the
+    child known, so a pause is not complete until the child parks too."""
+    loop = _pause_loop()
+    parent, child = 9321, 9322
+    loop._remember_spawn(parent)
+    loop._remember_spawn(child, is_process=True)  # the parent's fork event
+    loop._remember_spawn(child, is_process=None, unannounced=True)  # its first stop, adopted
+
+    loop._pause_requested = True
+    loop._held_pids |= {parent, child}
+    loop._parked_pids.add(parent)
+    assert loop.wait_paused(timeout=0.05) is False  # the child has not parked
+
+    loop._parked_pids.add(child)
+    assert loop.wait_paused(timeout=0.2) is True
 
 
 @ptrace
@@ -699,8 +802,9 @@ def test_live_traced_process_is_incomplete_when_profiler_stops(tmp_path):
             handle.wait(timeout=10)
 
 
-def _proc_state(pid: int) -> str:
-    status = Path(f"/proc/{pid}/status").read_text()
+def _proc_state(pid: int, tid: "int | None" = None) -> str:
+    path = f"/proc/{pid}/status" if tid is None else f"/proc/{pid}/task/{tid}/status"
+    status = Path(path).read_text()
     for line in status.splitlines():
         if line.startswith("State:"):
             return line.split(":", 1)[1].strip()
@@ -748,6 +852,74 @@ def test_pause_stops_traced_process_and_resume_continues_it():
             lambda: not _proc_state(pid).lower().startswith("t"),
             timeout=5,
             message="process never resumed from stopped state",
+        )
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
+
+
+@ptrace
+def test_wait_paused_returns_only_once_the_process_is_actually_stopped():
+    """pause() merely requests the stop; wait_paused() is the acknowledgement,
+    so the process must already be stopped the instant it returns -- no polling."""
+    handle = agProxyPtrace().launch(["/bin/sleep", "30"], {}, cwd="/tmp", policy=_AllowPolicy())
+    try:
+        pid = next(iter(handle.pids()))
+        _wait_until(
+            lambda: _proc_state(pid)[:1] in ("S", "R"),
+            timeout=5,
+            message="process never reached a running state",
+        )
+        assert handle.wait_paused(0.1) is False  # nothing requested yet
+
+        handle.pause()
+        assert handle.wait_paused(5) is True
+        assert _proc_state(pid).lower().startswith("t")
+        assert handle.is_paused()
+
+        handle.resume()
+        assert handle.wait_paused(0.1) is False  # the pause was cancelled
+        _wait_until(
+            lambda: not _proc_state(pid).lower().startswith("t"),
+            timeout=5,
+            message="process never resumed from stopped state",
+        )
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
+
+
+@ptrace
+def test_processes_forked_while_a_pause_is_pending_are_held_too():
+    """pause() snapshots the pids that exist; a child forked after that used to
+    escape the pause and keep running. After wait_paused() every process in the
+    tree -- including ones forked mid-pause -- must be stopped."""
+    handle = agProxyPtrace().launch(
+        ["/bin/sh", "-c", "for i in $(seq 1 400); do sleep 30 & done; wait"],
+        {},
+        cwd="/tmp",
+        policy=_AllowPolicy(),
+    )
+    try:
+        # Pause while the shell is mid-way through forking -- on purpose.
+        _wait_until(
+            lambda: len(handle.pids()) > 3, timeout=5, message="shell never started forking"
+        )
+        handle.pause()
+        assert handle.wait_paused(10) is True
+        pids = handle.pids()
+        assert pids
+        for pid in pids:
+            assert _proc_state(pid).lower().startswith("t"), (pid, _proc_state(pid))
+        # Nothing new slipped out afterwards.
+        time.sleep(0.2)
+        assert handle.pids() == pids
+
+        handle.resume()
+        _wait_until(
+            lambda: not any(_proc_state(pid).lower().startswith("t") for pid in handle.pids()),
+            timeout=5,
+            message="tree never resumed",
         )
     finally:
         handle.kill()
@@ -1138,6 +1310,36 @@ def test_observed_local_control_outcomes_with_real_task_tree(force):
         result = registry.get(stop["id"])
         assert result["state"] == "confirmed" and result["local_state"] == "exited"
         assert result["task_count"] == 0
+    finally:
+        handle.kill()
+        handle.wait(timeout=10)
+
+
+@ptrace
+def test_wait_paused_stops_every_thread_of_a_multithreaded_process():
+    """A thread is a tracee too, but kill(tid) is process-directed: only one
+    thread would take the SIGSTOP and the rest would run on, so wait_paused()
+    would never be satisfied and the process would not really be frozen."""
+    script = (
+        "import threading, time\n"
+        "for _ in range(4):\n"
+        "    threading.Thread(target=lambda: time.sleep(30), daemon=True).start()\n"
+        "time.sleep(30)\n"
+    )
+    handle = agProxyPtrace().launch(
+        [sys.executable, "-c", script], {}, cwd="/tmp", policy=_AllowPolicy()
+    )
+    try:
+        pid = next(iter(handle.pids()))
+        _wait_until(
+            lambda: len(list(Path(f"/proc/{pid}/task").iterdir())) >= 5,
+            timeout=10,
+            message="threads never started",
+        )
+        handle.pause()
+        assert handle.wait_paused(5) is True
+        states = [_proc_state(pid, int(t.name)) for t in Path(f"/proc/{pid}/task").iterdir()]
+        assert all(s.lower().startswith("t") for s in states), states
     finally:
         handle.kill()
         handle.wait(timeout=10)

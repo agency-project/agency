@@ -125,6 +125,9 @@ class llmconfig(confignamespace):
     rate_limit_max_backoff_s: float = 80.0
     rate_limit_retry_after_jitter_s: float = 5.0
     default_context_limit: int = 200_000
+    # Clear the oldest tool output from a request that would exceed the
+    # context limit instead of sending it to be rejected (llm/context_fit.py).
+    fit_to_context_limit: bool = True
 
     # What the host does with a provider response it cannot hand to a harness
     # as a finished turn (see agency/llm/response_check.py).
@@ -211,7 +214,9 @@ class sandboxconfig(confignamespace):
     docker_rm_timeout_s: float = 120
     file_io_timeout_s: float = 120
     image_timeout_s: float = 120
-    commit_timeout_s: float = 120
+    # Model weights and installed toolchains can make filesystem snapshots
+    # exceed the short command budget even after the harness has finished.
+    commit_timeout_s: float = 600
     keyring_wait_timeout_s: float = 120
     unkillable_child_grace_s: float = 10
     container_limit_floor: int = 4
@@ -313,6 +318,9 @@ class harnessadapterconfig(confignamespace):
     session_resume_id: "str | None" = None
     binary_path: "str | None" = None
     allow_subagents: bool = False
+    # Seconds of upstream silence before a streaming route sends its wire's
+    # keepalive frame; 0 = never.
+    stream_keepalive_s: float = 15.0
 
 
 @dataclass(slots=True)

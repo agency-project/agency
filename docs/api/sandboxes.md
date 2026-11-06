@@ -11,7 +11,7 @@ from agency.sandbox.checkpoint import CheckpointHandle, CheckpointCapabilityErro
 
 ## Commands, files and lifetime
 
-Facade methods delegate with `*args, **kwargs`; these are the useful backend forms. Generated facade signatures below preserve that distinction.
+Facade methods delegate with `*args, **kwargs`; these are the useful backend forms. The linked facade source preserves that distinction.
 
 | Form | Return, blocking, side effects |
 | --- | --- |

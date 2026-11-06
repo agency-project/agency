@@ -71,8 +71,11 @@ class CodexGateway:
 
     def dispatch(self, body):
         from openai.types.chat import ChatCompletion
+        from agency.llm.message_store import split_tool_schema, with_tool_schema
 
         context = self.adapter._format_context_harness_to_agency(body)
+        messages, tools, tool_choice, extra = split_tool_schema(context["messages"])
+        context["messages"] = messages
         for message in context["messages"]:
             for block in message["blocks"]:
                 call_id = block.get("tool_call_id")
@@ -103,7 +106,7 @@ class CodexGateway:
             self.error = "dispatch deadline exhausted"
             raise RuntimeError(self.error)
         annotation = native("annotations")
-        context["tools"] = annotation.augment_schemas(context.get("tools") or [], self.arm)
+        tools = annotation.augment_schemas(tools or [], self.arm)
         instruction = annotation.instruction(self.arm)
         if instruction:
             if context["messages"] and context["messages"][0]["role"] in ("system", "developer"):
@@ -129,12 +132,13 @@ class CodexGateway:
                     "arm": self.arm,
                     "harness": "codex",
                     "version": annotation.VERSION,
-                    "schemas": context["tools"],
+                    "schemas": tools,
                     "instruction": instruction,
                     "codex_version": self.config["codex_version"],
                 },
             )
         self.calls += 1
+        context["messages"] = with_tool_schema(context["messages"], tools, tool_choice, extra)
         request = self.backend._format_context_agency_to_backend(context)
         self.trace("codex_request", {"exchange": self.calls - 1, "context": context})
         response = self.client.dispatch(

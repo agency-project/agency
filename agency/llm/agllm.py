@@ -11,6 +11,14 @@ try:
 except ImportError:
     _anthropic_sdk = None
 
+# Mirrors openai.py's/anthropic.py's own prefix constants (can't import
+# them: both those modules import this one). Used to reverse their
+# unknown-field fallthrough when replaying history in build_kwargs.
+_UNKNOWN_FIELD_PREFIXES = ("openai_chatcompletions_", "anthropic_")
+
+# The second-system-class-message warning below repeats on every LLM call of a
+# harness that always does this, so it is printed once per process.
+
 
 # Common per-call generation params every OpenAI-compatible server accepts as
 # top-level chat.completions.create() kwargs (see agllm.build_kwargs's
@@ -300,12 +308,30 @@ class agllm:
            one model under a served-model-name that may differ from ours. A
            multi-model listing never lends another model's window.
         5. ``self.known_context_limit()`` — static fallback (e.g. Bedrock,
-           which has no model-listing API at all)
+           which has no model-listing API at all); also caps 2-4
         6. ``self.agconfig.llm.default_context_limit`` — safe fallback so compaction always runs
         """
         if self.agconfig.llm.context_limit is not None:
             return int(self.agconfig.llm.context_limit)
         model_id = self.agconfig.llm.model or ""
+        listed = self._listed_context_limit(model_id)
+        known = self.known_context_limit(model_id)
+        if listed is not None and known is not None:
+            # A proxy's listing can carry the model's total window where the
+            # known value is its input cap (LiteLLM lists gpt-6-luna at
+            # 1,050,000 for a 922,000-token input cap); it never raises it.
+            return min(listed, known)
+        if listed is not None:
+            return listed
+        if known is not None:
+            return known
+        print(
+            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.llm.default_context_limit}"
+        )
+        return self.agconfig.llm.default_context_limit
+
+    def _listed_context_limit(self, model_id: str) -> "int | None":
+        """Steps 2-4 of `fetch_context_limit`: the window the API reports."""
         all_models: list = []
         try:
             all_models = self.list_models()
@@ -324,16 +350,8 @@ class agllm:
         except Exception as _e:
             print(f"[agllm] WARNING: failed to retrieve model {model_id!r} from API: {_e}")
         if len(all_models) == 1:
-            limit = self._context_limit_of(all_models[0])
-            if limit is not None:
-                return limit
-        known = self.known_context_limit(model_id)
-        if known is not None:
-            return known
-        print(
-            f"[agllm] WARNING: context limit unknown, falling back to {self.agconfig.llm.default_context_limit}"
-        )
-        return self.agconfig.llm.default_context_limit
+            return self._context_limit_of(all_models[0])
+        return None
 
     def _client_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(
@@ -451,6 +469,13 @@ class agllm:
         # its exact role name) may keep it; anything after becomes a `user`
         # message at its original position.
         _SYSTEM_CLASS_ROLES = {"system", "developer"}
+        from .openai_responses import ENCRYPTED_REASONING_TAG
+
+        def is_responses_reasoning(block):
+            return block["type"] == "thinking" and (block.get("signature") or "").startswith(
+                ENCRYPTED_REASONING_TAG
+            )
+
         wire_messages: list[dict] = []
         conversation_started = False
         system_class_used = False
@@ -461,7 +486,7 @@ class agllm:
             if not is_system_class:
                 conversation_started = True
             if role == "assistant":
-                if any(b["type"] == "thinking" and b.get("signature") for b in blocks):
+                if any(is_responses_reasoning(b) for b in blocks):
                     # Chat Completions has no slot for a previous turn's
                     # reasoning item, so it cannot be replayed on this wire
                     # format. Say so instead of dropping it unseen.
@@ -493,6 +518,33 @@ class agllm:
                 }
                 if tool_calls:
                     wire_msg["tool_calls"] = tool_calls
+                reasoning_text = "".join(
+                    b["text"]
+                    for b in blocks
+                    if b["type"] == "thinking" and not is_responses_reasoning(b)
+                )
+                if reasoning_text:
+                    wire_msg["reasoning_content"] = reasoning_text
+                # Resend extended-thinking/other unknown blocks verbatim too.
+                for b in blocks:
+                    for prefix in _UNKNOWN_FIELD_PREFIXES:
+                        if b["type"].startswith(prefix):
+                            wire_msg[b["type"][len(prefix) :]] = b.get("data")
+                            break
+                # LiteLLM's replay shape for signed (Anthropic/Bedrock) thinking; overrides
+                # any raw streamed thinking_blocks fragments resent just above.
+                signed = [
+                    b
+                    for b in blocks
+                    if b["type"] == "thinking"
+                    and b.get("signature")
+                    and not is_responses_reasoning(b)
+                ]
+                if signed:
+                    wire_msg["thinking_blocks"] = [
+                        {"type": "thinking", "thinking": b["text"], "signature": b["signature"]}
+                        for b in signed
+                    ]
             elif role == "tool":
                 result_block = next((b for b in blocks if b["type"] == "tool_result"), None)
                 wire_msg = {
@@ -518,7 +570,7 @@ class agllm:
                     f'(role:"{role}") message -- sending it as a `user` message '
                     "at its original position instead, since not every "
                     "OpenAI-compatible server's chat template tolerates more "
-                    "than one",
+                    "than one (this warning is printed once)",
                 )
                 wire_msg = {"role": "user", "content": text}
             else:

@@ -20,7 +20,7 @@ test('dialog is labelled, bounded by targets, safe text, and defaults focus to C
   const f=fixture(),dialog=f.open();
   assert.equal(dialog['aria-labelledby'],'control-confirmation-title');
   assert.equal(dialog.querySelector('h2').textContent,'Force stop 2 agents?');
-  assert.match(dialog.querySelector('.confirmation-execution').textContent,/CURRENT LIVE/);
+  assert.match(dialog.querySelector('.confirmation-execution').textContent,/current live/i);
   assert.equal(dialog.querySelector('ul').children[0].textContent,'Agent <b>');
   assert.match(dialog.querySelector('#control-confirmation-consequence').textContent,/SIGKILL.*cleanup is not guaranteed/);
   assert.equal(f.document.activeElement,dialog.querySelector('[data-confirm-cancel]'));

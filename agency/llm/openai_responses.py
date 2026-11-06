@@ -19,6 +19,15 @@ from __future__ import annotations
 
 from .agllm import ProviderResponseError, StreamInterruptedError, _warn_once
 from .openai import _OpenAICompatibleBackend, _detail
+from .message_store import split_tool_schema
+from .responses_native import (
+    NATIVE_REQUEST,
+    NativeRequest,
+    NativeResult,
+    NativeStream,
+    request_from_agency,
+    native_result,
+)
 
 _RESPONSES_TYPE_PREFIX = "openai_responses_"
 _METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real content-block index
@@ -418,9 +427,12 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         llm = self.agconfig.llm
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        if NATIVE_REQUEST in _extra:
+            return request_from_agency(messages, tools, tool_choice, _extra[NATIVE_REQUEST], llm)
         kwargs: dict = dict(
             model=llm.model or "",
-            input=_agency_messages_to_responses_input(request["messages"]),
+            input=_agency_messages_to_responses_input(messages),
             max_output_tokens=llm.max_completion_tokens or llm.max_tokens or llm.default_max_tokens,
             store=False,
             # Without this, reasoning items come back with no
@@ -440,12 +452,12 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
             kwargs["top_p"] = llm.top_p
         if llm.extra_body:
             kwargs["extra_body"] = dict(llm.extra_body)
-        tools = _agency_tools_to_responses(request.get("tools"))
-        if tools:
-            kwargs["tools"] = tools
+        responses_tools = _agency_tools_to_responses(tools)
+        if responses_tools:
+            kwargs["tools"] = responses_tools
             # OpenAI rejects tool_choice when no tools are present, so it's
             # only ever sent alongside them.
-            tool_choice = _agency_tool_choice_to_responses(request.get("tool_choice"))
+            tool_choice = _agency_tool_choice_to_responses(tool_choice)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
         return kwargs
@@ -453,11 +465,20 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
     def _call_backend(self, backend_request: dict):
         client = self.make_client(self._client_timeout())
         try:
+            if isinstance(backend_request, NativeRequest):
+                client.max_retries = 0
+                return NativeResult(
+                    client.responses.with_raw_response.create(
+                        **backend_request
+                    ).http_response.json()
+                )
             return client.responses.create(**backend_request)
         finally:
             client.close()
 
     def _format_context_backend_to_agency(self, raw_result) -> dict:
+        if isinstance(raw_result, NativeResult):
+            return native_result(raw_result.value)
         if getattr(raw_result, "status", None) == "failed":
             raise _response_failure(raw_result)
         blocks = _output_items_to_blocks(getattr(raw_result, "output", None))
@@ -483,13 +504,23 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
         if on_client is not None:
             on_client(client)
         try:
-            raw_stream = client.responses.create(**backend_request, stream=True)
+            if isinstance(backend_request, NativeRequest):
+                client.max_retries = 0
+                owner = client.responses.with_streaming_response.create(
+                    **backend_request, stream=True
+                )
+                raw_stream = NativeStream(owner.__enter__(), owner)
+            else:
+                raw_stream = client.responses.create(**backend_request, stream=True)
         except BaseException:
             client.close()
             raise
         return raw_stream, client
 
     def _format_stream_to_agency(self, raw_stream):
+        if isinstance(raw_stream, NativeStream):
+            yield from self._native_stream_to_agency(raw_stream)
+            return
         indexes = _StreamBlockIndexes()
         events = 0
         terminated = False
@@ -540,6 +571,31 @@ class _OpenAIResponsesBackend(_OpenAICompatibleBackend):
                 f"responses stream ended without a terminal event after {events} event(s)",
                 details={"events": events},
             )
+
+    def _native_stream_to_agency(self, raw_stream):
+        events = []
+        body = {}
+        for data in raw_stream:
+            events.append(data)
+            if data.get("type") in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                body = data.get("response", {})
+        # EOF is native protocol state too. Some routers end an HTTP 200 SSE
+        # stream with an untyped error object and no completion event. Replay
+        # those events unchanged and let the CLI apply its stream retry policy;
+        # converting EOF to an HTTP error selects a different retry path.
+        result = native_result(body, events)
+        for block in result["message"]["blocks"]:
+            yield {
+                "type": "block_delta",
+                "block_type": block["type"],
+                **{k: v for k, v in block.items() if k != "type"},
+            }
+        yield {"type": "usage", "usage": result["usage"], "stop_reason": result["stop_reason"]}
 
     @staticmethod
     def _final_deltas(response):

@@ -59,7 +59,9 @@ export function mergeTrajectorySnapshot(run, snapshot) {
 // saved review and explicit historical pages retain their original evidence.
 export function boundTrajectory(run, pins=[]) {
   const keep=new Set(pins.slice(0,2000));
-  const sorted=[...(run.actions||[])].sort((a,b)=>b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
+  // High-volume syscalls may fill spare profiler capacity but cannot evict
+  // actual model/tool calls from the live trajectory's retention window.
+  const sorted=[...(run.actions||[])].sort((a,b)=>Number(a.kind==='syscall')-Number(b.kind==='syscall')||b.start-a.start||(a.id>b.id?1:a.id<b.id?-1:0));
   let completed=0,active=0;
   for(const a of sorted)if(a.outcome==='running'?active++<200:completed++<2000)keep.add(a.id);
   const trim=(key,predicate)=>{const items=run[key];if(!items)return;const retained=items.filter(predicate);if(retained.length!==items.length){items.splice(0,items.length,...retained);indexes.delete(items);}};
@@ -71,7 +73,7 @@ export function boundTrajectory(run, pins=[]) {
   let clipped=false;
   for(const points of Object.values(run.counters||{}))if(points.length>2000){points.splice(0,points.length-2000);clipped=true;}
   run.coverage ||= {};
-  if(active>200)inflightWindowedRuns.add(run);
+  if(sorted.filter(a=>a.kind!=='syscall'&&a.outcome==='running').length>200)inflightWindowedRuns.add(run);
   if(inflightWindowedRuns.has(run))run.coverage.client_inflight_windowed=true;
   if(removed||clipped||run.coverage.client_window)windowedRuns.add(run);
   if(windowedRuns.has(run))run.coverage.client_window='Live view retains up to 2,000 recent completed calls, 200 in-flight calls, bounded inspection/reading pins and 2,000 samples per series. Use column paging for older calls; complete evidence remains in recorded review/export.';
@@ -92,6 +94,7 @@ export class TrajectoryStream {
     this.onTransport(this.attempt ? 'reconnecting' : 'connecting');
     const query = new URLSearchParams({cursor: this.cursor, epoch: this.epoch});
     if (this.replay) {query.set('mode', 'replay'); query.set('run', this.runId);if(Number.isFinite(this.replayClock))query.set('clock',this.replayClock);if(this.replayPlaying){query.set('play','1');if(Number.isFinite(this.replaySpeed))query.set('speed',this.replaySpeed);}}
+    if(this.replaySeekId!=null)query.set('seek_id',this.replaySeekId);
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/trajectory?${query}`);
     this.socket = ws;
     ws.onopen = () => {if (!this.closed) {this.attempt = 0; this.onTransport('connected');}};
@@ -99,6 +102,8 @@ export class TrajectoryStream {
       if (this.closed || ws !== this.socket) return;
       const message = JSON.parse(event.data);
       if (message.type === 'execution_command_result' || message.type === 'measurement_command_result') {this.onMessage(message); return;}
+      if(this.replaySeekId!=null&&message.replay?.seek_id!==this.replaySeekId)return;
+      this.replaySeekId=null;
       // Ignore duplicate or stale revisions, including delayed frames after reconnect.
       if (!this.replay && this.received && message.epoch === this.epoch && (message.type==='updates'?message.cursor<=this.cursor:message.cursor<this.cursor)) return;
       this.received=true;
@@ -129,7 +134,9 @@ export class TrajectoryStream {
       && this.send('measurement_command', {...extra, command});
   }
   sendReplay(type, extra = {}) {
-    return this.replay && ['play','pause','step','seek'].includes(type) && this.send(type, extra);
+    const sent=this.replay && ['play','pause','step','seek'].includes(type) && this.send(type, extra);
+    if(sent&&type==='seek'){this.replayClock=extra.clock;this.replaySeekId=extra.seek_id??null;}
+    return sent;
   }
   reconnect() {
     clearTimeout(this.timer);

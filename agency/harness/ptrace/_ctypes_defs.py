@@ -19,6 +19,8 @@ import time via `_configure_libc()` instead of trusting each call site.
 from __future__ import annotations
 
 import ctypes
+import os
+import mmap
 import platform
 import socket
 import struct
@@ -47,6 +49,20 @@ def _configure_libc() -> None:
 
 
 _configure_libc()
+
+SYS_TGKILL = 234  # x86_64; this module is guarded to x86_64 above
+
+
+def tgkill(tgid: int, tid: int, sig: int) -> None:
+    """Send *sig* to the single thread *tid* of process *tgid*.
+
+    ``kill(tid)`` is process-directed: the kernel hands it to one arbitrary
+    thread, so it cannot be used to signal every thread of a process."""
+    ctypes.set_errno(0)
+    if libc.syscall(ctypes.c_long(SYS_TGKILL), tgid, tid, sig) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
 
 # ---------------------------------------------------------------------------
 # ptrace(2) request / option / event constants (Linux, from <sys/ptrace.h>)
@@ -199,6 +215,9 @@ def get_eventmsg(pid: int) -> int:
     return msg.value
 
 
+_PAGE_SIZE = mmap.PAGESIZE
+
+
 def read_bytes(pid: int, addr: int, length: int) -> bytes:
     """Read *length* bytes from the tracee's memory at *addr*. Tries
     process_vm_readv first (no ptrace-stop overhead); falls back to
@@ -221,24 +240,38 @@ def _read_bytes_vm_readv(pid: int, addr: int, length: int) -> bytes:
 
 
 def _read_bytes_peekdata(pid: int, addr: int, length: int) -> bytes:
+    # Aligned words never straddle a page, so a read ending at a mapping's
+    # last byte does not fault on the unmapped page after it.
+    offset = addr % 8
     out = bytearray()
-    a = addr
-    while len(out) < length:
+    a = addr - offset
+    while len(out) < offset + length:
         ctypes.set_errno(0)
         word = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(a), None)
         if word == -1 and ctypes.get_errno() != 0:
             raise PtraceError(ctypes.get_errno(), "PTRACE_PEEKDATA failed")
         out += struct.pack("<q", word)
         a += 8
-    return bytes(out[:length])
+    return bytes(out[offset : offset + length])
 
 
 def read_cstring(pid: int, addr: int, max_len: int = 4096) -> str:
     """Read a NUL-terminated C string from the tracee's memory."""
     if addr == 0:
         return ""
-    raw = read_bytes(pid, addr, max_len)
-    return raw.split(b"\x00", 1)[0].decode(errors="replace")
+    out = bytearray()
+    a = addr
+    while len(out) < max_len:
+        chunk = read_bytes(pid, a, min(_PAGE_SIZE - a % _PAGE_SIZE, max_len - len(out)))
+        if not chunk:
+            raise OSError(f"empty read from pid {pid} at {a:#x}")
+        nul = chunk.find(b"\x00")
+        if nul >= 0:
+            out += chunk[:nul]
+            break
+        out += chunk
+        a += len(chunk)
+    return out.decode(errors="replace")
 
 
 # sizeof(struct sockaddr_in6) -- the largest of the two shapes this decodes,

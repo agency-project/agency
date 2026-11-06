@@ -54,8 +54,8 @@ def _agent(tmp_path, sandbox: _TransactionSandbox) -> agent:
 
 
 def _committed_context() -> agcontext:
-    return agcontext(
-        recent_transcript=[{"role": "user", "content": "committed transcript"}],
+    return agcontext.from_messages(
+        [{"role": "user", "content": "committed transcript"}],
         harness_sessions={"native": {"session_id": "committed-session"}},
         retained_messages=[
             {
@@ -70,20 +70,16 @@ def _committed_context() -> agcontext:
     )
 
 
-def _mutate_working_context(context: agcontext) -> None:
-    context.recent_transcript.append(
-        {"role": "assistant", "content": "uncommitted harness transcript"}
+def _stage_uncommitted_updates(engine: AgentEngine, context: agcontext) -> None:
+    """What a finished harness attempt leaves staged on its engine: the engine
+    writes these into the agcontext only once the run has committed."""
+    engine._pending_message_hash_list = context.message_store.add_messages(
+        [
+            *context.get_resolved_transcript(),
+            {"role": "assistant", "content": "uncommitted harness transcript"},
+        ]
     )
-    context.harness_sessions["native"] = {"session_id": "uncommitted-session"}
-    context.retained_messages.append(
-        {
-            "sequence": 6,
-            "type": "message",
-            "role": "system",
-            "content": "uncommitted retained mutation",
-            "source": "test-harness",
-        }
-    )
+    engine._pending_session_update = (context, "native", "uncommitted-session", "blob", 6)
 
 
 def test_cancel_after_harness_success_wins_before_commit_and_discards(monkeypatch, tmp_path):
@@ -95,7 +91,7 @@ def test_cancel_after_harness_success_wins_before_commit_and_discards(monkeypatc
     release_harness_return = threading.Event()
 
     def successful_harness(self, context, *_args, **_kwargs):
-        _mutate_working_context(context)
+        _stage_uncommitted_updates(self, context)
         harness_succeeded.set()
         assert release_harness_return.wait(timeout=2)
         return agdata(ok=True)
@@ -114,7 +110,9 @@ def test_cancel_after_harness_success_wins_before_commit_and_discards(monkeypatc
     assert request.cancelled is True
     assert sandbox.events == ["discard"]
     output_context = request.context_future.result(timeout=2)
-    assert output_context.recent_transcript == [{"role": "user", "content": "committed transcript"}]
+    assert output_context.get_resolved_transcript() == [
+        {"role": "user", "content": "committed transcript"}
+    ]
     assert output_context.harness_sessions == {"native": {"session_id": "committed-session"}}
     assert output_context.harness_message_cursors == {"native": 5}
     assert output_context.retained_messages == _committed_context().retained_messages
@@ -129,17 +127,19 @@ def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkey
     ag.context = _committed_context()
 
     def failed_harness(self, context, *_args, **_kwargs):
-        _mutate_working_context(context)
+        _stage_uncommitted_updates(self, context)
         return agerror("ordinary harness failure")
 
     monkeypatch.setattr(AgentEngine, "_execute_harness", failed_harness)
     invocation = ag.run(agskill("ordinary-failure", ""), agdata())
-    request = _request_for(invocation)
+    output_context = ag.context  # the pending agcontext this run settles
 
     assert invocation.wait(timeout=2).to_dict() == {"error": "ordinary harness failure"}
     assert sandbox.events == ["discard"]
-    output_context = request.context_future.result(timeout=2)
-    assert output_context.recent_transcript == [{"role": "user", "content": "committed transcript"}]
+    output_context.resolve_prev_dependencies()
+    assert output_context.get_resolved_transcript() == [
+        {"role": "user", "content": "committed transcript"}
+    ]
     assert output_context.harness_sessions == {"native": {"session_id": "committed-session"}}
     assert output_context.harness_message_cursors == {"native": 5}
     assert len(output_context.retained_messages) == 2
@@ -151,6 +151,29 @@ def test_ordinary_failure_discards_and_appends_exactly_one_context_notice(monkey
     assert notice["source"] == "context_notice"
     assert "previous skill call failed" in notice["content"]
     assert "workspace changes have been discarded" in notice["content"]
+
+
+def test_commit_publishes_the_staged_message_chain_and_session(monkeypatch, tmp_path):
+    sandbox = _TransactionSandbox()
+    ag = _agent(tmp_path, sandbox)
+    ag.context = _committed_context()
+
+    def successful_harness(self, context, *_args, **_kwargs):
+        _stage_uncommitted_updates(self, context)
+        return agdata(ok=True)
+
+    monkeypatch.setattr(AgentEngine, "_execute_harness", successful_harness)
+    invocation = ag.run(agskill("commit-publishes", ""), agdata())
+    output_context = ag.context  # the pending agcontext this run settles
+
+    assert invocation.wait(timeout=2).to_dict() == {"ok": True}
+    output_context.resolve_prev_dependencies()
+    assert output_context.get_resolved_transcript() == [
+        {"role": "user", "content": "committed transcript"},
+        {"role": "assistant", "content": "uncommitted harness transcript"},
+    ]
+    assert output_context.harness_sessions["native"]["session_id"] == "uncommitted-session"
+    assert output_context.harness_message_cursors == {"native": 6}
 
 
 def test_cancel_during_claimed_commit_cannot_discard_the_committed_context(monkeypatch, tmp_path):
@@ -165,7 +188,9 @@ def test_cancel_during_claimed_commit_cannot_discard_the_committed_context(monke
         assert release_commit.wait(2)
 
     def harness(self, context, *_args, **_kwargs):
-        context.recent_transcript.append({"role": "assistant", "content": "committed"})
+        context.set_transcript(
+            [*context.get_resolved_transcript(), {"role": "assistant", "content": "committed"}]
+        )
         return agdata(answer=42)
 
     sandbox.commit = commit
@@ -206,7 +231,7 @@ def test_fork_retries_when_context_advances_while_waiting_for_sandbox(tmp_path):
 
     sandbox = SnapshotSandbox("old")
     source = _agent(tmp_path, sandbox)
-    source.context = agcontext(recent_transcript=[{"version": "old"}])
+    source.context = agcontext.from_messages([{"version": "old"}])
     children = []
     worker = threading.Thread(
         target=lambda: children.append(agent.fork(source)), name="fork-caller"
@@ -215,7 +240,7 @@ def test_fork_retries_when_context_advances_while_waiting_for_sandbox(tmp_path):
         worker.start()
         assert waiting.wait(2)
         with source._orchestrator._event_cond:
-            source.context = agcontext(recent_transcript=[{"version": "new"}])
+            source.context = agcontext.from_messages([{"version": "new"}])
             sandbox.version = "new"
     worker.join(2)
     assert not worker.is_alive()

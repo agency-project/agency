@@ -18,7 +18,7 @@ export function requestControlConfirmation(options) {
   dialog.setAttribute('aria-describedby','control-confirmation-consequence');
   dialog.innerHTML='<h2 id="control-confirmation-title"></h2><p class="confirmation-execution"></p><ul class="confirmation-targets" tabindex="0"></ul><p id="control-confirmation-consequence"></p><p class="confirmation-status" role="status" aria-live="polite"></p><div class="confirmation-actions"><button type="button" data-confirm-cancel>Cancel</button><button type="button" data-confirm-submit></button></div>';
   dialog.querySelector('h2').textContent=`${options.force?'Force stop':'Stop'} ${options.targets.length} agent${options.targets.length===1?'':'s'}?`;
-  dialog.querySelector('.confirmation-execution').textContent=`Execution: ${options.execution}${options.frozen?' · view frozen; targets are CURRENT LIVE agents':''}`;
+  dialog.querySelector('.confirmation-execution').textContent=`Execution: ${options.execution}${options.frozen?' · view frozen; targets are current live agents':''}`;
   for(const target of options.targets){const item=document.createElement('li');item.textContent=target;dialog.querySelector('ul').append(item);}
   dialog.querySelector('#control-confirmation-consequence').textContent=options.force?'Cancel outstanding work and send SIGKILL. Process exit must be observed separately; cleanup is not guaranteed.':'Cancel outstanding work and send SIGTERM. A process may ignore it; exit and cleanup are not guaranteed.';
   const cancel=dialog.querySelector('[data-confirm-cancel]'),submit=dialog.querySelector('[data-confirm-submit]');

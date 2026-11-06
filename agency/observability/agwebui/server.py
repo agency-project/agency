@@ -743,7 +743,7 @@ def _json_object(value: str) -> dict:
 
 
 # record_llm_exchange() (agdatalogger.py) stores each distinct block once in
-# a content-addressable `blocks` table (keyed by content hash) and records
+# a content-addressable `message_block_lookup` table (keyed by content hash) and records
 # each exchange's full prompt and response as two ordered hash chains in
 # `exchange_chain`, rather than one `events` row per block the way the
 # older model did. The metadata block for an exchange is its own chain
@@ -767,7 +767,7 @@ _TOKEN_TOTALS_SQL = (
     "SUM(json_extract(b.payload, '$.usage.cache_write_tokens')) "
     "FROM exchange_chain ec "
     "JOIN exchanges e ON e.call_label = ec.call_label "
-    "JOIN blocks b ON b.hash = ec.hash "
+    "JOIN message_block_lookup b ON b.hash = ec.hash "
     "WHERE e.type = 'llm_block' AND ec.kind = 'response' "
     "AND json_extract(b.payload, '$.type') = 'metadata'"
 )
@@ -779,7 +779,7 @@ def _fetch_finalized_llm_block_rows(
     """Reproduce the flat, deduplicated `(type, call_label, payload_json,
     timestamp)` row sequence the older row-per-block `events` model used
     to hand to `_reconstruct_in_progress_messages` directly -- from the
-    content-addressable `exchanges`/`exchange_chain`/`blocks` schema.
+    content-addressable `exchanges`/`exchange_chain`/`message_block_lookup` schema.
 
     Each exchange's prompt chain (its full recorded request -- including
     any resent history, since a request's prompt is stored in full every
@@ -793,7 +793,7 @@ def _fetch_finalized_llm_block_rows(
         "SELECT e.call_label, e.timestamp, ec.hash, b.payload "
         "FROM exchanges e "
         "JOIN exchange_chain ec ON ec.call_label = e.call_label "
-        "JOIN blocks b ON b.hash = ec.hash "
+        "JOIN message_block_lookup b ON b.hash = ec.hash "
         "WHERE e.type = 'llm_block' "
         "ORDER BY e.id, ec.kind, ec.seq"
     ).fetchall()
@@ -993,6 +993,15 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
+# Compare has a read-only router and shares the historical investigator store.
+from .compare import create_router as _compare_router
+
+app.include_router(_compare_router(_profiler_dir))
+
+from .critical_path_api import router as _critical_path_router
+
+app.include_router(_critical_path_router(_profiler_dir))
+
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
@@ -1001,14 +1010,16 @@ async def _no_cache_static(request, call_next):
     file, since a plain refresh can silently keep serving stale JS/CSS with
     no visible sign anything is wrong."""
     response = await call_next(request)
-    if request.url.path in ("/", "/profiler") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/profiler", "/critical-path") or request.url.path.startswith(
+        "/static/"
+    ):
         response.headers["Cache-Control"] = "no-store"
     return response
 
 
 @app.get("/")
 async def index():
-    return FileResponse(_STATIC / "index.html")
+    return FileResponse(_STATIC / "investigator.html")
 
 
 def _profile_trace_path() -> Path:
@@ -1127,6 +1138,11 @@ async def terminal_relay(ws: WebSocket):
         await ws.close()
     except RuntimeError:
         pass  # already closed by the browser
+
+
+@app.get("/critical-path")
+async def critical_path_page():
+    return FileResponse(_STATIC / "critical-path.html")
 
 
 @app.get("/api/investigator/runs")
@@ -1329,7 +1345,7 @@ async def _trajectory_replay_data(run_id):
         await asyncio.to_thread(source.refresh)
         with source.lock:
             run = {
-                key: value
+                key: dict(value) if key == "measurement" else value
                 for key, value in source.model.run.items()
                 if key
                 in {
@@ -1344,6 +1360,8 @@ async def _trajectory_replay_data(run_id):
                     "task",
                     "format",
                     "time_origin",
+                    "execution_started_at",
+                    "measurement",
                 }
             }
             origin = source.model.origin or 0
@@ -1464,6 +1482,7 @@ async def _replay_stream(ws):
     # A client that seeks out of a live view, or reconnects, resumes as it was.
     playing = ws.query_params.get("play") == "1"
     speed = _replay_speed(ws.query_params.get("speed"), 1.0)
+    seek_id = int(ws.query_params["seek_id"]) if "seek_id" in ws.query_params else None
 
     def exhausted():
         # A running execution keeps producing evidence: its playback idles
@@ -1471,7 +1490,14 @@ async def _replay_stream(ws):
         return cursor == len(events) and (run_id != "live" or run.get("status") != "running")
 
     def rebuild():
-        model = Trajectory(run["id"], run["title"], mode="replay", source=run["source"])
+        model = Trajectory(
+            run["id"],
+            run["title"],
+            mode="replay",
+            source=run["source"],
+            defer_causal_graph=run_id == "live"
+            and run.get("status") not in {"completed", "failed", "cancelled"},
+        )
         for key in ("model", "harness", "condition", "task", "format", "time_origin"):
             if key in run:
                 model.run[key] = run[key]
@@ -1495,15 +1521,37 @@ async def _replay_stream(ws):
         # Saved trace counters already share its relative clock. Canonical live
         # counters enter through resource_sample events and incremental patches.
         if run_id != "live":
+            if run.get("clock"):
+                model.run["clock"] = run["clock"]
             model.run["counters"] = {
                 name: [point for point in points if point[0] <= clock]
                 for name, points in run.get("counters", {}).items()
             }
+        duration = max(run["duration"], events[-1]["ts"] if events else 0)
+        started = run.get("execution_started_at")
+        measurement = run.get("measurement") or {}
+        end_offset = measurement.get("end_offset")
+        wall_end = (
+            min(duration, end_offset)
+            if end_offset is not None and not measurement.get("held")
+            else duration
+        )
+        wall_start = (
+            min(wall_end, max(0, started - (run.get("time_origin") or 0)))
+            if started is not None
+            else 0
+        )
         meta = {
             "position": cursor,
             "total": len(events),
             "clock": clock,
-            "duration": max(run["duration"], events[-1]["ts"] if events else 0),
+            "duration": duration,
+            "wall_clock": {
+                "start": wall_start,
+                "end": wall_end,
+                "pending": "execution_started_at" in run and started is None,
+            },
+            "seek_id": seek_id,
             "playing": playing,
             "finished": exhausted(),
             "speed": speed,
@@ -1557,6 +1605,7 @@ async def _replay_stream(ws):
             else:
                 run = latest_run
         if kind == "seek":
+            seek_id = command.get("seek_id")
             target = float(command.get("clock", 0))
             if not math.isfinite(target):
                 target = 0

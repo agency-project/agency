@@ -4,6 +4,18 @@ import {test} from 'node:test';
 const source = await readFile(new URL('../../agency/observability/agwebui/static/agent-roster.js', import.meta.url), 'utf8');
 const {agentRoster, longRunningCalls, rosterAgents, reconcilePinnedAgents, pinAgent, MAX_AGENT_COLUMNS} = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
+test('raw syscalls do not become active, failed, or long-running agent calls',()=>{
+  const run={duration:60,agents:[{id:'a'}],actions:[
+    {id:'send',agent:'a',kind:'syscall',start:0,outcome:'running'},
+    {id:'exec',agent:'a',kind:'syscall',start:0,outcome:'failed'},
+    {id:'model',agent:'a',kind:'model',start:0,outcome:'running'},
+  ]};
+  const row=agentRoster(run)[0];
+  assert.equal(row.activeCount,1);
+  assert.equal(row.failedActionCount,0);
+  assert.deepEqual(longRunningCalls(run).map(x=>x.action.id),['model']);
+});
+
 function fixture(count) {
   return {id: `fixture-${count}`, duration: 90,
     agents: Array.from({length: count}, (_, index) => ({id: `agent-${index}`, label: `Worker ${index}`, status: index === 1 ? 'completed' : 'running', parent: null})),

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import httpx
 
+from agency.llm.message_store import with_tool_schema
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.anthropic import (
     _AnthropicBackend,
@@ -17,6 +18,7 @@ from agency.llm.anthropic import (
     _agency_messages_to_anthropic,
     _agency_tool_choice_to_anthropic,
     _agency_tools_to_anthropic,
+    _anthropic_sdk_timeout,
     _known_anthropic_context_window,
 )
 
@@ -79,7 +81,7 @@ class TestAnthropicBackend:
         with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
             client = backend.make_client(httpx.Timeout(30.0))
         mock_sdk.Anthropic.assert_called_once_with(
-            api_key="sk-ant-from-config", timeout=httpx.Timeout(30.0)
+            api_key="sk-ant-from-config", timeout=_anthropic_sdk_timeout(httpx.Timeout(30.0))
         )
         assert client is mock_sdk.Anthropic.return_value
 
@@ -91,7 +93,7 @@ class TestAnthropicBackend:
         with patch("agency.llm.anthropic._anthropic_sdk", mock_sdk):
             backend.make_client(httpx.Timeout(5.0))
         mock_sdk.Anthropic.assert_called_once_with(
-            api_key="sk-ant-from-env", timeout=httpx.Timeout(5.0)
+            api_key="sk-ant-from-env", timeout=_anthropic_sdk_timeout(httpx.Timeout(5.0))
         )
 
     def test_config_api_key_takes_priority_over_env_var(self, monkeypatch):
@@ -816,8 +818,10 @@ class TestFormatContextAgencyToBackend:
         )
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
-                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "messages": with_tool_schema(
+                    [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                    [{"type": "function", "function": {"name": "f"}}],
+                )
             }
         )
         assert kwargs == {
@@ -856,9 +860,11 @@ class TestFormatContextAgencyToBackend:
         backend = _AnthropicBackend(_cfg(model=model))
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
-                "tools": [{"type": "function", "function": {"name": "f"}}],
-                "tool_choice": "auto",
+                "messages": with_tool_schema(
+                    [_text_msg("system", "Be terse."), _text_msg("user", "hi")],
+                    [{"type": "function", "function": {"name": "f"}}],
+                    "auto",
+                )
             }
         )
         assert kwargs["model"] == model
@@ -976,7 +982,7 @@ class TestFormatContextAgencyToBackend:
     def test_tool_choice_included_when_given(self):
         backend = _AnthropicBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [_text_msg("user", "x")], "tool_choice": "auto"}
+            {"messages": with_tool_schema([_text_msg("user", "x")], tool_choice="auto")}
         )
         assert kwargs["tool_choice"] == {"type": "auto"}
 
@@ -1081,13 +1087,16 @@ class TestFormatContextBackendToAgency:
     def test_usage_and_stop_reason_extracted(self):
         raw = _ev(content=[], usage=_ev(input_tokens=10, output_tokens=5), stop_reason="end_turn")
         result = _AnthropicBackend(_cfg())._format_context_backend_to_agency(raw)
-        assert result["usage"] == {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-        }
+        usage = result["usage"]
+        assert usage["prompt_tokens"] == 10
+        assert usage["completion_tokens"] == 5
+        assert usage["total_tokens"] == 15
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+        # The SDK's own raw fields survive alongside the renamed aliases --
+        # not narrowed away, see _serialize_anthropic_usage's docstring.
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
         assert result["stop_reason"] == "end_turn"
 
     def test_unrecognized_content_block_preserved_as_unknown(self):
@@ -1139,13 +1148,16 @@ class TestFormatStreamToAgency:
         assert [i["text"] for i in text_items] == ["Hello", ", world"]
         usage_item = items[-1]
         assert usage_item["type"] == "usage"
-        assert usage_item["usage"] == {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-        }
+        usage = usage_item["usage"]
+        assert usage["prompt_tokens"] == 10
+        assert usage["completion_tokens"] == 5
+        assert usage["total_tokens"] == 15
+        assert usage["cache_read_tokens"] == 0
+        assert usage["cache_write_tokens"] == 0
+        # Both message_start's and message_delta's own raw fields survive
+        # the merge, not just the renamed aliases.
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
         assert usage_item["stop_reason"] == "end_turn"
 
     def test_citations_delta_emitted_for_text_block(self):
@@ -1472,9 +1484,7 @@ def fresh_warnings(monkeypatch):
 
 def _kwargs(model, tool_choice=None, **llm_fields):
     backend = _AnthropicBackend(_cfg(model=model, **llm_fields))
-    request = {"messages": [_text_msg("user", "call f")], "tools": _TOOLS}
-    if tool_choice is not None:
-        request["tool_choice"] = tool_choice
+    request = {"messages": with_tool_schema([_text_msg("user", "call f")], _TOOLS, tool_choice)}
     return backend._format_context_agency_to_backend(request)
 
 

@@ -146,7 +146,7 @@ def test_client_public_none_and_old_daemon_compatibility():
     client._client.close()
     client._client = httpx.Client(transport=httpx.MockTransport(respond), base_url="http://local")
     try:
-        assert client.pause_harness() is None
+        assert client.pause_harness()["ok"] is True  # the ack, which a synchronous pause needs
         assert client._last_control_observation["uds_path"] == "/unused"
         assert client.resume_harness() is None
         assert client._last_control_observation is None

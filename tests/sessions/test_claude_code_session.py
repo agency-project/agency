@@ -455,9 +455,9 @@ def test_data_logger_keeps_a_reported_timestamp(tmp_path):
     logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(tmp_path / "db.sqlite3"))))
     logger.start()
     logger.record_event("agent_state", {"state": "x"}, timestamp=123.5, flush=True)
-    logger.record_llm_exchange(
-        "label", exchange_type="llm_block", prompt_chain=[], response_chain=[], timestamp=124.0
-    )
+    from tests.exchange_helpers import record_exchange
+
+    record_exchange(logger, "label", timestamp=124.0)
     logger.stop()
     with sqlite3.connect(tmp_path / "db.sqlite3") as connection:
         assert connection.execute("SELECT timestamp FROM events").fetchone() == (123.5,)

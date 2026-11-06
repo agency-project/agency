@@ -92,10 +92,10 @@ def catalog(profile_dir: str, bucket: int = 0):
     sibling_runs = Path(profile_dir).resolve().parent.parent
     if sibling_runs != (ROOT / "agency_runs").resolve() and sibling_runs.is_dir():
         paths.extend(sorted(sibling_runs.glob("*/profiler/agprof.trace.json")))
-    for base in (ROOT / "agency_runs", ROOT / "artifacts"):
+    for base in (ROOT / "agency_runs", ROOT / "artifacts", ROOT / "runs"):
         if base.exists():
             paths.extend(sorted(base.rglob("agprof.trace.json")))
-    seen = set()
+    seen = {entry["id"] for entry in entries}
     for path in paths:
         key = run_key(path)
         if key in seen:
@@ -105,10 +105,14 @@ def catalog(profile_dir: str, bucket: int = 0):
         summary_path = path.parent / "summary.json"
         if summary_path.exists():
             try:
-                summary = json.loads(summary_path.read_text())
+                value = json.loads(summary_path.read_text())
+                summary = value if isinstance(value, dict) else {}
             except (OSError, ValueError):
                 pass  # A partially written summary does not hide a usable trace.
-        engines = summary.get("coverage", {}).get("engines", {})
+        coverage = summary.get("coverage", {})
+        coverage = coverage if isinstance(coverage, dict) else {}
+        engines = coverage.get("engines", {})
+        engines = engines if isinstance(engines, dict) else {}
         entries.append(
             {
                 "id": key,
@@ -116,9 +120,9 @@ def catalog(profile_dir: str, bucket: int = 0):
                 "subtitle": str(path.parent.relative_to(ROOT))
                 if path.is_relative_to(ROOT)
                 else "Configured profiler directory",
-                "source": "recorded",
+                "source": "synthetic" if summary.get("data_source") == "mock" else "recorded",
                 "path": str(path),
-                "duration": (summary.get("duration_ms") or 0) / 1000,
+                "duration": (number(summary.get("duration_ms")) or 0) / 1000,
                 "model": recorded_model(str(path), path.stat().st_mtime),
                 "harness": ", ".join(engines) or "unknown",
             }
@@ -482,6 +486,12 @@ def normalize_trace(trace, entry, summary=None):
     intervals = []
     counters = defaultdict(list)
     sandbox_owners = defaultdict(set)
+    # Saved collector metadata identifies process generations. Do not merge
+    # identically labelled RSS/CPU counters from independent Chrome PID tracks.
+    process_by_pid = defaultdict(list)
+    for process in (summary or {}).get("process_metrics", []):
+        if isinstance(process, dict) and process.get("identity") and process.get("pid") is not None:
+            process_by_pid[process["pid"]].append(process)
 
     def remember_owner(agent, sandbox):
         if isinstance(agent, str) and agent and isinstance(sandbox, str) and sandbox:
@@ -567,6 +577,8 @@ def normalize_trace(trace, entry, summary=None):
         captured_response = (
             visible_model_response(attrs.get("llm.response")) if kind == "model" else None
         )
+        from .causal_graph import messages_evidence
+
         action = {
             "id": attrs.get("span_id") or attrs.get("agency.span_id") or f"action-{len(actions)}",
             "agent": agent,
@@ -575,6 +587,7 @@ def normalize_trace(trace, entry, summary=None):
             "intent": intent,
             "start": start,
             "duration": elapsed,
+            "missing_end": number(span.get("dur")) is None or span.get("dur", 0) < 0,
             "outcome": outcome,
             "command": command if name.startswith("tool:") else "",
             "arguments": attrs.get("tool.arguments") if name.startswith("tool:") else None,
@@ -584,6 +597,9 @@ def normalize_trace(trace, entry, summary=None):
             "context": context,
             "model": attrs.get("model"),
             "model_response": captured_response,
+            "causal_evidence": messages_evidence(attrs.get("llm.messages"), captured_response)
+            if kind == "model"
+            else None,
             "tool_call_ids": response_tool_ids(captured_response),
             "model_tool_call_id": attrs.get("model_tool_call_id"),
             "model_id": attrs.get("model_id"),
@@ -630,11 +646,36 @@ def normalize_trace(trace, entry, summary=None):
         if not isinstance(event, dict) or event.get("ph") != "C" or number(event.get("ts")) is None:
             continue
         name = event.get("name", "")
+        info = {}
         if name.startswith("agency-counter-v1:"):
             info = object_value(name.removeprefix("agency-counter-v1:"))
             info = info if isinstance(info, dict) else {}
             presentation_owners(info)
             name = info.get("label", name)
+        if name in {"rss_mb", "vms_mb", "cpu_percent", "io_read_mb_s", "io_write_mb_s"}:
+            path = info.get("path", [])
+            identities = (
+                {
+                    part[0].removeprefix("process:")
+                    for part in path
+                    if isinstance(part, list)
+                    and part
+                    and isinstance(part[0], str)
+                    and part[0].startswith("process:")
+                }
+                if isinstance(path, list)
+                else set()
+            )
+            candidates = process_by_pid.get(event.get("pid"), [])
+            identity = next(iter(identities)) if len(identities) == 1 else None
+            if identity is None and len(candidates) == 1:
+                identity = candidates[0]["identity"]
+            if identity is None and info.get("version") == 1 and event.get("pid") is not None:
+                # The sampler allocates a fresh Chrome PID track on PID reuse.
+                # Keep its trace identity when OS generation metadata is absent.
+                identity = f"trace-{event['pid']}"
+            if identity:
+                name = f"process:{identity}:{name}"
         for key, value in (event.get("args") or {}).items():
             if number(value) is not None:
                 counters[name if key == "value" else f"{name} {key}"].append(
@@ -706,6 +747,14 @@ def normalize_trace(trace, entry, summary=None):
         "intervals": sorted(intervals, key=lambda i: i["start"]),
         "edges": edges,
         "counters": {key: reduce_samples(values) for key, values in counters.items()},
+        # agprof stamps spans and resource samples with one perf_counter_ns
+        # clock, so both share this run-relative axis without alignment.
+        "clock": {
+            "events": "agprof perf_counter_ns",
+            "resources": "agprof perf_counter_ns",
+            "shared": True,
+            "origin": "first recorded span",
+        },
         "obligations": obligations(actions, entry.get("resolved")),
         "summary": summary or {},
         "coverage": {
@@ -730,7 +779,11 @@ def load_run(path: str, modified: float, entry_json: str):
     entry = json.loads(entry_json)
     if entry.get("format") == "native_events":
         return normalize_native_events(trace_path, entry)
-    return normalize_trace(json.loads(trace_path.read_text()), entry, summary)
+    from .causal_graph import enrich_saved_evidence
+
+    return enrich_saved_evidence(
+        normalize_trace(json.loads(trace_path.read_text()), entry, summary), trace_path
+    )
 
 
 def normalize_native_events(path, entry):

@@ -173,9 +173,10 @@ def test_bare_agsync_inside_worker_does_not_deadlock():
 
 @container
 def _seed_base():
+    from agency.configs.agconfig import agconfig, sandboxconfig
     from agency.sandbox.agsandbox import agSandbox
 
-    base = agSandbox("agmap-base")
+    base = agSandbox("agmap-base", agconfig=agconfig(sandboxconfig(gpu_passthrough=False)))
     base.write_file("/workspace/repo/data.txt", "hello-from-checkpoint\n")
     # commit() checkpoints for forks; stop() hibernates (old stop(commit=True)).
     base.commit()

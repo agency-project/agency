@@ -55,10 +55,30 @@ class ExecutionScheduler:
         """Return true when one wait-pool request is ready for promotion."""
         owner = self._orchestrator
         dependencies: set[Future] = set()
+        sources: list[dict] = []
         predecessor_future = pending_exec.context_dependency._future
+        predecessor_id = getattr(pending_exec.context_dependency, "_execution_id", None)
+        if predecessor_id is None and predecessor_future is not None:
+            predecessor_id = owner._future_producers.get(predecessor_future)
+        if predecessor_id is not None:
+            sources.append(
+                {
+                    "request_id": predecessor_id,
+                    "agent_id": getattr(
+                        pending_exec.context_dependency, "_execution_agent_id", None
+                    )
+                    or str(pending_exec.agent.agname),
+                    "kind": "context",
+                    "evidence": "context_chain",
+                }
+            )
         if predecessor_future is not None and not predecessor_future.done():
             dependencies.add(predecessor_future)
-        failure = self._discover_dependencies(pending_exec.skill_input, dependencies)
+        failure = self._discover_dependencies(pending_exec.skill_input, dependencies, sources)
+        pending_exec.unidentified_dependency_count = sum(
+            future not in owner._future_producers for future in dependencies
+        )
+        owner._record_dependencies_locked(pending_exec, sources)
         if failure is not None:
             owner._fail_request_locked(pending_exec, failure)
             return False
@@ -92,7 +112,13 @@ class ExecutionScheduler:
                 owner._record_request_event(
                     "request_blocked",
                     pending_exec,
-                    {"dependency_count": len(dependencies)},
+                    {
+                        "dependency_count": len(dependencies),
+                        # Source identities are persisted once in the
+                        # request_dependencies event and span. Repeating the
+                        # entire fan-in on every completed Future is quadratic.
+                        "unidentified_dependency_count": pending_exec.unidentified_dependency_count,
+                    },
                 )
             return False
         return True
@@ -234,7 +260,9 @@ class ExecutionScheduler:
 
         return materialize(value)
 
-    def _discover_dependencies(self, value: object, found: set[Future]) -> "str | None":
+    def _discover_dependencies(
+        self, value: object, found: set[Future], sources: "list[dict] | None" = None
+    ) -> "str | None":
         seen: set[int] = set()
 
         def visit(current: object, *, from_future: bool = False) -> "str | None":
@@ -246,6 +274,28 @@ class ExecutionScheduler:
                     return None
                 seen.add(marker)
                 future = object.__getattribute__(current, "_future")
+                identity = object.__getattribute__(current, "__dict__")
+                producer_id = identity.get("_execution_id")
+                producer = None
+                if producer_id is None and future is not None:
+                    producer_id = self._orchestrator._future_producers.get(future)
+                if producer_id is not None and sources is not None:
+                    producer = self._orchestrator._requests.get(producer_id)
+                    producer_agent = identity.get("_execution_agent")
+                    sources.append(
+                        {
+                            "request_id": producer_id,
+                            "agent_id": str(producer_agent.agname)
+                            if producer_agent is not None
+                            else str(producer.agent.agname)
+                            if producer is not None
+                            else None,
+                            "kind": "input",
+                            "evidence": "result_handle"
+                            if identity.get("_execution_id")
+                            else "registered_future",
+                        }
+                    )
                 if future is not None:
                     if not future.done():
                         found.add(future)

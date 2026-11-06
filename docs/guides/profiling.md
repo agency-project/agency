@@ -30,15 +30,32 @@ to your browser machine. A port already in use prevents `agwebui.run()` from sta
 
 ## Live execution profiler
 
-Open `/profiler?run=live&view=trajectory` and keep **Following latest** enabled
-for incoming calls and results. Running calls stay at the top of each selected
-agent column; completed calls move into history. Use **Add agent** to inspect
-agents side by side, or **Agent overlay** for a shared time axis.
+Open `/profiler?run=live&view=trajectory`. Each selected agent column follows
+incoming calls and results until you scroll into its history; **Live in this
+column** resumes following that column, and **Jump to live** returns the whole
+display to the latest activity. Running calls stay above completed history.
+Use **Add agent** to inspect agents side by side, or **Agent overlay** for a
+shared time axis.
 
-The **Multi-agent** view combines agent transcripts, token/time summaries,
-concurrent work, and recorded system counters. Missing measurements stay
-unavailable. See [live trajectory](profiling/live-trajectory.md) for replay
-and history controls.
+Navigation provides **Execution Trajectory**, **Profiler**, **Critical Path**,
+and **Compare runs**. Profiler contains Activity, LLM, Tools, and Systems
+categories; Critical Path opens the dedicated historical view. Missing
+measurements stay unavailable. See
+[live metrics](../live-metrics.md) for metric scopes and measurement boundaries,
+[Critical Path](profiling/critical-path.md) for
+observed dependencies, and [live trajectory](profiling/live-trajectory.md) for
+replay, history, and execution controls.
+
+## Historical Critical Path Profiler
+
+Open `/critical-path`, or choose **Critical Path** in the navigation, to analyze
+saved executions on a shared agent timeline. The view loads compact backend
+analysis and provides dependency inspection, agent focus, process expansion,
+zoom/pan, and links to detailed recorded evidence. It reports measured path
+coverage and unexplained intervals explicitly. Recorded files under
+`agency_runs/`, `artifacts/`, `runs/`, and the configured profiler directory are
+available in its catalog. See the [profiler guide](profiling/critical-path.md)
+for correlation rules and known limitations.
 
 <a id="raw-trace-viewer"></a>
 
@@ -129,7 +146,6 @@ explains attribution and measurement limits.
 
 ## Inspect a run
 
-Continue with [profiler views and interpretation](profiling/views.md),
-[live trajectory and replay](profiling/live-trajectory.md), or the
-[screenshot gallery](profiling/screenshots.md). These are details of the same
+Continue with [profiler views and interpretation](profiling/views.md) or
+[live trajectory and replay](profiling/live-trajectory.md). These are details of the same
 viewer, with recorded, inferred, synthetic and unavailable data kept distinct.

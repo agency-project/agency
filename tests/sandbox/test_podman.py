@@ -62,7 +62,11 @@ def _make_sandbox(**kwargs):
     from agency.sandbox.agsandbox import agSandbox
 
     uid = str(uuid.uuid4())
-    cfg = kwargs.pop("agconfig", None) or agconfig_cls()
+    cfg = kwargs.pop("agconfig", None)
+    if cfg is None:
+        cfg = agconfig_cls()
+        # Filesystem/checkpoint tests do not require GPU device setup.
+        cfg.sandbox.gpu_passthrough = False
     cfg.sandbox.backend = "podman"
     return agSandbox(uid, agconfig=cfg, **kwargs)
 

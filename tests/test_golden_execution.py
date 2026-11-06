@@ -22,9 +22,9 @@ Pause/resume assertions cover requested state, not proof that every PID is stopp
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -47,6 +47,7 @@ from agency.engine.host_servers import llm_handler_server
 from agency.engine.host_servers.host_interaction_server import HostInteractionServer
 from agency.harness.executable import harness_installation_mounts, resolve_harness_binary
 from agency.llm.mock import _MockBackend
+from tests.exchange_helpers import record_exchange
 
 
 # for_config() currently uses these strings; there is no harness enum/registry.
@@ -125,6 +126,10 @@ def _harness_problem(harness: str, image: str) -> "str | None":
             f"{proc.returncode}); supply an image with its runtime through "
             f"AGENCY_TEST_HARNESS_IMAGE. Output: {output}"
         )
+    if harness == "codex" and not re.search(
+        r"\bcodex-cli (?:0\.147\.0|0\.162\.1)\b", proc.stdout + proc.stderr
+    ):
+        return "golden Codex execution requires supported CLI version 0.147.0 or 0.162.1"
     return None
 
 
@@ -159,41 +164,33 @@ def _text(messages, role):
     return "\n".join(parts)
 
 
-def _response_chain(payloads: "list[dict]") -> "list[tuple[str, dict]]":
-    """Hash each block deterministically for storage -- the mock backend
-    (agency/llm/mock.py) only ever reads an exchange's response chain, so
-    this fixture never needs a prompt chain at all."""
-    return [
-        (hashlib.sha256(json.dumps(p, sort_keys=True, default=str).encode()).hexdigest(), p)
-        for p in payloads
-    ]
-
-
 def _write_replay(path):
     logger = agDataLogger(agconfig(dataloggerconfig(db_path=str(path))))
     logger.start()
     try:
         for index, answer in enumerate((ANSWER,) * 8):
-            logger.record_llm_exchange(
+            record_exchange(
+                logger,
                 f"golden-{index}",
-                exchange_type="llm_block",
-                prompt_chain=[],
-                response_chain=_response_chain(
-                    [
-                        {"type": "text", "index": 0, "text": answer},
-                        {
-                            "type": "metadata",
-                            "index": 2**31 - 1,
-                            "usage": {
-                                "prompt_tokens": 10,
-                                "completion_tokens": 2,
-                                "total_tokens": 12,
+                response=[
+                    {
+                        "role": "assistant",
+                        "blocks": [
+                            {"type": "text", "index": 0, "text": answer},
+                            {
+                                "type": "metadata",
+                                "index": 2**31 - 1,
+                                "usage": {
+                                    "prompt_tokens": 10,
+                                    "completion_tokens": 2,
+                                    "total_tokens": 12,
+                                },
+                                "stop_reason": "stop",
+                                "data": [],
                             },
-                            "stop_reason": "stop",
-                            "data": [],
-                        },
-                    ]
-                ),
+                        ],
+                    }
+                ],
             )
     finally:
         logger.stop()
@@ -261,7 +258,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
     _write_replay(replay)
     config = agconfig(
         agentconfig(harness=harness, log_dir=str(directory / "logs")),
-        sandboxconfig(backend=CONTAINER_BACKEND, base_image=golden_image),
+        sandboxconfig(backend=CONTAINER_BACKEND, base_image=golden_image, gpu_passthrough=False),
         resourcesconfig(idle_cpus=1, idle_memory="2g"),
         llmconfig(
             provider="mock",

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import itertools
 import json
 import queue
@@ -12,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import Future
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -30,13 +29,24 @@ from ...llm.agllm import agllm, dispatch_attempt
 from ...llm.response_check import (
     EMPTY,
     TRUNCATED,
+    ResponseVerdict,
     inspect_response,
     mark_incomplete_tool_calls,
 )
+from ...llm.message_store import MessageStore, split_tool_schema
+from ...llm.context_fit import (
+    SizeEstimator,
+    fit_messages,
+    is_context_overflow,
+    message_chars,
+    shrink,
+)
 from ...llm.usage_tracker import LlmUsageTracker
+from ...native_harness.usage import prompt_tokens as whole_prompt_tokens
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
+    from ...agcontext import agcontext
     from ...observability.agdatalogger import agDataLogger
 
 TRANSIENT_DISPATCH_EXCS = (
@@ -47,6 +57,12 @@ _STREAM_QUEUE_MAXSIZE = 256
 _STREAM_JOIN_TIMEOUT_S = 5.0
 
 
+# A request the backend rejects for its size is cut further and sent again at
+# most this many times (llm/context_fit.py).
+_OVERFLOW_REFITS = 3
+_CONTEXT_OVERFLOW = "context_overflow"
+
+
 def _annotate(span, **metadata) -> None:
     annotate = getattr(span, "annotate", None)
     if annotate is not None:
@@ -55,19 +71,6 @@ def _annotate(span, **metadata) -> None:
 
 def _blocks_to_message(blocks: "dict[int, dict]") -> dict:
     return {"role": "assistant", "blocks": [blocks[i] for i in sorted(blocks)]}
-
-
-def _request_profile_metadata(request: dict) -> dict:
-    from ...observability.profiler import agprof
-
-    known = ("messages", "tools", "tool_choice")
-    return {
-        **agprof.detail_metadata("llm.tools", request.get("tools") or []),
-        **agprof.detail_metadata("llm.tool_choice", request.get("tool_choice")),
-        **agprof.detail_metadata(
-            "llm.request_extra", {k: v for k, v in request.items() if k not in known}
-        ),
-    }
 
 
 def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason) -> dict:
@@ -92,37 +95,47 @@ def _response_profile_metadata(message: dict, usage: "dict | None", stop_reason)
     }
 
 
-def _payload_hash(payload: dict) -> str:
-    """Content-addressable storage key for one {role, **block} transcript
-    payload."""
-    role = payload.get("role")
-    block_type = payload.get("type")
-    if block_type == "tool_use" and payload.get("id"):
-        identity: dict = {"role": role, "type": block_type, "id": payload["id"]}
-    elif block_type == "tool_result" and payload.get("tool_call_id"):
-        identity = {"role": role, "type": block_type, "tool_call_id": payload["tool_call_id"]}
-    elif block_type == "text":
-        identity = {"role": role, "type": block_type, "text": payload.get("text")}
-    elif block_type == "thinking":
-        # Current Claude models return thinking with empty text by default,
-        # so text alone would collapse every block of a run into one stored
-        # payload; the signature (Anthropic) / encrypted content (OpenAI
-        # Responses) is what tells them apart. Missing and "" normalize alike
-        # so a rich response block and its replay still dedupe.
-        identity = {
-            "role": role,
-            "type": block_type,
-            "text": payload.get("text"),
-            "signature": payload.get("signature") or "",
-        }
-    else:
-        identity = payload
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+def _display_tag(internal_kind: "str | None") -> "str | None":
+    """A short, human label for the optional `agency_internal_kind` a
+    caller's dispatch/check_tool_policy request carried (e.g.
+    "example_worker" -> "Worker") -- None when there's nothing to tag. Kept
+    generic (a prefix-strip + capitalize, not a hardcoded per-harness
+    mapping) so any future "<namespace>_<role>"-shaped internal_kind value
+    gets a reasonable label without this file needing to know about it."""
+    if not internal_kind:
+        return None
+    label = internal_kind.rsplit("_", 1)[-1]
+    return label.capitalize() if label else None
 
 
-def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
+def _tag_response_message_for_display(response_message: "dict | None", tag: str) -> "dict | None":
+    """A tagged DEEP COPY of `response_message`, for recording only -- the
+    caller must keep using the original, untagged dict for anything that
+    continues the actual conversation (the model's own context) or matches
+    a tool call by name for dispatch. Only text content and tool_use block
+    names get the tag; tool_result content is left alone since it's often
+    raw JSON a viewer may try to parse, and the adjacent (now-tagged)
+    tool_use block already carries the same attribution."""
+    if response_message is None:
+        return None
+    tagged = copy.deepcopy(response_message)
+    for block in tagged.get("blocks") or []:
+        if block.get("type") == "tool_use" and block.get("name"):
+            block["name"] = f"[{tag}] {block['name']}"
+        elif block.get("type") == "text" and block.get("text"):
+            block["text"] = f"[{tag}] {block['text']}"
+    return tagged
+
+
+def _classify_dispatch_exception(
+    error: BaseException, *, native: bool = False
+) -> "tuple[int, bool] | None":
     """(status_code, transient) for a known LLM-backend failure category, or
     None if *error* isn't one of them (caller re-raises it unmodified)."""
+    if native:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if isinstance(status, int) and 400 <= status <= 599:
+            return status, status in {408, 409, 425, 429} or status >= 500
     if isinstance(error, BAD_REQUEST_EXCS):
         return 400, False
     if isinstance(error, UnusableResponseError):
@@ -151,13 +164,28 @@ def _retry_in_place(error: BaseException) -> bool:
 class _ResponsePolicy:
     """llmconfig's handling of unusable responses, read once per request."""
 
-    def __init__(self, llm) -> None:
+    def __init__(self, llm, *, native: bool = False) -> None:
+        self.native = native
         self.unusable_retries = max(0, int(getattr(llm, "unusable_response_retries", 0) or 0))
         self.backoff_s = max(0.0, float(getattr(llm, "unusable_response_backoff_s", 0.0) or 0.0))
         self.fail_on_empty = bool(getattr(llm, "fail_on_empty_response", True))
         self.truncation_retries = max(0, int(getattr(llm, "truncation_retries", 0) or 0))
         self.multiplier = float(getattr(llm, "truncation_output_multiplier", 2.0) or 2.0)
         self.ceiling = getattr(llm, "truncation_max_output_tokens", None)
+        if native:
+            # A native CLI must see the original response and decide whether
+            # to retry. Host regeneration would silently change its attempt
+            # count, output budget, and handling of empty responses.
+            self.unusable_retries = 0
+            self.truncation_retries = 0
+            self.fail_on_empty = False
+
+    def inspect(self, message, stop_reason, *, empty_is_unusable=True):
+        # The native CLI owns malformed/truncated output handling too. Never
+        # turn the provider's original response into a host-generated error.
+        if self.native:
+            return ResponseVerdict(True)
+        return inspect_response(message, stop_reason, empty_is_unusable=empty_is_unusable)
 
     def next_output_cap(self, current: int) -> "int | None":
         """The larger limit to re-ask with after a cut-off response, or None
@@ -199,14 +227,57 @@ def _response_ids_of(message: "dict | None") -> dict:
     return {}
 
 
+def _provider_error_fields(error: BaseException) -> dict:
+    body = getattr(error, "provider_error", None)
+    if body is None:
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                body = response.json()
+            except (ValueError, AttributeError):
+                body = getattr(response, "text", None)
+        if body is None:
+            body = getattr(error, "body", None)
+    fields = {"provider_error": copy.deepcopy(body)} if isinstance(body, (dict, str)) else {}
+    headers = getattr(error, "provider_headers", None)
+    if headers is None:
+        headers = getattr(getattr(error, "response", None), "headers", {})
+    safe = {
+        key.lower(): value
+        for key, value in (headers or {}).items()
+        if key.lower()
+        in {
+            "content-type",
+            "retry-after",
+            "retry-after-ms",
+            "x-should-retry",
+            "request-id",
+            "x-request-id",
+        }
+    }
+    if safe:
+        fields["provider_headers"] = safe
+    return fields
+
+
 class _DispatchError(Exception):
     """Raised by the non-streaming path; carries what build_app()'s route
     needs to translate this into an HTTP response."""
 
-    def __init__(self, message: str, *, status_code: int, transient: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        transient: bool,
+        provider_error=None,
+        provider_headers=None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.transient = transient
+        self.provider_error = provider_error
+        self.provider_headers = provider_headers
 
 
 class _RequestAborted(Exception):
@@ -364,6 +435,8 @@ class LlmHandlerServer:
         parent_context=None,
         request_id: "str | None" = None,
         skill_name: "str | None" = None,
+        context: "agcontext | None" = None,
+        outputs_complete: "Callable[[], bool] | None" = None,
     ) -> None:
         self._data_logger = data_logger
         self._usage_tracker = usage_tracker
@@ -380,9 +453,42 @@ class LlmHandlerServer:
         self._transcript: "list[dict]" = []
         self._transcript_lock = threading.Lock()
         self._request_id = request_id
+        from ...observability.profiler import agprof
+
+        self._profile_attributes = {
+            **agprof.current_execution_attributes(),
+            **(
+                {"request_id": request_id, "agency.run_id": request_id}
+                if request_id is not None
+                else {}
+            ),
+        }
         self._skill_name = skill_name
+        # The skill run's agcontext. Its ``message_store`` is used here directly:
+        # ``message_patch_lookup`` is applied to every request, and every message
+        # and block hashed lands in its lookups. The engine sets the agcontext's
+        # ``message_hash_list`` once the skill run has committed.
+        self._context = context
+        self._message_store = context.message_store if context is not None else MessageStore()
+        # Per call_label, from the request's arrival until the reply: the hashes of
+        # the messages the harness sent and of the patched messages sent to the LLM
+        # backend, and the harness's own message dicts (for the usage tracker).
+        self._call_messages: "dict[str, dict]" = {}
+        self._call_messages_lock = threading.Lock()
+        self._outputs_complete = outputs_complete
 
         self.change_config(agconfig)
+
+    def _can_finish_empty(self, stop_reason, internal_kind) -> bool:
+        # Tool output submission does not itself end a harness turn. Once
+        # every required field is recorded, a normal empty stop is a valid
+        # finish. Internal helper calls still need an answer of their own.
+        return (
+            stop_reason == "stop"
+            and internal_kind is None
+            and self._outputs_complete is not None
+            and self._outputs_complete()
+        )
 
     def get_all_transcripts(self) -> "list[dict]":
         with self._transcript_lock:
@@ -393,33 +499,43 @@ class LlmHandlerServer:
             entries.extend(handle.get_transcript())
         return entries
 
-    def get_main_transcript(self, needle: "str | None" = None) -> "list[dict]":
+    def get_main_history(self, needle: "str | None" = None) -> "list[str]":
+        """The skill run's final history as message hashes, which resolve against
+        this server's ``message_store``. The main call is the one whose harness
+        messages are the longest -- for a stateful harness the last -- and its
+        reply goes on the end."""
         entries = [
             entry
             for entry in self.get_all_transcripts()
             if isinstance(entry.get("request"), dict)
-            and isinstance(entry["request"].get("messages"), list)
             and isinstance(entry.get("response"), dict)
+            and entry.get("harness_message_hashes") is not None
         ]
         if not entries:
             return []
+
+        message_store = self._message_store
         candidates = entries
         if needle is not None:
             matching = [
                 e
                 for e in entries
                 if any(
-                    b.get("text") == needle
-                    for m in e["request"]["messages"]
-                    for b in m.get("blocks", [])
+                    payload.get("text") == needle
+                    for message_hash in e["harness_message_hashes"]
+                    for _block_hash, payload in message_store.payloads(message_hash)
                 )
             ]
             if matching:
                 candidates = matching
-        best = max(candidates, key=lambda e: len(e["request"]["messages"]))
-        messages = [m for m in best["request"]["messages"] if m.get("role") != "system"]
-        messages.append(best["response"])
-        return messages
+        best = max(candidates, key=lambda e: len(e["harness_message_hashes"]))
+        history = [
+            message_hash
+            for message_hash in best["harness_message_hashes"]
+            if message_store.role(message_hash) != "system"
+        ]
+        history.append(message_store.add_message(best["response"]))
+        return history
 
     def _tag_metadata_block(
         self,
@@ -428,9 +544,12 @@ class LlmHandlerServer:
         *,
         ttft_ms: "float | None" = None,
         retries: "list[dict] | None" = None,
+        sent_chars: "tuple[int, bool] | None" = None,
     ) -> None:
         """Enrich this exchange's metadata block with its own new (non-
-        cumulative) prompt token count and the skill/request it belongs to."""
+        cumulative) prompt token count and the skill/request it belongs to.
+        `sent_chars`, the size of what the backend was sent and whether it
+        was fitted, calibrates context fitting against the backend's count."""
         blocks = message.get("blocks") or []
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
@@ -462,12 +581,16 @@ class LlmHandlerServer:
         metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
             request_messages, message, prompt_tokens, completion_tokens
         )
+        if sent_chars:
+            self._fit_size.observe(sent_chars[0], whole_prompt_tokens(usage).total, sent_chars[1])
         metadata_block["request_id"] = self._request_id
         metadata_block["skill"] = self._skill_name
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
         self._backend = agllm.for_config(agconfig)
+        self._fit_limit: "int | None" = None
+        self._fit_size = SizeEstimator()
 
     def resolve_model(self) -> str:
         return self._backend.model or ""
@@ -498,12 +621,20 @@ class LlmHandlerServer:
     ) -> dict:
         from ...observability.profiler import agprof
 
-        request = self._prepare_request(request, abort_event=abort_event)
+        internal_kind = split_tool_schema(request.get("messages") or [])[3].get(
+            "agency_internal_kind"
+        )
         call_label = uuid.uuid4().hex[:12]
+        request = self._prepare_request(
+            request,
+            abort_event=abort_event,
+            call_label=call_label,
+        )
         self._data_logger.record_event(
             type="agent_state",
             payload={
                 "state": "waiting_llm",
+                "causal_evidence": self._request_evidence(request),
                 "request_id": self._request_id,
                 "model": self.resolve_model(),
             },
@@ -515,12 +646,12 @@ class LlmHandlerServer:
 
         def finalize_error(error: BaseException) -> None:
             nonlocal finalized
-            self._finalize_terminal(call_label, kind="error", error=error)
+            self._finalize_terminal(call_label, kind="error", request=request, error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
-            self._finalize_terminal(call_label, kind="cancelled")
+            self._finalize_terminal(call_label, kind="cancelled", request=request)
             finalized = True
 
         def complete_failure(error: BaseException) -> None:
@@ -532,10 +663,17 @@ class LlmHandlerServer:
         def aborted() -> bool:
             return abort_event is not None and abort_event.is_set()
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         backend = self._backend
         unusable_left = policy.unusable_retries
         truncation_left = policy.truncation_retries
+        overflow_left = _OVERFLOW_REFITS
         retries: "list[dict]" = []
         attempt = 0
         try:
@@ -552,11 +690,11 @@ class LlmHandlerServer:
                 ) as attempt_span:
                     _annotate(
                         attempt_span,
+                        **self._profile_attributes,
                         model=backend.model,
                         provider=type(backend).__name__,
                         call_label=call_label,
                         **agprof.detail_metadata("llm.messages", request.get("messages", [])),
-                        **_request_profile_metadata(request),
                     )
                     t0 = time.perf_counter()
                     try:
@@ -580,21 +718,29 @@ class LlmHandlerServer:
                             and not aborted()
                         ):
                             retry = (error.reason, f"{type(error).__name__}: {error}")
+                        elif overflow_left > 0 and self._refit_after_overflow(request, error):
+                            retry = (_CONTEXT_OVERFLOW, f"{type(error).__name__}: {error}")
                         else:
                             complete_failure(error)
-                            classified = _classify_dispatch_exception(error)
+                            classified = _classify_dispatch_exception(error, native=policy.native)
                             if classified is None:
                                 raise
                             status_code, transient = classified
                             raise _DispatchError(
-                                str(error), status_code=status_code, transient=transient
+                                str(error),
+                                status_code=status_code,
+                                transient=transient,
+                                **_provider_error_fields(error),
                             ) from error
                     else:
                         ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
-                        verdict = inspect_response(
+                        output_complete = self._can_finish_empty(
+                            result["stop_reason"], internal_kind
+                        )
+                        verdict = policy.inspect(
                             result["message"],
                             result["stop_reason"],
-                            empty_is_unusable=policy.fail_on_empty,
+                            empty_is_unusable=policy.fail_on_empty and not output_complete,
                         )
                         deliver = verdict.usable
                         if verdict.reason == TRUNCATED:
@@ -616,10 +762,11 @@ class LlmHandlerServer:
                                 ttft_ms=ttft_ms,
                             )
                             self._tag_metadata_block(
-                                request["messages"],
+                                self._tracked_messages(call_label, request),
                                 result["message"],
                                 ttft_ms=ttft_ms,
                                 retries=retries,
+                                sent_chars=self._sent_chars(call_label),
                             )
                             with self._transcript_lock:
                                 self._transcript.append(
@@ -630,10 +777,14 @@ class LlmHandlerServer:
                                         "finish_reason": result["stop_reason"],
                                         "streaming": False,
                                         "ts": time.time(),
+                                        **self._transcript_fields(call_label),
                                     }
                                 )
-                            self._finalize_success(call_label, request, result["message"])
+                            self._finalize_success(
+                                call_label, request, result["message"], internal_kind=internal_kind
+                            )
                             finalized = True
+                            result["structured_output_complete"] = output_complete
                             return result
                         _annotate(
                             attempt_span,
@@ -653,7 +804,10 @@ class LlmHandlerServer:
                             ) from error
                         retry = (verdict.reason, verdict.detail)
                 reason, detail = retry
-                if reason == TRUNCATED:
+                if reason == _CONTEXT_OVERFLOW:
+                    overflow_left -= 1
+                    retries.append(self._record_retry(call_label, attempt, reason, detail))
+                elif reason == TRUNCATED:
                     truncation_left -= 1
                     retries.append(
                         self._record_retry(
@@ -702,12 +856,20 @@ class LlmHandlerServer:
         handle = _handle if _handle is not None else self._new_stream_handle(abort_event)
         if abort_event is not None and handle._cancel_event is not abort_event:
             raise ValueError("stream handle and abort event must use the same event")
-        request = self._prepare_request(request, abort_event=handle._cancel_event)
+        internal_kind = split_tool_schema(request.get("messages") or [])[3].get(
+            "agency_internal_kind"
+        )
         call_label = handle.call_label
+        request = self._prepare_request(
+            request,
+            abort_event=handle._cancel_event,
+            call_label=call_label,
+        )
         self._data_logger.record_event(
             type="agent_state",
             payload={
                 "state": "waiting_llm",
+                "causal_evidence": self._request_evidence(request),
                 "request_id": self._request_id,
                 "model": self.resolve_model(),
             },
@@ -720,6 +882,7 @@ class LlmHandlerServer:
                 self._run_stream_producer,
                 request,
                 handle,
+                internal_kind=internal_kind,
                 daemon=True,
             )
             with self._handles_lock:
@@ -741,9 +904,9 @@ class LlmHandlerServer:
                     self._handles.remove(handle)
             handle._thread = None
             if was_cancelled:
-                self._finalize_terminal(call_label, kind="cancelled")
+                self._finalize_terminal(call_label, kind="cancelled", request=request)
                 raise _RequestAborted from error
-            self._finalize_terminal(call_label, kind="error", error=error)
+            self._finalize_terminal(call_label, kind="error", request=request, error=error)
             raise
 
     def stop(self) -> None:
@@ -876,7 +1039,7 @@ class LlmHandlerServer:
             server = http_request.app.state.llm_handler_server
             request = await http_request.json()
             try:
-                if request.get("stream"):
+                if request.pop("stream", False):
                     abort_event = threading.Event()
                     handle = server._new_stream_handle(abort_event)
                     worker, result = server._spawn_http_worker(
@@ -904,6 +1067,11 @@ class LlmHandlerServer:
                                 "error": {
                                     "message": item["message"],
                                     "transient": item["transient"],
+                                    **{
+                                        key: item[key]
+                                        for key in ("provider_error", "provider_headers")
+                                        if key in item
+                                    },
                                 }
                             },
                             status_code=item["status_code"],
@@ -928,7 +1096,13 @@ class LlmHandlerServer:
                 return JSONResponse(result.result())
             except _DispatchError as e:
                 return JSONResponse(
-                    {"error": {"message": str(e), "transient": e.transient}},
+                    {
+                        "error": {
+                            "message": str(e),
+                            "transient": e.transient,
+                            **_provider_error_fields(e),
+                        }
+                    },
                     status_code=e.status_code,
                 )
             except _RequestAborted as error:
@@ -955,126 +1129,250 @@ class LlmHandlerServer:
         request: dict,
         *,
         abort_event: "threading.Event | None" = None,
+        call_label: "str | None" = None,
     ) -> dict:
         prepared = copy.deepcopy(request)
-        prepared.pop("agency_internal_kind", None)
         if abort_event is not None and abort_event.is_set():
             raise _RequestAborted
+        if call_label is not None:
+            # Hash once, right after translation; everything below (the patches,
+            # the record, the committed history) reuses these hashes.
+            self._stage_request(prepared, call_label)
         return prepared
+
+    # ------------------------------------------------------------------
+    # Message hashing and the persistent message_patch_lookup (llm/message_store.py)
+    # ------------------------------------------------------------------
+
+    def _stage_request(self, prepared: dict, call_label: str) -> None:
+        """Hash the harness's (translated) messages, then replace the request's
+        messages with the same messages rebuilt through ``message_patch_lookup``."""
+        harness_messages = prepared.get("messages")
+        if not isinstance(harness_messages, list):
+            return
+        with self._message_store:
+            harness_message_hashes = self._message_store.add_messages(harness_messages)
+            patched_messages, fitted = self._fit_to_context(
+                self._message_store.materialize(harness_message_hashes), call_label
+            )
+            patched_message_hashes = self._message_store.add_messages(patched_messages)
+        prepared["messages"] = patched_messages
+        with self._call_messages_lock:
+            self._call_messages[call_label] = {
+                "harness_message_hashes": harness_message_hashes,
+                "patched_message_hashes": patched_message_hashes,
+                "harness_messages": harness_messages,
+                # The size of what the backend is sent, for context fitting.
+                "sent_chars": sum(message_chars(m) for m in patched_messages),
+                "fitted": fitted,
+            }
+
+    def _fit_to_context(self, messages: "list[dict]", call_label: str) -> "tuple[list[dict], bool]":
+        """A request the backend would reject for its size, with its oldest
+        tool output cleared until it fits (agency/llm/context_fit.py), and
+        whether anything was cleared."""
+        if not self._agconfig.llm.fit_to_context_limit:
+            return messages, False
+        if self._fit_limit is None:
+            try:
+                self._fit_limit = self.context_limit()
+            except Exception:  # noqa: S110 -- no limit known: send as is
+                return messages, False
+        budget = self._fit_size.budget(sum(message_chars(m) for m in messages), self._fit_limit)
+        fitted, cleared = fit_messages(messages, budget)
+        if cleared:
+            agname = getattr(self._data_logger, "_default_name", None)
+            self._data_logger.record_event(
+                type="context_fit",
+                payload={"cleared_tool_results": cleared, "context_limit": self._fit_limit},
+                call_label=call_label,
+                term_message=(
+                    f"[{agname}] LLM    ✂  request over the {self._fit_limit}-token context "
+                    f"limit: cleared {cleared} old tool result(s)"
+                ),
+                print_to_terminal=False,
+            )
+        return fitted, bool(cleared)
+
+    def _refit_after_overflow(self, request: dict, error: BaseException) -> bool:
+        """For a request the backend rejected for its size although context
+        fitting let it through, cut it further (in place) so that it can be
+        sent again, rather than handing the harness an error most harnesses
+        end their turn on. False if this is not that, or nothing is left."""
+        if not self._agconfig.llm.fit_to_context_limit or not is_context_overflow(str(error)):
+            return False
+        messages = request.get("messages")
+        if not isinstance(messages, list):
+            return False
+        shrunk, cleared = shrink(messages)
+        if not cleared:
+            return False
+        request["messages"] = shrunk
+        call_label = request.get("call_label")
+        agname = getattr(self._data_logger, "_default_name", None)
+        self._data_logger.record_event(
+            type="context_fit",
+            payload={"cleared_tool_results": cleared, "after_overflow": str(error)[:500]},
+            call_label=call_label,
+            term_message=f"[{agname}] LLM    ✂  backend rejected the size: cleared {cleared} more",
+            print_to_terminal=False,
+        )
+        return True
+
+    def _sent_chars(self, call_label: "str | None") -> "tuple[int, bool] | None":
+        """(characters sent, whether context fitting cleared any) for a call."""
+        call = self._call_messages_of(call_label)
+        if call is None or "sent_chars" not in call:
+            return None
+        return call["sent_chars"], call["fitted"]
+
+    def _call_messages_of(self, call_label: "str | None") -> "dict | None":
+        with self._call_messages_lock:
+            return self._call_messages.get(call_label) if call_label is not None else None
+
+    def _tracked_messages(self, call_label: "str | None", request: dict) -> "list[dict]":
+        """The messages the usage tracker should match branches by: what the
+        harness sent, not what ``message_patch_lookup`` turned it into, or a patched
+        prefix would break the match with the harness's next, unpatched request. The
+        ``tool_schema`` message is left out as well: the tools a harness sends can
+        change between the calls of one conversation."""
+        call = self._call_messages_of(call_label)
+        messages = call["harness_messages"] if call is not None else request["messages"]
+        return split_tool_schema(messages)[0]
+
+    def _transcript_fields(self, call_label: "str | None") -> dict:
+        """What every transcript entry carries besides request and response."""
+        fields: dict = {"call_label": call_label}
+        call = self._call_messages_of(call_label)
+        if call is not None:
+            fields["harness_message_hashes"] = call["harness_message_hashes"]
+        return fields
 
     def _finalize_terminal(
         self,
         call_label: "str | None",
         *,
         kind: str,
+        request: "dict | None" = None,
         error: "BaseException | None" = None,
     ) -> None:
-        """Record this exchange's non-success outcome. No prompt is
-        captured here (matching prior behavior) -- only a single synthetic
-        marker block on the response chain."""
+        """Record this exchange's non-success outcome, retaining the attempted
+        prompt even when a request fails or is cancelled. The response is one
+        assistant message holding a single ``error`` or ``cancelled`` block."""
         agname = getattr(self._data_logger, "_default_name", None)
         if kind == "cancelled":
-            marker = {"cancelled": True}
+            block = {"type": "cancelled", "index": 0}
             suffix = "cancelled"
         else:
             suffix = f"{type(error).__name__}: {error}"
-            marker = {"error": suffix}
+            block = {"type": "error", "index": 0, "error": suffix}
+        call = self._call_messages_of(call_label) if request else None
+        with self._message_store:
+            if call is not None:
+                harness_message_hashes = call["harness_message_hashes"]
+                patched_message_hashes = call["patched_message_hashes"]
+            elif request:
+                harness_message_hashes = patched_message_hashes = self._message_store.add_messages(
+                    request.get("messages") or []
+                )
+            else:
+                harness_message_hashes = patched_message_hashes = []
+            response_message_hashes = [
+                self._message_store.add_message({"role": "assistant", "blocks": [block]})
+            ]
         self._data_logger.record_llm_exchange(
             call_label,
             exchange_type=f"llm_stream_{kind}",
-            prompt_chain=[],
-            response_chain=[(_payload_hash(marker), marker)],
+            message_store=self._message_store,
+            harness_message_hashes=harness_message_hashes,
+            patched_message_hashes=patched_message_hashes,
+            response_message_hashes=response_message_hashes,
             term_message=f"[{agname}] LLM    ✗  {suffix}",
             print_to_terminal=False,
         )
 
-    def _prompt_chain(self, request: dict) -> "list[tuple[str, dict]]":
-        """This exchange's *complete* prompt, as an ordered list of
-        (content hash, payload) pairs -- covers every block the request
-        carries, not just `messages`."""
-        candidates: "list[dict]" = []
-        for message in request.get("messages") or []:
-            role = message.get("role")
-            for block in message.get("blocks") or []:
-                candidates.append({"role": role, **block})
-        for tool in request.get("tools") or []:
-            function = tool.get("function") or {}
-            candidates.append(
-                {
-                    "role": "tool_schema",
-                    "type": "tool_definition",
-                    "name": function.get("name", ""),
-                    "description": function.get("description", ""),
-                    "parameters": function.get("parameters"),
-                }
-            )
-        if request.get("tool_choice") is not None:
-            candidates.append(
-                {"role": "tool_schema", "type": "tool_choice", "value": request["tool_choice"]}
-            )
-        # Catch-all for any field this function doesn't know to name yet --
-        # same reasoning as llm.request_extra on the span side: an unnamed
-        # field caused exactly this kind of silent gap once already, so a
-        # *new* one must show up here too instead of requiring someone to
-        # notice and hand-add it to the list above first.
-        known_keys = {"messages", "tools", "tool_choice"}
-        request_extra = {k: v for k, v in request.items() if k not in known_keys}
-        if request_extra:
-            candidates.append(
-                {"role": "tool_schema", "type": "request_extra", "value": request_extra}
-            )
-        return [(_payload_hash(payload), payload) for payload in candidates]
+    def _request_evidence(self, request: dict) -> dict:
+        from ...observability.agwebui.causal_graph import exchange_evidence
 
-    def _response_chain(self, response_message: "dict | None") -> "list[tuple[str, dict]]":
-        """This exchange's *complete* response, as an ordered list of
-        (content hash, payload) pairs."""
-        if response_message is None:
-            return []
-        role = response_message.get("role", "assistant")
-        candidates = [{"role": role, **block} for block in response_message.get("blocks") or []]
-        return [(_payload_hash(payload), payload) for payload in candidates]
+        return exchange_evidence(self._prompt_payloads(request), [])
+
+    @staticmethod
+    def _prompt_payloads(request: dict) -> "list[dict]":
+        """This exchange's prompt as ordered ``{role, **block}`` payloads; the
+        tool schema travels as its own ``tool_schema`` message."""
+        return [
+            {"role": message.get("role"), **block}
+            for message in request.get("messages") or []
+            for block in message.get("blocks") or []
+        ]
 
     def _finalize_success(
-        self, call_label: "str | None", request: dict, response_message: "dict | None"
+        self,
+        call_label: "str | None",
+        request: dict,
+        response_message: "dict | None",
+        *,
+        internal_kind: "str | None" = None,
     ) -> None:
-        prompt_chain = self._prompt_chain(request)
-        response_chain = self._response_chain(response_message)
-        if prompt_chain or response_chain:
+        tag = _display_tag(internal_kind)
+        if tag is not None:
+            response_message = _tag_response_message_for_display(response_message, tag)
+        call = self._call_messages_of(call_label)
+        with self._message_store:
+            if call is not None:
+                harness_message_hashes = call["harness_message_hashes"]
+                patched_message_hashes = call["patched_message_hashes"]
+            else:
+                harness_message_hashes = patched_message_hashes = self._message_store.add_messages(
+                    request.get("messages") or []
+                )
+            response_message_hashes = (
+                [self._message_store.add_message(response_message)]
+                if response_message is not None
+                else []
+            )
+        if patched_message_hashes or response_message_hashes:
             self._data_logger.record_llm_exchange(
                 call_label,
                 exchange_type="llm_block",
-                prompt_chain=prompt_chain,
-                response_chain=response_chain,
+                message_store=self._message_store,
+                harness_message_hashes=harness_message_hashes,
+                patched_message_hashes=patched_message_hashes,
+                response_message_hashes=response_message_hashes,
             )
 
     def _run_stream_producer(
         self,
         request: dict,
         handle: "_StreamHandle",
+        internal_kind: "str | None" = None,
     ) -> None:
         from ...observability.profiler import agprof
 
         finalized = False
+        entry_fields = self._transcript_fields(handle.call_label)
 
         def finalize_error(error: BaseException) -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_terminal(handle.call_label, kind="error", error=error)
+            self._finalize_terminal(handle.call_label, kind="error", request=request, error=error)
             finalized = True
 
         def finalize_cancelled() -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_terminal(handle.call_label, kind="cancelled")
+            self._finalize_terminal(handle.call_label, kind="cancelled", request=request)
             finalized = True
 
         def finalize_success(response_message: dict) -> None:
             nonlocal finalized
             if finalized:
                 return
-            self._finalize_success(handle.call_label, request, response_message)
+            self._finalize_success(
+                handle.call_label, request, response_message, internal_kind=internal_kind
+            )
             finalized = True
 
         def publish_error(
@@ -1093,6 +1391,7 @@ class LlmHandlerServer:
                     "message": str(exception),
                     "transient": getattr(exception, "transient", transient),
                     "status_code": getattr(exception, "status_code", status_code),
+                    **_provider_error_fields(exception),
                 },
                 **entry_fields,
             )
@@ -1102,8 +1401,15 @@ class LlmHandlerServer:
                 finalize_cancelled()
             return enqueued
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         retries: "list[dict]" = []
+        overflow_left = [_OVERFLOW_REFITS]
 
         def run_attempt(attempt: int, backend) -> tuple:
             """One ask of the provider. Returns ("stop",) once this producer
@@ -1120,11 +1426,11 @@ class LlmHandlerServer:
             ) as attempt_span:
                 _annotate(
                     attempt_span,
+                    **self._profile_attributes,
                     model=backend.model,
                     provider=type(backend).__name__,
                     call_label=handle.call_label,
                     **agprof.detail_metadata("llm.messages", request.get("messages", [])),
-                    **_request_profile_metadata(request),
                 )
                 t0 = time.perf_counter()
                 try:
@@ -1149,6 +1455,7 @@ class LlmHandlerServer:
                         request=request,
                         response=empty_message,
                         streaming=False,
+                        **entry_fields,
                     )
                     if not enqueued:
                         finalize_cancelled()
@@ -1168,7 +1475,9 @@ class LlmHandlerServer:
                         # a transport failure before any answer is left to the
                         # SDK's own retries and to the harness.
                         return ("retry", e.reason, f"{type(e).__name__}: {e}", e)
-                    classified = _classify_dispatch_exception(e)
+                    if overflow_left[0] > 0 and self._refit_after_overflow(request, e):
+                        return ("overflow", f"{type(e).__name__}: {e}")
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(e, status_code=status_code, transient=transient)
                     return ("stop",)
@@ -1176,7 +1485,7 @@ class LlmHandlerServer:
                 _annotate(attempt_span, ttft_ms=ttft_ms)
 
                 handle.register_stream_exchange(
-                    request=request, response={"role": "assistant", "blocks": []}
+                    request=request, response={"role": "assistant", "blocks": []}, **entry_fields
                 )
                 blocks: "dict[int, dict]" = {}
                 usage = None
@@ -1262,7 +1571,7 @@ class LlmHandlerServer:
                             f"{type(e).__name__}: {e}",
                             e,
                         )
-                    classified = _classify_dispatch_exception(e)
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(
                         e,
@@ -1277,8 +1586,13 @@ class LlmHandlerServer:
                     finalize_cancelled()
                     return ("stop",)
                 message = _blocks_to_message(blocks)
-                verdict = inspect_response(
-                    message, stop_reason, empty_is_unusable=policy.fail_on_empty
+                verdict = policy.inspect(
+                    message,
+                    stop_reason,
+                    empty_is_unusable=(
+                        policy.fail_on_empty
+                        and not self._can_finish_empty(stop_reason, internal_kind)
+                    ),
                 )
                 _annotate(
                     attempt_span,
@@ -1301,6 +1615,9 @@ class LlmHandlerServer:
                     "message": message,
                     "usage": usage,
                     "stop_reason": stop_reason,
+                    "structured_output_complete": self._can_finish_empty(
+                        stop_reason, internal_kind
+                    ),
                 },
                 request=request,
                 response=message,
@@ -1311,7 +1628,13 @@ class LlmHandlerServer:
             if not enqueued:
                 finalize_cancelled()
                 return
-            self._tag_metadata_block(request["messages"], message, ttft_ms=ttft_ms, retries=retries)
+            self._tag_metadata_block(
+                self._tracked_messages(handle.call_label, request),
+                message,
+                ttft_ms=ttft_ms,
+                retries=retries,
+                sent_chars=self._sent_chars(handle.call_label),
+            )
             finalize_success(message)
 
         try:
@@ -1335,6 +1658,15 @@ class LlmHandlerServer:
                 if kind == "ok":
                     deliver(*outcome[1:5])
                     return
+                if kind == "overflow":
+                    overflow_left[0] -= 1
+                    retries.append(
+                        self._record_retry(
+                            handle.call_label, attempt, _CONTEXT_OVERFLOW, outcome[1]
+                        )
+                    )
+                    attempt += 1
+                    continue
                 if kind == "truncated":
                     _, message, usage, stop_reason, ttft_ms, verdict = outcome
                     next_cap = (

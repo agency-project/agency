@@ -12,7 +12,6 @@ import json
 import os
 import shlex
 import shutil
-import sys
 import threading
 import time
 from pathlib import Path
@@ -27,14 +26,14 @@ from agency.configs.agconfig import (
     resourcesconfig,
     sandboxconfig,
 )
-from agency.observability.agwebui import _flush_loop
 from agency.orchestrator import get_orchestrator
 
 from smoke_test_models import load_env_file
+from _common import close_sandboxes, run_example
 
 
 def pace_provider_requests(interval):
-    """Share a request-start budget across this example's two model clients."""
+    """Share a request-start budget across this example's model requests."""
     import httpx
     import openai
 
@@ -114,9 +113,11 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--codex-binary", required=True)
+    parser.add_argument("--source-dir", type=Path, help="Prepared checkout to mount at /testbed")
+    parser.add_argument("--test-python", default="/opt/miniconda3/envs/testbed/bin/python")
+    parser.add_argument("--harness-python", default="python3")
     parser.add_argument("--model", default="gpt-6-luna")
     parser.add_argument("--timeout", type=float, default=600)
-    parser.add_argument("--agents", type=int, choices=(1, 2), default=1)
     parser.add_argument("--request-interval", type=float, default=0)
     args = parser.parse_args()
     load_env_file(args.env_file)
@@ -126,14 +127,17 @@ def main():
     task = json.loads(args.task_file.read_text())
     directory = args.run_dir.resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    # Agency mounts its package root. Supply only runtime code here, so the
-    # host .env and evaluator's gold patches cannot enter that mount.
+
+    # Mount runtime code separately so credentials and reference patches stay on the host.
     runtime = directory / "runtime"
     source = Path(__file__).resolve().parents[1]
     shutil.copytree(
         source / "agency", runtime / "agency", ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
     )
     shutil.copy2(source / "pyproject.toml", runtime / "pyproject.toml")
+    mounts = {"_agency_package": (str(runtime), "/opt/agency_pkg", "ro")}
+    if args.source_dir:
+        mounts["task_source"] = (str(args.source_dir.resolve()), "/testbed", "ro")
     cfg = agconfig(
         llmconfig(
             provider="openai",
@@ -141,208 +145,68 @@ def main():
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             api_key=os.environ["OPENAI_API_KEY"],
             reasoning_effort="none",
-            context_limit=196000,
             max_completion_tokens=4096,
-            idle_timeout=180,
-            stream_timeout=180,
         ),
         agentconfig(
             harness="codex", log_dir=str(directory / "logs"), output_dir=str(directory / "output")
         ),
         harnessadapterconfig(binary_path=args.codex_binary),
         sandboxconfig(
-            backend="docker",
             base_image=args.image,
             gpu_passthrough=False,
-            harness_python_path="/opt/agency-harness-venv/bin/python",
-            mounts={"_agency_package": (str(runtime), "/opt/agency_pkg", "ro")},
+            harness_python_path=args.harness_python,
+            mounts=mounts,
         ),
-        orchestratorconfig(
-            max_concurrent_engines=args.agents, db_path=str(directory / "logs/global_data.sqlite3")
-        ),
+        orchestratorconfig(db_path=str(directory / "logs/global_data.sqlite3")),
         resourcesconfig(idle_cpus=2, idle_memory="4g"),
     )
-    pool = get_orchestrator(cfg, default_db_path=directory / "logs/global_data.sqlite3")
-    actor = Agent("swebench-codex-luna", agconfig=cfg, harness="codex")
-    tester = (
-        Agent("swebench-regression-luna", agconfig=cfg, harness="codex")
-        if args.agents == 2
-        else None
+    pool = get_orchestrator(cfg)
+    actor = Agent("swebench-codex", agconfig=cfg, harness="codex")
+    skill = agskill(
+        name="resolve_swebench_issue",
+        prompt=(
+            "Fix the reported issue in /workspace. Inspect the code, reproduce the bug, "
+            "make a minimal patch, and run relevant tests. "
+            f"Use {args.test_python} for repository tests. "
+            "Edit with Python or sed if apply_patch is unavailable. "
+            "Leave changes in the working tree without committing. "
+            "Finish with a brief report of changes and actual test results."
+        ),
+        input_schema=agdata(issue=agrawstring),
+        output_schema=agdata(report=agrawstring),
     )
-    actors = [actor] if tester is None else [actor, tester]
-    stop = threading.Event()
-    threading.Thread(target=_flush_loop, args=(stop,), daemon=True).start()
     status = "failed"
     result = None
-    pending = []
     pool.data_logger.record_event(
-        "workload_started",
-        {
-            "task": f"SWE-bench Lite · {task['instance_id']}",
-            "model": args.model,
-            "harness": "codex",
-            "dataset": "princeton-nlp/SWE-bench_Lite",
-        },
-        flush=True,
+        "workload_started", {"task": task["instance_id"], "model": args.model}, flush=True
     )
     try:
-        for member in actors:
-            prepare_workspace(member, task)
-        skill = agskill(
-            name="resolve_swebench_issue",
-            prompt=(
-                "Fix the reported issue in the /workspace repository. "
-                "Inspect the code, reproduce the bug, make the patch, and run relevant tests. "
-                "Use /opt/miniconda3/envs/testbed/bin/python for the repository tests. "
-                "Use grep/find inside /workspace (rg is unavailable), and inspect focused code excerpts. "
-                "The shell apply_patch command is unavailable; edit using a Python script or sed. "
-                + (
-                    "Change source code only; another agent is writing the regression test. "
-                    if tester
-                    else ""
-                )
-                + "Leave changes in the working tree. Do not commit. Finish with a brief "
-                "report of changes and actual verification results."
-            ),
-            input_schema=agdata(issue=agrawstring),
-            output_schema=agdata(report=agrawstring),
-        )
-        result = actor.run(skill, agdata(issue=task["problem_statement"]), max_steps=50)
-        pending.append((actor, result))
-        if tester is not None:
-            test_skill = agskill(
-                name="write_swebench_regression",
-                prompt=(
-                    "Independently reproduce the reported issue in /workspace. "
-                    "Add a focused regression test to the existing test_requests.py file. "
-                    "Do not modify source code. Another agent is implementing the fix. "
-                    "Run your test against the unchanged source and report the actual failure. "
-                    "Use /opt/miniconda3/envs/testbed/bin/python for tests. Do not commit. "
-                    "Use grep/find inside /workspace (rg is unavailable), and focused code excerpts. "
-                    "The shell apply_patch command is unavailable; edit using a Python script. "
-                    "For a mocked Response, mark its empty content consumed and provide a no-op close. "
-                    "Finish with the test selector, failure evidence, and edge cases to review."
-                ),
-                input_schema=agdata(issue=agrawstring),
-                output_schema=agdata(report=agrawstring),
-            )
-            test_result = tester.run(
-                test_skill, agdata(issue=task["problem_statement"]), max_steps=50
-            )
-            pending.append((tester, test_result))
-        wait_for_report(actor, result, args.timeout, directory / "agent-result.json")
-        if tester is not None:
-            test_report = wait_for_report(
-                tester, test_result, args.timeout, directory / "tester-result.json"
-            )
-            patch = extract_patch(tester, " -- test_requests.py")
-            if not patch.strip():
-                retry = tester.run(
-                    test_skill,
-                    agdata(
-                        issue=(
-                            task["problem_statement"]
-                            + "\n\nYour previous turn produced no test patch. Use Python to edit "
-                            "test_requests.py directly; do not rely on a shell apply_patch command. "
-                            "Complete the edit and execute the regression on unchanged source."
-                        )
-                    ),
-                    max_steps=30,
-                )
-                pending.append((tester, retry))
-                test_report = wait_for_report(
-                    tester, retry, args.timeout, directory / "tester-followup-result.json"
-                )
-                patch = extract_patch(tester, " -- test_requests.py")
-            if not patch.strip():
-                raise RuntimeError("The regression agent did not produce its test patch")
-            (directory / "regression.patch").write_text(patch)
-            actor.sandbox.write_file("/tmp/regression.patch", patch)
-            output, code = actor.sandbox.exec(
-                "git apply /tmp/regression.patch", workdir="/workspace"
-            )
-            if code:
-                raise RuntimeError(f"Regression patch integration failed: {output}")
-            tester.data_logger.record_event(
-                "handoff",
-                {
-                    "to": str(actor.agname),
-                    "task": "Regression test patch applied to implementer's workspace",
-                    "artifact": "regression.patch",
-                },
-                flush=True,
-            )
-            review = actor.run(
-                skill,
-                agdata(
-                    issue=(
-                        "The regression agent's test has now been applied to your workspace. "
-                        "Verify the combined fix and regression test, review its edge cases, "
-                        "and correct source code if needed. Leave the test intact. "
-                        "Report actual commands and results.\n\n" + json.dumps(test_report)
-                    )
-                ),
-                max_steps=30,
-            )
-            pending.append((actor, review))
-            wait_for_report(actor, review, args.timeout, directory / "integration-result.json")
+        prepare_workspace(actor, task)
+        # Dataset rows can contain CRLF, which the terminal harness rejects.
+        issue = task["problem_statement"].replace("\r\n", "\n").replace("\r", "\n")
+        result = actor.run(skill, agdata(issue=issue), max_steps=50)
+        report = wait_for_report(actor, result, args.timeout, directory / "agent-result.json")
+        patch = extract_patch(actor)
+        (directory / "prediction.patch").write_text(patch)
+        prediction = {
+            "instance_id": task["instance_id"],
+            "model_name_or_path": args.model,
+            "model_patch": patch,
+        }
+        (directory / "prediction.jsonl").write_text(json.dumps(prediction) + "\n")
+        print(report["report"])
+        print(f"patch: {directory / 'prediction.patch'}")
         status = "completed"
     finally:
-        active_error = sys.exc_info()[0] is not None
-        for member, handle in pending:
-            if handle.is_pending():
-                member.cancel(handle)
-                try:
-                    handle.wait(timeout=60)
-                except Exception as error:
-                    print(
-                        f"Cancellation cleanup failed for {member.agname}: {error}", file=sys.stderr
-                    )
-        collection_error = None
         try:
-            if actor.sandbox is not None:
-                patch = extract_patch(actor)
-                (directory / "prediction.patch").write_text(patch)
-                prediction = {
-                    "instance_id": task["instance_id"],
-                    "model_name_or_path": args.model,
-                    "model_patch": patch,
-                }
-                (directory / "prediction.jsonl").write_text(json.dumps(prediction) + "\n")
-        except Exception as error:
-            collection_error = str(error)
-            status = "failed"
-            (directory / "collection-error.json").write_text(
-                json.dumps({"error": collection_error})
-            )
+            if result is not None and result.is_pending():
+                actor.cancel(result)
+                result.wait(timeout=60)
         finally:
-            try:
-                for member in actors:
-                    if member.sandbox is not None:
-                        member.sandbox.destroy()
-            finally:
-                pool.data_logger.record_event(
-                    "done", {"status": status}, update_latest_snapshot=True, flush=True
-                )
-                for member in actors:
-                    member.data_logger.flush()
-                stop.set()
-                pool.shutdown()
-        print(
-            json.dumps(
-                {
-                    "task": task["instance_id"],
-                    "model": args.model,
-                    "harness": "codex",
-                    "agents": args.agents,
-                    "status": status,
-                    "run_dir": str(directory),
-                }
-            )
-        )
-        if collection_error and not active_error:
-            raise RuntimeError(collection_error)
+            close_sandboxes([actor])
+            pool.data_logger.record_event("done", {"status": status}, flush=True)
+        print(f"status: {status}; artifacts: {directory}")
 
 
 if __name__ == "__main__":
-    main()
+    run_example(main)

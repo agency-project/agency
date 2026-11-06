@@ -70,6 +70,7 @@ def test_driver_has_only_interactive_launch_and_isolated_config(name, runtime, t
         assert driver.argv[-2:] == ["--max-turns", "4"]
         config = tomllib.loads((tmp_path / "config.toml").read_text())
         assert config["model"]["agency-proxy"]["api_backend"] == "chat_completions"
+        assert config["ui"]["prompt_suggestions"] is False
         assert "StopCancelled" in json.loads((tmp_path / "hooks/agency.json").read_text())["hooks"]
     else:
         config = json.loads((tmp_path / "opencode.json").read_text())
@@ -95,15 +96,13 @@ def test_context_limit_is_written_into_config_when_lookup_succeeds(
     else:
         config = json.loads((tmp_path / "opencode.json").read_text())
         assert config["provider"]["agency-proxy"]["models"][runtime.model]["limit"] == {
-            "context": 42_000,
-            # 42_000 is too small a window for the 10% share to beat the
-            # flat default floor -- see the dedicated large-window test for
-            # the branch where it actually scales.
-            "output": runtime.agconfig.llm.default_max_tokens,
+            # OpenCode compacts at context - min(output, 32K): 90% of 42_000.
+            "context": 37_800 + 4_200,
+            "output": 4_200,
         }
 
 
-def test_opencode_output_reservation_scales_with_a_large_context_window(
+def test_opencode_reserve_stops_at_its_32k_cap_for_a_large_context_window(
     runtime, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -114,8 +113,9 @@ def test_opencode_output_reservation_scales_with_a_large_context_window(
     )
     config = json.loads((tmp_path / "opencode.json").read_text())
     limit = config["provider"]["agency-proxy"]["models"][runtime.model]["limit"]
-    assert limit["context"] == 500_000
-    assert limit["output"] == max(runtime.agconfig.llm.default_max_tokens, 50_000)
+    # OpenCode never keeps more than 32K free, so context carries the rest of
+    # the 10% margin: it compacts at 450_000.
+    assert limit == {"context": 450_000 + 32_000, "output": 32_000}
 
 
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
@@ -704,7 +704,8 @@ def test_grok_full_answer_is_read_from_committed_updates_not_clipped_stop_hook(r
     assert (event["input_tokens"], event["output_tokens"]) == (10, 20)
 
 
-def test_stream_cancellation_closes_upstream_generator():
+@pytest.mark.parametrize("keepalive_s", [0, 30])
+def test_stream_cancellation_closes_upstream_generator(keepalive_s):
     import asyncio
     from agency.harness.adapters.streaming import stream_response
 
@@ -724,6 +725,8 @@ def test_stream_cancellation_closes_upstream_generator():
             {},
             "model",
             lambda items, model: [items[0]["message"]],
+            keepalive_frame=": keepalive\n\n",
+            keepalive_s=keepalive_s,
         )
         assert await anext(stream) == "committed"
         await stream.aclose()
@@ -983,3 +986,174 @@ def test_retained_unified_pty_prepares_once_and_reuses_handle(runtime, tmp_path,
     finally:
         execution.close()
     handle.close.assert_called_once()
+
+
+def test_stream_response_sends_keepalive_frames_while_upstream_is_silent():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def upstream():
+        await asyncio.sleep(0.35)
+        yield {"type": "done", "message": "committed"}
+
+    async def run():
+        stream = stream_response(
+            SimpleNamespace(dispatch_stream_async=lambda *args: upstream()),
+            "token",
+            {},
+            "model",
+            lambda items, model: [items[0]["message"]],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+        )
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+    assert frames[-1] == "committed"
+    assert set(frames[:-1]) == {"KA"} and len(frames[:-1]) >= 2
+
+
+def test_stream_response_raises_upstream_errors_through_keepalive():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def upstream():
+        await asyncio.sleep(0.15)
+        raise RuntimeError("host dispatch failed")
+        yield
+
+    async def run():
+        stream = stream_response(
+            SimpleNamespace(dispatch_stream_async=lambda *args: upstream()),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+        )
+        return [frame async for frame in stream]
+
+    with pytest.raises(RuntimeError, match="host dispatch failed"):
+        asyncio.run(run())
+
+
+def _failing_after(delay_s, exc):
+    import asyncio
+
+    async def upstream():
+        await asyncio.sleep(delay_s)
+        raise exc
+        yield
+
+    return SimpleNamespace(dispatch_stream_async=lambda *args: upstream())
+
+
+def test_stream_response_sends_error_frame_once_a_keepalive_went_out():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def run():
+        stream = stream_response(
+            _failing_after(0.15, RuntimeError("upstream overloaded")),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=0.1,
+            error_frame=lambda exc: f"ERR:{exc}",
+        )
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+    assert frames[0] == "KA"
+    assert frames[-1] == "ERR:upstream overloaded"
+
+
+def test_stream_response_still_raises_errors_before_any_frame():
+    import asyncio
+    from agency.harness.adapters.streaming import stream_response
+
+    async def run():
+        stream = stream_response(
+            _failing_after(0, RuntimeError("bad request")),
+            "token",
+            {},
+            "model",
+            lambda items, model: [],
+            keepalive_frame="KA",
+            keepalive_s=10,
+            error_frame=lambda exc: f"ERR:{exc}",
+        )
+        return [frame async for frame in stream]
+
+    with pytest.raises(RuntimeError, match="bad request"):
+        asyncio.run(run())
+
+
+def test_codex_idle_without_native_stop_is_failure(execution, monkeypatch):
+    execution.driver.require_completion_signal = CodexDriver.require_completion_signal
+    execution._launched = True
+    execution.driver.ready = lambda handle: True
+    monkeypatch.setattr(execution, "_wait_until", lambda *args: None)
+    monkeypatch.setattr(execution, "_submit", lambda *args: setattr(execution, "_deadline", 0))
+    monkeypatch.setattr(execution, "close", Mock())
+    with pytest.raises(TimeoutError, match="without a native completion signal"):
+        execution.run("work")
+
+
+def test_codex_config_sets_native_reasoning_and_subagent_preferences(runtime, tmp_path):
+    from agency.harness.adapters.codex import CodexAdapter
+
+    runtime.agconfig.llm.reasoning_effort = "medium"
+    runtime.agconfig.harness_adapter.allow_subagents = False
+    adapter = CodexAdapter(runtime.agconfig)
+    adapter._write_codex_config(tmp_path, "http://localhost:1", "gpt-6.1-sol")
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["model_reasoning_effort"] == "medium"
+    assert config["features"]["multi_agent"] is False
+
+
+def test_codex_waits_for_model_settings_before_accepting_composer():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver._model_label = "gpt-6.1-sol"
+    driver._reasoning_effort = "medium"
+    lines = ["› Ask Codex to do anything", "GPT-6.1-Sol default · /workspace"]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 0, 1))
+    assert not driver.ready(handle)
+    lines[1] = "GPT-6.1-Sol medium · /workspace"
+    assert driver.ready(handle)
+
+
+def test_codex_accepts_current_native_trust_dialog():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver.cwd = "/workspace"
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            ["Folder access /workspace", "Trust this folder?", "› 1. Trust and continue"],
+            1,
+            2,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    handle.write_terminal.assert_called_once_with(b"\r")
+
+
+def test_codex_waits_until_paste_is_rendered():
+    driver = CodexDriver.__new__(CodexDriver)
+    screen = ["› Ask Codex to do anything"]
+    generation = [1]
+    handle = SimpleNamespace(terminal_screen=lambda: (screen, 0, 0, generation[0]))
+
+    def wait(predicate, description):
+        assert not predicate()
+        screen[0] = "› [Pasted Content 2000 chars]"
+        generation[0] += 1
+        assert predicate()
+
+    driver.pasted(handle, wait, 1)

@@ -11,7 +11,8 @@ This loop carries no invocation-lifecycle state of its own: cancellation
 propagates the same way it does for every other harness -- a denied tool
 call (`bridge.check_tool_policy`) or a denied/errored model dispatch
 (`llm.dispatch`), both mediated by the same host-side admission checks any
-external harness goes through. There is no separate "checkpoint" concept."""
+external harness goes through. Optional progress snapshots are written only
+after all tool results in a turn have been appended."""
 
 from __future__ import annotations
 
@@ -19,11 +20,12 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from . import tools
-from .profiling import profile_run, span as profile_span
+from .profiling import profile_run, span as profile_span, tool_execution
 from .compaction import maybe_compact
+from .usage import prompt_tokens
 from .annotations import augment_schemas, extract, instruction, event_id, redact
 
 if TYPE_CHECKING:
@@ -90,6 +92,7 @@ def run_react_loop(
     max_steps: int = _DEFAULT_MAX_STEPS,
     offload_dir: str = "./long_tool_call_outputs",
     progress_path: "str | None" = None,
+    on_checkpoint: "Callable[[list], None] | None" = None,
     annotation_arm: str = "baseline",
     observer=None,
     toolset: "tuple[list[dict], dict] | None" = None,
@@ -129,12 +132,15 @@ def run_react_loop(
             },
         )
 
+    measured = None
     for step in range(max_steps):
         with profile_span(bridge, f"turn{step}"):
             before_compaction = messages
             messages, previous_summary = maybe_compact(
-                messages, context_limit, llm, model, previous_summary
+                messages, context_limit, llm, model, previous_summary, measured
             )
+            if messages is not before_compaction:
+                measured = None
             if observer is not None and messages != before_compaction:
                 observer("compaction", {"exchange": step, "messages": messages})
 
@@ -161,6 +167,10 @@ def run_react_loop(
             message = resp["message"]
             tool_calls = message.get("tool_calls") or []
             messages.append(message)
+            measured = (
+                prompt_tokens(usage).total + (usage.get("completion_tokens", 0) or 0),
+                len(messages),
+            )
             if not tool_calls:
                 return ReactLoopResult(
                     status="done",
@@ -201,6 +211,8 @@ def run_react_loop(
                     )
                 prepared_calls.append((tc, fn_name, fn_args, correlation, annotation))
 
+            tool_batch_id = event_id()
+            preceding_tool_call_id = preceding_model_tool_call_id = None
             for tc, fn_name, fn_args, correlation, annotation in prepared_calls:
                 handler = dispatch_table.get(fn_name)
                 call_id = None
@@ -212,7 +224,19 @@ def run_react_loop(
                         fn_name,
                         _parse_tool_input(fn_args),
                         annotation=redact(
-                            {**annotation, "model_tool_call_id": tc["id"]},
+                            {
+                                **annotation,
+                                "model_tool_call_id": tc["id"],
+                                "tool_batch_id": tool_batch_id,
+                                **(
+                                    {
+                                        "preceding_tool_call_id": preceding_tool_call_id,
+                                        "preceding_model_tool_call_id": preceding_model_tool_call_id,
+                                    }
+                                    if preceding_tool_call_id is not None
+                                    else {}
+                                ),
+                            },
                             (getattr(bridge, "token", None),),
                         ),
                     )
@@ -232,7 +256,8 @@ def run_react_loop(
                         tool_started_ns = time.perf_counter_ns()
                         tool_started_wall_ns = time.time_ns()
                         try:
-                            result_content = handler(fn_args)
+                            with tool_execution(bridge, call_id, tc["id"]):
+                                result_content = handler(fn_args)
                         except Exception as exc:
                             result_content = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
                         tool_duration_ns = time.perf_counter_ns() - tool_started_ns
@@ -275,9 +300,18 @@ def run_react_loop(
                         )
                     else:
                         bridge.complete_tool_policy(call_id, result_content)
+                    if tool_duration_ns is not None and isinstance(call_id, str):
+                        preceding_tool_call_id, preceding_model_tool_call_id = call_id, tc["id"]
                 messages.append(
                     {"role": "tool", "tool_call_id": tc["id"], "content": result_content}
                 )
+            # Only after every tool result is in: a resume must never start from a
+            # dangling tool_use, so a crash mid-turn reverts to the previous turn.
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint(messages)
+                except Exception:  # noqa: S110 - best-effort, same as _write_progress
+                    pass
     return ReactLoopResult(
         status="error",
         message=f"exceeded max_steps={max_steps} without a final answer",

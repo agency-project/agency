@@ -29,6 +29,8 @@ class HostDispatchError(RuntimeError):
         super().__init__(item["message"])
         self.status_code = item.get("status_code", 500)
         self.transient = item.get("transient", False)
+        self.provider_error = item.get("provider_error")
+        self.provider_headers = item.get("provider_headers")
 
 
 class HostServicesClient:
@@ -36,12 +38,13 @@ class HostServicesClient:
     `agmanager_host` instance -- the single UDS path any harness (or a
     harness's own profiler) uses to reach the host."""
 
-    def __init__(self, uds_path: str, timeout_s: float = 300) -> None:
+    def __init__(self, uds_path: str, timeout_s: float = 0) -> None:
         self._uds_path = uds_path
-        self._timeout_s = timeout_s
+        # 0 = wait indefinitely: the host sends nothing until a response is final.
+        self._timeout_s = None if timeout_s == 0 else timeout_s
         transport = httpx.HTTPTransport(uds=uds_path)
         self.client = httpx.Client(
-            transport=transport, base_url="http://agmanager-host", timeout=timeout_s
+            transport=transport, base_url="http://agmanager-host", timeout=self._timeout_s
         )
         self._attempt_token_lock = threading.Lock()
         self._active_attempt_token: "str | None" = None
@@ -100,6 +103,9 @@ class HostServicesClient:
             raise RuntimeError("no active upstream attempt token")
         return {ATTEMPT_TOKEN_HEADER: upstream}
 
+    def _dispatch_headers(self, token: str) -> dict[str, str]:
+        return self._attempt_headers(token)
+
     def quiesce_connections(self) -> None:
         """Remove host-external sockets before a container-level CRIU dump."""
         self.client.close()
@@ -109,17 +115,17 @@ class HostServicesClient:
             timeout=self._timeout_s,
         )
 
-    def resolve_model(self, token: str) -> str:
-        resp = self.client.get("/llm/resolve_model", headers=self._attempt_headers(token))
+    def resolve_model(self, token: str, *, mount: str = "llm") -> str:
+        resp = self.client.get(f"/{mount}/resolve_model", headers=self._attempt_headers(token))
         resp.raise_for_status()
         return resp.json()["model"]
 
-    def context_limit(self, token: str) -> "int | None":
+    def context_limit(self, token: str, *, mount: str = "llm") -> "int | None":
         """This agent's model's context window, for a caller that runs its
         own ReAct loop and needs to know when to compact (native_harness's
         `compaction.py`)."""
         try:
-            resp = self.client.get("/llm/context_limit", headers=self._attempt_headers(token))
+            resp = self.client.get(f"/{mount}/context_limit", headers=self._attempt_headers(token))
             if resp.status_code != 200:
                 return None
             return resp.json().get("context_limit")
@@ -145,7 +151,12 @@ class HostServicesClient:
         response.raise_for_status()
 
     def check_tool_policy(
-        self, token: str, tool_name: str, tool_input: dict, annotation: dict | None = None
+        self,
+        token: str,
+        tool_name: str,
+        tool_input: dict,
+        annotation: dict | None = None,
+        model_tool_call_id: str | None = None,
     ) -> dict:
         # A GPU-gated tool call can legitimately block on the host for as
         # long as another agent holds the GPU it reserved -- unbounded by
@@ -159,6 +170,7 @@ class HostServicesClient:
                 "tool_name": tool_name,
                 "tool_input": tool_input,
                 **({"annotation": annotation} if annotation is not None else {}),
+                **({"model_tool_call_id": model_tool_call_id} if model_tool_call_id else {}),
             },
             headers=self._attempt_headers(token),
             timeout=None,
@@ -228,22 +240,38 @@ class HostServicesClient:
         )
         response.raise_for_status()
 
-    def dispatch(self, token: str, agency_context: dict) -> dict:
+    def dispatch(self, token: str, agency_context: dict, *, mount: str = "llm") -> dict:
         resp = self.client.post(
-            "/llm/dispatch",
+            f"/{mount}/dispatch",
             json=agency_context,
-            headers=self._attempt_headers(token),
+            headers=self._dispatch_headers(token),
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"host dispatch failed: {resp.status_code} {resp.text}")
+            try:
+                error = resp.json()["error"]
+            except (ValueError, KeyError, TypeError):
+                error = {}
+            if not isinstance(error, dict):
+                error = {}
+            raise HostDispatchError(
+                {
+                    "message": error.get(
+                        "message", f"host dispatch failed: {resp.status_code} {resp.text}"
+                    ),
+                    "status_code": resp.status_code,
+                    "transient": error.get("transient", resp.status_code >= 500),
+                    "provider_error": error.get("provider_error"),
+                    "provider_headers": error.get("provider_headers"),
+                }
+            )
         return resp.json()
 
-    def dispatch_stream(self, token: str, agency_context: dict):
+    def dispatch_stream(self, token: str, agency_context: dict, *, mount: str = "llm"):
         with self.client.stream(
             "POST",
-            "/llm/dispatch",
+            f"/{mount}/dispatch",
             json={**agency_context, "stream": True},
-            headers=self._attempt_headers(token),
+            headers=self._dispatch_headers(token),
         ) as resp:
             if resp.status_code != 200:
                 resp.read()
@@ -258,7 +286,7 @@ class HostServicesClient:
                 if item["type"] == "done":
                     return
 
-    async def dispatch_stream_async(self, token: str, agency_context: dict):
+    async def dispatch_stream_async(self, token: str, agency_context: dict, *, mount: str = "llm"):
         async with httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=self._uds_path),
             base_url="http://agency-host",
@@ -266,9 +294,9 @@ class HostServicesClient:
         ) as client:
             async with client.stream(
                 "POST",
-                "/llm/dispatch",
+                f"/{mount}/dispatch",
                 json={**agency_context, "stream": True},
-                headers=self._attempt_headers(token),
+                headers=self._dispatch_headers(token),
             ) as response:
                 if response.is_error:
                     await response.aread()
@@ -281,6 +309,8 @@ class HostServicesClient:
                             "message": error.get("message", "host dispatch failed"),
                             "status_code": response.status_code,
                             "transient": error.get("transient", response.status_code >= 500),
+                            "provider_error": error.get("provider_error"),
+                            "provider_headers": error.get("provider_headers"),
                         }
                     )
                 async for line in response.aiter_lines():

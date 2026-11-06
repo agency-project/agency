@@ -1,6 +1,7 @@
 from .configs.agconfig import agconfig
 from .agdata import agdata, agerror, agcanceled, AgError
 from .agcontext import agcontext
+from .llm.message_store import MessageBlock
 from .agtype import agtype, agfile, agbinary, agimage, agrawstring, agpath
 from .agschema import agschema
 from .agskill import agskill
@@ -29,6 +30,7 @@ __all__ = [
     "agerror",
     "agcanceled",
     "agcontext",
+    "MessageBlock",
     "agschema",
     "agtype",
     "agfile",

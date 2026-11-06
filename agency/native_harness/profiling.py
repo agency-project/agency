@@ -13,13 +13,35 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
+
+
+_active_tool: ContextVar[tuple | None] = ContextVar("native_profile_tool", default=None)
+
+
+def _process_identity(pid: int) -> dict:
+    """Use the full Linux identity; a PID by itself cannot identify a process."""
+    try:
+        process = Path("/proc") / str(pid)
+        stat = (process / "stat").read_text()
+        fields = stat[stat.rfind(") ") + 2 :].split()
+        namespace = os.readlink(process / "ns/pid")
+        return {
+            "agency.namespace_pid": pid,
+            "agency.process_start_ticks": int(fields[19]),
+            "agency.pid_namespace": namespace,
+            "namespace_ppid": int(fields[1]),
+        }
+    except (OSError, ValueError, IndexError):
+        return {}
 
 
 class NativeProfiler:
@@ -37,10 +59,14 @@ class NativeProfiler:
         if self.failed:
             return
         try:
+            attributes = payload.get("attributes", {})
+            identity = (
+                {} if attributes.get("provenance") == "native_subprocess" else self.process_identity
+            )
             payload["attributes"] = {
-                **payload.get("attributes", {}),
-                **self.process_identity,
+                **identity,
                 "agency.namespace_tid": threading.get_native_id(),
+                **attributes,
             }
             result = self.bridge.record_profiler_span(payload)
             if not result.get("ok", True):
@@ -169,6 +195,87 @@ class NativeProfiler:
 def span(bridge, name):
     profiler = getattr(bridge, "_profiler", None)
     return profiler.span(name) if profiler is not None else nullcontext()
+
+
+@contextmanager
+def tool_execution(bridge, call_id, model_tool_call_id):
+    """Scope process launches to the explicitly admitted tool invocation."""
+    profiler = getattr(bridge, "_profiler", None)
+    if profiler is None or not profiler.enabled or profiler.failed:
+        yield
+        return
+    token = _active_tool.set((profiler, call_id, model_tool_call_id))
+    try:
+        yield
+    finally:
+        _active_tool.reset(token)
+
+
+def run_process(argv, **kwargs):
+    """Equivalent built-in subprocess execution with optional launch evidence.
+
+    This deliberately covers only the native tools' own Popen roots. Children
+    are linked by sampled or ptrace ancestry, never by timestamp overlap.
+    """
+    active = _active_tool.get()
+    if active is None:
+        return subprocess.run(argv, **kwargs)
+    profiler, call_id, model_tool_call_id = active
+    timeout = kwargs.pop("timeout", None)
+    capture_output = kwargs.pop("capture_output", False)
+    if capture_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    started_ts = time.time()
+    span_id = uuid.uuid4().hex
+    parent_id = profiler.stack[-1] if profiler.stack else None
+    with subprocess.Popen(argv, **kwargs) as process:
+        identity = _process_identity(process.pid)
+        attributes = {
+            **identity,
+            "agency.process_identity_unknown": not bool(identity),
+            "agency.namespace_tid": process.pid,
+            "tool_call_id": call_id,
+            "model_tool_call_id": model_tool_call_id,
+            "provenance": "native_subprocess",
+            "timing": "observed_launch_to_reap",
+            # An argument-free name avoids copying shell commands/prompts.
+            "executable": Path(argv[0]).name,
+        }
+        payload = {
+            "name": f"process:{attributes['executable']}",
+            "span_id": span_id,
+            "parent": parent_id,
+            "start_ts": started_ts,
+            "attributes": attributes,
+        }
+        profiler._report_span(payload)
+        outcome = "failure"
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            outcome = "success" if process.returncode == 0 else "failure"
+            return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout, stderr = process.communicate()
+            exc.output, exc.stderr = stdout, stderr
+            raise
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            profiler._report_span(
+                {
+                    **payload,
+                    "end_ts": time.time(),
+                    "attributes": {
+                        **attributes,
+                        "outcome": outcome,
+                        "exit_code": process.returncode,
+                    },
+                }
+            )
 
 
 def profile_run(function):

@@ -25,6 +25,8 @@ import time
 import uuid
 from typing import Generator
 
+from .profiling import run_process
+
 _BASH_TIMEOUT_S = 120
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024
 _WEBFETCH_DEFAULT_TIMEOUT = 30
@@ -527,14 +529,26 @@ def _parse_tool_args(arguments_json: str) -> dict:
 def _run_bash_tool(arguments_json: str) -> str:
     args = _parse_tool_args(arguments_json)
     command = args.get("command", "") if isinstance(args, dict) else ""
+    workdir = args.get("workdir") or None
+    # BASH_PARAMS advertises both of these to the model; both were
+    # previously ignored here, so a command silently ran in this process's
+    # own cwd and with the hardcoded default no matter what was passed.
     try:
-        proc = subprocess.run(
-            ["bash", "-c", command], capture_output=True, timeout=_BASH_TIMEOUT_S, text=True
+        timeout = int(args.get("timeout") or _BASH_TIMEOUT_S)
+    except (TypeError, ValueError):
+        timeout = _BASH_TIMEOUT_S
+    try:
+        proc = run_process(
+            ["bash", "-c", command],
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+            cwd=workdir,
         )
         output = proc.stdout + proc.stderr
         return json.dumps({"output": output, "returncode": proc.returncode})
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": f"command timed out after {_BASH_TIMEOUT_S}s"})
+        return json.dumps({"error": f"command timed out after {timeout}s"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -633,7 +647,7 @@ def _run_glob_tool(arguments_json: str) -> str:
                     if len(files) > GLOB_LIMIT:
                         break
             return json.dumps(parse_glob_output("\n".join(files)))
-        proc = subprocess.run(
+        proc = run_process(
             ["bash", "-c", glob_command(pattern, path)],
             capture_output=True,
             timeout=30,
@@ -702,7 +716,7 @@ def _run_grep_tool(arguments_json: str) -> str:
                     "truncated": truncated,
                 }
             )
-        proc = subprocess.run(
+        proc = run_process(
             ["bash", "-c", grep_command(pattern, path, include)],
             capture_output=True,
             timeout=30,

@@ -1,4 +1,9 @@
 // Shared, deterministic projections used by every view.
+export function trajectoryActions(run) {
+  // Keep kernel telemetry available to the Systems profiler, not the agent feed.
+  return (run?.actions || []).filter(action => action.kind !== 'syscall');
+}
+
 export function matchesAction(action, agent, query) {
   if (agent && action.agent !== agent) return false;
   return !query || `${action.name} ${action.intent} ${action.command} ${action.result} ${(action.files || []).join(' ')}`.toLowerCase().includes(query.toLowerCase());
@@ -31,6 +36,7 @@ export function packActionTracks(actions, minimumDuration = 0) {
 export function groupCallStack(actions) {
   const groups=[],running=new Map();
   for(const action of actions) {
+    if(action.kind==='syscall')continue;
     if(action.outcome!=='running') {
       groups.push({id:action.id,agent:action.agent,actions:[action],running:false,
         latest:action.start});
@@ -76,14 +82,15 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
   for(const name of names) {
     const samples=counters[name]||[];
     if(!Array.isArray(samples))continue;
-    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|memory_mb|rss_mb|vms_mb|mem_mb|process_mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|net_receive_mb_s|net_transmit_mb_s|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
+    const match=name.match(/(?:^|[: ])(cpu_pct|cpu_percent|cpu %|cpu_us|cpu_s|cpu_util_pct|cpu_count|memory_mb|rss_mb|vms_mb|mem_mb|mem_used_mb|mem_total_mb|process_mem_mb|util_pct|power_w_est|power_w|io_r|io_w|net_rx|net_tx|io_read_mb_s|io_write_mb_s|disk_read_mb_s|disk_write_mb_s|net_rx_mb_s|net_tx_mb_s|net_receive_mb_s|net_transmit_mb_s|(?:cpu|memory|io)_psi_(?:some|full)_pct|io read MB\/s|io write MB\/s|net rx MB\/s|net tx MB\/s)$/i);
     if(!match)continue;
     const kind=match[1],prefix=name.slice(0,name.length-kind.length);
-    const cpu=/^cpu/.test(kind),rawCPU=/^cpu_(us|s)$/.test(kind);
+    const pressure=kind.includes('_psi_'),capacity=kind==='cpu_count'||kind==='mem_total_mb';
+    const cpu=/^cpu/.test(kind)&&!pressure&&!capacity,rawCPU=/^cpu_(us|s)$/.test(kind);
     if(rawCPU&&Array.isArray(counters[prefix+'cpu_pct'])&&counters[prefix+'cpu_pct'].some(p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&(!Number.isFinite(run.duration)||p[0]<=run.duration)))continue;
     const bytes=['io_r','io_w','net_rx','net_tx'].includes(kind);
-    const label=cpu?'CPU':kind==='rss_mb'?'RSS':/^(memory|mem)_mb$/.test(kind)?'RAM':kind==='vms_mb'?'Virtual memory':kind==='util_pct'?'GPU':kind==='power_w'?'Power':kind==='power_w_est'?'Power estimate':/^(io_r|io_read|io read)/.test(kind)?'Disk read':/^(io_w|io_write|io write)/.test(kind)?'Disk write':/^net_(rx|receive)|^net rx/.test(kind)?'Network RX':'Network TX';
-    const unit=cpu||kind==='util_pct'?'%':kind.startsWith('power')?'W':/(_mb|MB)$/.test(kind)?'MB':'MB/s';
+    const label=pressure?`${kind.startsWith('cpu')?'CPU':kind.startsWith('memory')?'Memory':'I/O'} pressure (${kind.includes('_full_')?'full':'some'})`:kind==='cpu_count'?'CPU capacity':kind==='mem_total_mb'?'Memory capacity':kind==='cpu_util_pct'?'Host utilization':cpu?'CPU':kind==='rss_mb'?'RSS':/^(memory|mem)_mb$/.test(kind)||kind==='mem_used_mb'?'RAM':kind==='vms_mb'?'Virtual memory':kind==='util_pct'?'GPU':kind==='power_w'?'Power':kind==='power_w_est'?'Power estimate':/^(io_r|io_read|io read|disk_read)/.test(kind)?'Disk read':/^(io_w|io_write|io write|disk_write)/.test(kind)?'Disk write':/^net_(rx|receive)|^net rx/.test(kind)?'Network RX':'Network TX';
+    const unit=kind==='cpu_count'?'cores':cpu||pressure||kind==='util_pct'?'%':kind.startsWith('power')?'W':/(_mb|MB)$/.test(kind)?'MB':'MB/s';
     const usable=p=>Array.isArray(p)&&Number.isFinite(p[0])&&Number.isFinite(p[1])&&p[0]>=0&&(!Number.isFinite(run.duration)||p[0]<=run.duration);
     let source;
     if(latestOnly){
@@ -132,7 +139,7 @@ export function systemMeasurements(run,{latestOnly=false}={}) {
 // A value is displayed only when its observation exists. Zero remains valid
 // reported usage; absent usage and empty resource series are not zero samples.
 export function executionMeasurements(run,{includeResources=true}={}) {
-  const actions=run.actions||[],agents=(run.agents||[]).filter(a=>a.id!=='workflow');
+  const actions=trajectoryActions(run),agents=(run.agents||[]).filter(a=>a.id!=='workflow');
   const models=actions.filter(a=>a.kind==='model');
   const input=models.filter(a=>Number.isFinite(a.tokens)),output=models.filter(a=>Number.isFinite(a.output_tokens));
   const sum=(items,key)=>items.reduce((total,a)=>total+a[key],0);
@@ -213,4 +220,28 @@ export function agentResources(run,ids,stale=10) {
     return sandboxes?{value,sandboxes}:null;
   };
   return {cpu:read('CPU',['cg','sandbox']),memory:read('RAM',['sandbox']),sandboxes:own.length,shared:linked.length-own.length};
+}
+
+// Attribution requires an explicit captured action identity. A timestamp or
+// PID overlap alone is insufficient, especially across reused processes.
+export function systemActivity(run, operationId=null) {
+  const graph=run.causal_graph||{},ops=new Map((graph.operations||[]).map(o=>[o.action_id||o.id,o]));
+  const groups=new Map();let count=0,unattributed=0,duration=0,unmeasured=0;
+  for(const action of run.actions||[]) {
+    if(action.kind!=='syscall')continue;
+    const meta=action.metadata||{};
+    const owners=[meta.process_action_id,meta.tool_action_id,meta.operation_action_id].filter(Boolean);
+    const identities=new Set(owners.map(id=>ops.get(id)?.id).filter(Boolean));
+    // Conflicting explicit identities are ambiguous; do not choose one.
+    const owner=identities.size===1&&owners.every(id=>ops.has(id))?ops.get(owners[0]):null;
+    if(!owner)unattributed++;
+    if(operationId&&owner?.id!==operationId)continue;
+    count++;
+    const measured=Number.isFinite(action.duration)&&!action.missing_start&&!['running','incomplete','interrupted','unknown'].includes(action.outcome)&&!action.missing_end;
+    if(measured)duration+=action.duration;else unmeasured++;
+    const name=action.name||'unknown syscall';
+    const g=groups.get(name)||{name,count:0,duration:0,unmeasured:0};
+    g.count++;if(measured)g.duration+=action.duration;else g.unmeasured++;groups.set(name,g);
+  }
+  return {count,unattributed,duration,unmeasured,groups:[...groups.values()].sort((a,b)=>b.duration-a.duration)};
 }

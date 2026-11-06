@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/theme.css">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
@@ -10,8 +13,8 @@
 </head>
 <body>
   <nav id="view-tabs" aria-label="Views">
-    <button id="view-run" class="active" aria-pressed="true">Run</button>
     <a class="investigator-link" href="/profiler">Profiler</a>
+    <a class="investigator-link" href="/critical-path">Critical Path Profiler</a>
     <a class="investigator-link" id="terminal-link" href="/terminal" hidden>Terminal</a>
   </nav>
   <div id="app">
@@ -22,7 +25,7 @@
           <span id="timeline-from"></span>
           <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" disabled>
           <span id="timeline-to"></span>
-          <button id="timeline-live-btn" class="tl-live active">LIVE</button>
+          <button id="timeline-live-btn" class="tl-live active">Live</button>
         </div>
         <div id="shared-log"></div>
       </div>

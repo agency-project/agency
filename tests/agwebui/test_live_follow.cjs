@@ -79,8 +79,9 @@ function page(replay=false,view=null) {
       sendExecution(command,extra){sent.push({type:'execution_command',command,...extra});return true;}
       sendReplay(type,extra){sent.push({type,...extra});return true;}
     },
-    matchesAction:()=>true,
+    matchesAction:()=>true,causalSummary:()=>'<p>Causal summary</p>',
     // The summary module is not loaded here; its scope contract is this small.
+    resetProfilerTables:()=>{},handleProfilerTableEvent:()=>false,
     metricScope:()=>metricScope,setMetricScope:ids=>{metricScope=ids==null?null:new Set(ids);},renderMetricsSummary:()=>{summaryRenders++;},
     navigator:{clipboard:{writeText:async text=>{if(clipboardFails)throw Error('denied');copied.push(text);}}},
     requestControlConfirmation:options=>{confirmations.push(options);if(autoConfirm&&!options.validate())options.onConfirm();},refreshControlConfirmation:()=>{},
@@ -106,9 +107,9 @@ function page(replay=false,view=null) {
     var paints=0,realUpdate=updateTrajectory;
     updateTrajectory=(...args)=>{paints++;realUpdate(...args);};
     var lastWindowEnd;
-    globalThis.ui={state,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,
-      windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
-      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,renderAgentColumnControls};
+    globalThis.ui={state,selectProfilerRange,inspectProfilerOperation,handleProfilerClick,setInspectorWidth,toggleInspectorSize,inspectorWidthBounds,renderMetricsDashboard,readingState,holdColumn,liveColumn,followLatest,olderCalls,setView,setSelection,syncInspector,toggleInspector,loadRun,selectAction,handleClick,agentExecutionControls,holdHistory,pauseDisplay,resumeDisplay,pauseResumeExecution,stopExecution,sendExecutionCommand,receiveCommandResult,openInteraction,submitInteraction,closeInteraction,renderComposer,renderInteractionStatus,renderInteractionOperation,revealEvent,renderRoster,pauseReplay,wallClockRange,followClock,projectClock,renderSession:realRenderSession,renderInspector:realRenderInspector,actionButton,originalPayload,readingPins,criticalPathView,detailedProfilerView,profilerCategories,
+      seekPlayback,paintPlayhead,playheadPosition,windowEnd:()=>lastWindowEnd,reconcile:realReconcile,groupCallStack,renderCallStack,renderSystemMetrics,
+      paints:()=>paints,setTimeline:viewer=>{timelineViewer=viewer;},setCausal:viewer=>{causalViewer=viewer;},visibleAgentColumns,addAgentColumn,removeAgentColumn,selectAgentColumn,setContent,trajectoryView,payloadSection,renderFullPayload,pagePayload,fullPayloads,handlePayloadClick,views,executionNavigation,renderAgentColumnControls};
   `,context);
   const agentButton=(kind,id='a')=>{
     const attribute=`data-execution-${kind}`,html=context.ui.agentExecutionControls(id);
@@ -123,7 +124,8 @@ function page(replay=false,view=null) {
     episodes:[{id:'one',actions:['old'],status:'completed'}],agents:[],edges:[],coverage:{}};
   context.ui.loadRun('live',null,replay);
   subscription.onMessage({type:'snapshot',run});
-  return {ui:context.ui, copied, failClipboard:value=>clipboardFails=value, metricScope:()=>metricScope&&[...metricScope],summaryRenders:()=>summaryRenders, confirmations,setAutoConfirm:value=>autoConfirm=value, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
+  return {ui:context.ui, copied, ignoreProfilerMarkup:()=>vm.runInContext('refreshProfiler=()=>{};',context),failClipboard:value=>clipboardFails=value,
+    metricScope:()=>metricScope&&[...metricScope],summaryRenders:()=>summaryRenders, confirmations,setAutoConfirm:value=>autoConfirm=value, document, node,agentButton,flush,delays,sent,setFetch:fn=>context.fetch=fn,receive:message=>subscription.onMessage(message.execution_controls?{...message,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},...message.execution_controls}}:message),transport:value=>subscription.onTransport(value),window:context.window,
     feed:agent=>{const columns=node('call-stack').querySelectorAll('[data-agent-column]');const body=(agent?columns.find(c=>c.dataset.agentColumn===agent):columns[0]).querySelector('.agent-call-stack');const column=body.host;return {get children(){return [...column.querySelector('.agent-current-calls').children,...column.querySelector('.agent-history-calls').children];},get firstElementChild(){return this.children[0];}};},
     columnFeed:agent=>node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-call-stack'),
     visibility:hidden=>{document.hidden=hidden;listeners.visibilitychange.forEach(fn=>fn());},
@@ -138,7 +140,7 @@ test('trajectory is the default execution view and the inspector starts collapse
   const p=page();p.ui.renderInspector();
   assert.equal(p.ui.state.view,'trajectory');
   assert.equal(p.node('inspector').hidden,true);
-  assert.equal(p.node('inspector-toggle').disabled,true);
+  assert.doesNotMatch(pageSource(),/id="inspector-toggle"/);
 });
 test('top system dashboard follows resource-only patches and freezes with the held display',()=>{
   const p=page(),run=p.ui.state.run;
@@ -168,8 +170,10 @@ test('first-use prompt is removed when agent columns become available',()=>{
   assert.equal(stack.querySelectorAll('[data-agent-column]').length,1);
 });
 test('explicit alternative execution views remain selected on entry',()=>{
-  assert.equal(page(false,'timeline').ui.state.view,'timeline');
+  assert.equal(page(false,'timeline').ui.state.view,'critical');
   assert.equal(page(false,'profiler').ui.state.view,'profiler');
+  assert.equal(page(false,'critical').ui.state.view,'critical');
+  assert.equal(page(false,'profiler&profiler=critical').ui.state.view,'critical');
   // Links to the removed views open the trajectory instead of failing.
   for(const removed of ['context','resources','agents','compare'])assert.equal(page(false,removed).ui.state.view,'trajectory');
 });
@@ -180,7 +184,7 @@ test('inspector opens on selection, closes without clearing identity and stays c
   assert.equal(p.node('inspector').hidden,false);
   p.ui.toggleInspector(false);p.append();p.ui.renderInspector(true);
   assert.equal(p.node('inspector').hidden,true);assert.equal(p.ui.state.selected,selected);
-  assert.equal(p.document.activeElement,p.node('inspector-toggle'));
+  assert.equal(p.document.activeElement,p.node('content'));
   p.ui.selectAction('new-call');p.ui.renderInspector();
   assert.equal(p.node('inspector').hidden,false);assert.equal(p.ui.state.selected.id,'new-call');
 });
@@ -188,7 +192,7 @@ test('reloading the same selected recording rebuilds its cleared inspector',()=>
   const p=page();p.ui.selectAction('old');p.ui.renderInspector();
   const run=structuredClone(p.ui.state.run);
   p.ui.loadRun('live',{type:'action',id:'old'});p.receive({type:'snapshot',run});p.ui.renderInspector();
-  assert.match(p.node('inspector').innerHTML,/SELECTION INSPECTOR/);
+  assert.match(p.node('inspector').innerHTML,/Selection inspector/i);
   assert.equal(p.ui.state.selected.id,'old');
 });
 test('trajectory and timeline switches retain the same execution and event selection',()=>{
@@ -320,7 +324,7 @@ test('live control updates never repaint frozen event columns',()=>{
   p.ui.renderSession();
   assert.equal(p.ui.state.run.actions[0].result,undefined);assert.equal(p.ui.state.liveRun.actions[0].result,'New evidence');
   assert.equal(p.feed('a').firstElementChild.querySelector('.call-group-grid').firstElementChild,card);
-  assert.match(p.node('display-state').textContent,/agents may still be running/);
+  assert.match(p.node('display-state').title,/agents may still be running/);
   assert.match(p.node('execution-state').textContent,/1 agent with pause intent recorded/);
   assert.equal(p.node('follow-live').hidden,false);
   assert.match(p.node('call-stack').children[0].querySelector('.agent-column-heading').querySelector('.column-follow').querySelector('span').textContent,/View frozen/);
@@ -351,19 +355,6 @@ test('replay selections still hold history',()=>{
   const p=page(true);p.ui.selectAction('old');p.append();
   assert.equal(p.ui.state.follow,false);
   assert.equal(p.ui.windowEnd(),1);
-});
-
-test('live overlay updates preserve both chart scroll positions',()=>{
-  const p=page();p.ui.state.trajectoryLayout='overlay';
-  p.ui.state.run.agents=[{id:'a',label:'Agent A'}];
-  p.ui.state.run.actions[0].name='Tool';
-  const region=p.node('content').querySelector('.trajectory-scroll');
-  region.scrollLeft=140;region.scrollTop=220;
-  // Replacing the chart resets its scrolling element before it is restored.
-  Object.defineProperty(p.node('content'),'innerHTML',{set(){region.scrollLeft=0;region.scrollTop=0;}});
-  p.append();
-  assert.equal(region.scrollLeft,140);
-  assert.equal(region.scrollTop,220);
 });
 
 test('new activities and calls prepend without replacing expanded cards',()=>{
@@ -555,7 +546,7 @@ test('display pause freezes mutable evidence while live updates continue without
   assert.match(p.node('inspector').innerHTML,/Waiting/);
   assert.doesNotMatch(p.node('inspector').innerHTML,/Finished/);
   assert.equal(p.node('display-toggle').textContent,'Unfreeze view');
-  assert.match(p.node('display-state').textContent,/2 calls changed/);
+  assert.match(p.node('display-state').title,/2 calls changed/);
   p.node('display-toggle').onclick();
   assert.equal(p.ui.state.run,run);
   assert.equal(p.ui.state.liveRun,null);
@@ -577,12 +568,12 @@ test('execution controls use live agent state while the display is frozen',()=>{
   assert.equal(p.ui.state.run.agents[0].status,'waiting_llm');
   assert.equal(p.ui.state.displayPaused,true);
   p.ui.renderSession();
-  assert.equal(p.node('execution-all').textContent,'▶ Resume all active agents');
+  assert.equal(p.node('execution-all').textContent,'Resume All');
   p.node('execution-all').onclick();
   assert.equal(p.sent[1].command,'resume_all');
   assert.equal(p.ui.state.displayPaused,true);
   p.ui.state.selected={type:'agent',id:'a'};p.ui.renderSession();
-  assert.equal(p.agentButton('agent').textContent,'▶ Resume');
+  assert.equal(p.agentButton('agent').textContent,'Resume');
 });
 
 test('reconnect snapshots are retained behind the paused display and run switching resets it',()=>{
@@ -651,7 +642,7 @@ test('debugger controls follow action selection and send named-agent commands',(
   p.receive({type:'snapshot',run,execution_controls:{relay_id:'fixture-relay',execution:{id:'live'},available:true,agents:['a','b']}});
   p.ui.renderSession();
   assert.equal(p.ui.state.executionPending,null);
-  assert.equal(p.agentButton('agent').textContent,'▶ Resume');
+  assert.equal(p.agentButton('agent').textContent,'Resume');
   assert.match(p.node('execution-state').textContent,/1 agent with pause intent recorded/);
   p.agentButton('agent').onclick();
   assert.equal(p.sent[1].command,'resume');
@@ -672,15 +663,15 @@ test('global debugger controls target all agents and expose resume for mixed pau
   assert.equal(p.sent[1].command,'resume_all');
 });
 
-test('replay and saved review hide execution controls and replay pause uses only playback',()=>{
+test('replay and saved review disable execution controls and replay pause uses only playback',()=>{
   const p=debuggerPage();p.ui.state.replay=true;p.ui.renderSession();
-  assert.equal(p.node('execution-all').hidden,true);
+  assert.equal(p.node('execution-all').hidden,false);assert.equal(p.node('execution-all').disabled,true);
   p.ui.pauseResumeExecution(true);
   assert.equal(p.sent.length,0);
   p.ui.state.replayState={playing:true};p.node('display-toggle').onclick();
   assert.equal(p.sent[0].type,'pause');assert.equal(p.sent[0].command,undefined);
   p.ui.state.replay=false;p.ui.state.run.id='saved';p.ui.renderSession();
-  assert.equal(p.node('execution-all').hidden,true);
+  assert.equal(p.node('execution-all').hidden,false);assert.equal(p.node('execution-all').disabled,true);
 });
 
 test('failed, unconfirmed and disconnected commands retain recorded status and recover controls',()=>{
@@ -756,7 +747,7 @@ test('stop all uses live execution while display is paused and SIGKILL all keeps
   assert.match(p.ui.state.executionMessage,/terminal state recorded/);
 });
 
-test('stop controls hide in saved/replay views and disable on disconnect or completion',()=>{
+test('stop controls stay disabled in saved/replay, disconnected and completed views',()=>{
   const p=debuggerPage();p.ui.selectAction('old');
   const ids=['execution-stop-all','execution-kill-all'];
   p.transport('disconnected');p.ui.renderSession();
@@ -764,10 +755,10 @@ test('stop controls hide in saved/replay views and disable on disconnect or comp
   p.transport('connected');p.ui.renderSession();
   ids.forEach(id=>assert.equal(p.node(id).disabled,false));
   p.ui.state.replay=true;p.ui.renderSession();
-  assert.equal(p.node('all-agent-controls').hidden,true);
+  assert.equal(p.node('all-agent-controls').hidden,false);ids.forEach(id=>assert.equal(p.node(id).disabled,true));
   assert.equal(p.ui.agentExecutionControls('a'),'');
   p.ui.state.replay=false;p.ui.state.run.id='saved';p.ui.renderSession();
-  assert.equal(p.node('all-agent-controls').hidden,true);
+  assert.equal(p.node('all-agent-controls').hidden,false);ids.forEach(id=>assert.equal(p.node(id).disabled,true));
   assert.equal(p.ui.agentExecutionControls('a'),'');
   p.ui.state.run.id='live';p.ui.state.run.status='completed';p.ui.renderSession();
   ids.forEach(id=>assert.equal(p.node(id).disabled,true));
@@ -786,27 +777,28 @@ test('column controls target their own agent even when another agent is selected
 });
 
 
-test('column headings contain agent controls while global controls sit under the trajectory heading',()=>{
+test('column controls stay mounted while global controls share the agent management row',()=>{
   const p=debuggerPage();p.ui.renderCallStack();
   for(const column of p.node('call-stack').children) {
     const html=column.querySelector('[data-agent-controls]').innerHTML;
     assert.match(html,new RegExp(`data-execution-agent="${column.dataset.agentColumn}"`));
-    assert.match(html,/Agent controls/);assert.match(html,/SIGKILL/);
+    assert.doesNotMatch(html,/Agent controls ·/);assert.match(html,/data-remove-column/);assert.match(html,/SIGKILL/);
     assert.doesNotMatch(html,/Stop all agents/);
   }
   const pageHtml=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
   // One mounted control group holds the bulk agent controls and the session actions; the old middle bar is gone.
   const strip=pageHtml.slice(pageHtml.indexOf('<section id="trajectory-controls"'),pageHtml.indexOf('</section>',pageHtml.indexOf('<section id="trajectory-controls"')));
-  for(const id of ['all-agent-controls','execution-all','execution-stop-all','execution-kill-all','open-live','start-replay','replay-restart','reconnect-updates','execution-message','control-scope'])assert.match(strip,new RegExp(`id="${id}"`));
+  for(const id of ['all-agent-controls','execution-all','execution-stop-all','execution-kill-all','execution-message','control-scope'])assert.match(strip,new RegExp(`id="${id}"`));
   assert.doesNotMatch(pageHtml,/trajectory-session|session-bar|session-actions/);
   const view=p.ui.trajectoryView();
-  assert.match(view,/<h2>Execution Trajectory<\/h2>[\s\S]*?<div id="trajectory-controls-slot"><\/div>[\s\S]*id="call-stack"/);
+  assert.doesNotMatch(view,/<h2>Execution Trajectory<\/h2>/);
+  assert.match(view,/<div class="agent-column-controls"><div id="trajectory-controls-slot"><\/div>[\s\S]*id="call-stack"/);
   p.ui.setContent(view);
   assert.equal(p.node('trajectory-controls').parentElement,p.node('trajectory-controls-slot'));
   // Every replacement of the view markup goes through setContent, so the mounted controls are never destroyed with it.
   const script=fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.js'),'utf8');
   const writes=[...script.matchAll(/\$\('content'\)\.innerHTML\s*=\s*([^;]{0,24})/g)].map(match=>match[1]);
-  assert.deepEqual([...new Set(writes)],['html','detailedProfilerView()']);
+  assert.deepEqual([...new Set(writes)],['html']);
   assert.doesNotMatch(pageHtml,/id="execution-agent"|id="execution-stop-agent"|id="execution-kill-agent"/);
 });
 
@@ -832,7 +824,7 @@ test('pause closes control menus and updates controls without replacing their fo
   assert.equal(group.querySelector('[data-execution-agent]'),button);assert.equal(p.document.activeElement,button);
   p.receive({type:'execution_command_result',id:p.sent[0].id,queued:false,error:'Fixture rejection'});
   p.ui.state.run.agents[0].status='paused';p.ui.renderSession();
-  assert.equal(button.textContent,'▶ Resume');assert.equal(button.disabled,false);
+  assert.equal(button.textContent,'Resume');assert.equal(button.disabled,false);
   assert.equal(group.querySelector('[data-execution-agent]'),button);
   assert.equal(p.window.scrollY,0);
 });
@@ -910,7 +902,7 @@ test('redirect uses only an active explicit invocation and becomes unavailable w
 
 test('frozen composer targets the current live execution and retains frozen inspection',()=>{
   const p=interactionPage();p.ui.pauseDisplay();const frozen=p.ui.state.run;p.ui.renderInteractionStatus();
-  assert.match(p.node('interaction-target-status').textContent,/View frozen.*CURRENT LIVE/);p.ui.submitInteraction();assert.equal(p.sent.length,1);assert.equal(p.ui.state.run,frozen);assert.equal(p.ui.state.displayPaused,true);
+  assert.match(p.node('interaction-target-status').textContent,/View frozen.*current live/i);p.ui.submitInteraction();assert.equal(p.sent.length,1);assert.equal(p.ui.state.run,frozen);assert.equal(p.ui.state.displayPaused,true);
 });
 
 test('filtered roster return and unpin preserve actual pinned order',()=>{
@@ -1013,6 +1005,40 @@ test('Profiler hides the summary dashboard and trajectory restores it',()=>{
   assert.equal(p.node('metrics').hidden,false);
 });
 
+test('time cursor keeps freeze labels across live, replay and saved recording states',()=>{
+  assert.doesNotMatch(pageSource(),/replay-speed|Instant batches/);
+  const p=debuggerPage(),button=p.node('display-toggle');
+  const getElementById=p.document.getElementById;
+  p.document.getElementById=id=>id==='replay-speed'?null:getElementById(id);
+  const check=(label,frozen)=>{
+    p.ui.renderSession();
+    assert.equal(button.textContent,label);
+    assert.equal(button['aria-pressed'],String(frozen));
+  };
+  check('Freeze view',false);
+  button.onclick();check('Unfreeze view',true);
+  button.onclick();check('Freeze view',false);
+  // Scrubbing into history opens replay; its stream updates keep the same labels.
+  const run={...p.ui.state.run,id:'saved'};
+  p.ui.seekPlayback(.4);
+  const replay={clock:.4,duration:10,playing:true,speed:1};
+  p.receive({type:'snapshot',run,replay});
+  check('Freeze view',false);
+  button.onclick();assert.equal(p.sent.at(-1).type,'pause');
+  p.receive({type:'updates',patches:[],replay:{...replay,playing:false}});
+  check('Unfreeze view',true);
+  button.onclick();assert.equal(p.sent.at(-1).type,'play');
+  assert.equal(p.sent.at(-1).speed,1);
+  p.receive({type:'updates',patches:[],replay});
+  check('Freeze view',false);
+  p.ui.state.replay=false;p.ui.state.stream=null;
+  check('Unfreeze view',true);
+  assert.match(button.title,/Unfreeze the recording/);
+  button.onclick();
+  p.receive({type:'snapshot',run,replay});
+  check('Freeze view',false);
+});
+
 test('time cursor starts with the wall clock, not with setup before the first agent execution',()=>{
   const p=page(),run=p.ui.state.run;
   Object.assign(run,{duration:30,time_origin:100,execution_started_at:null});
@@ -1046,6 +1072,45 @@ test('projected clock never retreats when reports arrive with uneven delay',()=>
   assert.equal(projectClock(clock,now+60000),projectClock(clock,now+3000));
 });
 
+test('replay scrubber has the full wall interval before its first call and after seeking backward',()=>{
+  const p=page(true),run={...p.ui.state.run,execution_started_at:null,duration:0};
+  const replay={clock:0,duration:90,playing:false,speed:1,wall_clock:{start:20,end:80,pending:false}};
+  p.receive({type:'snapshot',run,replay});p.ui.paintPlayhead();
+  assert.equal(p.node('cursor').disabled,false);
+  assert.equal(p.node('cursor').min,20);assert.equal(p.node('cursor').max,80);
+  assert.equal(p.node('duration-label').textContent,'1m 0s');
+  p.ui.seekPlayback(50);const seek=p.sent.at(-1);
+  assert.equal(seek.type,'seek');assert.equal(seek.clock,50);
+  p.receive({type:'snapshot',run,replay:{...replay,clock:50,seek_id:seek.seek_id}});
+  p.ui.paintPlayhead();assert.equal(p.node('cursor').value,50);
+  assert.equal(p.node('cursor').max,80);
+});
+
+test('older replay updates and seek acknowledgements cannot overwrite the latest scrub',()=>{
+  const p=page(true),run=p.ui.state.run;
+  const replay={clock:5,duration:100,playing:false,speed:1,wall_clock:{start:0,end:100}};
+  p.receive({type:'snapshot',run,replay});
+  p.ui.seekPlayback(20);const oldSeek=p.sent.at(-1);
+  p.ui.seekPlayback(70);const newSeek=p.sent.at(-1);
+  p.receive({type:'updates',patches:[{meta:{duration:6}}],replay:{...replay,clock:6}});
+  p.receive({type:'snapshot',run:{...run,duration:20},replay:{...replay,clock:20,seek_id:oldSeek.seek_id}});
+  p.ui.paintPlayhead();assert.equal(p.node('cursor').value,70);
+  assert.equal(p.ui.state.replayState.clock,70);
+  p.receive({type:'snapshot',run:{...run,duration:70},replay:{...replay,clock:70,seek_id:newSeek.seek_id}});
+  p.ui.paintPlayhead();assert.equal(p.node('cursor').value,70);
+});
+
+test('clock paints cannot move the slider while dragging and cancellation releases it',()=>{
+  const p=page();p.ui.paintPlayhead();
+  p.node('cursor').emit('pointerdown');
+  p.node('cursor').value=.4;p.node('cursor').oninput({target:p.node('cursor')});
+  p.append(false);p.ui.paintPlayhead();
+  assert.equal(p.node('cursor').value,.4);
+  assert.equal(p.node('cursor-value').textContent,'0.4s');
+  p.node('cursor').emit('pointercancel');p.flush();
+  p.ui.paintPlayhead();assert.ok(p.node('cursor').value>=2);
+});
+
 // Agent-scoped metrics: compact column status and column-to-dashboard selection.
 const usage=(p,agent)=>p.node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-column-heading').querySelector('.column-usage');
 test('column status shows live per-agent sandbox CPU and compact tokens beside the existing in-flight count',()=>{
@@ -1055,19 +1120,19 @@ test('column status shows live per-agent sandbox CPU and compact tokens beside t
     episodes:[{id:'b1',agent:'b',actions:['bt'],status:'running'}],
     counter_samples:{'workload:cpu_pct':[[2,640]],'host:cpu_pct':[[2,900]],'cg:sandbox_a_0000:cpu_pct':[[2,12.4]]},meta:{duration:2}}]});
   p.flush();p.ui.reconcile();
-  assert.equal(usage(p,'a').textContent,'CPU 12% · 8.2K tok');
+  assert.equal(usage(p,'a').textContent,'CPU 12% · RAM — · 8.2K tok');
   assert.match(usage(p,'a').title,/sandbox container.*100% = one core.*8,000 input \+ 200 output/);
   // Missing measurements are dashes; the workload or host value is never shown as an agent's CPU.
-  assert.equal(usage(p,'b').textContent,'CPU — · — tok');assert.match(usage(p,'b').title,/no sandbox measurement recorded.*no usage reported/);
+  assert.equal(usage(p,'b').textContent,'CPU — · RAM — · — tok');assert.match(usage(p,'b').title,/no sandbox measurement recorded.*no usage reported/);
   const heading=p.node('call-stack').children.find(c=>c.dataset.agentColumn==='b').querySelector('.agent-column-heading');
-  assert.equal(heading.querySelector('.column-call-count').textContent,'1 in flight');
+  assert.equal(heading.querySelector('.column-call-count').textContent,'1 active calls');
   // Values follow the existing stream; execution-wide counters win over the retained window.
   p.receive({type:'patch',patches:[{counter_samples:{'cg:sandbox_a_0000:cpu_pct':[[3,3.44]]},meta:{duration:3,metrics_by_agent:{a:{models:90,input:1390000,output:10000,input_samples:90,output_samples:90}}}}]});
   p.flush();p.ui.reconcile();
-  assert.equal(usage(p,'a').textContent,'CPU 3.4% · 1.4M tok');
+  assert.equal(usage(p,'a').textContent,'CPU 3.4% · RAM — · 1.4M tok');
   // A container that stopped reporting has no current utilization.
   p.receive({type:'patch',patches:[{meta:{duration:60}}]});p.flush();p.ui.reconcile();
-  assert.equal(usage(p,'a').textContent,'CPU — · 1.4M tok');assert.match(usage(p,'a').title,/no current container sample/);
+  assert.equal(usage(p,'a').textContent,'CPU — · RAM — · 1.4M tok');assert.match(usage(p,'a').title,/no current container sample/);
   assert.equal(run.agents.length>=2,true);
 });
 test('selecting a column header scopes the dashboard to that agent without changing columns or controls',()=>{
@@ -1097,14 +1162,16 @@ test('selecting a column header scopes the dashboard to that agent without chang
   assert.equal(p.feed('a').children.some(card=>card.dataset.callCard==='new-call'||card.dataset.callGroup==='new-call'),true);
 });
 
-// UI reorganisation: three views, relocated controls, readable payloads, typed cards.
+// UI navigation order, relocated controls, readable payloads, typed cards.
 const pageSource=()=>fs.readFileSync(path.join(__dirname,'../../agency/observability/agwebui/static/investigator.html'),'utf8');
-test('navigation is Execution Trajectory, Timeline, Profiler and the removed views are gone',()=>{
+test('navigation exposes Compare Runs beside the execution views and redirects retired Timeline',()=>{
   const p=page();
-  assert.equal(JSON.stringify(p.ui.views),JSON.stringify([['trajectory','Execution Trajectory'],['timeline','Timeline'],['profiler','Profiler']]));
+  assert.equal(JSON.stringify(p.ui.views),JSON.stringify([['trajectory','Execution Trajectory'],['profiler','Profiler'],['critical','Critical Path']]));
   assert.equal(p.ui.state.view,'trajectory');
+  assert.match(p.ui.executionNavigation(),/href="\/compare"/);assert.match(p.ui.executionNavigation(),/Compare Runs/);
+  assert.match(pageSource(),/<nav id="views"[^>]*>.*href="\/compare"/);
   const selection=(p.ui.selectAction('old'),p.ui.state.selected),run=p.ui.state.run;
-  for(const view of ['timeline','profiler','trajectory']){p.ui.setView(view);assert.equal(p.ui.state.view,view);assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selection);}
+  for(const view of ['profiler','critical','trajectory']){p.ui.setView(view);assert.equal(p.ui.state.view,view);assert.equal(p.ui.state.run,run);assert.equal(p.ui.state.selected,selection);}
   // Profiler categories still deep-link into the Profiler view.
   p.ui.setView('llm');assert.equal(p.ui.state.view,'profiler');assert.equal(p.ui.state.profilerCategory,'llm');
   for(const removed of ['agents','compare','context','resources']){p.ui.setView(removed);assert.equal(p.ui.state.view,'profiler');}
@@ -1131,7 +1198,7 @@ test('Jump to live sits beside Freeze view and column headings have no reorder b
   const p=page();p.ui.renderCallStack();
   const column=p.node('call-stack').children[0];
   assert.doesNotMatch(column.innerHTML,/data-column-order|Move .* column/);
-  assert.match(column.innerHTML,/data-remove-column="a"/);assert.match(column.innerHTML,/data-agent-controls="a"/);
+  assert.match(column.querySelector('[data-agent-controls]').innerHTML,/data-remove-column="a"/);assert.match(column.innerHTML,/data-agent-controls="a"/);
   // The two display controls keep their separate behaviour.
   p.ui.pauseDisplay();assert.equal(p.ui.state.displayPaused,true);
   p.ui.followLatest();assert.equal(p.ui.state.displayPaused,false);assert.equal(p.ui.state.follow,true);
@@ -1140,8 +1207,8 @@ test('tool calls and model requests carry a type class and a text label',()=>{
   const p=page();
   const tool=p.ui.actionButton({id:'t',agent:'a',kind:'tool',name:'bash',command:'ls',start:0,duration:1,outcome:'success'});
   const model=p.ui.actionButton({id:'m',agent:'a',kind:'model',name:'chat',model:'model-x',start:0,duration:1,outcome:'success'});
-  assert.match(tool,/class="action-row type-tool /);assert.match(tool,/<span class="call-type">Tool<\/span>bash/);
-  assert.match(model,/class="action-row type-model /);assert.match(model,/<span class="call-type">Model request<\/span>/);
+  assert.match(tool,/class="action-row type-tool /);assert.match(tool,/class="sr-only">Tool<\/span><\/span>bash/);
+  assert.match(model,/class="action-row type-model /);assert.match(model,/class="sr-only">Model<\/span><\/span>Model request/);
   // Status indicators keep their own meaning beside the type.
   assert.match(tool,/class="status-icon success"/);
   p.ui.state.run.actions.push({id:'m1',agent:'a',episode:'one',kind:'model',name:'chat',start:1,duration:1,outcome:'success',files:[]});p.ui.renderCallStack();
@@ -1208,4 +1275,111 @@ test('copy takes the complete recorded payload in either view and reports the ou
     p.flush();assert.equal(button.textContent,'Copy');
   }
   assert.equal(p.copied.length,2);
+});
+
+
+test('Critical Path uses the frozen snapshot for scrolling and resize while ingestion continues',()=>{
+  const p=page();let displayed,held;
+  const viewer={update:run=>{displayed=run;},setFrozen:value=>{held=value;}};
+  p.ui.setCausal(viewer);p.ui.pauseDisplay();
+  assert.equal(displayed,p.ui.state.run);assert.equal(held,true);
+  const clock=displayed.duration;p.append();
+  assert.equal(displayed.duration,clock);
+  assert.equal(p.ui.state.liveRun.duration,clock+1);
+});
+
+
+test('Critical Path is separate from profiler categories and updates its mounted graph',()=>{
+  const p=page(false,'critical');let updates=0,displayed;
+  p.ui.setCausal({update:run=>{updates++;displayed=run;}});
+  p.append();
+  assert.ok(updates>0);assert.equal(displayed,p.ui.state.run);
+  assert.equal(JSON.stringify(Object.keys(p.ui.profilerCategories)),JSON.stringify(['overview','llm','tools','systems']));
+  p.ui.renderMetricsDashboard();assert.equal(p.node('summary-strip').hidden,true);
+});
+
+test('unified operation inspector shows both boundaries, nonblocking provenance and only explicit system attribution',()=>{
+  const p=page(false,'critical'),run=p.ui.state.run;
+  run.causal_graph={operations:[{id:'operation',action_id:'old',agent:'a',kind:'tool',label:'Captured tool',start_node:'start',end_node:'end',duration:2,outcome:'success',metrics:{cpu_ms:15}}],nodes:[{id:'start',operation:'operation',time:1,timing:'observed'},{id:'end',operation:'operation',time:3,timing:'observed'},{id:'process',operation:'child',label:'Recorded process',time:1}],edges:[{id:'owner',source:'start',target:'process',kind:'process_owner',confidence:'provenance',blocking:false,evidence:'Explicit tool_action_id'}],critical_path:{slack:{start:0}},coverage:{unknown:[],gaps:[]}};
+  run.actions.push({id:'syscall',kind:'syscall',name:'read',duration:.1,outcome:'success',metadata:{tool_action_id:'old'}});
+  p.ui.setSelection({type:'causal-operation',id:'operation',action_id:'old'});p.ui.renderInspector();
+  const html=p.node('inspector').innerHTML;
+  assert.match(html,/Captured tool/);assert.match(html,/Start on trace/);assert.match(html,/End on trace/);
+  assert.match(html,/nonblocking relationship/);assert.match(html,/Explicitly attributed syscall events/);assert.match(html,/cpu_ms/);
+  assert.ok(p.ui.readingPins().includes('old'));
+  run.actions.at(-1).metadata={pid:123};p.ui.renderInspector();
+  assert.match(p.node('inspector').innerHTML,/No syscall ownership was recorded/);
+});
+
+test('process observations expose captured PID/argv but never turn syscall latency into runtime or slack',()=>{
+ const p=page(false,'critical'),run=p.ui.state.run;
+ run.causal_graph={operations:[{id:'process',kind:'process',band:'System',label:'python',agent:'a',duration:null,outcome:'execution_observed',start_node:'observed',metrics:{pid:42,path:'/usr/bin/python',argv:['python','build.py'],execution_observation:'Successful execve; lifecycle not recorded'}}],nodes:[{id:'observed',operation:'process',time:1,timing:'execve_observation'}],edges:[],operation_critical_path:{slack:{observed:100}},coverage:{unknown:[],gaps:[]}};
+ p.ui.setSelection({type:'causal-operation',id:'process'});p.ui.renderInspector();const html=p.node('inspector').innerHTML;
+ assert.match(html,/Execution observed at/);assert.match(html,/PID/);assert.match(html,/python build.py/);assert.match(html,/Lifecycle boundaries unavailable/);
+ assert.match(html,/Slack in observed operation chain<\/span><span[^>]*>Unknown/);assert.match(html,/CPU time/);assert.match(html,/Unavailable/);
+});
+
+test('collapsed calls summarize structured arguments and keep complete evidence available',()=>{
+ const p=page();
+ const action={id:'json-call',agent:'a',kind:'tool',name:'read_file',arguments:JSON.stringify({path:'src/worker.py',offset:0,limit:120}),start:1,duration:2,outcome:'running'};
+ const html=p.ui.actionButton(action);
+ assert.match(html,/read_file/);assert.match(html,/src\/worker\.py/);
+ assert.doesNotMatch(html,/json-key|&quot;offset&quot;|Result not captured yet/);
+ assert.match(html,/class="status-icon running"/);assert.match(html,/Calculated wall interval/);
+ p.ui.state.run.actions.push(action);p.ui.selectAction(action.id);p.ui.renderInspector();
+ assert.match(p.node('inspector').innerHTML,/offset/);assert.match(p.node('inspector').innerHTML,/limit/);
+});
+
+test('page chrome has one primary heading and removed controls do not return',()=>{
+ const html=pageSource(),p=page(),view=p.ui.trajectoryView();
+ assert.equal((html.match(/<h1\b/g)||[]).length,1);
+ assert.match(html,/<h1 id="view-label">Execution Trajectory<\/h1>/);
+ assert(html.indexOf('id="view-label"')<html.indexOf('id="run-select"'));
+ assert(html.indexOf('id="metrics"')<html.indexOf('class="cursor-bar"'));
+ assert.doesNotMatch(html,/id="inspector-toggle"|id="clear-selection"|Execution details &amp; metrics|Session actions|All agent controls|breadcrumb/);
+ assert.doesNotMatch(view,/Current activity|<h2>Execution Trajectory/);
+ assert.match(view,/Execution notifications/);
+});
+
+
+test('inspector sizing clamps to the workspace and preserves evidence nodes',()=>{
+ const p=page(),panel=p.node('inspector');
+ p.ui.state.selected={type:'action',id:'old'};p.ui.syncInspector();
+ const evidence=panel.querySelector('.payload-text');evidence.textContent='Retained output';
+ p.ui.setInspectorWidth(10000);assert.equal(p.ui.state.inspectorWidth,872);
+ p.ui.setInspectorWidth(100);assert.equal(p.ui.state.inspectorWidth,280);
+ p.ui.setInspectorWidth(400);p.ui.toggleInspectorSize();assert.equal(p.ui.state.inspectorWidth,872);
+ p.ui.toggleInspectorSize();assert.equal(p.ui.state.inspectorWidth,400);
+ assert.equal(panel.querySelector('.payload-text'),evidence);assert.equal(evidence.textContent,'Retained output');
+});
+
+test('agent columns are the only trajectory layout and collapsed outputs remain disclosed',()=>{
+ const p=page();assert.doesNotMatch(p.ui.trajectoryView(),/Agent overlay|trajectory-layout|Trajectory layout options/);
+ p.ui.state.run.actions[0].result='Sensitive multiline output\nSecond line';
+ p.ui.reconcile();
+ const card=p.node('call-stack').firstElementChild.querySelectorAll('[data-call-card]')[0];
+ assert.doesNotMatch(card.querySelector('.call-card-status').innerHTML,/Sensitive|Second line/);
+});
+
+test('profiler interval and agent scope persist across all tabs without joining live',()=>{
+ const p=page();p.ui.state.run.duration=10;p.ui.state.view='trajectory';
+ p.ui.state.profiler.agent='a';p.ui.selectProfilerRange(1,2);
+ assert.equal(p.ui.state.displayPaused,true);
+ const displayed=p.ui.state.run;
+ for(const tab of ['overview','llm','tools','systems']){
+  p.ui.setView(tab);
+  assert.equal(p.ui.state.profiler.agent,'a');
+  assert.equal(JSON.stringify(p.ui.state.profiler.range),JSON.stringify([1,2]));
+  assert.equal(p.ui.state.run,displayed);assert.equal(p.ui.state.displayPaused,true);
+ }
+ assert.equal(p.ui.state.profilerCategory,'systems');
+});
+test('profiler range reset preserves frozen display and explicit jump to live rejoins updates',()=>{
+ const p=page();p.ui.state.profiler.range=[1,2];p.ui.pauseDisplay();
+ // The real handler runs; isolate its markup renderer from the minimal DOM fixture.
+ p.ui.state.view='profiler';
+ p.ignoreProfilerMarkup();
+ p.ui.handleProfilerClick({target:{closest:()=>({dataset:{},hasAttribute:key=>key==='data-prof-reset-range'})}});
+ assert.equal(p.ui.state.profiler.range,null);assert.equal(p.ui.state.displayPaused,true);
+ p.ui.state.view='trajectory';p.ui.followLatest();assert.equal(p.ui.state.displayPaused,false);
 });

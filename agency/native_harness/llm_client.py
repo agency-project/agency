@@ -90,7 +90,8 @@ class LLMClient:
         self.observer = observer
         self._client = httpx.Client(
             base_url=base_url,
-            timeout=timeout_s,
+            # 0 = wait indefinitely: a bridged response arrives only once complete.
+            timeout=None if timeout_s == 0 else timeout_s,
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         )
 
@@ -118,10 +119,13 @@ class LLMClient:
             if self.observer is not None:
                 self.observer("model_attempt", {"attempt": attempt, "internal_kind": internal_kind})
             content_parts: "list[str]" = []
+            reasoning_parts: "list[str]" = []
+            signature_parts: "list[str]" = []
             tool_calls_raw: "dict[int, dict]" = {}
             usage: "dict | None" = None
             finish_reason = None
             received_chunk = False
+            stream_error = None
             try:
                 with self._client.stream("POST", "/v1/chat/completions", json=kwargs) as resp:
                     if resp.status_code == 503:
@@ -177,6 +181,9 @@ class LLMClient:
                             break
                         received_chunk = True
                         chunk = json.loads(payload)
+                        if chunk.get("error"):
+                            stream_error = chunk["error"]
+                            break
                         if chunk.get("usage"):
                             usage = chunk["usage"]
                         choices = chunk.get("choices") or []
@@ -186,6 +193,10 @@ class LLMClient:
                         finish_reason = choices[0].get("finish_reason") or finish_reason
                         if delta.get("content"):
                             content_parts.append(delta["content"])
+                        if delta.get("reasoning_content"):
+                            reasoning_parts.append(delta["reasoning_content"])
+                        if delta.get("reasoning_signature"):
+                            signature_parts.append(delta["reasoning_signature"])
                         for tc_delta in delta.get("tool_calls") or []:
                             idx = tc_delta.get("index", 0)
                             slot = tool_calls_raw.setdefault(
@@ -204,7 +215,26 @@ class LLMClient:
                             if fn_delta.get("arguments"):
                                 slot["function"]["arguments"] += fn_delta["arguments"]
 
+                if stream_error is not None:
+                    last_error = f"dispatch failed: {stream_error.get('message', stream_error)}"
+                    assembled = (
+                        content_parts or reasoning_parts or signature_parts or tool_calls_raw
+                    )
+                    if (
+                        stream_error.get("transient")
+                        and not assembled
+                        and attempt < self.max_attempts - 1
+                    ):
+                        with profile_span(self, f"llm:retry_backoff[{attempt}]"):
+                            time.sleep(_retry_backoff_s(attempt))
+                        continue
+                    return self._dispatch_error(last_error, attempt + 1, internal_kind)
+
                 message = {"role": "assistant", "content": "".join(content_parts) or None}
+                if reasoning_parts:
+                    message["reasoning_content"] = "".join(reasoning_parts)
+                if signature_parts:
+                    message["reasoning_signature"] = "".join(signature_parts)
                 if tool_calls_raw:
                     message["tool_calls"] = [tool_calls_raw[i] for i in sorted(tool_calls_raw)]
                 result = {"message": message, "usage": usage}

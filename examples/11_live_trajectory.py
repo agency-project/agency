@@ -13,6 +13,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,9 +33,11 @@ def logger(path, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, default=Path("/tmp/agency-trajectory-live/logs"))
+    parser.add_argument("--run-dir", type=Path, help="Fresh directory for telemetry logs")
     parser.add_argument("--delay", type=float, default=3)
     args = parser.parse_args()
+    if args.run_dir is None:
+        args.run_dir = Path(tempfile.mkdtemp(prefix="agency-trajectory-")) / "logs"
     if any(args.run_dir.glob("*.sqlite3")):
         parser.error(
             "Use a fresh --run-dir. Existing telemetry is preserved; choose a new directory."
@@ -45,11 +48,10 @@ def main():
     target = workspace / "retry.py"
     target.write_text("RETRIES = 2\n")
     (workspace / "test_retry.py").write_text(
-        "import time, unittest\nfrom retry import RETRIES\n"
-        "class RetryTest(unittest.TestCase):\n"
-        "    def test_retry_limit(self):\n"
-        f"        time.sleep({max(0, args.delay)!r})\n"
-        "        self.assertEqual(RETRIES, 3, 'expected 3 retries')\n"
+        "import time, sys\nfrom retry import RETRIES\n"
+        f"time.sleep({max(0, args.delay)!r})\n"
+        "print(f'retry limit: {RETRIES}')\n"
+        "sys.exit(0 if RETRIES == 3 else 1)\n"
     )
     global_log = logger(args.run_dir / "global_data.sqlite3", "workflow")
     agent_log = logger(args.run_dir / "local-tools.sqlite3", "local-tools")
@@ -82,7 +84,7 @@ def main():
 
     def check():
         result = subprocess.run(
-            [sys.executable, "-B", "-m", "unittest", "test_retry"],
+            [sys.executable, "-B", "test_retry.py"],
             cwd=workspace,
             capture_output=True,
             text=True,
@@ -92,8 +94,8 @@ def main():
     status = "completed"
     try:
         run_tool("read_file", {"path": str(target)}, lambda: {"content": target.read_text()})
-        for _ in range(3):
-            run_tool("Bash", {"command": f"{sys.executable} -B -m unittest test_retry"}, check)
+        before = run_tool("Bash", {"command": f"{sys.executable} -B test_retry.py"}, check)
+        print(f"before edit: {before}")
 
         def edit():
             target.write_text("RETRIES = 3\n")
@@ -110,7 +112,10 @@ def main():
             }
 
         run_tool("edit", {"path": str(target)}, edit)
-        run_tool("Bash", {"command": f"{sys.executable} -B -m unittest test_retry"}, check)
+        after = run_tool("Bash", {"command": f"{sys.executable} -B test_retry.py"}, check)
+        print(f"after edit: {after}")
+        if after["exit_code"]:
+            raise RuntimeError("Retry check failed after editing the file")
         print(json.dumps({"status": status, "run_dir": str(args.run_dir)}))
     except Exception:
         status = "failed"

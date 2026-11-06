@@ -1,81 +1,96 @@
-# Agency
+ <div align="center">
 
-**See. Understand. Control.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/agency_dark_v2.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/agency_light_v2.png">
+  <img alt="Agency logo" src="docs/assets/agency_light.png" width="500">
+</picture>
 
-See what your agents are doing. Understand why. Control what happens next.
+Live debugging and systems profiling for AI agents.
 
-**Any model. Any harness.**
+[Getting Started](docs/getting-started.md) · [Documentation](docs/api/index.md) · [Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
 
-Agency gives you one place to observe and control agent execution, while
-keeping your existing agent stack and orchestration.
+</div>
 
-> **Product GIF placeholder** — live execution and trajectory, systems/model
-> profiling, and runtime intervention.
+Agency is an open-source platform developed at [UC Berkeley Sky Computing Lab](https://sky.cs.berkeley.edu/) for **running, debugging, profiling, and controlling AI agents**.
 
-<!-- TODO: Replace this block with docs/assets/agency-demo.gif showing live agent
-execution, trajectory + systems/model profiling, and runtime intervention.
-Planned recording using existing views and Python controls. -->
+As agents tackle longer tasks, invoke tools, and work in parallel, understanding what they're actually doing gets harder. Model traces only tell part of the story. What is an agent waiting for? Where is time being spent? Why is one run slower than another?
 
-## See
+Agency connects **LLM requests, tool calls, and system activity** in one place, giving you the visibility to investigate execution, find bottlenecks, and understand what changed.
 
-Follow a live trajectory that groups model/tool calls and highlights waits,
-repeated failures and requests for input. Tell what is progressing and what
-needs attention before opening individual calls. Recorded profiles add
-process activity, CPU/memory/I/O samples, optional GPU metrics, and reported
-file or artifact effects.
+We are model and harness agnostic! Run Claude Code, Codex, OpenCode, or Agency's native harness with supported backends including OpenAI, Anthropic, Bedrock, and local models via vLLM. [Get started](#getting-started)
 
-## Understand
+<!-- TODO(release): Record multi-agent live execution, invocation inspection, and runtime control. -->
+![Agency Live Execution](docs/assets/agency-demo.webp)
 
-Distinguish model wait, CPU work and scheduler/dependency waits. Inspect the
-context supplied to the model, tool arguments/results, failures and retries.
-Compare runs for trajectory divergence, timing changes and multi-agent
-dependencies or overlapping work. Recorded evidence stays separate from
-inferred actions; missing data remains unavailable. [Profiler views](docs/guides/profiling/views.md)
-explain how to read it.
+## What you can do with Agency
 
-## Control
+### Live Execution — See what's happening
 
-**Observe → understand → intervene → measure**
+Think **htop + gdb for AI agents**.
 
-Use Python controls to pause, resume or cancel. Redirect supported interactive
-harnesses mid-run; native or unavailable delivery queues context for later
-submissions. Set CPU/memory limits, request GPU leases, apply tool/syscall
-policies and attach custom tools through supported integrations. Choose
-sandbox images and project mounts for your environment.
+Watch agents execute in real time. Inspect model requests, tool calls, outputs, failures, and waits across agents. Pause, resume, or stop supported executions directly from the dashboard.
 
-Controls are best-effort. Image checkpoints capture filesystem state;
-optional ZFS restore is private to the same sandbox. Host mounts and external
-side effects are outside rollback. See [control behavior](docs/architecture/orchestrator.md)
-and [checkpoint limits](docs/api/sandboxes.md#checkpoint-backends).
+When execution finishes, the same view becomes a navigable history of everything that happened.
+
+### Critical Path — Find what's slowing you down
+
+See where wall-clock time actually goes.
+
+Trace model requests, tool calls, processes, and dependencies across agents. Identify the work determining completion time, distinguish parallel execution from waiting, and zoom into bottlenecks.
+
+Use the **Critical Path Profiler** after execution to investigate what held the run back.
+
+<!-- TODO(release): Record agent lanes, dependencies, critical path, and timeline zoom. -->
+![Agency Critical Path Profiler](docs/assets/agency-critical.png)
+
+### Detailed Profiler — Go deeper
+
+Dig into the measurements behind execution.
+
+Explore LLM latency, token usage, tool durations, errors, retries, CPU, memory, I/O, and optional GPU metrics. Follow linked records from high-level activity down to individual events and processes.
+
+No invented numbers. Missing measurements stay missing.
+
+### Compare Runs — Understand what changed
+
+Compare completed runs side by side.
+
+Examine execution trajectories, model and tool activity, latency, resource usage, failures, and outcomes. Find where execution paths diverged and which measurements changed.
+
+Agency compares recorded evidence, without guessing at causes.
+
+<!-- TODO(release): Record two historical runs with trajectory and metric comparisons. -->
+![Agency Compare Runs](docs/assets/agency-compare.png)
 
 ## Underneath your agent stack
 
-Agency supplies the runtime underneath your application. Choose a supported
-harness and model independently; keep workflow logic in your Python loops,
-state machines, supervisor/worker systems or queues. LangGraph, Temporal or
-Ray integrations use application-written calls; dedicated adapters are not
-included. Agency schedules local invocations and returns pending results.
+Agency provides a sandboxed execution environment, Python API, supported agent harnesses, and integrated telemetry. Your application keeps control of its workflow and orchestration.
 
-![Agency underneath application orchestration, with harnesses, models and tools below it](docs/assets/agency-runtime.png)
+![Agency architecture](docs/assets/agency-architecture.svg)
 
-[Editable diagram source](docs/assets/agency-runtime.mmd).
-
-| Component | Implemented choices |
+| Layer | Supported options |
 | --- | --- |
-| Harness | Native, Claude Code, Codex, OpenCode, Grok, Kimi |
-| Model backend | OpenAI Chat Completions / Responses, Anthropic, Bedrock, tool-capable OpenAI-compatible endpoints such as vLLM |
+| Agent harnesses | Native, Claude Code, Codex, OpenCode, Grok, Kimi |
+| Model backends | OpenAI Chat Completions / Responses, Anthropic, Amazon Bedrock, OpenAI-compatible endpoints (including vLLM) |
+| Environment | Linux sandboxes using Docker or Podman, with configurable resources and mounts |
 
-Pairings require matching model features and CLI versions; external CLIs need
-installation. See [configuration and requirements](docs/guides/configuration.md).
+Compatibility depends on model capabilities, configuration, and external CLI versions. External harness CLIs must be installed separately.
 
-## Quick start
+**Experimental:** Integration with existing Claude Code and Codex CLI sessions on Linux is experimental. Profiling, interception, and execution controls may be limited. Python-orchestrated workflows currently provide the most complete experience.
 
-Use **Linux x86-64**, **Python 3.12+**, Git,
-[uv](https://docs.astral.sh/uv/getting-started/installation/) and local
-**Docker or Podman** on the driver's host. Check `docker info` or `podman info`;
-the Python client does not install an engine.
+See [configuration and requirements](docs/guides/configuration.md).
 
-Install from source:
+## Getting started
+
+### Requirements
+
+- Linux x86-64 and Python 3.12+
+- Git and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Docker or Podman
+- API key for your configured model provider
+
+### Install and run
 
 ```bash
 git clone https://github.com/agency-project/agency.git
@@ -84,89 +99,38 @@ uv sync --locked --python 3.12
 
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="gpt-6-luna"
+
 uv run python examples/quickstart.py
 ```
 
-The example uses native with OpenAI Chat Completions and function tools;
-the model must accept `reasoning_effort="none"`. `OPENAI_MODEL` defaults as
-shown. Requests incur API charges. The script reads the exported key without
-loading `.env`.
+This runs a native agent in an isolated sandbox. The configured model must support `reasoning_effort="none"`. Model API usage may incur charges.
 
-First startup needs network access to pull the image and install dependencies.
-GPU passthrough is disabled; no GPU, ZFS, CRIU or host provisioning is needed.
-[Getting started](docs/getting-started.md) covers setup failures.
+First startup requires network access for the sandbox image and dependencies. No GPU, ZFS, or CRIU required.
 
-## Basic usage
-
-A skill defines the task and input/output fields. This is the complete workload
-in [quickstart.py](examples/quickstart.py). Save it as `first_agent.py` and run
-`uv run python first_agent.py` from the checkout:
-
-```python
-import os
-from pathlib import Path
-
-from agency import Agent, agdata, agskill
-from agency.configs.agconfig import agconfig, llmconfig, resourcesconfig, sandboxconfig
-
-cfg = agconfig(
-    llmconfig(
-        provider="openai",
-        base_url="https://api.openai.com/v1",
-        model=os.environ.get("OPENAI_MODEL", "gpt-6-luna"),
-        api_key=os.environ["OPENAI_API_KEY"],
-        reasoning_effort="none",
-        max_completion_tokens=4096,
-    ),
-    sandboxconfig(gpu_passthrough=False),
-    resourcesconfig(idle_cpus=1),
-)
-task = agskill(
-    name="code_and_test",
-    prompt="Complete the request in /workspace. Run the code, then summarize the result.",
-    input_schema=agdata(request=str),
-    output_schema=agdata(summary=str),
-)
-worker = Agent("coder", agconfig=cfg, harness="native")
-result = worker.run(
-    task,
-    agdata(request="Write sum_even(numbers) in Python and run assertions for empty and mixed lists."),
-)
-result.wait()
-print(result.summary)
-print(f"Run directory: {Path(worker.data_logger.db_path).parent.parent}")
-```
-
-`run()` returns a pending result; wait before reading output. Check
-`result.to_dict()` for `error` after failure. Code runs inside `/workspace`;
-the printed host directory retains logs after sandbox cleanup on process exit.
-
-## Profile the run
-
-Run the same example with the dashboard and profiler:
+### Launch the dashboard
 
 ```bash
 AGENCY_PROFILE=1 AGENCY_PROFILE_SCOPE=workload \
   uv run python examples/quickstart.py --webui
 ```
 
-Open [the dashboard](http://localhost:7860/) or
-[profiler](http://localhost:7860/profiler) for live trajectory and model/tool
-activity. The profiler starts without a viewer build and retains raw trace
-downloads for completed profiles. The server binds to `0.0.0.0`.
-[Profiling guide](docs/guides/profiling.md) covers saved runs and setup.
+Open [localhost:7860](http://localhost:7860/) for live execution and [localhost:7860/profiler](http://localhost:7860/profiler) for profiling.
 
-## Compare runs
+The dashboard binds to `0.0.0.0` by default; don't expose it to untrusted networks without appropriate access controls.
 
-Vary a supported harness, model or CPU allocation. Compare trajectories,
-resource contention, scheduling waits and task outcomes, or redirect an
-interactive harness and compare its continuation. The common runtime and
-telemetry support reproducible experimentation; retain source, configuration,
-environment and outcome evidence with each run.
+For Python integration, see [`examples/quickstart.py`](examples/quickstart.py). You can configure the harness and model independently, define tasks with typed inputs and outputs, and collect execution records for later analysis.
 
-## Next steps
+## Documentation
 
-- [Examples](examples/README.md): tools, context, workflows and files.
-- [API reference](docs/api/index.md): signatures, defaults and current contracts.
-- [Architecture](docs/architecture/index.md): package responsibilities, design and execution flow.
-- [Contributing](CONTRIBUTING.md): development setup and checks.
+- [Getting Started](docs/getting-started.md) — Installation and first run
+- [Configuration](docs/guides/configuration.md) — Harnesses, models, and environments
+- [Profiling](docs/guides/profiling.md) — Recording and interpreting execution
+- [Examples](examples/README.md) — Agent workflows and integrations
+- [API Reference](docs/api/index.md) — Python interfaces
+- [Architecture](docs/architecture/index.md) — Runtime and system design
+
+## Contributing
+
+Agency is open source. Contributions, bug reports, and feedback are welcome.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.

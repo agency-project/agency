@@ -55,7 +55,7 @@ print(state.running_count, state.blocked_count)
 
 ## Conversation context
 
-`agcontext(recent_transcript=None, harness_sessions=None, retained_messages=None, harness_message_cursors=None, _future=None)` holds ordered agent state. Omitted mappings/lists are fresh; supplied ones are retained. `_future` belongs to infrastructure. Prefer `agent.history` and `queue_message` for application changes.
+`agcontext(harness_sessions=None, retained_messages=None, harness_message_cursors=None, _future=None, *, message_hash_list=None, message_store=None)` holds ordered agent state. The transcript is a list of message hashes resolved against its `message_store`, which also holds the persistent message patches (see [Message patches](../Message_Patches.md)); `agcontext.from_messages(messages)` builds one from plain messages. Omitted mappings/lists are fresh; supplied ones are retained. `_future` belongs to infrastructure. Prefer `agent.history` and `queue_message` for application changes.
 
 `is_pending()` reports presence of a context future (even if done). `resolve_prev_dependencies()` blocks and merges predecessor state, returns None. `get_resolved_transcript()` blocks and returns a shallow list snapshot; `copy()` blocks and returns a deep independent context. `set_transcript(list)` replaces with a list copy without waiting itself.
 
@@ -109,7 +109,9 @@ Environment profiling is enabled when AGENCY_PROFILE is unset, or explicitly `1`
 
 ## Web UI entry point
 
-`agwebui.run(fn, *args, run_dir=None, port=7860, linger=True, **kwargs) -> None` starts its server subprocess and viewer assets, then calls fn synchronously in the caller's thread inside a workload profiling boundary. The fn return value is discarded. run_dir/port/linger are consumed by the UI; remaining args/kwargs go to fn. run_dir selects saved artifacts; default is generated under the run root. The server binds 0.0.0.0. An occupied port raises RuntimeError. Viewer build/download and service-start failures propagate before fn runs.
+`agwebui.run(fn, *args, run_dir=None, port=7860, linger=True, ui_tasks=None, **kwargs) -> None` starts its server subprocess, then calls fn synchronously in the caller's thread inside a workload profiling boundary. The fn return value is discarded. run_dir/port/linger/ui_tasks are consumed by the UI; remaining args/kwargs go to fn. run_dir selects the log directory; its default is generated under the run root. Use the same directory for application agent logs. The server binds 0.0.0.0. An occupied port raises RuntimeError. Process-launch failures propagate; a server that does not become healthy within the startup polling window produces a warning and the workload continues.
+
+`ui_tasks` optionally maps nonblank task IDs to existing `agskill` objects. Only these skills can be submitted through the live profiler; no allowlist means no browser Run task capability. The execution-owned relay also supports pause/resume, stop, retained messages and supported active-invocation redirects while the workload is running. Saved runs and a standalone log server cannot control agents. See [live controls and receipts](../guides/profiling/live-trajectory.md#pause-and-inspect-live-execution) for delivery and observation limits.
 
 With linger=True it remains until Ctrl+C; false exits after fn. Ordinary fn Exceptions are logged/printed as failed workload and are **not reraised**; BaseException follows Python cleanup propagation. Don't use the return value or absence of an exception as a success signal. The execution profiler starts without downloading or building viewer assets. A workload should settle its background results before returning so profiling ends at the intended boundary.
 
@@ -119,7 +121,7 @@ from agency.observability.agwebui import agwebui
 def workload():
     print("Replace this with a joined application workload")
 
-# Creates server/artifacts and may build viewer assets.
+# Creates the server and run artifacts; no viewer build is needed.
 # agwebui.run(workload, linger=False)
 ```
 
@@ -129,13 +131,13 @@ def workload():
 
 ::: agency.agcontext.agcontext
     options:
-      members: ["__init__", "is_pending", "resolve_prev_dependencies", "get_resolved_transcript", "set_transcript", "append_retained_message", "pending_retained_messages", "advance_retained_cursor", "copy"]
+      members: ["__init__", "is_pending", "resolve_prev_dependencies", "get_resolved_transcript", "set_transcript", "append_retained_message", "pending_retained_messages", "advance_retained_cursor", "copy", "from_messages", "message_state", "message_state_fields"]
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
 ::: agency.orchestrator.orchestrator.GlobalAgentOrchestrator
     options:
-      members: ["__init__", "change_config", "submit", "submit_context_message", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown"]
+      members: ["__init__", "change_config", "submit", "submit_context_message", "redirect_request", "cancel_request", "cancel_agent", "snapshot", "flush", "shutdown", "submit_context_patch"]
 
 [Source: orchestrator.py](../../agency/orchestrator/orchestrator.py)
 
@@ -191,7 +193,7 @@ def workload():
 
 ::: agency.observability.profiler.agprof
     options:
-      members: ["start", "stop", "session", "workload", "profile_scope", "enabled", "span", "annotate", "thread_name", "spawn_traced", "bind_execution", "execution_context", "current_span_context", "current_span_attributes", "next_index", "summary_metrics", "profile_records", "summary_table"]
+      members: ["start", "stop", "session", "workload", "profile_scope", "enabled", "span", "annotate", "thread_name", "spawn_traced", "bind_execution", "execution_context", "current_span_context", "current_span_attributes", "next_index", "summary_metrics", "profile_records", "summary_table", "active_output_dir", "current_execution_attributes", "current_span_id", "session_identity"]
 
 [Source: __init__.py](../../agency/observability/agwebui/__init__.py)
 

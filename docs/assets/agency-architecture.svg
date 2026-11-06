@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1220 580" width="1220" height="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>Agency architecture</title>
+  <desc>Your Python workflow submits agent.run() calls to the Agency runtime on the host. The orchestrator schedules them; an engine per running agent routes model calls, enforces tool and policy guards and records events. Each agent's harness runs inside a Docker or Podman sandbox.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .ink { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .card { fill: #ffffff; stroke: #d1d9e0; stroke-width: 1.2; }
+    .ext { fill: #f6f8fa; stroke: #b7c0c9; stroke-width: 1.2; }
+    .user { fill: #eef4ff; stroke: #5b8def; stroke-width: 1.5; }
+    .host { fill: #f4f0fd; stroke: #8b6ad8; stroke-width: 1.5; }
+    .box  { fill: #f9f6ff; stroke: #b9a3ea; stroke-width: 1.2; }
+    .sbx  { fill: #fff7e8; stroke: #d39a2c; stroke-width: 1.5; }
+    .arrow { stroke: #59636e; stroke-width: 1.6; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+    .head { fill: #59636e; }
+    .h1 { font-size: 17px; font-weight: 700; }
+    .h2 { font-size: 15px; font-weight: 600; }
+    .t  { font-size: 13px; }
+    .s  { font-size: 11.5px; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .ink { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .card { fill: #151b23; stroke: #3d444d; }
+      .ext { fill: #151b23; stroke: #3d444d; }
+      .user { fill: #121d33; stroke: #4d7fe0; }
+      .host { fill: #1c1630; stroke: #8b6ad8; }
+      .box  { fill: #231c3b; stroke: #6c55b0; }
+      .sbx  { fill: #261d0c; stroke: #b9862a; }
+      .arrow { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="head"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1220" height="580" rx="12"/>
+
+  <!-- External services (top) -->
+  <rect class="ext" x="342.5" y="40" width="220" height="64" rx="8"/>
+  <text class="ink h2" x="452.5" y="66" text-anchor="middle">Model providers</text>
+  <text class="muted s" x="452.5" y="86" text-anchor="middle">OpenAI · Anthropic · Bedrock · vLLM</text>
+
+  <rect class="ext" x="607.5" y="40" width="220" height="64" rx="8"/>
+  <text class="ink h2" x="717.5" y="66" text-anchor="middle">Live Web UI &amp; profiler</text>
+  <text class="muted s" x="717.5" y="86" text-anchor="middle">trajectories · timing · resources</text>
+
+  <!-- ============ Column 1: your workflow ============ -->
+  <rect class="user" x="20" y="140" width="270" height="420" rx="12"/>
+  <text class="ink h1" x="155" y="172" text-anchor="middle">Your Python workflow</text>
+
+  <rect class="card" x="35" y="192" width="240" height="58" rx="8"/>
+  <text class="ink t code" x="155" y="216" text-anchor="middle">agent.run(skill, inputs)</text>
+  <text class="muted s" x="155" y="236" text-anchor="middle">returns a pending result immediately</text>
+
+  <rect class="card" x="35" y="288" width="108" height="44" rx="8"/>
+  <text class="ink t" x="89" y="315" text-anchor="middle">Agent A</text>
+  <rect class="card" x="167" y="288" width="108" height="44" rx="8"/>
+  <text class="ink t" x="221" y="315" text-anchor="middle">Agent B</text>
+
+  <rect class="card" x="35" y="370" width="240" height="44" rx="8"/>
+  <text class="ink t" x="155" y="397" text-anchor="middle">Agent C  (uses A + B results)</text>
+
+  <path class="arrow dash" d="M130,250 L94,286" marker-end="url(#ah)"/>
+  <path class="arrow dash" d="M180,250 L216,286" marker-end="url(#ah)"/>
+  <path class="arrow" d="M89,332 L130,368" marker-end="url(#ah)"/>
+  <path class="arrow" d="M221,332 L180,368" marker-end="url(#ah)"/>
+
+  <text class="muted s" x="155" y="456" text-anchor="middle">Plain Python — loops, threads, queues</text>
+  <text class="muted s" x="155" y="474" text-anchor="middle">or your own orchestration framework.</text>
+  <text class="muted s" x="155" y="500" text-anchor="middle">Dependencies are inferred from</text>
+  <text class="muted s" x="155" y="518" text-anchor="middle">pending results passed as inputs.</text>
+
+  <!-- ============ Column 2: Agency host runtime ============ -->
+  <rect class="host" x="350" y="140" width="470" height="420" rx="12"/>
+  <text class="ink h1" x="585" y="172" text-anchor="middle">Agency runtime  ·  host</text>
+
+  <!-- Engine -->
+  <rect class="box" x="375" y="190" width="420" height="168" rx="10"/>
+  <text class="ink h2" x="585" y="214" text-anchor="middle">Engine  —  one per running agent</text>
+
+  <rect class="card" x="390" y="230" width="125" height="68" rx="8"/>
+  <text class="ink t" x="452.5" y="259" text-anchor="middle">Model router</text>
+  <text class="muted s" x="452.5" y="279" text-anchor="middle">API translation</text>
+
+  <rect class="card" x="522" y="230" width="125" height="68" rx="8"/>
+  <text class="ink t" x="584.5" y="259" text-anchor="middle">Tool &amp; policy</text>
+  <text class="muted s" x="584.5" y="279" text-anchor="middle">guards · host tools</text>
+
+  <rect class="card" x="655" y="230" width="125" height="68" rx="8"/>
+  <text class="ink t" x="717.5" y="259" text-anchor="middle">Event recorder</text>
+  <text class="muted s" x="717.5" y="279" text-anchor="middle">logs · metrics</text>
+
+  <text class="muted s" x="585" y="332" text-anchor="middle">Prepares inputs · validates structured outputs · commits state</text>
+
+  <!-- Orchestrator -->
+  <rect class="box" x="375" y="400" width="420" height="136" rx="10"/>
+  <text class="ink h2" x="585" y="428" text-anchor="middle">Orchestrator</text>
+  <text class="ink t" x="585" y="456" text-anchor="middle">Schedules requests by their dependencies</text>
+  <text class="ink t" x="585" y="478" text-anchor="middle">Shares CPU · memory · GPU across agents</text>
+  <text class="ink t" x="585" y="500" text-anchor="middle">Pause · resume · redirect · cancel</text>
+
+  <path class="arrow" d="M585,400 L585,362" marker-end="url(#ah)"/>
+
+  <!-- Up to external services -->
+  <path class="arrow" d="M452.5,228 L452.5,108" marker-start="url(#ah)" marker-end="url(#ah)"/>
+  <path class="arrow" d="M717.5,228 L717.5,108" marker-end="url(#ah)"/>
+
+  <!-- Workflow <-> orchestrator -->
+  <path class="arrow" d="M292,448 L371,448" marker-end="url(#ah)"/>
+  <text class="muted s" x="320" y="440" text-anchor="middle">submit</text>
+  <path class="arrow" d="M373,492 L294,492" marker-end="url(#ah)"/>
+  <text class="muted s" x="320" y="510" text-anchor="middle">results</text>
+
+  <!-- ============ Column 3: sandbox ============ -->
+  <rect class="sbx" x="880" y="140" width="320" height="420" rx="12"/>
+  <text class="ink h1" x="1040" y="172" text-anchor="middle">Sandbox  ·  Docker / Podman</text>
+
+  <rect class="card" x="905" y="190" width="270" height="84" rx="8"/>
+  <text class="ink h2" x="1040" y="222" text-anchor="middle">Harness daemon</text>
+  <text class="muted s" x="1040" y="244" text-anchor="middle">bridges model, tool &amp; policy calls</text>
+  <text class="muted s" x="1040" y="260" text-anchor="middle">back to the host</text>
+
+  <rect class="card" x="905" y="304" width="270" height="96" rx="8"/>
+  <text class="ink h2" x="1040" y="334" text-anchor="middle">Any agent harness</text>
+  <text class="ink t" x="1040" y="358" text-anchor="middle">Claude Code · Codex · OpenCode</text>
+  <text class="ink t" x="1040" y="380" text-anchor="middle">Grok · Kimi · Agency native</text>
+
+  <rect class="card" x="905" y="430" width="270" height="106" rx="8"/>
+  <text class="ink h2" x="1040" y="460" text-anchor="middle">Isolated files &amp; processes</text>
+  <text class="muted s" x="1040" y="484" text-anchor="middle">syscall policy · CPU/memory limits</text>
+  <text class="muted s" x="1040" y="502" text-anchor="middle">filesystem checkpoints</text>
+
+  <path class="arrow" d="M1040,274 L1040,300" marker-end="url(#ah)"/>
+  <path class="arrow" d="M1040,400 L1040,426" marker-end="url(#ah)"/>
+
+  <!-- Engine <-> sandbox -->
+  <path class="arrow" d="M797,256 L901,256" marker-start="url(#ah)" marker-end="url(#ah)"/>
+  <text class="muted s" x="850" y="230" text-anchor="middle">local</text>
+  <text class="muted s" x="850" y="244" text-anchor="middle">socket</text>
+</svg>

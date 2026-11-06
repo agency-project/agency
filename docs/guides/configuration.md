@@ -127,14 +127,12 @@ to CLI versions; start with native for the shortest setup.
 
 ## Work on a project
 
-Add a mount before creating the agent. This example keeps the model settings
+Add a mount before creating the agent. This example preserves all settings
 from `cfg` and exposes the current project at `/workspace/project`:
 
 ```python
 from pathlib import Path
-from agency.configs.agconfig import sandboxconfig
-
-project_cfg = agconfig(cfg.llm, sandboxconfig())
+project_cfg = cfg.clone()
 project_cfg.sandbox.add_mount(
     "project", Path.cwd(), "/workspace/project", mode="rw"
 )

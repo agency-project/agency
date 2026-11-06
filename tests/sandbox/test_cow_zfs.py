@@ -165,7 +165,11 @@ def test_config_requires_zfs_parent_for_cow_backend():
 
 
 def test_benchmark_accepts_docker_and_podman_cow_layouts():
-    from benchmarks.checkpoint_size_microbenchmark.runner import validate_checkpoint_comparison
+    runner = pytest.importorskip(
+        "benchmarks.checkpoint_size_microbenchmark.runner",
+        reason="benchmark sources are maintained outside the Agency repository",
+    )
+    validate_checkpoint_comparison = runner.validate_checkpoint_comparison
 
     for runtime in ("docker", "podman"):
         validate_checkpoint_comparison(

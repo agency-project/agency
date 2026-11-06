@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from agency.llm.message_store import split_tool_schema
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.claude_code import ClaudeCodeAdapter
 
@@ -180,7 +183,7 @@ def test_harness_to_agency_tools_and_tool_choice():
         "tool_choice": {"type": "tool", "name": "get_weather"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"] == [
+    assert split_tool_schema(agency["messages"])[1] == [
         {
             "type": "function",
             "function": {
@@ -190,7 +193,10 @@ def test_harness_to_agency_tools_and_tool_choice():
             },
         }
     ]
-    assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+    assert split_tool_schema(agency["messages"])[2] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
 
 
 def test_harness_to_agency_tool_schema_drops_dollar_schema_key():
@@ -210,7 +216,7 @@ def test_harness_to_agency_tool_schema_drops_dollar_schema_key():
         ],
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"][0]["function"]["parameters"] == {
+    assert split_tool_schema(agency["messages"])[1][0]["function"]["parameters"] == {
         "type": "object",
         "properties": {"city": {"type": "string"}},
     }
@@ -243,7 +249,7 @@ def test_harness_to_agency_tool_schema_drops_noop_property_names():
         ],
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"][0]["function"]["parameters"] == {
+    assert split_tool_schema(agency["messages"])[1][0]["function"]["parameters"] == {
         "type": "object",
         "properties": {
             "answers": {
@@ -280,7 +286,9 @@ def test_harness_to_agency_tool_schema_keeps_real_property_names_constraint():
     }
     agency = _backend()._format_context_harness_to_agency(body)
     assert (
-        agency["tools"][0]["function"]["parameters"]["properties"]["perms"]["propertyNames"]
+        split_tool_schema(agency["messages"])[1][0]["function"]["parameters"]["properties"][
+            "perms"
+        ]["propertyNames"]
         == real_property_names
     )
 
@@ -356,7 +364,7 @@ def test_harness_to_agency_tool_choice_none():
         "tool_choice": {"type": "none"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == "none"
+    assert split_tool_schema(agency["messages"])[2] == "none"
 
 
 def test_harness_to_agency_mid_array_system_message_kept_in_place():
@@ -409,7 +417,13 @@ def test_agency_to_harness_text_only():
     assert out["role"] == "assistant"
     assert out["content"] == [{"type": "text", "text": "hi there"}]
     assert out["stop_reason"] == "end_turn"
-    assert out["usage"] == {"input_tokens": 5, "output_tokens": 3}
+    assert out["usage"]["input_tokens"] == 5
+    assert out["usage"]["output_tokens"] == 3
+    # The source dict's own fields survive alongside the Anthropic-native
+    # aliases -- not narrowed away, see _forward_usage_to_anthropic.
+    assert out["usage"]["prompt_tokens"] == 5
+    assert out["usage"]["completion_tokens"] == 3
+    assert out["usage"]["total_tokens"] == 8
 
 
 def test_agency_to_harness_tool_use():
@@ -803,6 +817,58 @@ def test_messages_stream_transient_upstream_error_keeps_503():
     assert response.json()["error"]["transient"] is True
 
 
+def test_native_delayed_rejection_preserves_http_status_and_provider_body():
+    import asyncio
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.configs.agconfig import harnessadapterconfig, llmconfig
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.1.output_config: unsupported",
+        },
+    }
+
+    class Router(_StreamRouter):
+        async def dispatch_stream_async(self, token, request):
+            await asyncio.sleep(0.05)
+            raise HostDispatchError(
+                {
+                    "message": "wrapped",
+                    "status_code": 400,
+                    "transient": False,
+                    "provider_error": body,
+                    "provider_headers": {"retry-after": "2", "x-should-retry": "false"},
+                }
+            )
+            yield
+
+    router = Router([])
+    app = FastAPI()
+    adapter = ClaudeCodeAdapter(
+        agconfig(llmconfig(provider="anthropic"), harnessadapterconfig(stream_keepalive_s=0.005))
+    )
+    adapter.register(app, router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer fake"},
+            json={
+                "model": "claude-sonnet-5-5",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert response.status_code == 400
+    assert response.json() == body
+    assert response.headers["retry-after"] == "2"
+    assert response.headers["x-should-retry"] == "false"
+
+
 def test_messages_stream_success_is_unchanged_sse():
     done = {
         "type": "done",
@@ -825,3 +891,27 @@ def test_messages_stream_success_is_unchanged_sse():
     )
     assert text == "hello"
     assert router.closed
+
+
+@pytest.mark.parametrize(
+    "status,error_type",
+    [
+        (400, "invalid_request_error"),
+        (429, "rate_limit_error"),
+        (529, "overloaded_error"),
+        (500, "api_error"),
+    ],
+)
+def test_anthropic_error_frame_uses_the_wire_error_type_for_the_status(status, error_type):
+    from agency.harness.adapters.claude_code import _anthropic_error_frame
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    frame = _anthropic_error_frame(
+        HostDispatchError({"message": "upstream said no", "status_code": status})
+    )
+    event, data = frame.strip().split("\n")
+    assert event == "event: error"
+    assert json.loads(data[len("data: ") :]) == {
+        "type": "error",
+        "error": {"type": error_type, "message": "upstream said no"},
+    }

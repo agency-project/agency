@@ -95,6 +95,7 @@ def test_sampler_persists_measured_samples_without_second_collection(monkeypatch
     )
     monkeypatch.setattr(sampler, "_tick_processes", lambda t: None)
     monkeypatch.setattr(sampler, "_tick_cgroups", lambda t: None)
+    monkeypatch.setattr(sampler, "_tick_host", lambda t: None)
     monkeypatch.setattr(
         sampler,
         "_tick_workload_cgroup",
@@ -116,6 +117,36 @@ def test_reconnect_preserves_time_between_events(tmp_path, monkeypatch):
         assert frame["replay"]["clock"] == 20.5
         assert not frame["replay"]["playing"]
         assert all(a["start"] <= 20.5 for a in frame["run"]["actions"])
+
+
+def test_replay_range_uses_full_recording_and_seek_acknowledges_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_run_dir", tmp_path)
+    write_rows(
+        tmp_path / "global_data.sqlite3",
+        [
+            event(0, "workload_started", ts=100),
+            event(1, "tool_call", ts=120, call_id="one", tool="read", arguments={}),
+            event(2, "tool_result", ts=125, call_id="one", result="ok"),
+            event(3, "done", ts=130),
+        ],
+    )
+    with (
+        TestClient(server.app) as client,
+        client.websocket_connect("/ws/trajectory?mode=replay&run=live") as ws,
+    ):
+        opened = ws.receive_json()
+        assert opened["run"]["execution_started_at"] is None
+        bounds = opened["replay"]["wall_clock"]
+        assert bounds == {"start": 20, "end": 30, "pending": False}
+        ws.send_json({"type": "seek", "clock": 24.5, "seek_id": 7})
+        for _ in range(30):
+            frame = ws.receive_json()
+            if frame["replay"]["seek_id"] == 7:
+                break
+        assert frame["type"] == "snapshot"
+        assert frame["replay"]["clock"] == 24.5
+        assert frame["replay"]["wall_clock"] == bounds
+        assert receive_seek(ws, 0)["replay"]["wall_clock"] == bounds
 
 
 def test_replay_history_bounds_payloads_but_keeps_original_evidence(tmp_path):

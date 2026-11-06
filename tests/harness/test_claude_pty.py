@@ -124,14 +124,16 @@ def test_claude_native_input_is_acknowledged_or_execution_is_retired(tmp_path, m
 @pytest.mark.parametrize(
     "context_limit,expected_window",
     [
-        (32_000, None),  # 28.8k after margin -- still below the flag's 100k floor
-        (100_000, None),  # 90k after margin -- just below the floor
-        (500_000, 450_000),
-        (1_000_000, 900_000),
-        (2_000_000, None),  # 1.8M after margin -- still above the flag's 1M ceiling
+        # 90% of the limit plus Claude Code's own 33K reserve, within the
+        # flag's 100K-1M range (tests/harness/test_context_window.py).
+        (32_000, None),  # 61.8K: below the flag's floor, set by env instead
+        (100_000, 123_000),
+        (500_000, 483_000),
+        (1_000_000, 933_000),
+        (2_000_000, 1_000_000),
     ],
 )
-def test_autocompact_uses_a_safety_margin_and_claudes_accepted_range(
+def test_autocompact_leaves_claudes_reserve_above_90_percent_of_the_limit(
     tmp_path, monkeypatch, context_limit, expected_window
 ):
     (tmp_path / "events").mkdir()

@@ -20,6 +20,11 @@ from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
 def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
     from agency.harness.clients.host_services_client import HostDispatchError
 
+    provider_error = {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "native error"},
+    }
+
     def handler(request):
         if streamed:
             return httpx.Response(
@@ -30,11 +35,23 @@ def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
                         "message": "synthetic",
                         "status_code": 400,
                         "transient": False,
+                        "provider_error": provider_error,
+                        "provider_headers": {"retry-after": "2"},
                     }
                 )
                 + "\n",
             )
-        return httpx.Response(400, json={"error": {"message": "synthetic", "transient": False}})
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "synthetic",
+                    "transient": False,
+                    "provider_error": provider_error,
+                    "provider_headers": {"retry-after": "2"},
+                }
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: transport)
@@ -46,6 +63,8 @@ def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
                 pass
         assert caught.value.status_code == 400
         assert caught.value.transient is False
+        assert caught.value.provider_error == provider_error
+        assert caught.value.provider_headers == {"retry-after": "2"}
 
     try:
         asyncio.run(consume())
@@ -452,3 +471,53 @@ def test_profiler_bridge_calls_use_a_safe_timeout_not_2s():
     for timeout in seen_timeouts:
         assert timeout["connect"] >= 5.0
         assert timeout["read"] >= 5.0
+
+
+def test_permission_hook_identity_survives_router_rpc_and_host_completion():
+    from tests.engine.host_servers_tests.test_host_interaction_server import (
+        _make_server,
+        _FakeDataLogger,
+    )
+
+    logger = _FakeDataLogger()
+    host = _make_server(data_logger=logger)
+    with TestClient(host.build_app()) as host_client:
+
+        def handler(request):
+            response = host_client.post(
+                request.url.path.removeprefix("/interaction"), json=json.loads(request.content)
+            )
+            return httpx.Response(response.status_code, json=response.json())
+
+        bridge = _bridge(handler)
+        app = FastAPI()
+        app.include_router(build_interaction_router(bridge))
+        try:
+            with TestClient(app) as client:
+                admission = client.post(
+                    "/agpolicy/check_tool",
+                    headers={"Authorization": "Bearer token"},
+                    json={
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "local fixture"},
+                        "model_tool_call_id": "model-use-id",
+                    },
+                )
+                assert admission.status_code == 200 and admission.json()["decision"] == "allow"
+                assert (
+                    client.post(
+                        "/agpolicy/complete_tool",
+                        headers={"Authorization": "Bearer token"},
+                        json={"call_id": admission.json()["call_id"], "result": "ok"},
+                    ).status_code
+                    == 200
+                )
+            calls = [
+                payload
+                for kind, payload, *_ in logger.events
+                if kind in {"tool_call", "tool_result"}
+            ]
+            assert len(calls) == 2
+            assert all(payload["model_tool_call_id"] == "model-use-id" for payload in calls)
+        finally:
+            bridge.client.close()

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -38,6 +39,8 @@ EVENT_TYPES = (
     "ui_intervention",
     "tool_call",
     "tool_result",
+    "syscall_call",
+    "syscall_result",
     "skill_start",
     "skill_call",
     "skill_error",
@@ -68,6 +71,31 @@ TITLES = {
     "input": "Waiting for your input",
 }
 TERMINAL = {"completed", "failed", "cancelled"}
+JOURNAL_BYTE_LIMIT = 64 * 1024 * 1024
+
+
+def _patch_size(value, limit):
+    """Conservative heap bound; stop counting an oversized patch immediately.
+
+    Count shared immutable values per reference, so the estimate can overcount
+    but cannot hide the dictionaries/lists retained by the revision journal.
+    """
+    pending = [value]
+    containers = set()
+    size = 0
+    while pending and size <= limit:
+        item = pending.pop()
+        if isinstance(item, (dict, list, tuple)):
+            if id(item) in containers:
+                continue
+            containers.add(id(item))
+            if isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
+        size += sys.getsizeof(item)
+    return size
 
 
 def text(value):
@@ -113,7 +141,10 @@ def returned_preview(value):
 
 
 class Trajectory:
-    def __init__(self, run_id, title, *, mode="live", source="recorded"):
+    def __init__(self, run_id, title, *, mode="live", source="recorded", defer_causal_graph=None):
+        self.defer_causal_graph = (
+            mode == "live" if defer_causal_graph is None else defer_causal_graph
+        )
         self.run = {
             "id": run_id,
             "title": title,
@@ -148,6 +179,14 @@ class Trajectory:
             "edges": [],
             "intervals": [],
             "counters": {},
+            # Canonical events and resource_sample.sampled_at are both Unix
+            # wall-clock seconds from the same host, offset by one origin.
+            "clock": {
+                "events": "host Unix wall clock",
+                "resources": "host Unix wall clock",
+                "shared": True,
+                "origin": "first canonical event",
+            },
             "obligations": [],
             "signals": [],
             "messages": [],
@@ -165,6 +204,7 @@ class Trajectory:
         self.origin = None if mode == "live" else 0
         self.seen = set()
         self.actions = {}
+        self._graph_revision = 0
         self.episodes = {}
         self.agents = {}
         self.current = {}
@@ -306,11 +346,20 @@ class Trajectory:
         self.dirty["episodes"].add(episode["id"])
 
     def _call(self, event, kind, key, *, ending=False):
+        self._graph_revision += 1
         actor, payload, timestamp = event["actor"], event["payload"], event["ts"]
         action_id = payload.get("action_id") or f"{actor}:{key}"
         action = self.actions.get(action_id)
         if action is None:
-            arguments = payload.get("arguments") or {}
+            arguments = payload.get("arguments") or (
+                {
+                    k: payload[k]
+                    for k in ("pid", "path", "argv", "program", "address", "port")
+                    if payload.get(k) is not None
+                }
+                if kind == "syscall"
+                else {}
+            )
             command = (
                 arguments.get("command", text(arguments))
                 if isinstance(arguments, dict)
@@ -320,7 +369,7 @@ class Trajectory:
             declared = annotation.get("raw", {}) if annotation.get("status") == "valid" else {}
             declared = declared if isinstance(declared, dict) else {}
             intent = payload.get("intent") or declared.get("purpose") or ""
-            name = payload.get("tool") or payload.get("name") or kind
+            name = payload.get("tool") or payload.get("name") or payload.get("syscall") or kind
             category = payload.get("kind") or (
                 classify(f"tool:{name}", command) if kind == "tool" else kind
             )
@@ -408,6 +457,8 @@ class Trajectory:
                     if isinstance(item, str) and item
                 )
             )
+        if payload.get("causal_evidence") is not None:
+            action["causal_evidence"] = payload["causal_evidence"]
         if not ending:
             missing_start = action["missing_start"]
             action["missing_start"] = False
@@ -479,6 +530,11 @@ class Trajectory:
             self.running.discard(action_id)
         action["metadata"] = {
             **action["metadata"],
+            **(
+                {k: payload[k] for k in ("pid", "program", "path", "return_value") if k in payload}
+                if kind == "syscall"
+                else {}
+            ),
             **payload.get("metadata", {}),
             "event_ids": action["event_ids"],
             "call_id": action["call_id"],
@@ -499,7 +555,7 @@ class Trajectory:
             "agent": action["agent"],
             "action": action["id"],
             "kind": action["kind"]
-            if action["kind"] in {"model", "queue", "dependency"}
+            if action["kind"] in {"model", "queue", "dependency", "syscall"}
             else "tool",
             "start": action["start"],
             "duration": action["duration"],
@@ -515,6 +571,8 @@ class Trajectory:
         self.dirty["intervals"].add(action["id"])
 
     def _attention(self, action):
+        if action["kind"] == "syscall":
+            return  # Raw system-call failures belong to recorded system telemetry.
         actor = action["agent"]
         if action["kind"] == "edit" and action["outcome"] == "success":
             self.edit_version[actor] = self.edit_version.get(actor, 0) + 1
@@ -643,6 +701,7 @@ class Trajectory:
                     [event["id"]],
                 )
             self.finished_at = event["ts"]
+            self._graph_revision += 1
             if self.running:
                 self._signal(
                     "unfinished",
@@ -746,8 +805,20 @@ class Trajectory:
                     agent["sandbox"] = payload["sandbox"]
                 if payload.get("state") == "waiting_llm" and event.get("call_label"):
                     self._call(event, "model", f"model:{event['call_label']}")
-            elif kind in {"tool_call", "tool_result", "model_result"}:
-                call_kind = "model" if kind == "model_result" else "tool"
+            elif kind in {
+                "tool_call",
+                "tool_result",
+                "model_result",
+                "syscall_call",
+                "syscall_result",
+            }:
+                call_kind = (
+                    "model"
+                    if kind == "model_result"
+                    else "syscall"
+                    if kind.startswith("syscall_")
+                    else "tool"
+                )
                 key = payload.get("call_id") or event.get("call_label") or event["id"]
                 if call_kind == "model":
                     key = f"model:{key}"
@@ -970,8 +1041,38 @@ class Trajectory:
         self.run["metrics_totals"] = self.metrics_counters.update(calls)
         self.run["metrics_by_agent"] = self.metrics_counters.by_agent
 
+    def _causal_graph(self):
+        from .causal_graph import build_graph
+
+        # Live monitoring must never build a history-sized Critical Path graph.
+        # A reopened completed run must finish reading its backlog first, too.
+        if self.defer_causal_graph and (
+            self.finished_at is None or self.run["coverage"]["catching_up"]
+        ):
+            self.run["causal_graph"] = {
+                "state": "pending",
+                "nodes": [],
+                "edges": [],
+                "operations": [],
+            }
+            self._graph_signature = "pending"
+            return
+        signature = self._graph_revision
+        if signature != getattr(self, "_graph_signature", None):
+            self.run["causal_graph"] = build_graph(self.run)
+            self._graph_signature = signature
+        for node in self.run["causal_graph"]["nodes"]:
+            if node["phase"] == "open":
+                node["time"] = self.run["duration"]
+        self.run["causal_graph"]["summary"]["execution_duration"] = (
+            self.run["execution_wall_time"]
+            if self.run["execution_started_at"] is not None
+            else self.run["duration"]
+        )
+
     def patch(self):
         self._metrics()
+        self._causal_graph()
         maps = {
             "actions": self.actions,
             "episodes": self.episodes,
@@ -1006,6 +1107,9 @@ class Trajectory:
             )
             if key in self.run
         }
+        if self._graph_signature != getattr(self, "_published_graph_signature", None):
+            patch["meta"]["causal_graph"] = copy.deepcopy(self.run["causal_graph"])
+            self._published_graph_signature = self._graph_signature
         patch["counter_samples"] = self.counter_updates
         self.counter_updates = {}
         for ids in self.dirty.values():
@@ -1014,6 +1118,7 @@ class Trajectory:
 
     def snapshot(self):
         self._metrics()
+        self._causal_graph()
         self.run["signals"] = list(self.signals.values())
         return copy.deepcopy(self.run)
 
@@ -1027,6 +1132,7 @@ def trajectory_history(
             a
             for a in run["actions"]
             if a["agent"] == agent
+            and a["kind"] != "syscall"
             and (a["outcome"] == "running") == active
             and query.lower()
             in " ".join(
@@ -1074,6 +1180,9 @@ class LiveSource:
         self.epoch = uuid.uuid4().hex
         self.revision = 0
         self.journal = deque(maxlen=512)
+        self.journal_byte_limit = JOURNAL_BYTE_LIMIT
+        self.journal_bytes = 0
+        self._journal_sizes = {}
         self.lock = threading.RLock()
         self.last_poll = 0
         self.refiner = None
@@ -1249,9 +1358,16 @@ class LiveSource:
 
     @staticmethod
     def _exchange(con, label, kind, *, full=False):
+        from .causal_graph import block_table, exchange_evidence
+
+        tables = {
+            row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
         chains = {"prompt": [], "response": []}
         for chain_kind, raw in con.execute(
-            "SELECT c.kind,b.payload FROM exchange_chain c JOIN blocks b ON b.hash=c.hash WHERE c.call_label=? ORDER BY c.kind,c.seq",
+            "SELECT c.kind,b.payload FROM exchange_chain c "
+            f"JOIN {block_table(tables) or 'message_block_lookup'} b ON b.hash=c.hash "
+            "WHERE c.call_label=? ORDER BY c.kind,c.seq",
             (label,),
         ):
             block = json.loads(raw)
@@ -1296,6 +1412,7 @@ class LiveSource:
         return {
             "model": recorded_model if isinstance(recorded_model, str) else None,
             "model_response": model_response,
+            "causal_evidence": exchange_evidence(chains["prompt"], chains["response"]),
             "output_truncated": response_truncated,
             "result": "\n".join(visible),
             "error": markers.get("error"),
@@ -1402,7 +1519,26 @@ class LiveSource:
             if self.refiner:
                 self.refiner.update(self.model)
             self.revision += 1
-            self.journal.append((self.revision, self.model.patch()))
+            self._retain_patch(self.model.patch())
+
+    def _retain_patch(self, patch):
+        if not self.journal:
+            self.journal_bytes = 0
+            self._journal_sizes.clear()
+        size = _patch_size(patch, self.journal_byte_limit)
+        # Eviction uses the existing snapshot recovery protocol. An oversized
+        # final patch is sent via a current snapshot rather than retained.
+        while self.journal and (
+            self.journal_bytes + size > self.journal_byte_limit
+            or self.journal.maxlen is not None
+            and len(self.journal) >= self.journal.maxlen
+        ):
+            revision, _ = self.journal.popleft()
+            self.journal_bytes -= self._journal_sizes.pop(revision)
+        if size <= self.journal_byte_limit:
+            self.journal.append((self.revision, patch))
+            self._journal_sizes[self.revision] = size
+            self.journal_bytes += size
 
     def message(self, after=0, epoch=None):
         with self.lock:
@@ -1410,7 +1546,7 @@ class LiveSource:
                 epoch != self.epoch
                 or not after
                 or after > self.revision
-                or (self.journal and after < self.journal[0][0] - 1)
+                or (after < self.revision and (not self.journal or after < self.journal[0][0] - 1))
             ):
                 return {
                     "type": "snapshot",
@@ -1469,6 +1605,7 @@ def replay_events(run):
             "model": action.get("model"),
             "model_id": action.get("model_id"),
             "model_tool_call_id": action.get("model_tool_call_id"),
+            "causal_evidence": action.get("causal_evidence"),
             "metadata": {
                 key: value
                 for key, value in action.get("metadata", {}).items()
@@ -1485,6 +1622,8 @@ def replay_events(run):
         }
         model = action["kind"] == "model"
         start = {**common, "state": "waiting_llm"} if model else common
+        if model and action.get("causal_evidence"):
+            start["causal_evidence"] = {**action["causal_evidence"], "response": []}
         events.append(
             {
                 "id": f"replay/start/{action['id']}",
@@ -1555,4 +1694,7 @@ def historical_projection(run):
     # Existing attribution, resources, evaluator evidence and context stay intact.
     for key in ("actions", "episodes", "signals", "mode", "status"):
         run[key] = projected[key]
+    from .causal_graph import build_graph
+
+    run["causal_graph"] = build_graph(run)
     return run

@@ -60,7 +60,11 @@ def test_pretooluse_allow_checks_policy_and_persists_call_id(monkeypatch, capsys
     request = requests[0]
     assert request.get_header("Authorization") == "Bearer secret-token"
     body = json.loads(request.data)
-    assert body == {"tool_name": "Bash", "tool_input": {"command": "printf ok"}}
+    assert body == {
+        "tool_name": "Bash",
+        "tool_input": {"command": "printf ok"},
+        "model_tool_call_id": "tool-1",
+    }
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
 
@@ -94,6 +98,7 @@ def test_grok_pretooluse_and_posttooluse_use_canonical_policy_and_shared_call_id
     assert json.loads(requests[0].data) == {
         "tool_name": "run_terminal_command",
         "tool_input": {"command": "printf ok"},
+        "model_tool_call_id": "grok-call-1",
     }
     state_file = tmp_path / ".agpolicy_call_grok-call-1.json"
     assert json.loads(state_file.read_text()) == {"call_id": "call-grok"}

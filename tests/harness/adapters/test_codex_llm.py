@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import pytest
 
+from agency.llm.message_store import split_tool_schema
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import CodexAdapter
 
@@ -164,7 +165,7 @@ def test_harness_to_agency_tools_and_tool_choice():
         "tool_choice": {"type": "function", "name": "get_weather"},
     }
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tools"] == [
+    assert split_tool_schema(agency["messages"])[1] == [
         {
             "type": "function",
             "function": {
@@ -174,7 +175,10 @@ def test_harness_to_agency_tools_and_tool_choice():
             },
         }
     ]
-    assert agency["tool_choice"] == {"type": "function", "function": {"name": "get_weather"}}
+    assert split_tool_schema(agency["messages"])[2] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
 
 
 def test_additional_tools_are_definitions_not_assistant_messages():
@@ -189,8 +193,9 @@ def test_additional_tools_are_definitions_not_assistant_messages():
         ]
     }
     converted = _backend()._format_context_harness_to_agency(body)
-    assert converted["messages"] == [{"role": "user", "blocks": [_text_block("Run pwd")]}]
-    assert converted["tools"][0]["function"]["name"] == "pwd"
+    chat_messages, tools, _tool_choice, _extra = split_tool_schema(converted["messages"])
+    assert chat_messages == [{"role": "user", "blocks": [_text_block("Run pwd")]}]
+    assert tools[0]["function"]["name"] == "pwd"
 
 
 def test_namespaced_custom_tools_round_trip_without_shared_adapter_state():
@@ -220,7 +225,7 @@ def test_namespaced_custom_tools_round_trip_without_shared_adapter_state():
     }
     backend = _backend()
     converted = backend._format_context_harness_to_agency(body)
-    tools = converted["tools"]
+    tools = split_tool_schema(converted["messages"])[1]
     assert len(tools) == 2
     custom_name = tools[0]["function"]["name"]
     assert len(custom_name) <= 64
@@ -282,9 +287,9 @@ def test_namespace_function_identity_survives_history_and_forced_choice():
     }
     backend = _backend()
     converted = backend._format_context_harness_to_agency(body)
-    names = [tool["function"]["name"] for tool in converted["tools"]]
+    names = [tool["function"]["name"] for tool in split_tool_schema(converted["messages"])[1]]
     assert names[0] != names[1]
-    assert converted["tool_choice"]["function"]["name"] == names[0]
+    assert split_tool_schema(converted["messages"])[2]["function"]["name"] == names[0]
     response = {
         "message": {
             "blocks": [{"type": "tool_use", "id": "c", "name": names[0], "arguments": "{}"}]
@@ -317,7 +322,9 @@ def test_registered_route_restores_custom_calls_for_each_request(stream):
                         {
                             "type": "tool_use",
                             "id": "c",
-                            "name": request["tools"][0]["function"]["name"],
+                            "name": split_tool_schema(request["messages"])[1][0]["function"][
+                                "name"
+                            ],
                             "arguments": json.dumps({"input": "text(42)"}),
                         }
                     ]
@@ -416,13 +423,13 @@ def test_harness_to_agency_local_shell_call_item_preserved():
 def test_harness_to_agency_tool_choice_auto_passthrough():
     body = {"model": "m", "input": "hi", "tool_choice": "auto"}
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == "auto"
+    assert split_tool_schema(agency["messages"])[2] == "auto"
 
 
 def test_harness_to_agency_hosted_tool_choice_preserved_with_named_type():
     body = {"model": "m", "input": "hi", "tool_choice": {"type": "file_search"}}
     agency = _backend()._format_context_harness_to_agency(body)
-    assert agency["tool_choice"] == {
+    assert split_tool_schema(agency["messages"])[2] == {
         "type": "openai_responses_file_search",
         "data": {"type": "file_search"},
     }
@@ -445,7 +452,11 @@ def test_agency_to_harness_text_only():
             "content": [{"type": "output_text", "text": "hi there", "annotations": []}],
         }
     ]
-    assert out["usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+    assert out["usage"]["input_tokens"] == 5
+    assert out["usage"]["output_tokens"] == 3
+    assert out["usage"]["total_tokens"] == 8
+    assert "prompt_tokens" not in out["usage"]
+    assert "completion_tokens" not in out["usage"]
 
 
 def test_agency_to_harness_tool_use():
@@ -791,6 +802,19 @@ def test_empty_response_fails_before_any_frame_is_sent(blocks):
         next(frames)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stop_reason", [None, "tool_calls"])
+def test_structured_completion_marker_does_not_allow_an_empty_nonfinal_response(
+    streaming, stop_reason
+):
+    response = {**_done([], stop_reason), "structured_output_complete": True}
+    with pytest.raises(ValueError, match="no message and no tool call"):
+        if streaming:
+            next(_backend()._format_agency_stream_to_harness([response], "m"))
+        else:
+            _backend()._format_context_agency_to_harness(response, "m")
+
+
 @pytest.mark.parametrize("arguments", [TRUNCATED_ARGUMENTS, "not json", "[1, 2]"])
 def test_malformed_tool_call_with_a_normal_stop_reason_is_never_emitted(arguments):
     frames = _backend()._format_agency_stream_to_harness(
@@ -926,6 +950,21 @@ def test_route_answers_an_empty_response_with_a_retryable_http_error_not_a_200()
     assert "no message and no tool call" in response.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("events", [[], [{"error": {"message": "native server error"}}]])
+def test_route_keeps_native_nonterminal_stream_http_200_and_original_events(events):
+    from agency.llm.responses_native import native_result
+
+    client, _ = _route_client({"type": "done", **native_result({}, events)})
+    with client:
+        response = client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer t"},
+            json={"input": "hi", "stream": True},
+        )
+    assert response.status_code == 200
+    assert [value for _, value in _parse_sse(response.text)] == events
+
+
 def test_route_streams_response_incomplete_for_a_truncated_turn():
     client, _ = _route_client(_done([_tool_block(TRUNCATED_ARGUMENTS)], "length"))
     with client:
@@ -961,3 +1000,55 @@ def test_route_reports_untranslated_request_fields_once():
     assert len(warnings) == 1
     assert "prompt_cache_key" in warnings[0] and "reasoning" in warnings[0]
     assert "include" not in warnings[0]  # empty values are not worth a warning
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "body,content_type",
+    [
+        (
+            {"error": {"message": "native", "type": "rate_limit_error"}, "request_id": "real"},
+            "application/json",
+        ),
+        ("<html>upstream unavailable</html>", "text/html"),
+    ],
+)
+def test_native_http_error_status_body_and_retry_headers_survive_daemon(stream, body, content_type):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    class Router:
+        def validate_token(self, token):
+            return True
+
+        def resolve_model(self, token):
+            return "gpt-6.1-sol"
+
+        def dispatch(self, token, request):
+            raise HostDispatchError(
+                {
+                    "message": "native",
+                    "status_code": 429,
+                    "transient": True,
+                    "provider_error": body,
+                    "provider_headers": {"retry-after": "7", "content-type": content_type},
+                }
+            )
+
+        async def dispatch_stream_async(self, token, request):
+            self.dispatch(token, request)
+            yield
+
+    app = FastAPI()
+    _backend().register(app, Router())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer fake"},
+            json={"input": "hi", "stream": stream},
+        )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "7"
+    assert response.headers["content-type"] == content_type
+    assert (response.json() if isinstance(body, dict) else response.text) == body

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import hmac
 import json
 import os
@@ -748,10 +747,14 @@ class CliSession:
             "source": f"{self.harness}_otel",
             **(details or {}),
         }
-        response = [(_block_hash(metadata), metadata)]
+        from agency.llm.message_store import MessageStore
+
+        store = MessageStore()
+        response = [metadata]
         if error is not None:
             marker = {"error": error}
-            response.append((_block_hash(marker), marker))
+            response.append(marker)
+        response_hashes = store.add_messages([{"role": "assistant", "blocks": response}])
         # A backdated start must not overwrite the agent's live state.
         actor.logger.record_event(
             "agent_state",
@@ -763,8 +766,10 @@ class CliSession:
         actor.logger.record_llm_exchange(
             call_label,
             exchange_type="llm_stream_error" if error is not None else "llm_block",
-            prompt_chain=[],
-            response_chain=response,
+            message_store=store,
+            harness_message_hashes=[],
+            patched_message_hashes=[],
+            response_message_hashes=response_hashes,
             term_message=f"[{actor.name}] LLM    {'✗' if error else '✓'}  {model}",
             print_to_terminal=False,
             timestamp=ended_at,
@@ -950,10 +955,6 @@ def number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _block_hash(block: dict) -> str:
-    return hashlib.sha256(json.dumps(block, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _otlp_value(value: dict):

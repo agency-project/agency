@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import threading
 import time
 from types import SimpleNamespace
 
@@ -98,11 +97,11 @@ def test_pythonpath_is_exported_not_just_assigned(monkeypatch, tmp_path):
     )
 
 
-def test_ensure_harness_daemon_default_timeout_is_120s():
+def test_ensure_harness_daemon_default_timeout_is_300s():
     import inspect
 
     assert (
-        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 120.0
+        inspect.signature(launcher.ensure_harness_daemon).parameters["timeout_s"].default == 300.0
     )
 
 
@@ -201,30 +200,26 @@ def test_ensure_harness_daemon_resets_deadline_on_fresh_progress_ping(monkeypatc
     monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: False)
 
     progress = SimpleNamespace(last_bootstrap_ping_ts=None)
+    clock = SimpleNamespace(now=0.0)
 
-    def ping_after_a_bit():
-        time.sleep(0.15)
-        progress.last_bootstrap_ping_ts = time.monotonic()
+    def sleep(seconds):
+        clock.now += seconds
+        if clock.now >= 0.15 and progress.last_bootstrap_ping_ts is None:
+            progress.last_bootstrap_ping_ts = clock.now
 
-    thread = threading.Thread(target=ping_after_a_bit)
-    thread.start()
-    start = time.monotonic()
-    try:
-        with pytest.raises(RuntimeError):
-            launcher.ensure_harness_daemon(
-                sandbox,
-                "/tmp/host.sock",
-                "agent-1",
-                "claude_code",
-                timeout_s=0.2,
-                progress_source=progress,
-            )
-        elapsed = time.monotonic() - start
-    finally:
-        thread.join()
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    with pytest.raises(RuntimeError):
+        launcher.ensure_harness_daemon(
+            sandbox,
+            "/tmp/host.sock",
+            "agent-1",
+            "claude_code",
+            timeout_s=0.2,
+            progress_source=progress,
+        )
     # Without the reset this would time out at ~0.2s; the ping at ~0.15s
     # should push the deadline out to ~0.35s instead.
-    assert elapsed > 0.3
+    assert clock.now > 0.3
 
 
 def test_ensure_harness_daemon_ignores_progress_source_with_no_ping_yet(monkeypatch, tmp_path):
@@ -293,23 +288,26 @@ def test_daemon_log_is_preclaimed_host_side_before_container_can_write_it(monkey
     assert oct(log_path.stat().st_mode)[-3:] == "666"
 
 
-def test_daemon_config_excludes_unrelated_and_secret_host_configuration():
+def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials():
+    """Adapter settings and the daemon's sandbox controls survive JSON transport."""
     config = agconfig(
-        harnessadapterconfig(binary_path="/bin/claude"),
-        llmconfig(api_key="secret"),
+        harnessadapterconfig(
+            binary_path="/bin/claude", stream_keepalive_s=7.5, allow_subagents=True
+        ),
+        llmconfig(provider="anthropic", api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
-    assert launcher._daemon_config(config) == {
-        "harness_adapter": {"binary_path": "/bin/claude"},
-        "sandbox": {"checkpoint_fast_resume": False, "harness_python_path": None},
-        "ptrace": {
-            "syscalls": list(agconfig().ptrace.syscalls),
-            "file_access": False,
-            "profiler": None,
-            "disable_harness_native_sandbox": True,
-        },
-    }
+    result = json.loads(json.dumps(launcher._daemon_config(config)))
+    assert result["harness_adapter"]["binary_path"] == "/bin/claude"
+    assert result["harness_adapter"]["stream_keepalive_s"] == 7.5
+    assert result["sandbox"]["harness_python_path"] is None
+    assert result["harness_adapter"]["allow_subagents"] is True
+    assert result["ptrace"]["syscalls"] == list(config.ptrace.syscalls)
+    assert result["llm_provider"] == "anthropic"
+    # Only the provider identifier crosses this boundary, never credentials.
+    assert "llm" not in result
+    assert not any("secret" in json.dumps(section) for section in result.values())
 
 
 @pytest.mark.parametrize("harness", ["claude_code", "codex", "grok", "opencode"])

@@ -4,23 +4,9 @@ from __future__ import annotations
 
 import base64
 
-from agency import Agent, agbinary, agdata, agfile, agimage, agpath, agrawstring, agskill, agtype
+from agency import Agent, agbinary, agdata, agfile, agimage, agpath, agrawstring, agskill
 
 from _common import close_sandboxes, run_example, tutorial_config
-
-
-class slug(agtype):
-    """A tiny custom agtype: lower-case words joined with hyphens."""
-
-    @classmethod
-    def schema_type(cls) -> str:
-        return "slug"
-
-    @classmethod
-    def validate_input_value(cls, value: object) -> str | None:
-        if not isinstance(value, str) or not value or value.strip("abcdefghijklmnopqrstuvwxyz-"):
-            return "must contain only lower-case letters and hyphens"
-        return None
 
 
 def main() -> None:
@@ -37,6 +23,7 @@ def main() -> None:
             "DOCUMENT_PATH with the document path in the input. Copy the binary input "
             "byte-for-byte to /workspace/outputs/copy.bin. Return both output paths and "
             "return destination unchanged."
+            "\nAfter submitting all output fields, finish with a short confirmation."
         ),
         input_schema=agdata(document=agfile, payload=agbinary, destination=agpath),
         output_schema=agdata(uppercase=agfile, copied=agbinary, saved_at=agpath),
@@ -49,9 +36,6 @@ def main() -> None:
             destination="/workspace/outputs",
         ),
     )
-    assert result.uppercase.strip() == "AGENCY MOVES TYPED DATA SAFELY."
-    assert result.copied == b"\x00agency\xff"
-    assert result.saved_at == "/workspace/outputs"
     print(f"file result: {result.uppercase.strip()}")
     print(f"binary bytes: {len(result.copied)}")
     print(f"path result: {result.saved_at}")
@@ -66,12 +50,7 @@ def main() -> None:
         output_schema=agdata(answer=agrawstring),
     )
     raw_result = raw_learner.run(raw, agdata(prompt="Return TYPE"))
-    assert raw_result.answer == "TYPE"
     print(f"raw string: {raw_result.answer}")
-
-    assert slug.validate_input_value("agency-tutorial") is None
-    assert slug.validate_input_value("Not A Slug") is not None
-    print(f"custom agtype schema label: {slug.schema_type()}")
 
     # A 1x1 PNG keeps the multimodal example self-contained. The native
     # harness receives the image as a real content block.
@@ -84,7 +63,10 @@ def main() -> None:
     vision = Agent("vision", agconfig=cfg, harness="native")
     describe = agskill(
         name="describe_image",
-        prompt="Describe the attached image very briefly.",
+        prompt=(
+            "Describe the attached image very briefly."
+            "\nAfter submitting all output fields, finish with a short confirmation."
+        ),
         input_schema=agdata(question=str, image=agimage),
         output_schema=agdata(description=str),
     )

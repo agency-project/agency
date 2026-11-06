@@ -3,7 +3,7 @@ calling a real model.
 
 Loads the `llm_block`-finalized exchanges from another agent's own
 agDataLogger sqlite db (`agdatalogger.py`'s `exchanges`/`exchange_chain`/
-`blocks` tables) and replays them back, one exchange per
+`message_block_lookup` tables) and replays them back, one exchange per
 `dispatch()`/`dispatch_stream()` call, in the order they were originally
 recorded. Matching is purely positional -- the Nth call this backend
 receives replays the Nth successful exchange in the source db -- since

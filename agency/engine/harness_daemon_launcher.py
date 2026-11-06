@@ -88,13 +88,15 @@ def _container_socket_path(host_path: Path) -> str:
 
 
 def _daemon_config(agconfig: "agconfig_cls | None") -> dict:
+    """Forward adapter and ptrace settings plus the daemon's sandbox controls."""
     if agconfig is None:
         return {}
     # The daemon needs harness/ptrace knobs, not host credentials or live
     # Python objects. Keeping this allow-list narrow also keeps secrets out
     # of the detached process command line.
     config = {
-        "harness_adapter": {"binary_path": agconfig.harness_adapter.binary_path},
+        "llm_provider": agconfig.llm.provider,
+        "harness_adapter": agconfig.harness_adapter.safe_snapshot(),
         "ptrace": {
             "syscalls": list(agconfig.ptrace.syscalls),
             "file_access": agconfig.ptrace.file_access,
@@ -264,7 +266,7 @@ def ensure_harness_daemon(
     harness: str,
     *,
     agconfig: "agconfig_cls | None" = None,
-    timeout_s: float = 120.0,
+    timeout_s: float = 300.0,
     progress_source: "HostInteractionServer | None" = None,
 ) -> DaemonHandle:
     """Ensure one ready Harness Manager exists for this engine and sandbox.

@@ -242,13 +242,29 @@ def test_timeout_preserves_partial_files_for_collection_and_grading():
     """Cancel the real harness while its tool runs; grade its retained filesystem."""
     name = f"pytest-timeout-preservation-{os.getpid()}"
     result = subprocess.run(
-        [str(REPOSITORY / "scripts" / "agency-bench"), "smoke",
-         "--agents", "1", "--tasks", "1", "--task", SMALL, "--name", name,
-         # exec_command may yield while sleep remains in the background. Keep
-         # the next scripted model response pending past the cap as well.
-         "--task-seconds", "25", "--latency", "8", "--command",
-         "echo partial-at-cap > /logs/artifacts/agency-smoke.txt; sleep 120"],
-        capture_output=True, text=True, timeout=800,
+        [
+            str(REPOSITORY / "scripts" / "agency-bench"),
+            "smoke",
+            "--agents",
+            "1",
+            "--tasks",
+            "1",
+            "--task",
+            SMALL,
+            "--name",
+            name,
+            # exec_command may yield while sleep remains in the background. Keep
+            # the next scripted model response pending past the cap as well.
+            "--task-seconds",
+            "25",
+            "--latency",
+            "8",
+            "--command",
+            "echo partial-at-cap > /logs/artifacts/agency-smoke.txt; sleep 120",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=800,
     )
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-2000:]
     run_dir = sorted((ROOT / "validation" / "smoke-tests" / name).glob("attempt-*"))[-1]
@@ -259,8 +275,16 @@ def test_timeout_preserves_partial_files_for_collection_and_grading():
     assert read_json(agent / "task.json")["discard_container_preserved"]
     assert read_json(agent / "task.json")["cancellation_resolved"]
     assert task["collection_ok"] and task["verdict"]["ok"]
-    artifact = (run_dir / "grading" / "source" / task["directory"] /
-                "artifacts" / "logs" / "artifacts" / "agency-smoke.txt")
+    artifact = (
+        run_dir
+        / "grading"
+        / "source"
+        / task["directory"]
+        / "artifacts"
+        / "logs"
+        / "artifacts"
+        / "agency-smoke.txt"
+    )
     assert artifact.read_text().strip() == "partial-at-cap"
     assert summary["ledger_ok"] and summary["isolation"]["leaked_containers"] == []
     assert summary["counts"]["graded"] == 1

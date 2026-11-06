@@ -43,6 +43,9 @@ class AgentEngine:
         self._services_closed = True
         self._request_id: "str | None" = None
         self._pending_session_update: "tuple[agcontext, str, str, str, int | None] | None" = None
+        # The skill run's main message chain, as hashes in the agcontext's
+        # message_store; becomes ``message_hash_list`` once the run has committed.
+        self._pending_message_hash_list: "list[str] | None" = None
         self._agtype_cleanup_paths: set[str] = set()
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
@@ -129,6 +132,7 @@ class AgentEngine:
         try:
             failed = True
             self._pending_session_update = None
+            self._pending_message_hash_list = None
             try:
                 if is_cancelled():
                     return self._controlled_error()
@@ -191,9 +195,12 @@ class AgentEngine:
                                 flush=True,
                             )
                 self._commit_pending_session_update()
+                if self._pending_message_hash_list is not None:
+                    context.message_hash_list = self._pending_message_hash_list
                 failed = False
                 return output
             finally:
+                self._pending_message_hash_list = None
                 if failed:
                     self._pending_session_update = None
                     with agprof.span("teardown:discard"):
@@ -248,6 +255,7 @@ class AgentEngine:
             resource_pool,
             is_cancelled=is_cancelled,
             request_id=request_id,
+            context=context,
         )
         with self._services_lock:
             self._host_server_manager = manager
@@ -291,7 +299,9 @@ class AgentEngine:
                 try:
                     with handle.client(timeout_s=10) as client:
                         if self._agent.is_paused():
-                            client.pause_harness()
+                            # No harness process exists yet, so this returns at
+                            # once.
+                            client.pause_harness(wait_timeout_s=10)
                         else:
                             client.resume_harness()
                 except Exception as exc:
@@ -617,14 +627,17 @@ class AgentEngine:
     ) -> "agdata":
         from ..agdata import agdata, agerror
 
-        needle = initial_prompt.user_content if initial_prompt is not None else None
-        context.recent_transcript = (
-            self._host_server_manager.llm_handler_server.get_main_transcript(needle)
-        )
-
         if attempt is None or not attempt.ok:
             message = attempt.error_message if attempt is not None else "no attempt was made"
             return agerror(message)
+
+        # The skill run's main chain replaces ``message_hash_list`` -- but only
+        # once the run has committed (see ``execute``). The server already
+        # hashed every message into this agcontext's message_store.
+        needle = initial_prompt.user_content if initial_prompt is not None else None
+        self._pending_message_hash_list = list(
+            self._host_server_manager.llm_handler_server.get_main_history(needle)
+        )
 
         output_schema = skill.output_schema
         if output_schema is not None and output_schema.raw_key() is None:

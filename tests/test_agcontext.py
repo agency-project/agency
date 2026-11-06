@@ -23,7 +23,7 @@ def test_concurrent_resolution_uses_the_captured_future():
             return value
 
     future = Future()
-    future.set_result(agcontext(recent_transcript=[{"content": "done"}]))
+    future.set_result(agcontext.from_messages([{"content": "done"}]))
     context = InterleavedContext(_future=future)
 
     def resolve():
@@ -42,7 +42,7 @@ def test_concurrent_resolution_uses_the_captured_future():
         worker.join(2)
     assert not worker.is_alive()
     assert errors == []
-    assert context.recent_transcript == [{"content": "done"}]
+    assert context.get_resolved_transcript() == [{"content": "done"}]
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ def test_concurrent_resolution_uses_the_captured_future():
 
 def test_default_construction():
     context = agcontext()
-    assert context.recent_transcript == []
+    assert context.get_resolved_transcript() == []
     assert context.harness_sessions == {}
     assert context.retained_messages == []
     assert context.harness_message_cursors == {}
@@ -62,16 +62,16 @@ def test_default_construction():
 def test_construction_with_values():
     msgs = [{"role": "user", "content": "hi"}]
     sessions = {"claude_code": {"session_id": "s1", "blob_b64": "abc"}}
-    context = agcontext(recent_transcript=msgs, harness_sessions=sessions)
-    assert context.recent_transcript is msgs
+    context = agcontext.from_messages(msgs, harness_sessions=sessions)
+    assert context.get_resolved_transcript() == msgs
     assert context.harness_sessions is sessions
 
 
-def test_recent_transcript_default_is_empty_list_not_shared():
+def test_message_lookups_are_not_shared_between_contexts():
     ctx1 = agcontext()
     ctx2 = agcontext()
-    ctx1.recent_transcript.append({"role": "user", "content": "x"})
-    assert ctx2.recent_transcript == []
+    ctx1.set_transcript([{"role": "user", "content": "x"}])
+    assert ctx2.get_resolved_transcript() == []
 
 
 def test_harness_sessions_default_is_empty_dict_not_shared():
@@ -99,7 +99,7 @@ def test_is_pending_true_when_future_set():
 def test_is_pending_false_after_resolve():
     f: Future[agcontext] = Future()
     context = agcontext(_future=f)
-    resolved = agcontext(recent_transcript=[{"role": "user", "content": "resolved"}])
+    resolved = agcontext.from_messages([{"role": "user", "content": "resolved"}])
     f.set_result(resolved)
     context.resolve_prev_dependencies()
     assert context.is_pending() is False
@@ -111,16 +111,16 @@ def test_is_pending_false_after_resolve():
 
 
 def test_resolve_no_op_when_not_pending():
-    context = agcontext(recent_transcript=[{"role": "user", "content": "x"}])
+    context = agcontext.from_messages([{"role": "user", "content": "x"}])
     context.resolve_prev_dependencies()
-    assert context.recent_transcript == [{"role": "user", "content": "x"}]
+    assert context.get_resolved_transcript() == [{"role": "user", "content": "x"}]
 
 
 def test_resolve_merges_future_state():
     f: Future[agcontext] = Future()
     placeholder = agcontext(_future=f)
-    resolved = agcontext(
-        recent_transcript=[{"role": "assistant", "content": "done"}],
+    resolved = agcontext.from_messages(
+        [{"role": "assistant", "content": "done"}],
         harness_sessions={"claude_code": {"session_id": "s1"}},
         retained_messages=[
             {
@@ -135,7 +135,7 @@ def test_resolve_merges_future_state():
     f.set_result(resolved)
     placeholder.resolve_prev_dependencies()
 
-    assert placeholder.recent_transcript == [{"role": "assistant", "content": "done"}]
+    assert placeholder.get_resolved_transcript() == [{"role": "assistant", "content": "done"}]
     assert placeholder.harness_sessions == {"claude_code": {"session_id": "s1"}}
     assert placeholder.retained_messages[0]["content"] == "remember"
     assert placeholder.harness_message_cursors == {"claude_code": 1}
@@ -184,17 +184,17 @@ def test_resolve_is_idempotent():
 
 
 def test_copy_returns_new_instance():
-    context = agcontext(recent_transcript=[{"role": "user", "content": "a"}])
+    context = agcontext.from_messages([{"role": "user", "content": "a"}])
     c = context.copy()
     assert c is not context
 
 
-def test_copy_deep_copies_recent_transcript():
+def test_copy_isolates_the_rebuilt_messages():
     msgs = [{"role": "user", "content": "original"}]
-    context = agcontext(recent_transcript=msgs)
+    context = agcontext.from_messages(msgs)
     c = context.copy()
-    c.recent_transcript[0]["content"] = "mutated"
-    assert context.recent_transcript[0]["content"] == "original"
+    c.get_resolved_transcript()[0]["content"] = "mutated"
+    assert context.get_resolved_transcript()[0]["content"] == "original"
 
 
 def test_copy_deep_copies_harness_sessions():
@@ -269,9 +269,9 @@ def test_copy_deep_copies_retained_state():
 def test_copy_resolves_pending_future():
     f: Future[agcontext] = Future()
     context = agcontext(_future=f)
-    f.set_result(agcontext(recent_transcript=[{"role": "user", "content": "from future"}]))
+    f.set_result(agcontext.from_messages([{"role": "user", "content": "from future"}]))
     c = context.copy()
-    assert c.recent_transcript == [{"role": "user", "content": "from future"}]
+    assert c.get_resolved_transcript() == [{"role": "user", "content": "from future"}]
     assert c._future is None
 
 
@@ -290,14 +290,14 @@ def test_copy_does_not_carry_future():
 
 
 def test_repr_not_pending():
-    context = agcontext(
-        recent_transcript=[
+    context = agcontext.from_messages(
+        [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hey"},
         ],
     )
     r = repr(context)
-    assert "recent_transcript=2" in r
+    assert "message_hash_list=2" in r
     assert "harnesses=[]" in r
     assert "retained=0" in r
     assert "pending" not in r

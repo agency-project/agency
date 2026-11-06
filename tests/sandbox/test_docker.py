@@ -56,6 +56,7 @@ def _make_sandbox(**kwargs):
     cfg = kwargs.pop("agconfig", None)
     if cfg is None:
         cfg = agconfig_cls(sandboxconfig(backend="docker"))
+        cfg.sandbox.gpu_passthrough = False
     # Unit tests below mock the backend's command runner after construction.
     # Backend selection now performs a live daemon check during construction,
     # so stub only that selection probe; tests marked @docker still exercise a
@@ -1787,6 +1788,9 @@ class TestCheckpointAccumulator:
                         f"test process can't read {layerdb_root} (dockerd likely runs as a "
                         "different user on this host) -- fast path structurally unavailable here"
                     )
+            elif sb._backend._ctr_argv() is None:
+                sb.destroy()
+                pytest.skip("fast overlayfs squash requires access to Docker's containerd socket")
 
         base_layers_before = subprocess.run(
             [
@@ -2188,6 +2192,7 @@ class TestDockerGpuReleaseGating:
 
     def _lease_gpu(self, sb, gpu_id=3):
         released = []
+        sb.agconfig.sandbox.gpu_passthrough = True
         sb._gpu_count_requested = 1
         sb._gpu_ids = [gpu_id]
         sb._gpu_release_fn = lambda ids: released.extend(ids)

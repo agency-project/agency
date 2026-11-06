@@ -4,6 +4,18 @@ import {test} from 'node:test';
 const source=await readFile(new URL('../../agency/observability/agwebui/static/trajectory-stream.js',import.meta.url),'utf8');
 const {changedTrajectoryActions,mergeTrajectory,mergeTrajectorySnapshot,boundTrajectory,TrajectoryStream}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
+test('syscall floods cannot evict model and tool calls from the live window',()=>{
+  const real=[{id:'model',kind:'model',start:0,outcome:'running'},
+    {id:'tool',kind:'tool',start:0,outcome:'success'}];
+  const run={actions:[...real,...Array.from({length:3000},(_,i)=>({id:`sys-${i}`,kind:'syscall',start:i+1,outcome:i<1000?'running':'success'}))],counters:{}};
+  boundTrajectory(run);
+  assert.ok(run.actions.includes(real[0]));
+  assert.ok(run.actions.includes(real[1]));
+  assert.ok(run.actions.length<=2200);
+  assert.equal(run.coverage.client_inflight_windowed,undefined);
+  assert.ok(run.actions.some(a=>a.kind==='syscall'));
+});
+
 test('reconnect snapshots merge existing identities and duplicated samples without reviving completed calls',()=>{
   const action={id:'a',start:1,outcome:'success',event_ids:['start','end']};
   const run={actions:[action],episodes:[],counters:{cpu:[[1,2]]},coverage:{}};
@@ -125,6 +137,26 @@ test('late counter samples preserve series identity and temporal ordering',()=>{
   mergeTrajectory(run,{counter_samples:{cpu:[[1,10],[3,30]]}});
   assert.equal(run.counters.cpu,points);
   assert.deepEqual(points,[[1,10],[2,20],[3,30]]);
+});
+
+test('replay reconnect keeps the newest seek while older acknowledgements are in flight',()=>{
+  const previousSocket=globalThis.WebSocket,previousLocation=globalThis.location,sockets=[],received=[];
+  class Socket {static OPEN=1;constructor(url){this.url=url;this.readyState=1;sockets.push(this);}send(){}close(){}}
+  globalThis.WebSocket=Socket;globalThis.location={protocol:'http:',host:'localhost'};
+  const stream=new TrajectoryStream({runId:'saved',replay:true,onMessage:m=>received.push(m),onTransport:()=>{}});
+  const frame=(socket,clock,seek_id)=>socket.onmessage({data:JSON.stringify({type:'snapshot',cursor:1,replay:{clock,seek_id,playing:false,speed:1}})});
+  try {
+    frame(sockets[0],5,null);
+    stream.sendReplay('seek',{clock:20,seek_id:1});
+    stream.sendReplay('seek',{clock:70,seek_id:2});
+    frame(sockets[0],20,1);
+    assert.equal(received.length,1);assert.equal(stream.replayClock,70);
+    stream.reconnect();
+    const query=new URL(sockets[1].url).searchParams;
+    assert.equal(query.get('clock'),'70');assert.equal(query.get('seek_id'),'2');
+    frame(sockets[1],70,2);assert.equal(received.length,2);
+    assert.equal(stream.replaySeekId,null);
+  } finally {stream.close();globalThis.WebSocket=previousSocket;globalThis.location=previousLocation;}
 });
 
 test('measurement commands use their own path, stay out of replay and keep the recovery cursor',()=>{

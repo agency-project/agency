@@ -207,3 +207,74 @@ def test_codex_disconnect_before_first_frame_closes_upstream():
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("backend_cls", "path", "body"),
+    [
+        (
+            ClaudeCodeAdapter,
+            "/v1/messages",
+            {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (CodexAdapter, "/v1/responses", {"model": "m", "input": "hi"}),
+        (
+            GrokAdapter,
+            "/v1/chat/completions",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            NativeAdapter,
+            "/v1/chat/completions",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            OpenCodeAdapter,
+            "/v1/chat/completions",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+    ],
+)
+def test_non_stream_dispatch_does_not_block_the_event_loop(backend_cls, path, body):
+    import asyncio
+    import threading
+
+    import httpx
+
+    released = threading.Event()
+    seen: list = []
+
+    def dispatch(_token, _ctx):
+        seen.append(released.wait(5))
+        return {
+            "type": "done",
+            "message": {
+                "role": "assistant",
+                "blocks": [{"type": "text", "index": 0, "text": "ok"}],
+            },
+            "stop_reason": "stop",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
+
+    app = FastAPI()
+    app.get("/release")(lambda: released.set())
+    bridge = SimpleNamespace(
+        validate_token=lambda _token: True,
+        resolve_model=lambda _token: "m",
+        dispatch=dispatch,
+    )
+    backend_cls(agconfig()).register(app, bridge)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            pending = asyncio.create_task(
+                client.post(path, json=body, headers={"Authorization": "Bearer t"})
+            )
+            await asyncio.sleep(0.2)
+            await client.get("/release")
+            return await pending
+
+    response = asyncio.run(run())
+    assert response.status_code == 200, response.text
+    assert seen == [True]

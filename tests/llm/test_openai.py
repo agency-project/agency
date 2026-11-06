@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from agency.llm.message_store import with_tool_schema
 from agency.configs.agconfig import agconfig, llmconfig
 from agency.llm.openai import _OpenAICompatibleBackend
 
@@ -93,9 +94,11 @@ class TestFormatContextAgencyToBackend:
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [],
-                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-                "tool_choice": "required",
+                "messages": with_tool_schema(
+                    [],
+                    [{"type": "function", "function": {"name": "get_weather"}}],
+                    "required",
+                )
             }
         )
         assert kwargs["tool_choice"] == "required"
@@ -105,23 +108,27 @@ class TestFormatContextAgencyToBackend:
         tool_choice = {"type": "function", "function": {"name": "get_weather"}}
         kwargs = backend._format_context_agency_to_backend(
             {
-                "messages": [],
-                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-                "tool_choice": tool_choice,
+                "messages": with_tool_schema(
+                    [],
+                    [{"type": "function", "function": {"name": "get_weather"}}],
+                    tool_choice,
+                )
             }
         )
         assert kwargs["tool_choice"] == tool_choice
 
     def test_tool_choice_without_tools_is_dropped(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
-        kwargs = backend._format_context_agency_to_backend({"messages": [], "tool_choice": "auto"})
+        kwargs = backend._format_context_agency_to_backend(
+            {"messages": with_tool_schema([], tool_choice="auto")}
+        )
         assert "tool_choice" not in kwargs
 
     def test_foreign_origin_tool_choice_dropped(self):
         backend = _OpenAICompatibleBackend(_cfg(model="m"))
         tool_choice = {"type": "openai_responses_file_search", "data": {"type": "file_search"}}
         kwargs = backend._format_context_agency_to_backend(
-            {"messages": [], "tool_choice": tool_choice}
+            {"messages": with_tool_schema([], tool_choice=tool_choice)}
         )
         assert "tool_choice" not in kwargs
 
@@ -221,3 +228,67 @@ class TestFormatStreamToAgency:
         ]
         assert len(unknown_items) == 2
         assert unknown_items[0]["index"] == unknown_items[1]["index"]
+
+
+class TestSignedThinking:
+    def test_message_thinking_blocks_signature_lands_on_thinking_block(self):
+        message = _SdkObj(
+            content="391",
+            reasoning_content="17*23",
+            thinking_blocks=[{"type": "thinking", "thinking": "17*23", "signature": "sig"}],
+        )
+        raw = _ev(choices=[_ev(message=message, finish_reason="stop")], usage=None)
+        blocks = _OpenAICompatibleBackend(_cfg())._format_context_backend_to_agency(raw)["message"][
+            "blocks"
+        ]
+        thinking = [b for b in blocks if b["type"] == "thinking"]
+        assert thinking == [{"type": "thinking", "index": 1, "text": "17*23", "signature": "sig"}]
+
+    def test_signature_only_thinking_blocks_still_make_a_thinking_block(self):
+        message = _SdkObj(
+            content="ok",
+            thinking_blocks=[{"type": "thinking", "thinking": "", "signature": "sig"}],
+        )
+        raw = _ev(choices=[_ev(message=message, finish_reason="stop")], usage=None)
+        blocks = _OpenAICompatibleBackend(_cfg())._format_context_backend_to_agency(raw)["message"][
+            "blocks"
+        ]
+        assert [b for b in blocks if b["type"] == "thinking"] == [
+            {"type": "thinking", "index": 1, "text": "", "signature": "sig"}
+        ]
+
+    def test_stream_thinking_blocks_signature_becomes_thinking_signature_delta(self):
+        chunks = [
+            _ev(
+                usage=None,
+                choices=[
+                    _ev(
+                        delta=_SdkObj(
+                            content=None,
+                            reasoning_content="Bre",
+                            thinking_blocks=[{"type": "thinking", "thinking": "Bre"}],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            ),
+            _ev(
+                usage=None,
+                choices=[
+                    _ev(
+                        delta=_SdkObj(
+                            content=None,
+                            thinking_blocks=[{"type": "thinking", "signature": "sig"}],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+            ),
+        ]
+        chunks.append(_ev(usage=None, choices=[_ev(delta=_SdkObj(), finish_reason="stop")]))
+        items = list(_OpenAICompatibleBackend(_cfg())._format_stream_to_agency(iter(chunks)))
+        thinking = [i for i in items if i.get("block_type") == "thinking"]
+        assert [(i["index"], i.get("text"), i.get("signature")) for i in thinking] == [
+            (-2, "Bre", None),
+            (-2, None, "sig"),
+        ]

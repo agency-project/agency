@@ -13,7 +13,10 @@ nav:
   - Getting started: getting-started.md
   - Guides:
       - Configuration and providers: guides/configuration.md
+      - Context windows: Context_Window.md
+      - Message patches: Message_Patches.md
       - Profiling and viewing runs: guides/profiling.md
+      - Live metrics: live-metrics.md
       - Host setup: guides/host-setup.md
       - Checkpoints: guides/checkpoints.md
       - Development: guides/development.md

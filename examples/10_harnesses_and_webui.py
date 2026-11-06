@@ -13,7 +13,10 @@ from _common import close_sandboxes, run_example, tutorial_config
 
 ECHO = agskill(
     name="harness_echo",
-    prompt="Return the supplied harness label exactly.",
+    prompt=(
+        "Return the supplied harness label exactly."
+        "\nAfter submitting all output fields, finish with a short confirmation."
+    ),
     input_schema=agdata(label=str),
     output_schema=agdata(answer=str),
 )

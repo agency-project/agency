@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import anyio
 import json
 import os
 import shutil
+import subprocess
 import uuid
 from functools import partial
+from pathlib import Path
 
 from fastapi import Request
 
 from ...llm.response_check import tool_arguments_complete
+from ...llm.message_store import with_tool_schema
+from ...native_harness.usage import prompt_tokens
 from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_limit
 from ..common import extract_bearer_token
 from .pty.driver import _HookPtyDriver, run_pty_attempt
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
 
 
 def codex_available() -> bool:
@@ -246,28 +251,91 @@ def _output_items(message: dict, tool_routes) -> "list[dict]":
     return output
 
 
+# models-manager/src/model_info.rs: model_info_from_slug's max_context_window.
+CODEX_UNKNOWN_MODEL_MAX_WINDOW = 272_000
+# The instructions Codex 0.147.0 gives a model it does not know
+# (codex-rs/models-manager/prompt.md at rust-v0.147.0; Codex is Apache-2.0).
+_CODEX_PROMPT = Path(__file__).with_name("codex_prompt.md")
+_CODEX_PROMPT_0_162_1 = Path(__file__).with_name("codex_prompt_0_162_1.md")
+
+
+def codex_model_catalog(model: str, context_window: int, *, version: str = "0.147.0") -> dict:
+    """A one-model `model_catalog_json`: what the supported Codex version builds for a model
+    it does not know (model_info_from_slug), with the real context window.
+    tests/harness/test_context_window_live.py checks that Codex sends the same
+    request with it as without it."""
+    # The 0.147 prompt is codex-rs/models-manager/prompt.md (Apache-2.0).
+    # The 0.162.1 prompt is that release's effective fallback instructions,
+    # captured with the real CLI: its default tool set omits planning sections.
+    # The live catalog-parity test compares the complete provider requests.
+    prompt = _CODEX_PROMPT_0_162_1 if version == "0.162.1" else _CODEX_PROMPT
+    return {
+        "models": [
+            {
+                "slug": model,
+                "display_name": model,
+                "description": None,
+                "supported_reasoning_levels": [],
+                "shell_type": "default",
+                "visibility": "none",
+                "supported_in_api": True,
+                "priority": 99,
+                "additional_speed_tiers": [],
+                "service_tiers": [],
+                "availability_nux": None,
+                "upgrade": None,
+                "model_messages": {"instructions_template": prompt.read_text()},
+                "include_skills_usage_instructions": False,
+                "include_plugin_usage_instructions": False,
+                "include_apps_usage_instructions": False,
+                "default_reasoning_summary": "auto",
+                "support_verbosity": False,
+                "default_verbosity": None,
+                "apply_patch_tool_type": None,
+                "web_search_tool_type": "text",
+                "truncation_policy": {"mode": "bytes", "limit": 10_000},
+                "supports_parallel_tool_calls": False,
+                "supports_image_detail_original": False,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "supports_search_tool": False,
+                "use_responses_lite": False,
+            }
+        ]
+    }
+
+
 def _responses_usage(usage: "dict | None") -> dict:
+    """Responses-format usage. Codex compacts on `total_tokens` and takes
+    `cached_tokens` as a part of `input_tokens` (OpenAI's convention), so
+    `input_tokens` is the whole prompt whichever way the backend counted."""
     usage = usage or {}
-    input_tokens = usage.get("prompt_tokens", 0)
+    prompt = prompt_tokens(usage)
     output_tokens = usage.get("completion_tokens", 0)
     result = {
-        "input_tokens": input_tokens,
+        "input_tokens": prompt.total,
         "output_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": prompt.total + output_tokens,
     }
-    if usage.get("cached_tokens") is not None:
-        result["input_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+    if prompt.cache_read or usage.get("cached_tokens") is not None:
+        result["input_tokens_details"] = {"cached_tokens": prompt.cache_read}
     if usage.get("reasoning_tokens") is not None:
         result["output_tokens_details"] = {"reasoning_tokens": usage["reasoning_tokens"]}
     return result
 
 
-def _require_actionable(output: "list[dict]") -> None:
+def _require_actionable(output: "list[dict]", *, structured_output_complete: bool = False) -> None:
     """A completed response must carry something Codex can act on. One with
     no message and no tool call would end the turn -- and the task -- as if
     the model had answered. The host already refuses such a response; this
-    keeps the adapter from ever completing one on its own."""
-    if not any(item.get("type") != "reasoning" for item in output):
+    keeps the adapter from ever completing one on its own. The host may
+    explicitly accept an empty finish after all structured outputs were
+    submitted; that is a completed task even without assistant text."""
+    if not structured_output_complete and not any(
+        item.get("type") != "reasoning" for item in output
+    ):
         raise ValueError("model response has no message and no tool call")
 
 
@@ -298,13 +366,29 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _provider_error_response(exc):
+    from fastapi.responses import JSONResponse, Response
+
+    body = getattr(exc, "provider_error", None)
+    _message, status, _transient = upstream_error(exc)
+    headers = getattr(exc, "provider_headers", None)
+    if isinstance(body, str):
+        return Response(body, status_code=status, headers=headers)
+    if isinstance(body, dict):
+        return JSONResponse(body, status_code=status, headers=headers)
+    return None
+
+
 class CodexDriver(_HookPtyDriver):
     name = "codex"
+    require_completion_signal = True
     _HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
     _HOOK_PATH = ("hooks.json",)
 
     def __init__(self, adapter, runtime, root, session_id, blob, max_steps):
         self._trusted_directory = False
+        self._model_label = (runtime.model or "").lower()
+        self._reasoning_effort = adapter.agconfig.llm.reasoning_effort
         super().__init__(adapter, runtime, root, session_id, blob, max_steps)
 
     def prompt_matches(self, prompt, expected):
@@ -339,19 +423,37 @@ class CodexDriver(_HookPtyDriver):
 
     def ready(self, handle):
         lines, x, y, _generation = handle.terminal_screen()
-        if not self._trusted_directory and any(
-            "Do you trust the contents of this directory?" in line for line in lines
-        ):
-            # check both the real and symbolic path on where codex was launched
+        trust_prompt = any(
+            "Do you trust the contents of this directory?" in line or "Trust this folder?" in line
+            for line in lines
+        )
+        if not self._trusted_directory and trust_prompt:
             cwd_variants = {self.cwd, os.path.realpath(self.cwd)}
             if any(any(variant in line for variant in cwd_variants) for line in lines) and any(
-                "1. Yes, continue" in line for line in lines
+                "1. Yes, continue" in line or "1. Trust and continue" in line for line in lines
             ):
                 self._trusted_directory = True
                 handle.write_terminal(b"\r")
             return False
-        # Require the actual composer, never silence or an old message in history.
-        return lines[y].strip().startswith("›") and x <= 3
+        # The loading composer is painted before config initialization. New
+        # sessions defer SessionStart until submission, so wait for the native
+        # model/settings footer rather than a lifecycle event that needs input.
+        model = getattr(self, "_model_label", "")
+        effort = getattr(self, "_reasoning_effort", None)
+        configured = any(
+            model in line.lower() and "·" in line and (not effort or effort in line.lower())
+            for line in lines
+        )
+        return configured and lines[y].strip().startswith("›") and x <= 3
+
+    def pasted(self, handle, wait_until, previous_generation):
+        def rendered():
+            lines, _x, _y, generation = handle.terminal_screen()
+            return generation != previous_generation and any(
+                "[Pasted Content" in line or "[Agency " in line for line in lines
+            )
+
+        wait_until(rendered, "native pasted input")
 
     def _stop_event(self, event, payload):
         event = super()._stop_event(event, payload)
@@ -397,6 +499,7 @@ class CodexDriver(_HookPtyDriver):
 
 
 class CodexAdapter(HarnessAdapter):
+    _CONFIG_HOME_IN_USER_DATA = True
     _DEFAULT_BINARY = "codex"
     _PTY_DRIVER = CodexDriver
     _PROVIDER_NAME = "agency-proxy"
@@ -430,12 +533,42 @@ class CodexAdapter(HarnessAdapter):
         context_limit: "int | None" = None,
     ) -> None:
         toml_text = f'model = "{model}"\nmodel_provider = "{self._PROVIDER_NAME}"\n'
+        for config_name, field in (
+            ("model_reasoning_effort", "reasoning_effort"),
+            ("model_reasoning_summary", "reasoning_summary"),
+        ):
+            value = getattr(self.agconfig.llm, field, None)
+            if value is not None:
+                toml_text += f"{config_name} = {json.dumps(value)}\n"
+        if not self.agconfig.harness_adapter.allow_subagents:
+            toml_text += "features.multi_agent = false\n"
         if context_limit is not None:
             # Codex only knows the context window for its own house models --
             # for a name it doesn't recognize (any model proxied behind
             # agency), it silently assumes some default that can be far off
             # from what the actual backend supports. This is the real number.
             toml_text += f"model_context_window = {int(context_limit)}\n"
+            if context_limit > CODEX_UNKNOWN_MODEL_MAX_WINDOW:
+                # ...which Codex 0.147.0 caps at the unknown model's
+                # max_context_window (272K). A catalog entry for the model
+                # lifts the cap; it is the same fallback metadata otherwise.
+                catalog = Path(config_home) / "model_catalog.json"
+                binary = self.agconfig.harness_adapter.binary_path or shutil.which("codex")
+                version = "0.147.0"
+                if binary and Path(binary).is_file():
+                    reported = subprocess.run(
+                        [binary, "--version"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=30,
+                    ).stdout
+                    if reported.strip() == "codex-cli 0.162.1":
+                        version = "0.162.1"
+                catalog.write_text(
+                    json.dumps(codex_model_catalog(model, int(context_limit), version=version))
+                )
+                toml_text += f"model_catalog_json = {json.dumps(str(catalog.resolve()))}\n"
         retry_settings = ""
         for name in ("request_max_retries", "stream_max_retries"):
             value = getattr(self.agconfig.llm, "codex_" + name, None)
@@ -482,8 +615,12 @@ class CodexAdapter(HarnessAdapter):
                 return _auth_error()
             body = await request.json()
             model = router.resolve_model(token)
-            await self._report_untranslated_fields(router, token, body)
-            agency_context = self._format_context_harness_to_agency(body)
+            native = self.agconfig.llm.provider == "openai_responses"
+            if not native:
+                await self._report_untranslated_fields(router, token, body)
+            agency_context = self._format_context_harness_to_agency(
+                body, request.headers, request.query_params
+            )
             # Keep routing request-local: one adapter serves multiple tokens.
             tool_routes = _responses_tool_routes(body)
             if body.get("stream"):
@@ -493,11 +630,23 @@ class CodexAdapter(HarnessAdapter):
                     agency_context,
                     model,
                     partial(self._format_agency_stream_to_harness, tool_routes=tool_routes),
+                    keepalive_frame=None,
+                    keepalive_s=0,
                 )
                 # This adapter already buffers through `done`; see
                 # start_streaming_response for why the first frame comes first.
-                return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+                return await start_streaming_response(
+                    request, frames, error_response=_provider_error_response
+                )
+            try:
+                agency_response = await anyio.to_thread.run_sync(
+                    router.dispatch, token, agency_context
+                )
+            except Exception as exc:
+                response = _provider_error_response(exc)
+                if response is not None:
+                    return response
+                raise
             try:
                 payload = self._format_context_agency_to_harness(
                     agency_response, model, tool_routes=tool_routes
@@ -535,7 +684,13 @@ class CodexAdapter(HarnessAdapter):
         except Exception:  # noqa: S110 - a diagnostic must never fail a model request
             pass
 
-    def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
+    def _format_context_harness_to_agency(
+        self, raw_request: dict, headers=None, query_params=None
+    ) -> dict:
+        if self.agconfig.llm.provider == "openai_responses":
+            from ...llm.responses_native import context_from_request
+
+            return context_from_request(raw_request, headers, query_params)
         messages: "list[dict]" = []
 
         instructions = raw_request.get("instructions")
@@ -648,14 +803,21 @@ class CodexAdapter(HarnessAdapter):
             for index, block in enumerate(message["blocks"]):
                 block["index"] = index
         return {
-            "messages": grouped,
-            "tools": _responses_tools_to_agency(_responses_tool_routes(raw_request)),
-            "tool_choice": _responses_tool_choice_to_agency(raw_request.get("tool_choice")),
+            "messages": with_tool_schema(
+                grouped,
+                _responses_tools_to_agency(_responses_tool_routes(raw_request)),
+                _responses_tool_choice_to_agency(raw_request.get("tool_choice")),
+            )
         }
 
     def _format_context_agency_to_harness(
         self, agency_response: dict, model: str, *, tool_routes=None
     ) -> dict:
+        from ...llm.responses_native import response_fields
+
+        native = response_fields(agency_response["message"])
+        if native is not None and "response" in native:
+            return native["response"]
         response = {
             "id": f"resp_{uuid.uuid4().hex}",
             "object": "response",
@@ -673,10 +835,18 @@ class CodexAdapter(HarnessAdapter):
                 "output": [],
             }
         output = _output_items(agency_response["message"], tool_routes)
-        _require_actionable(output)
+        _require_actionable(
+            output,
+            structured_output_complete=(
+                agency_response.get("structured_output_complete") is True
+                and agency_response.get("stop_reason") == "stop"
+            ),
+        )
         return {**response, "status": "completed", "output": output}
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str, *, tool_routes=None):
+        from ...llm.responses_native import response_fields
+
         request_id = f"resp_{uuid.uuid4().hex}"
         for item in agency_stream:
             if item["type"] == "delta":
@@ -684,12 +854,27 @@ class CodexAdapter(HarnessAdapter):
                 # retract them, so wait for the authoritative host checkpoint.
                 continue
 
+            native = response_fields(item["message"])
+            if native is not None and "events" in native:
+                if not native["events"]:
+                    # Commit the original HTTP 200, then close the empty stream.
+                    # Otherwise first-frame validation synthesizes an HTTP 502.
+                    yield ""
+                for event in native["events"]:
+                    yield _sse(event.get("type", "message"), event)
+                return
             reason = _incomplete_reason(item.get("stop_reason"))
             # Built before the first frame: anything that cannot be sent to
             # Codex raises here, where it still becomes an HTTP error.
             output = [] if reason is not None else _output_items(item["message"], tool_routes)
             if reason is None:
-                _require_actionable(output)
+                _require_actionable(
+                    output,
+                    structured_output_complete=(
+                        item.get("structured_output_complete") is True
+                        and item.get("stop_reason") == "stop"
+                    ),
+                )
             envelope = {"id": request_id, "object": "response", "model": model}
             yield _sse(
                 "response.created",

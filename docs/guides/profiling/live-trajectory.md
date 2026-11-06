@@ -238,8 +238,8 @@ binding is unchanged.
 ## Replay and investigation
 
 Select a live or saved execution, then **Replay recorded events**. Replay starts
-frozen at the beginning; use **Unfreeze view** on the time cursor to play at the
-selected speed (1× by default), **Next event**, or **Restart replay**.
+frozen at the beginning; use **Unfreeze view** on the time cursor to advance at
+normal speed (1×) and **Freeze view** to hold the current time.
 `mode=replay` is preserved in the URL. Actual saved spans supply start/end
 boundaries, and results, usage, context, and final metadata arrive only at the
 recorded end. Reconstructed boundaries are identified as such in raw detail.
@@ -287,8 +287,8 @@ header and a **Current activity** area that supports
 multiple in-flight calls. Completed calls move into history ordered by newest
 start time, with stable action IDs breaking ties. Completion time does not reorder
 history. An inspected call keeps its execution/action identity as it moves.
-The **Multi-agent** view preserves expanded transcripts while live updates
-arrive and aligns concurrent work with any recorded system metrics.
+The trajectory's agent columns preserve expanded transcripts while live
+updates arrive. The Timeline aligns concurrent work with recorded system metrics.
 Expand an activity for its calls. Select a call for arguments, lifecycle,
 timing, output, artifacts, model links, and immutable source identifiers.
 Signals link to supporting calls or raw events. Agent focus retains explicit
@@ -334,8 +334,12 @@ describe a recorded pattern. These are separate kinds of evidence.
 
 `trajectory.py` supplies one incremental reducer for live, historical review,
 and replay. `LiveSource` reads the existing global/per-agent databases in
-batches of at most 500 meaningful rows per table. High-volume syscalls and
-streamed tokens do not become activity nodes. Producer changes add request
+batches of at most 500 meaningful rows per table. High-volume syscalls remain
+recorded system telemetry, available to the Systems profiler and evidence
+inspection, but are excluded from trajectory feeds, overlays, history pages,
+agent call counts, and tool invocation metrics. They cannot evict model/tool
+calls from the browser's live retention window. Streamed tokens do not become
+activity nodes. Producer changes add request
 correlation, forward native annotations, flush tool completion, and record
 workload lifecycle; interpretation runs outside the execution process.
 
@@ -409,7 +413,6 @@ render window, working earlier-page navigation, and actor filtering. All six
 profiler views and the original dashboard were checked again. The live feed
 was checked at 390px with no horizontal overflow; viewport overrides were
 reset. No application console errors were observed in the final browser check.
-Screenshots are in the [gallery](screenshots.md).
 
 Failures found and corrected during implementation: a saved demo edge lacked
 an ID (now assigned a stable derived ID); an optional absent RPC reason changed

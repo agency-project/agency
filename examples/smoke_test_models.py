@@ -307,12 +307,16 @@ class UpstreamErrorLog:
     def record_stream_delta(self, *args, **kwargs) -> None:
         pass
 
-    def record_llm_exchange(self, call_label, *, exchange_type, response_chain, **kwargs) -> None:
+    def record_llm_exchange(
+        self, call_label, *, exchange_type, message_store, response_message_hashes, **kwargs
+    ) -> None:
         if not exchange_type.endswith("_error"):
             return
-        for _payload_hash, marker in response_chain:
-            if "error" in marker:
-                self.errors.append(marker["error"])
+        for message_hash in response_message_hashes:
+            for block_hash in message_store.message_structure_lookup[message_hash]["blocks"]:
+                block = message_store.message_block_lookup[block_hash]
+                if block.get("type") == "error":
+                    self.errors.append(block["error"])
 
 
 class _Server:

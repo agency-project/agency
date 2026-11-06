@@ -37,4 +37,26 @@ The Web UI relays controls to live Python agents in the parent process; reading 
 
 Wall time includes provider latency, startup and idle waits. Nested spans overlap, so adding parent and child durations double-counts time. Counters are sampled, and missing usage or resource data should remain unavailable. Reconstructed activity labels and harness completion do not establish task correctness.
 
-Use the [profiling guide](../guides/profiling.md) for viewing runs and [runtime reference](../api/runtime.md) for session APIs. Historical benchmark observations are retained in the [measurement archive](../archive/measurements.md), separately from the package design.
+Use the [profiling guide](../guides/profiling.md) for viewing runs and [runtime reference](../api/runtime.md) for session APIs.
+
+## Critical Path
+
+The dedicated historical profiler is available at `/critical-path`. It uses a
+compact analysis API, independently of the live trajectory and its replay
+projection. Select **Critical Path** in the viewer navigation. The legacy
+`/profiler?view=critical_path` projection remains available for older links.
+
+The implementation reuses model exchange fingerprints, scoped model/tool call
+IDs, request span identities, persisted Future prerequisites, and process
+sampling. The analysis graph contains operation boundaries and dependency edges;
+it excludes individual syscalls and automatic Python stacks. Request envelopes
+and child processes do not add their durations to contained tool work.
+
+Only recorded or reliably reconstructed blocking relationships participate.
+Agent parentage, process ancestry, message provenance, and span containment stay
+nonblocking unless separate recorded execution evidence establishes a dependency.
+Missing links produce a partial or candidate path. Measured resource activity
+never establishes contention or the cause of a latency gap by itself.
+
+See the [Critical Path Profiler guide](../guides/profiling/critical-path.md) for
+the API, correlation rules, analysis algorithm, validation, and limitations.

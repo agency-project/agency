@@ -7,14 +7,25 @@ this `/v1/chat/completions` endpoint and the same block mapping.
 
 from __future__ import annotations
 
+import anyio
 import json
 import time
 import uuid
 
 from fastapi import Request
 
+from ...llm.message_store import with_tool_schema
 from ..common import extract_bearer_token
-from .streaming import start_streaming_response, stream_response
+from .streaming import start_streaming_response, stream_response, upstream_error
+from ...native_harness.usage import prompt_tokens
+
+CHAT_KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+def chat_error_frame(exc: BaseException) -> str:
+    message, _status, transient = upstream_error(exc)
+    error = {"message": message, "type": "upstream_error", "transient": transient}
+    return f"data: {json.dumps({'error': error})}\n\n"
 
 
 _STOP_REASON_TO_OPENAI = {
@@ -60,6 +71,25 @@ def _flatten_unknown_data(data):
     return merged
 
 
+def _forward_usage(usage: "dict | None") -> dict:
+    """Full copy of the usage dict, not a hand-picked subset, with the
+    Chat Completions fields in OpenAI's convention: `prompt_tokens` is the
+    whole prompt and `cached_tokens` a part of it. Grok compacts on
+    `total_tokens`, OpenCode on prompt + completion, Kimi on prompt_tokens with
+    top-level `cached_tokens` split out; an Anthropic-style `prompt_tokens`
+    (cache reads left out) would hide most of a cached prompt from all three."""
+    prompt = prompt_tokens(usage)
+    usage = dict(usage or {})
+    completion = usage.get("completion_tokens", 0) or 0
+    usage["prompt_tokens"] = prompt.total
+    usage["completion_tokens"] = completion
+    usage["total_tokens"] = prompt.total + completion
+    if prompt.cache_read:
+        usage["cached_tokens"] = prompt.cache_read
+        usage["prompt_tokens_details"] = {"cached_tokens": prompt.cache_read}
+    return usage
+
+
 class ChatCompletionsProtocol:
     """Mixin supplying the Chat Completions route and its block mapping."""
 
@@ -78,10 +108,17 @@ class ChatCompletionsProtocol:
             agency_context = self._format_context_harness_to_agency(body)
             if body.get("stream"):
                 frames = stream_response(
-                    router, token, agency_context, model, self._format_agency_stream_to_harness
+                    router,
+                    token,
+                    agency_context,
+                    model,
+                    self._format_agency_stream_to_harness,
+                    keepalive_frame=CHAT_KEEPALIVE_FRAME,
+                    keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
+                    error_frame=chat_error_frame,
                 )
                 return await start_streaming_response(request, frames)
-            agency_response = router.dispatch(token, agency_context)
+            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
     def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
@@ -160,9 +197,9 @@ class ChatCompletionsProtocol:
             messages.append({"role": role, "blocks": blocks})
 
         return {
-            "messages": messages,
-            "tools": raw_request.get("tools"),
-            "tool_choice": raw_request.get("tool_choice"),
+            "messages": with_tool_schema(
+                messages, raw_request.get("tools"), raw_request.get("tool_choice")
+            )
         }
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:
@@ -194,7 +231,6 @@ class ChatCompletionsProtocol:
                 field = b["type"][len(_CHATCOMPLETIONS_TYPE_PREFIX) :]
                 response_message[field] = _flatten_unknown_data(b.get("data"))
 
-        usage = agency_response.get("usage") or {}
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -207,11 +243,7 @@ class ChatCompletionsProtocol:
                     "finish_reason": _stop_reason_to_openai(agency_response.get("stop_reason")),
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": _forward_usage(agency_response.get("usage")),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -263,18 +295,13 @@ class ChatCompletionsProtocol:
 
             yield _chunk({}, finish_reason=_stop_reason_to_openai(item.get("stop_reason")))
 
-            usage = item.get("usage") or {}
             usage_payload = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                },
+                "usage": _forward_usage(item.get("usage")),
             }
             yield f"data: {json.dumps(usage_payload)}\n\n"
             yield "data: [DONE]\n\n"

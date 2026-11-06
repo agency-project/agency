@@ -1,9 +1,9 @@
 """Shared runtime setup for the numbered tutorials.
 
-The tutorials default to Codex running on an OpenAI model, but the harness and
+The tutorials default to the native harness running on an OpenAI model, but the harness and
 model backend remain independent. Change either with environment variables:
 
-    AGENCY_HARNESS=codex
+    AGENCY_HARNESS=native
     AGENCY_LLM_PROVIDER=openai
     AGENCY_LLM_MODEL=gpt-6-luna
     OPENAI_API_KEY=...
@@ -26,18 +26,18 @@ from agency.configs.agconfig import (
     agentconfig,
     agconfig,
     llmconfig,
+    harnessadapterconfig,
     orchestratorconfig,
+    resourcesconfig,
     sandboxconfig,
 )
 
 
-DEFAULT_HARNESS = "codex"
+DEFAULT_HARNESS = "native"
 DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
 
-# Profiling gets its own explicit lesson. Keeping process-lifetime profiling
-# off everywhere else makes the tutorial suite faster and its artifacts easier
-# to understand.
+# Enable profiling explicitly in lesson 9.
 os.environ.setdefault("AGENCY_PROFILE", "0")
 
 
@@ -63,13 +63,6 @@ def tutorial_config(
     llm_kwargs: dict[str, object] = {
         "provider": provider,
         "model": model,
-        # Agency calls OpenAI through Chat Completions, where GPT-6 Sol and
-        # Luna accept function tools only with reasoning_effort "none" (any
-        # other value, or leaving it unset, is a 400 once tools are present).
-        # GPT-6 Astra and GPT-6.1 Sol reject "none" and so cannot use tools
-        # on that endpoint at all -- use AGENCY_LLM_PROVIDER=openai_responses
-        # for them, where tools work with reasoning on; they still reject
-        # "none", so set AGENCY_REASONING_EFFORT to low/medium/high/xhigh/max.
         "reasoning_effort": os.environ.get("AGENCY_REASONING_EFFORT", "none"),
         "max_completion_tokens": int(os.environ.get("AGENCY_MAX_COMPLETION_TOKENS", "4096")),
     }
@@ -126,8 +119,11 @@ def tutorial_config(
             output_dir=str(run_dir / "agent_output"),
         ),
         sandboxconfig(
-            base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "docker.io/library/python:3.12-slim")
+            base_image=os.environ.get("AGENCY_SANDBOX_IMAGE", "docker.io/library/python:3.12-slim"),
+            gpu_passthrough=False,
         ),
+        resourcesconfig(idle_cpus=1),
+        harnessadapterconfig(binary_path=os.environ.get("AGENCY_CODEX_BINARY")),
         orchestratorconfig(
             max_concurrent_engines=max_concurrent_engines,
             db_path=str(run_dir / "agency.sqlite3"),

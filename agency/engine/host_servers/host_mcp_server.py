@@ -62,7 +62,15 @@ _mcp_server_logger.propagate = False
 # explicitly here; harmless regardless of whether that basicConfig() has
 # already fired or fires later, since an explicit level always wins over
 # inherited effective level.
-for _noisy_logger_name in ("httpx", "httpcore", "boto3", "botocore", "urllib3"):
+for _noisy_logger_name in (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "boto3",
+    "botocore",
+    "urllib3",
+):
     logging.getLogger(_noisy_logger_name).setLevel(logging.WARNING)
 
 
@@ -129,6 +137,14 @@ class HostMcpServer:
 
     def collected_output(self) -> dict:
         return dict(self._persistent_vars.get("submitted_output_store", {}))
+
+    def has_complete_output(self) -> bool:
+        """Only validated structured submissions can justify an empty final turn."""
+        schema = self._skill.output_schema
+        if schema is None or schema.raw_key() is not None:
+            return False
+        required = set(schema._data)
+        return bool(required) and required.issubset(self.collected_output())
 
     def build_app(self) -> "Starlette":
         server = MCPServer(name="agency-host-mcp-server")

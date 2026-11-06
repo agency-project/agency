@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import threading
 import pytest
 from unittest.mock import MagicMock, patch
@@ -58,7 +60,7 @@ def _route_unit_execution_stubs_through_agent_engine(monkeypatch):
         output, updated_context, _delta = stub(
             self._agent, context, skill_input, max_steps=max_steps
         )
-        context.recent_transcript = updated_context.recent_transcript
+        context.set_transcript(updated_context.get_resolved_transcript())
         context.harness_sessions = updated_context.harness_sessions
         return output
 
@@ -282,11 +284,11 @@ def test_history_updated_after_run():
     skill = agskill(name="s", prompt="")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_msgs = list(prev_ctx.recent_transcript) + [
+        new_msgs = list(prev_ctx.get_resolved_transcript()) + [
             {"role": "user", "content": inp.to_json()},
             {"role": "assistant", "content": "{}"},
         ]
-        return agdata(ok=True), agcontext(recent_transcript=new_msgs), []
+        return agdata(ok=True), agcontext.from_messages(new_msgs), []
 
     skill._test_execute = fake_execute_react
     ag = make_agent()
@@ -309,8 +311,10 @@ def test_sequential_calls_serialize_via_history_chain():
         def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
             with lock:
                 order.append(name)
-            new_msgs = list(prev_ctx.recent_transcript) + [{"role": "user", "content": name}]
-            return agdata(name=name), agcontext(recent_transcript=new_msgs), []
+            new_msgs = list(prev_ctx.get_resolved_transcript()) + [
+                {"role": "user", "content": name}
+            ]
+            return agdata(name=name), agcontext.from_messages(new_msgs), []
 
         sk._test_execute = fake_execute_react
         return sk
@@ -340,7 +344,7 @@ def test_history_passed_to_agskill():
 
     ag.run(skill, agdata(x=1))
     _ = ag.history  # sync
-    assert received["hist"].recent_transcript[0]["content"] == "prior"
+    assert received["hist"].get_resolved_transcript()[0]["content"] == "prior"
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +479,7 @@ def test_fork_waits_for_inflight_task():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(recent_transcript=[{"role": "user", "content": str(inp.v)}])
+        new_ctx = agcontext.from_messages([{"role": "user", "content": str(inp.v)}])
         return agdata(v=inp.v), new_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -497,7 +501,7 @@ def test_fork_runs_do_not_update_parent_history():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(recent_transcript=[{"role": "user", "content": "fork_msg"}])
+        new_ctx = agcontext.from_messages([{"role": "user", "content": "fork_msg"}])
         return agdata(ok=True), new_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -543,7 +547,7 @@ def test_fork_sees_parent_history_at_fork_time():
     skill = agskill("s", "")
 
     def fake_execute_react(ag, prev_ctx, inp, max_steps=None, **_):
-        seen["hist"] = list(prev_ctx.recent_transcript)
+        seen["hist"] = list(prev_ctx.get_resolved_transcript())
         return agdata(), prev_ctx, []
 
     skill._test_execute = fake_execute_react
@@ -743,17 +747,39 @@ def test_external_sandbox_survives_agent_deletion_while_still_referenced():
 # Checkpointing (requires Docker)
 # ---------------------------------------------------------------------------
 
-_docker_ok = pytest.mark.skipif(
-    not (
-        lambda: (
-            __import__("subprocess")
-            .run(["docker", "info"], capture_output=True, timeout=10)
-            .returncode
-            == 0
-        )
-    )(),
-    reason="Docker not available",
+
+def _docker_available():
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+_docker_ok = pytest.mark.skipif(not _docker_available(), reason="Docker not available")
+
+
+@pytest.mark.parametrize(
+    "probe,available",
+    [
+        (None, False),
+        (0, True),
+        (1, False),
+        (OSError("missing"), False),
+        (subprocess.TimeoutExpired("docker info", 10), False),
+    ],
 )
+def test_docker_availability_handles_missing_or_unreachable_runtime(monkeypatch, probe, available):
+    monkeypatch.setattr(shutil, "which", lambda name: None if probe is None else "/usr/bin/docker")
+    run = MagicMock()
+    if isinstance(probe, Exception):
+        run.side_effect = probe
+    else:
+        run.return_value.returncode = probe
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _docker_available() is available
+    assert run.call_count == (0 if probe is None else 1)
 
 
 @_docker_ok
@@ -765,7 +791,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
     skill_write = agskill(name="write", prompt="")
 
     def fake_write(ag, prev_ctx, inp, max_steps=None, **_):
-        new_ctx = agcontext(recent_transcript=[{"role": "assistant", "content": "42"}])
+        new_ctx = agcontext.from_messages([{"role": "assistant", "content": "42"}])
         return agdata(answer="42"), new_ctx, []
 
     skill_write._test_execute = fake_write
@@ -782,7 +808,7 @@ def test_save_and_load_restores_history_and_filesystem(tmp_path, monkeypatch):
 
     ag2 = agent.load(ckpt, agconfig=_llm_agconfig({"api_key": "k", "model": "m"}))
     assert ag2.agname == saved_agname
-    assert len(ag2.context.recent_transcript) > 0
+    assert len(ag2.context.get_resolved_transcript()) > 0
     assert ag2 in agent.all()
 
     import sqlite3

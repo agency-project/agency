@@ -2,8 +2,12 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # codex_prompt.md is Codex's own prompt, byte for byte (adapters/codex.py).
       - id: trailing-whitespace
+        exclude: ^agency/harness/adapters/codex_prompt(?:_0_162_1)?\.md$
       - id: end-of-file-fixer
+        # Preserve the vendored prompt byte for byte.
+        exclude: ^agency/harness/adapters/codex_prompt(?:_0_162_1)?\.md$
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files

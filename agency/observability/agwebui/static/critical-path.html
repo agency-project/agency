@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
+<title>Agency · Critical Path Profiler</title>
+<link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/GeistMono-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/investigator.css"><link rel="stylesheet" href="/static/critical-path.css">
+</head>
+<body class="profiler-workspace">
+<div id="workspace">
+<aside class="sidebar">
+<a class="brand" href="/profiler"><span class="brand-mark">a</span><span>agency<span class="brand-caption">Execution profiler</span></span></a>
+<div class="side-caption">Views</div>
+<nav id="views" aria-label="Execution views">
+<a id="trajectory-link" class="compare-nav-link" href="/profiler"><span class="view-number">1</span>Execution Trajectory</a>
+<a id="profiler-link" class="compare-nav-link" href="/profiler?view=profiler"><span class="view-number">2</span>Profiler</a>
+<a class="compare-nav-link" href="/critical-path" aria-current="page"><span class="view-number">3</span>Critical Path Profiler</a>
+<a class="compare-nav-link" href="/compare"><span class="view-number">4</span>Compare Runs</a>
+</nav>
+</aside>
+<div class="workspace-main">
+<main class="cp-page">
+<div class="cp-title"><div><h1>Critical Path Profiler</h1><p>Follow the recorded dependencies that constrained execution time.</p></div><div class="cp-recording-controls"><label>Historical execution<select id="cp-run" aria-label="Historical execution"><option>Reading recordings…</option></select></label><button id="cp-refresh" title="Refresh historical catalog">Refresh</button></div></div>
+<p id="cp-status" class="cp-status" role="status" aria-live="polite">Reading historical execution catalog…</p>
+<div id="cp-overview"></div>
+<section id="cp-workspace" class="cp-workspace" hidden>
+<div class="cp-graph-column">
+<div class="cp-toolbar"><label>Show<select id="cp-mode"><option value="critical">Path and dependencies</option><option value="all">All operation activity</option></select></label><label>Focus agent<select id="cp-agent"><option value="">All agents</option></select></label><label class="cp-search-label">Find operation<input id="cp-query" type="search" placeholder="Tool, model, identity…" maxlength="200"></label><label class="cp-check"><input id="cp-cross" type="checkbox">Cross-agent edges only</label><label class="cp-check"><input id="cp-relationships" type="checkbox">All recorded relationships</label></div>
+<div class="cp-navigation"><div class="cp-legend"><span class="critical">Critical contribution</span><span class="gating">Latest join prerequisite</span><span class="llm">LLM</span><span class="tool">Tool</span><span class="wait">Wait</span><span class="system">Process overlay</span><span class="reconstructed">Reconstructed dependency</span></div><div><button id="cp-zoom-out" aria-label="Zoom out">−</button><button id="cp-fit">Fit execution</button><button id="cp-zoom-in" aria-label="Zoom in">+</button></div></div>
+<p id="cp-graph-notice" class="cp-note"></p>
+<div id="cp-timeline" class="cp-timeline"><div class="cp-lane-rail"><div id="cp-lane-labels"></div></div><div id="cp-scroll" class="cp-scroll" tabindex="0" aria-label="Temporal dependency graph. Scroll or drag blank space to pan; Control and mouse wheel to zoom."><div id="cp-canvas"></div></div></div>
+<div class="cp-pagination"><button id="cp-previous">Previous operations</button><span id="cp-page-position"></span><button id="cp-next">Next operations</button></div>
+<p class="cp-note">Time increases left to right from the recording boundary; this may be the first trace span when the execution start was not captured. Select a span or dependency line for evidence. Drag empty space to pan; Ctrl/⌘ + wheel zooms. Process overlays expand from an owning tool’s inspector and never add to the tool’s duration.</p>
+<details class="cp-accessible-list"><summary>Operations in this page · keyboard and text access</summary><div id="cp-operation-list"></div></details>
+<details id="cp-process-explorer" class="cp-process-explorer"><summary id="cp-process-title">Recorded system processes</summary><p class="cp-note">Measurements retain their process generation and original scope. Process sampling intervals do not prove process birth or exit. An agent or sandbox owner alone does not establish a tool owner.</p><div class="cp-toolbar"><label>Process owner<select id="cp-process-agent"><option value="">All agents and unattributed processes</option></select></label><label class="cp-search-label">Find process<input id="cp-process-query" type="search" maxlength="200" placeholder="Command, identity, attribution…"></label></div><div id="cp-process-table"></div><div class="cp-pagination"><button id="cp-process-previous">Previous processes</button><span id="cp-process-position"></span><button id="cp-process-next">Next processes</button></div></details>
+</div>
+<aside id="cp-inspector" class="cp-inspector" aria-label="Evidence inspector" hidden></aside>
+</section>
+</main>
+<footer class="cp-footer">Agency · historical dependency analysis · no raw syscall stream is loaded by this view</footer>
+</div></div>
+<script type="module" src="/static/critical-path.js"></script>
+</body>
+</html>

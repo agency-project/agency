@@ -26,6 +26,7 @@ import httpx
 import openai
 
 from .agllm import agllm
+from .message_store import split_tool_schema
 from .openai import _OpenAICompatibleBackend
 from .anthropic import (
     _AnthropicBackend,
@@ -378,7 +379,8 @@ class _BedrockConverseBackend(agllm):
         return None
 
     def _format_context_agency_to_backend(self, request: dict) -> dict:
-        system, converse_messages = _agency_messages_to_converse(request["messages"])
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        system, converse_messages = _agency_messages_to_converse(messages)
         kwargs: dict = dict(modelId=self.agconfig.llm.model or "", messages=converse_messages)
         if system:
             kwargs["system"] = [{"text": system}]
@@ -397,10 +399,7 @@ class _BedrockConverseBackend(agllm):
             stop = self.agconfig.llm.stop
             inference_config["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
         kwargs["inferenceConfig"] = inference_config
-        tool_choice = request.get("tool_choice")
-        converse_tools = (
-            None if tool_choice == "none" else _agency_tools_to_converse(request.get("tools"))
-        )
+        converse_tools = None if tool_choice == "none" else _agency_tools_to_converse(tools)
         if converse_tools:
             tool_config: dict = {"tools": converse_tools}
             converse_tool_choice = _agency_tool_choice_to_converse(tool_choice)
@@ -467,13 +466,13 @@ class _BedrockConverseBackend(agllm):
         usage = raw_result.get("usage") or {}
         input_tokens = usage.get("inputTokens", 0) or 0
         output_tokens = usage.get("outputTokens", 0) or 0
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": usage.get("totalTokens") or (input_tokens + output_tokens),
-            "cache_read_tokens": usage.get("cacheReadInputTokens", 0) or 0,
-            "cache_write_tokens": usage.get("cacheWriteInputTokens", 0) or 0,
-        }
+        # Full copy of Bedrock's usage dict, not a hand-picked subset.
+        usage_dict = dict(usage)
+        usage_dict["prompt_tokens"] = input_tokens
+        usage_dict["completion_tokens"] = output_tokens
+        usage_dict["total_tokens"] = usage.get("totalTokens") or (input_tokens + output_tokens)
+        usage_dict["cache_read_tokens"] = usage.get("cacheReadInputTokens", 0) or 0
+        usage_dict["cache_write_tokens"] = usage.get("cacheWriteInputTokens", 0) or 0
         stop_reason = raw_result.get("stopReason")
         blocks.append(
             {
@@ -500,10 +499,7 @@ class _BedrockConverseBackend(agllm):
         return raw_stream, client
 
     def _format_stream_to_agency(self, raw_stream):
-        input_tokens = 0
-        output_tokens = 0
-        cache_read_tokens = 0
-        cache_write_tokens = 0
+        usage_acc: "dict" = {}
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
@@ -600,10 +596,10 @@ class _BedrockConverseBackend(agllm):
                 stop_reason = event["messageStop"].get("stopReason")
             elif "metadata" in event:
                 usage = event["metadata"].get("usage") or {}
-                input_tokens = usage.get("inputTokens", 0) or input_tokens
-                output_tokens = usage.get("outputTokens", 0) or output_tokens
-                cache_read_tokens = usage.get("cacheReadInputTokens", 0) or cache_read_tokens
-                cache_write_tokens = usage.get("cacheWriteInputTokens", 0) or cache_write_tokens
+                # Don't let a falsy field clobber an earlier real value.
+                for k, v in usage.items():
+                    if v or k not in usage_acc:
+                        usage_acc[k] = v
 
         # If the stream ended (e.g. stopReason="max_tokens") while a tool_use
         # block was still open, contentBlockStop never fires for it -- flush
@@ -635,13 +631,14 @@ class _BedrockConverseBackend(agllm):
                 ),
             }
 
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-        }
+        input_tokens = usage_acc.get("inputTokens") or 0
+        output_tokens = usage_acc.get("outputTokens") or 0
+        usage_dict = dict(usage_acc)
+        usage_dict["prompt_tokens"] = input_tokens
+        usage_dict["completion_tokens"] = output_tokens
+        usage_dict["total_tokens"] = usage_acc.get("totalTokens") or (input_tokens + output_tokens)
+        usage_dict["cache_read_tokens"] = usage_acc.get("cacheReadInputTokens") or 0
+        usage_dict["cache_write_tokens"] = usage_acc.get("cacheWriteInputTokens") or 0
         yield {
             "type": "block_delta",
             "index": _CONVERSE_METADATA_BLOCK_INDEX,

@@ -8,7 +8,9 @@ import sqlite3
 import threading
 import time
 
+from agency.llm.message_store import MessageBlock
 from agency.observability.agdatalogger import agDataLogger, read_llm_exchanges
+from tests.exchange_helpers import record_exchange
 from agency.configs.agconfig import agconfig as agconfig_cls, dataloggerconfig
 
 
@@ -160,7 +162,10 @@ def test_start_creates_schema_tables(tmp_path):
             "spans",
             "latest_values",
             "stream_deltas",
-            "blocks",
+            "message_block_lookup",
+            "message_structure_lookup",
+            "per_exchange_messages",
+            "message_patch_lookup",
             "exchanges",
             "exchange_chain",
         } <= tables
@@ -456,6 +461,14 @@ def test_record_stream_delta_only_touches_stream_deltas(tmp_path):
     dc.stop()
 
 
+def _text_message(role, text):
+    return {"role": role, "blocks": [{"type": "text", "index": 0, "text": text}]}
+
+
+def _block_hash(role, text):
+    return MessageBlock(role, {"type": "text", "index": 0, "text": text}).hash
+
+
 def test_record_llm_exchange_deletes_flushed_deltas_and_writes_chains(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
@@ -464,11 +477,11 @@ def test_record_llm_exchange_deletes_flushed_deltas_and_writes_chains(tmp_path):
     dc.flush()
     assert len(_select_all(db_path, "stream_deltas")) == 2
 
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
-        exchange_type="llm_block",
-        prompt_chain=[("h_prompt", {"role": "user", "type": "text", "text": "hey"})],
-        response_chain=[("h_resp", {"type": "text", "text": "hi"})],
+        prompt=[_text_message("user", "hey")],
+        response=[_text_message("assistant", "hi")],
     )
 
     assert _select_all(db_path, "stream_deltas") == []
@@ -478,11 +491,26 @@ def test_record_llm_exchange_deletes_flushed_deltas_and_writes_chains(tmp_path):
     assert exchanges[0]["type"] == "llm_block"
 
     chain = {(r["kind"], r["seq"]): r["hash"] for r in _select_all(db_path, "exchange_chain")}
-    assert chain == {("prompt", 0): "h_prompt", ("response", 0): "h_resp"}
+    assert chain == {
+        ("prompt", 0): _block_hash("user", "hey"),
+        ("response", 0): _block_hash("assistant", "hi"),
+    }
 
-    blocks = {r["hash"]: json.loads(r["payload"]) for r in _select_all(db_path, "blocks")}
-    assert blocks["h_prompt"] == {"role": "user", "type": "text", "text": "hey"}
-    assert blocks["h_resp"] == {"type": "text", "text": "hi"}
+    blocks = {
+        r["hash"]: json.loads(r["payload"]) for r in _select_all(db_path, "message_block_lookup")
+    }
+    assert blocks[_block_hash("user", "hey")] == {
+        "role": "user",
+        "type": "text",
+        "index": 0,
+        "text": "hey",
+    }
+    assert blocks[_block_hash("assistant", "hi")] == {
+        "role": "assistant",
+        "type": "text",
+        "index": 0,
+        "text": "hi",
+    }
     dc.stop()
 
 
@@ -492,7 +520,7 @@ def test_record_llm_exchange_clears_not_yet_flushed_pending_deltas(tmp_path):
     dc.record_stream_delta("llm_stream_delta", {"text": "h"}, call_label="c1")
     assert len(dc._stream_delta_rows) == 1
 
-    dc.record_llm_exchange("c1", exchange_type="llm_block", prompt_chain=[], response_chain=[])
+    record_exchange(dc, "c1")
 
     assert dc._stream_delta_rows == []
     assert _select_all(db_path, "stream_deltas") == []
@@ -506,9 +534,7 @@ def test_record_llm_exchange_only_clears_matching_call_label(tmp_path):
     dc.record_stream_delta("llm_stream_delta", {"text": "x"}, call_label="c2")
     dc.flush()
 
-    dc.record_llm_exchange(
-        "c1", exchange_type="llm_block", prompt_chain=[], response_chain=[("h1", {"text": "h"})]
-    )
+    record_exchange(dc, "c1", response=[_text_message("assistant", "h")])
 
     remaining = _select_all(db_path, "stream_deltas")
     assert len(remaining) == 1
@@ -518,44 +544,42 @@ def test_record_llm_exchange_only_clears_matching_call_label(tmp_path):
 
 def test_record_llm_exchange_dedups_repeated_hash_within_one_exchange(tmp_path):
     """The same content (e.g. a system prompt block) can legitimately
-    appear in both an exchange's prompt and response candidate lists, or
-    twice within one chain -- `blocks` stores it once regardless of how
-    many chain entries reference it."""
+    appear in both an exchange's prompt and response, or twice within one
+    chain -- `message_block_lookup` stores it once regardless of how many
+    chain entries reference it."""
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    block = {"role": "system", "type": "text", "text": "be helpful"}
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
-        exchange_type="llm_block",
-        prompt_chain=[("h_sys", block)],
-        response_chain=[("h_sys", block), ("h_resp", {"type": "text", "text": "hi"})],
+        prompt=[_text_message("system", "be helpful")],
+        response=[_text_message("system", "be helpful"), _text_message("assistant", "hi")],
     )
-    assert len(_select_all(db_path, "blocks")) == 2  # h_sys stored once, not three times
+    assert (
+        len(_select_all(db_path, "message_block_lookup")) == 2
+    )  # the system block stored once, not three times
     chain_rows = _select_all(db_path, "exchange_chain")
     assert len(chain_rows) == 3  # but every occurrence still gets its own chain reference
     dc.stop()
 
 
 def test_record_llm_exchange_dedups_repeated_hash_across_exchanges(tmp_path):
-    """Content resent verbatim in a later exchange's prompt chain (e.g.
+    """Content resent verbatim in a later exchange's prompt (e.g.
     history round-tripped through a harness) is free storage-wise: the
-    second exchange's `INSERT OR IGNORE` into `blocks` is a no-op."""
+    second exchange's `INSERT OR IGNORE` into `message_block_lookup` is a no-op."""
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    block = {"role": "user", "type": "text", "text": "find the bug"}
-    dc.record_llm_exchange(
-        "c1", exchange_type="llm_block", prompt_chain=[("h1", block)], response_chain=[]
-    )
-    dc.record_llm_exchange(
-        "c2", exchange_type="llm_block", prompt_chain=[("h1", block)], response_chain=[]
-    )
-    assert len(_select_all(db_path, "blocks")) == 1
+    message = _text_message("user", "find the bug")
+    record_exchange(dc, "c1", prompt=[message])
+    record_exchange(dc, "c2", prompt=[message])
+    assert len(_select_all(db_path, "message_block_lookup")) == 1
     chain_rows = _select_all(db_path, "exchange_chain")
-    assert {(r["call_label"], r["hash"]) for r in chain_rows} == {("c1", "h1"), ("c2", "h1")}
+    digest = _block_hash("user", "find the bug")
+    assert {(r["call_label"], r["hash"]) for r in chain_rows} == {("c1", digest), ("c2", digest)}
 
 
 def test_blocks_record_first_seen_call_label_timestamp_and_chronological_id(tmp_path):
-    """`blocks.id`/`call_label`/`timestamp` exist purely so a reader can walk
+    """`message_block_lookup.id`/`call_label`/`timestamp` exist purely so a reader can walk
     distinct blocks directly, in first-seen order, without joining through
     exchanges/exchange_chain -- see agwebui/server.py's
     _fetch_finalized_llm_block_rows for the join this is meant to replace.
@@ -564,49 +588,43 @@ def test_blocks_record_first_seen_call_label_timestamp_and_chronological_id(tmp_
     conflict, full stop."""
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    resent = {"role": "user", "type": "text", "text": "find the bug"}
-    dc.record_llm_exchange(
-        "c1", exchange_type="llm_block", prompt_chain=[("h1", resent)], response_chain=[]
-    )
-    dc.record_llm_exchange(
+    resent = _text_message("user", "find the bug")
+    record_exchange(dc, "c1", prompt=[resent])
+    record_exchange(
+        dc,
         "c2",
-        exchange_type="llm_block",
-        prompt_chain=[("h1", resent)],  # resent verbatim -- must not steal h1's identity
-        response_chain=[("h2", {"type": "text", "text": "new content"})],
+        prompt=[resent],  # resent verbatim -- must not steal its identity
+        response=[_text_message("assistant", "new content")],
     )
 
-    blocks = _select_all(db_path, "blocks")
-    assert [b["hash"] for b in blocks] == ["h1", "h2"]  # id order == first-seen order
+    blocks = _select_all(db_path, "message_block_lookup")
+    assert [b["hash"] for b in blocks] == [
+        _block_hash("user", "find the bug"),
+        _block_hash("assistant", "new content"),
+    ]  # id order == first-seen order
     assert blocks[0]["call_label"] == "c1"
     assert blocks[1]["call_label"] == "c2"
     assert blocks[0]["timestamp"] <= blocks[1]["timestamp"]
-    dc.stop()
     dc.stop()
 
 
 def test_record_llm_exchange_preserves_chain_order_via_seq(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
-        exchange_type="llm_block",
-        prompt_chain=[("h0", {"n": 0}), ("h1", {"n": 1}), ("h2", {"n": 2})],
-        response_chain=[],
+        prompt=[{"role": "user", "blocks": [{"n": 0}, {"n": 1}, {"n": 2}]}],
     )
     rows = sorted(_select_all(db_path, "exchange_chain"), key=lambda r: r["seq"])
-    assert [r["hash"] for r in rows] == ["h0", "h1", "h2"]
+    assert [r["hash"] for r in rows] == [MessageBlock("user", {"n": n}).hash for n in range(3)]
     dc.stop()
 
 
 def test_record_llm_exchange_safe_with_no_prior_deltas(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
-        "c1",
-        exchange_type="llm_block",
-        prompt_chain=[],
-        response_chain=[("h1", {"type": "text", "text": "hi"})],
-    )
+    record_exchange(dc, "c1", response=[_text_message("assistant", "hi")])
     assert len(_select_all(db_path, "exchanges")) == 1
     dc.stop()
 
@@ -619,11 +637,11 @@ def test_record_llm_exchange_safe_with_no_prior_deltas(tmp_path):
 def test_reconstruct_llm_exchanges_splits_prompt_and_response_per_exchange(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
-        exchange_type="llm_block",
-        prompt_chain=[("h_user", {"role": "user", "type": "text", "text": "hi"})],
-        response_chain=[("h_resp", {"role": "assistant", "type": "text", "text": "hello"})],
+        prompt=[_text_message("user", "hi")],
+        response=[_text_message("assistant", "hello")],
     )
     dc.stop()
 
@@ -631,25 +649,23 @@ def test_reconstruct_llm_exchanges_splits_prompt_and_response_per_exchange(tmp_p
     assert len(exchanges) == 1
     assert exchanges[0]["call_label"] == "c1"
     assert exchanges[0]["type"] == "llm_block"
-    assert exchanges[0]["prompt"] == [{"role": "user", "type": "text", "text": "hi"}]
-    assert exchanges[0]["response"] == [{"role": "assistant", "type": "text", "text": "hello"}]
+    assert exchanges[0]["prompt"] == [{"role": "user", "type": "text", "index": 0, "text": "hi"}]
+    assert exchanges[0]["response"] == [
+        {"role": "assistant", "type": "text", "index": 0, "text": "hello"}
+    ]
 
 
 def test_reconstruct_llm_exchanges_orders_exchanges_and_filters_by_type(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
-        "c1", exchange_type="llm_block", prompt_chain=[], response_chain=[("h1", {"n": 1})]
-    )
-    dc.record_llm_exchange(
+    record_exchange(dc, "c1", response=[{"role": "assistant", "blocks": [{"n": 1}]}])
+    record_exchange(
+        dc,
         "c2",
         exchange_type="llm_stream_error",
-        prompt_chain=[],
-        response_chain=[("h2", {"error": "boom"})],
+        response=[{"role": "assistant", "blocks": [{"type": "error", "error": "boom"}]}],
     )
-    dc.record_llm_exchange(
-        "c3", exchange_type="llm_block", prompt_chain=[], response_chain=[("h3", {"n": 3})]
-    )
+    record_exchange(dc, "c3", response=[{"role": "assistant", "blocks": [{"n": 3}]}])
     dc.stop()
 
     all_exchanges = read_llm_exchanges(db_path)
@@ -657,22 +673,24 @@ def test_reconstruct_llm_exchanges_orders_exchanges_and_filters_by_type(tmp_path
 
     llm_blocks = read_llm_exchanges(db_path, exchange_type="llm_block")
     assert [e["call_label"] for e in llm_blocks] == ["c1", "c3"]
-    assert [e["response"] for e in llm_blocks] == [[{"n": 1}], [{"n": 3}]]
+    assert [e["response"] for e in llm_blocks] == [
+        [{"role": "assistant", "n": 1}],
+        [{"role": "assistant", "n": 3}],
+    ]
 
 
 def test_reconstruct_llm_exchanges_preserves_seq_order_within_a_chain(tmp_path):
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
-        exchange_type="llm_block",
-        prompt_chain=[("h0", {"n": 0}), ("h1", {"n": 1}), ("h2", {"n": 2})],
-        response_chain=[],
+        prompt=[{"role": "user", "blocks": [{"n": 0}, {"n": 1}, {"n": 2}]}],
     )
     dc.stop()
 
     exchanges = read_llm_exchanges(db_path)
-    assert exchanges[0]["prompt"] == [{"n": 0}, {"n": 1}, {"n": 2}]
+    assert exchanges[0]["prompt"] == [{"role": "user", "n": n} for n in range(3)]
 
 
 def test_reconstruct_llm_exchanges_handles_exchange_with_empty_prompt(tmp_path):
@@ -681,17 +699,17 @@ def test_reconstruct_llm_exchanges_handles_exchange_with_empty_prompt(tmp_path):
     response chain."""
     dc, db_path = _make_logger(tmp_path, flush_batch_size=1000, flush_interval_s=1000)
     dc.start()
-    dc.record_llm_exchange(
+    record_exchange(
+        dc,
         "c1",
         exchange_type="llm_stream_cancelled",
-        prompt_chain=[],
-        response_chain=[("h1", {"cancelled": True})],
+        response=[{"role": "assistant", "blocks": [{"type": "cancelled", "index": 0}]}],
     )
     dc.stop()
 
     exchanges = read_llm_exchanges(db_path)
     assert exchanges[0]["prompt"] == []
-    assert exchanges[0]["response"] == [{"cancelled": True}]
+    assert exchanges[0]["response"] == [{"role": "assistant", "type": "cancelled", "index": 0}]
 
 
 # ---------------------------------------------------------------------------

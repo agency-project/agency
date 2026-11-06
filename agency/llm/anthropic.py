@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import httpx
 
 from .agllm import agllm
+from .message_store import split_tool_schema
 from .openai_responses import ENCRYPTED_REASONING_TAG
 
 try:
@@ -125,8 +126,13 @@ def _known_anthropic_context_window(model: str) -> "int | None":
 _CACHE_CONTROL = {"type": "ephemeral"}  # prompt-caching breakpoint, default 5-minute TTL
 
 
-def _serialize_sdk_object(obj):
+def _serialize_sdk_object(obj, *, exclude_unset=False):
     dump = getattr(obj, "model_dump", None)
+    if dump is not None and exclude_unset:
+        try:
+            return dump(exclude_unset=True)
+        except TypeError:
+            pass  # Older SDK/test objects need only the original dump API.
     return dump() if dump is not None else obj
 
 
@@ -136,6 +142,39 @@ _METADATA_BLOCK_INDEX = 2**31 - 1  # reserved index, sorts after any real conten
 
 def _anthropic_native_block_type(native_type: str) -> str:
     return f"{_ANTHROPIC_TYPE_PREFIX}{native_type}"
+
+
+def _usage_to_dict(usage) -> dict:
+    """Coerces to a real dict even when _serialize_sdk_object can't."""
+    if usage is None:
+        return {}
+    dumped = _serialize_sdk_object(usage)
+    if isinstance(dumped, dict):
+        return dumped
+    try:
+        return dict(vars(dumped))
+    except TypeError:
+        return {}
+
+
+def _merge_usage(acc: dict, dump: dict) -> None:
+    """Merges without letting a later falsy field clobber an earlier real one."""
+    for k, v in dump.items():
+        if v or k not in acc:
+            acc[k] = v
+
+
+def _serialize_anthropic_usage(usage) -> dict:
+    """Full copy of the SDK's usage object, not a hand-picked subset."""
+    dumped = _usage_to_dict(usage)
+    input_tokens = dumped.get("input_tokens") or 0
+    output_tokens = dumped.get("output_tokens") or 0
+    dumped["prompt_tokens"] = input_tokens
+    dumped["completion_tokens"] = output_tokens
+    dumped["total_tokens"] = input_tokens + output_tokens
+    dumped["cache_read_tokens"] = dumped.get("cache_read_input_tokens") or 0
+    dumped["cache_write_tokens"] = dumped.get("cache_creation_input_tokens") or 0
+    return dumped
 
 
 def _flatten_unknown_fragment(fragment) -> dict:
@@ -461,6 +500,10 @@ def _with_cache_control(content):
     return content
 
 
+class _NativeBackendRequest(dict):
+    """Transport marker, kept out of the provider's JSON/keyword arguments."""
+
+
 class _AnthropicBackend(agllm):
     """Claude models via the first-party Anthropic API (api.anthropic.com) —
     the anthropic SDK's plain Anthropic client (Messages API shape).
@@ -475,6 +518,8 @@ class _AnthropicBackend(agllm):
             api_key=self.agconfig.llm.api_key or os.environ.get("ANTHROPIC_API_KEY"),
             timeout=_anthropic_sdk_timeout(timeout),
         )
+        if self.agconfig.llm.base_url:
+            kwargs["base_url"] = self.agconfig.llm.base_url
         workspace_id = self.agconfig.llm.workspace_id or os.environ.get("ANTHROPIC_WORKSPACE_ID")
         if workspace_id:
             kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
@@ -525,7 +570,16 @@ class _AnthropicBackend(agllm):
     def _format_context_agency_to_backend(self, request: dict) -> dict:
         model = self.agconfig.llm.model or ""
         info = _anthropic_model_info(model)
-        system, anthropic_messages = _agency_messages_to_anthropic(request["messages"])
+        messages, tools, tool_choice, _extra = split_tool_schema(request["messages"])
+        from .anthropic_native import NATIVE_REQUEST, request_from_agency
+
+        if NATIVE_REQUEST in _extra:
+            return _NativeBackendRequest(
+                request_from_agency(
+                    messages, tools, tool_choice, _extra[NATIVE_REQUEST], self.agconfig.llm
+                )
+            )
+        system, anthropic_messages = _agency_messages_to_anthropic(messages)
         kwargs: dict = dict(
             model=model,
             messages=anthropic_messages,
@@ -557,11 +611,11 @@ class _AnthropicBackend(agllm):
         effort = _effort_for_model(self.agconfig.llm.reasoning_effort, model, info)
         if effort is not None:
             kwargs["output_config"] = {"effort": effort}
-        anthropic_tools = _agency_tools_to_anthropic(request.get("tools"))
+        anthropic_tools = _agency_tools_to_anthropic(tools)
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
         anthropic_tool_choice = _tool_choice_for_model(
-            _agency_tool_choice_to_anthropic(request.get("tool_choice")), model, info
+            _agency_tool_choice_to_anthropic(tool_choice), model, info
         )
         if anthropic_tool_choice is not None:
             kwargs["tool_choice"] = anthropic_tool_choice
@@ -579,6 +633,10 @@ class _AnthropicBackend(agllm):
 
     def _call_backend(self, backend_request: dict):
         client = self.make_client(self._client_timeout())
+        if isinstance(backend_request, _NativeBackendRequest):
+            # The CLI already owns retries. An SDK retry here multiplies its
+            # attempts and hides upstream errors from its own backoff policy.
+            client.max_retries = 0
         try:
             return client.messages.create(**backend_request)
         finally:
@@ -621,18 +679,7 @@ class _AnthropicBackend(agllm):
                         "data": _serialize_sdk_object(b),
                     }
                 )
-        usage = getattr(raw_result, "usage", None)
-        input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
-        output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
-        cache_read_tokens = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
-        cache_write_tokens = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-        }
+        usage_dict = _serialize_anthropic_usage(getattr(raw_result, "usage", None))
         stop_reason = getattr(raw_result, "stop_reason", None)
         blocks.append(
             {
@@ -640,7 +687,7 @@ class _AnthropicBackend(agllm):
                 "index": len(blocks),
                 "usage": usage_dict,
                 "stop_reason": stop_reason,
-                "data": _serialize_sdk_object(raw_result),
+                "data": _serialize_sdk_object(raw_result, exclude_unset=True),
             }
         )
         return {
@@ -651,6 +698,8 @@ class _AnthropicBackend(agllm):
 
     def _call_backend_stream(self, backend_request: dict, on_client=None):
         client = self.make_client(self._client_timeout())
+        if isinstance(backend_request, _NativeBackendRequest):
+            client.max_retries = 0
         if on_client is not None:
             on_client(client)
         raw_stream = client.messages.create(stream=True, **backend_request)
@@ -663,10 +712,7 @@ class _AnthropicBackend(agllm):
         viewer anyway, so nothing is lost — and emitting one complete item
         instead of many small ones avoids relying on every fragment
         individually surviving whatever consumes this generator."""
-        input_tokens = 0
-        output_tokens = 0
-        cache_read_tokens = 0
-        cache_write_tokens = 0
+        usage_acc: "dict" = {}
         stop_reason = None
         tool_blocks: "dict[int, dict]" = {}  # index -> {"id", "name", "json_parts"}
         unknown_blocks: "dict[int, dict]" = {}  # index -> {"native_type", "start", "deltas"}
@@ -675,14 +721,16 @@ class _AnthropicBackend(agllm):
         for event in raw_stream:
             etype = getattr(event, "type", None)
             if etype == "message_start":
+                metadata_events.append(
+                    {
+                        "event": "message_start",
+                        "data": _serialize_sdk_object(event, exclude_unset=True),
+                    }
+                )
                 usage = getattr(event.message, "usage", None)
                 if usage is not None:
-                    input_tokens = getattr(usage, "input_tokens", 0) or 0
-                    cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-                    cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                    metadata_events.append(
-                        {"event": "message_start", "usage": _serialize_sdk_object(usage)}
-                    )
+                    usage_dump = _usage_to_dict(usage)
+                    _merge_usage(usage_acc, usage_dump)
             elif etype == "content_block_start":
                 block = event.content_block
                 if block.type == "tool_use":
@@ -756,12 +804,16 @@ class _AnthropicBackend(agllm):
             elif etype == "message_delta":
                 usage = getattr(event, "usage", None)
                 if usage is not None:
-                    output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
+                    usage_dump = _usage_to_dict(usage)
+                    _merge_usage(usage_acc, usage_dump)
                 delta_stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
                 if delta_stop_reason is not None:
                     stop_reason = delta_stop_reason
                 metadata_events.append(
-                    {"event": "message_delta", "data": _serialize_sdk_object(event)}
+                    {
+                        "event": "message_delta",
+                        "data": _serialize_sdk_object(event, exclude_unset=True),
+                    }
                 )
 
         # If the stream ended (e.g. stop_reason="max_tokens") while a tool_use
@@ -795,13 +847,14 @@ class _AnthropicBackend(agllm):
                 "data": {"start": unknown["start"], "deltas": unknown["deltas"]},
             }
 
-        usage_dict = {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-        }
+        input_tokens = usage_acc.get("input_tokens") or 0
+        output_tokens = usage_acc.get("output_tokens") or 0
+        usage_dict = dict(usage_acc)
+        usage_dict["prompt_tokens"] = input_tokens
+        usage_dict["completion_tokens"] = output_tokens
+        usage_dict["total_tokens"] = input_tokens + output_tokens
+        usage_dict["cache_read_tokens"] = usage_acc.get("cache_read_input_tokens") or 0
+        usage_dict["cache_write_tokens"] = usage_acc.get("cache_creation_input_tokens") or 0
         # The metadata block is a plain block_delta -- like any other unknown
         # native block, it flows through the host server's generic block
         # accumulator with no dedicated handling required there. All
