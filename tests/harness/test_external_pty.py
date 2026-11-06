@@ -96,15 +96,13 @@ def test_context_limit_is_written_into_config_when_lookup_succeeds(
     else:
         config = json.loads((tmp_path / "opencode.json").read_text())
         assert config["provider"]["agency-proxy"]["models"][runtime.model]["limit"] == {
-            "context": 42_000,
-            # 42_000 is too small a window for the 10% share to beat the
-            # flat default floor -- see the dedicated large-window test for
-            # the branch where it actually scales.
-            "output": runtime.agconfig.llm.default_max_tokens,
+            # OpenCode compacts at context - min(output, 32K): 90% of 42_000.
+            "context": 37_800 + 4_200,
+            "output": 4_200,
         }
 
 
-def test_opencode_output_reservation_scales_with_a_large_context_window(
+def test_opencode_reserve_stops_at_its_32k_cap_for_a_large_context_window(
     runtime, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -115,8 +113,9 @@ def test_opencode_output_reservation_scales_with_a_large_context_window(
     )
     config = json.loads((tmp_path / "opencode.json").read_text())
     limit = config["provider"]["agency-proxy"]["models"][runtime.model]["limit"]
-    assert limit["context"] == 500_000
-    assert limit["output"] == max(runtime.agconfig.llm.default_max_tokens, 50_000)
+    # OpenCode never keeps more than 32K free, so context carries the rest of
+    # the 10% margin: it compacts at 450_000.
+    assert limit == {"context": 450_000 + 32_000, "output": 32_000}
 
 
 @pytest.mark.parametrize("name", ["codex", "grok", "opencode"])
@@ -773,6 +772,10 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
         terminal_screen=lambda: (["│ ❯   │"], 4, 0, 1),
         write_terminal=Mock(),
     )
+    # This same empty composer is visible during generation. Only a native
+    # cancellation event or a newly restored idle draft acknowledges Ctrl+C.
+    driver.begin_interrupt(handle)
+    assert not driver.interrupted(handle)
 
     def wait_until(predicate, description):
         assert predicate(), description
@@ -794,6 +797,33 @@ def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
     )
 
     assert driver.ready(handle)
+
+
+@pytest.mark.parametrize("directory", ["/workspace", "/workspace-other"])
+def test_grok_confirms_only_its_own_workspace_trust_dialog(runtime, tmp_path, directory):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            [
+                "Do you trust the contents of this directory?",
+                directory,
+                "Yes, proceed   y",
+                "No, quit   n",
+            ],
+            0,
+            0,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    assert not driver.ready(handle)
+    if directory == "/workspace":
+        handle.write_terminal.assert_called_once_with(b"y")
+    else:
+        handle.write_terminal.assert_not_called()
 
 
 def _codex_trust_dialog_screen(cwd_shown: str) -> "SimpleNamespace":
@@ -865,14 +895,21 @@ def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
     assert execution._turn_id == "current"
 
 
-def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
+@pytest.mark.parametrize("cursor_in_composer", [True, False])
+def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path, cursor_in_composer):
     driver = driver_for(
         HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "\n".join(["[Agency run test]"] + ["previous line"] * 10)
     driver._last_turn_id = "turn"
+    lines = [
+        "╭──────────────────────╮",
+        "│ ❯ [Pasted: 11 lines]  │",
+        "╰──────────────────────╯",
+        "",
+    ]
     handle = SimpleNamespace(
-        terminal_screen=lambda: (["│ ❯ [Pasted: 11 lines]  │"], 24, 0, 1),
+        terminal_screen=lambda: (lines, 24, 1 if cursor_in_composer else 3, 1),
         write_terminal=Mock(),
     )
 
@@ -881,6 +918,49 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
 
     driver.clear_input(handle, wait_until)
     handle.write_terminal.assert_called_once_with(b"\x03")
+
+
+@pytest.mark.parametrize(
+    "generation,footer,interrupted",
+    [(1, "Enter:send", False), (2, "Enter:queue", False), (2, "Enter:send", True)],
+)
+def test_grok_interruption_requires_a_new_restored_idle_draft(
+    runtime, tmp_path, generation, footer, interrupted
+):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    driver._last_prompt = "[Agency run test]\nprevious prompt"
+    driver._interrupt_generation = 1
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (["│ ❯ [Pasted: 2 lines] │", footer], 4, 0, generation)
+    )
+    assert driver.interrupted(handle) is interrupted
+
+
+@pytest.mark.parametrize(
+    "draft,bordered,ready",
+    [
+        ("", True, True),
+        ("a draft", True, False),
+        ("[Pasted: 11 lines]", True, False),
+        ("", False, False),
+    ],
+)
+def test_grok_readiness_finds_the_composer_when_the_cursor_is_on_the_footer(
+    runtime, tmp_path, draft, bordered, ready
+):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    lines = [
+        "╭──────────────────────╮" if bordered else "history",
+        f"│ ❯ {draft}  │",
+        "╰──────────────────────╯" if bordered else "history",
+        "Logged in with API key",
+    ]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 3, 1))
+    assert driver.ready(handle) is ready
 
 
 def test_cow_success_closes_pty_at_invocation_boundary(runtime, tmp_path, monkeypatch):
@@ -1091,3 +1171,70 @@ def test_stream_response_still_raises_errors_before_any_frame():
 
     with pytest.raises(RuntimeError, match="bad request"):
         asyncio.run(run())
+
+
+def test_codex_idle_without_native_stop_is_failure(execution, monkeypatch):
+    execution.driver.require_completion_signal = CodexDriver.require_completion_signal
+    execution._launched = True
+    execution.driver.ready = lambda handle: True
+    monkeypatch.setattr(execution, "_wait_until", lambda *args: None)
+    monkeypatch.setattr(execution, "_submit", lambda *args: setattr(execution, "_deadline", 0))
+    monkeypatch.setattr(execution, "close", Mock())
+    with pytest.raises(TimeoutError, match="without a native completion signal"):
+        execution.run("work")
+
+
+def test_codex_config_sets_native_reasoning_and_subagent_preferences(runtime, tmp_path):
+    from agency.harness.adapters.codex import CodexAdapter
+
+    runtime.agconfig.llm.reasoning_effort = "medium"
+    runtime.agconfig.harness_adapter.allow_subagents = False
+    adapter = CodexAdapter(runtime.agconfig)
+    adapter._write_codex_config(tmp_path, "http://localhost:1", "gpt-6.1-sol")
+    config = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert config["model_reasoning_effort"] == "medium"
+    assert config["features"]["multi_agent"] is False
+
+
+def test_codex_waits_for_model_settings_before_accepting_composer():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver._model_label = "gpt-6.1-sol"
+    driver._reasoning_effort = "medium"
+    lines = ["› Ask Codex to do anything", "GPT-6.1-Sol default · /workspace"]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 0, 1))
+    assert not driver.ready(handle)
+    lines[1] = "GPT-6.1-Sol medium · /workspace"
+    assert driver.ready(handle)
+
+
+def test_codex_accepts_current_native_trust_dialog():
+    driver = CodexDriver.__new__(CodexDriver)
+    driver._trusted_directory = False
+    driver.cwd = "/workspace"
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            ["Folder access /workspace", "Trust this folder?", "› 1. Trust and continue"],
+            1,
+            2,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    handle.write_terminal.assert_called_once_with(b"\r")
+
+
+def test_codex_waits_until_paste_is_rendered():
+    driver = CodexDriver.__new__(CodexDriver)
+    screen = ["› Ask Codex to do anything"]
+    generation = [1]
+    handle = SimpleNamespace(terminal_screen=lambda: (screen, 0, 0, generation[0]))
+
+    def wait(predicate, description):
+        assert not predicate()
+        screen[0] = "› [Pasted Content 2000 chars]"
+        generation[0] += 1
+        assert predicate()
+
+    driver.pasted(handle, wait, 1)

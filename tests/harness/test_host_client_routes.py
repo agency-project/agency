@@ -20,6 +20,11 @@ from agency.harness.protocol import ATTEMPT_TOKEN_HEADER
 def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
     from agency.harness.clients.host_services_client import HostDispatchError
 
+    provider_error = {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": "native error"},
+    }
+
     def handler(request):
         if streamed:
             return httpx.Response(
@@ -30,11 +35,23 @@ def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
                         "message": "synthetic",
                         "status_code": 400,
                         "transient": False,
+                        "provider_error": provider_error,
+                        "provider_headers": {"retry-after": "2"},
                     }
                 )
                 + "\n",
             )
-        return httpx.Response(400, json={"error": {"message": "synthetic", "transient": False}})
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "synthetic",
+                    "transient": False,
+                    "provider_error": provider_error,
+                    "provider_headers": {"retry-after": "2"},
+                }
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: transport)
@@ -46,6 +63,8 @@ def test_async_dispatch_preserves_permanent_error(monkeypatch, streamed):
                 pass
         assert caught.value.status_code == 400
         assert caught.value.transient is False
+        assert caught.value.provider_error == provider_error
+        assert caught.value.provider_headers == {"retry-after": "2"}
 
     try:
         asyncio.run(consume())

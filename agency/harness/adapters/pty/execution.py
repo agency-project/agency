@@ -197,7 +197,10 @@ class PtyExecution:
                 return
             self._check_alive()
             if now >= deadline:
-                raise RuntimeError(f"{self.driver.name} timed out waiting for {description}")
+                lines, _, _, _ = self.handle.terminal_screen()
+                detail = "\n".join(line.rstrip() for line in lines if line.strip())[-2000:]
+                message = f"{self.driver.name} timed out waiting for {description}"
+                raise RuntimeError(f"{message}\n{detail}" if detail else message)
             time.sleep(self.POLL_INTERVAL_S)
 
     def _submit(self, text, label):
@@ -210,7 +213,9 @@ class PtyExecution:
         self._acknowledged = False
         self._stop = None
         self._interrupted = False
+        generation = self.handle.terminal_screen()[3]
         self.handle.write_terminal(b"\x1b[200~" + self._expected_prompt.encode() + b"\x1b[201~")
+        self.driver.pasted(self.handle, self._wait_until, generation)
         self.handle.write_terminal(b"\r")
         self._wait_until(lambda: self._acknowledged, "native prompt acknowledgment")
         self._deadline = time.monotonic() + self.ATTEMPT_TIMEOUT
@@ -359,6 +364,11 @@ class PtyExecution:
                                 output_tokens=self._stop.get("output_tokens", 0),
                             )
                         if now > self._deadline:
+                            if getattr(self.driver, "require_completion_signal", False):
+                                raise TimeoutError(
+                                    f"{self.driver.name} idled for {self.ATTEMPT_TIMEOUT}s "
+                                    "without a native completion signal"
+                                )
                             # Driver-level completion detection (matching a CLI's
                             # own Stop hook against its local transcript) has
                             # proven unreliable across some model/CLI

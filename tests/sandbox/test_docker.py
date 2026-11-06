@@ -66,6 +66,51 @@ def _make_sandbox(**kwargs):
 
 
 # ---------------------------------------------------------------------------
+# CPU quotas must work even when the configured cap exceeds daemon capacity.
+# ---------------------------------------------------------------------------
+
+
+@docker
+@pytest.mark.parametrize("cpus", [None, 0.5, 2 * (os.cpu_count() or 1)])
+def test_cpu_cap_survives_creation_live_update_and_checkpoint_restore(cpus):
+    from agency.configs.agconfig import agconfig, resourcesconfig, sandboxconfig
+    from agency.sandbox.container import _ContainerBackendBase
+
+    if not _ContainerBackendBase._cfs_supported():
+        pytest.skip("CFS CPU quotas are unavailable")
+    config = agconfig(
+        resourcesconfig(idle_cpus=cpus),
+        sandboxconfig(backend="docker", gpu_passthrough=False),
+    )
+    sb = _make_sandbox(agconfig=config)
+
+    def assert_cap(expected):
+        result = subprocess.run(
+            ["docker", "inspect", "--format={{json .HostConfig}}", sb._backend._container_name()],
+            capture_output=True,
+            check=True,
+        )
+        limits = json.loads(result.stdout)
+        assert limits["CpuQuota"] == (int(expected * 100_000) if expected is not None else 0)
+        assert limits["CpuPeriod"] == (100_000 if expected is not None else 0)
+
+    try:
+        sb.write_file("/workspace/marker", "preserved")
+        assert_cap(cpus)
+        sb.update_limits(cpus=0.25)
+        assert_cap(0.25)
+        # Releasing back to a large resting cap must also work on a small host.
+        sb.update_limits(cpus=2 * (os.cpu_count() or 1))
+        assert_cap(2 * (os.cpu_count() or 1))
+        sb.commit()
+        sb.rm_container()
+        assert sb.read_file("/workspace/marker") == "preserved"
+        assert_cap(cpus)
+    finally:
+        sb.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Owner-PID labels let the orphan reaper distinguish a dead owner from
 # another process operating on a serialized copy of a live owner's backend.
 # ---------------------------------------------------------------------------

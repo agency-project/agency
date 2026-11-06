@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agency.configs.agconfig import agconfig
 from agency.harness.ptrace.supervisor import agProxyPtrace, ptrace_available
 
 ptrace = pytest.mark.skipif(not ptrace_available(), reason="ptrace not usable on this host")
@@ -34,6 +36,35 @@ _SPAWN_CHILD_SCRIPT = str(
 class _AllowPolicy:
     def check(self, _ag, _event):
         return True
+
+
+@ptrace
+def test_supervision_follows_a_child_that_drops_credentials():
+    if os.geteuid() != 0:
+        pytest.skip("credential-change regression requires root")
+    status = Path("/proc/self/status").read_text()
+    effective = int(
+        next(line.split()[1] for line in status.splitlines() if line.startswith("CapEff:")), 16
+    )
+    if not effective & (1 << 19):
+        pytest.skip("credential-change supervision requires CAP_SYS_PTRACE")
+    policy = _RecordingPolicy()
+    handle = agProxyPtrace(agconfig(), allow_initial_exec=True).launch(
+        [
+            sys.executable,
+            "-c",
+            'import os; os.setgid(65534); os.setuid(65534); os.execv("/bin/true", ["/bin/true"])',
+        ],
+        dict(os.environ),
+        policy=policy,
+        ag=None,
+    )
+    try:
+        _, _, code = handle.wait(timeout=10)
+        assert code == 0
+        assert any(event.path == "/bin/true" for event in policy.events)
+    finally:
+        handle.close()
 
 
 class _RecordingPolicy:

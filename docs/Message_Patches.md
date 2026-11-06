@@ -135,6 +135,32 @@ builds its own request, getting `(chat messages, tools, tool_choice, extra)`; it
 forwards `tools` and `tool_choice` natively and ignores `extra`. `stream` only
 chooses the transport, so the `/dispatch` route removes it and it is not recorded.
 
+Claude Code with `provider="anthropic"` uses a lossless native-request path.
+Its `request_extra` block retains native request options and the Anthropic version
+and beta headers and the native `beta` query flag; authentication headers are
+excluded. Message metadata retains
+the original boundaries and distinguishes top-level system blocks from system
+messages inside the conversation. The backend rebuilds the native request from
+the materialized, patched blocks. Native reasoning/context settings, cache markers,
+tool schemas and tool-result error flags survive when no intervention changes
+them. The configured model selects the CLI's initial model; native per-request
+model choices, including provider-directed fallback, remain intact. Other explicit
+LLM configuration values override the corresponding request options; unset values
+retain the harness's settings. Other harness/provider
+combinations continue to use their existing conversion paths.
+
+The native Claude route waits for upstream acceptance before sending keepalives.
+A provider rejection before streaming begins retains its HTTP status and native
+error body, allowing Claude's own compatibility recovery to run.
+Native requests use one provider attempt; the CLI owns retries. Retry response
+headers and native response envelopes, including refusal details and context
+management edits, survive the host/daemon relay.
+
+On that native path, a tool result whose content is a string exposes `text`;
+structured content exposes `raw_content` without a duplicate text copy. Patch
+that structured value to edit it. This avoids an unchanged copy of the original
+content silently overriding the replacement.
+
 An exchange that fails or is cancelled is recorded as one `assistant` response message
 whose single block is `{"type": "error", "index": 0, "error": "<Type: message>"}` or
 `{"type": "cancelled", "index": 0}`.

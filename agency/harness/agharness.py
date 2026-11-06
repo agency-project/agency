@@ -22,16 +22,14 @@ def _runtime_name(owner: "agent | str") -> str:
     return owner if isinstance(owner, str) else owner.agname
 
 
-def materialize_config_home(ag: "agent | str") -> Path:
+def materialize_config_home(ag: "agent | str", *, parent: "Path | None" = None) -> Path:
     """Create a fresh, isolated config-home directory for one harness
     launch; concrete backends write their own harness-specific files into
     it. Nested under this run's config_homes/ dir so it's cleaned up with
     the rest of the run's ephemeral state."""
-    return Path(
-        tempfile.mkdtemp(
-            prefix=f"agharness-{_runtime_name(ag)}-", dir=str(agency_config_homes_dir())
-        )
-    )
+    directory = parent if parent is not None else agency_config_homes_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return Path(tempfile.mkdtemp(prefix=f"agharness-{_runtime_name(ag)}-", dir=str(directory)))
 
 
 def cleanup_config_home(path: Path) -> None:

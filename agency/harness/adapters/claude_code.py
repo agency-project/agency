@@ -7,10 +7,13 @@ policy-aware runtime, and owns native PTY input and completion.
 from __future__ import annotations
 
 import anyio
+import copy
 import json
 import os
 import re
+import shlex
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -20,6 +23,7 @@ from .base import AdapterRuntime, AttemptResult, HarnessAdapter, fetch_context_l
 from .pty.driver import PtyDriver, run_pty_attempt
 from .streaming import start_streaming_response, stream_response, upstream_error
 from ...llm.message_store import with_tool_schema
+from ...native_harness.usage import prompt_tokens
 from ..common import extract_bearer_token
 from ..executable import HARNESS_PATH
 
@@ -43,26 +47,70 @@ _ANTHROPIC_ERROR_TYPES = {
 
 
 def _anthropic_error_frame(exc: BaseException) -> str:
+    body = getattr(exc, "provider_error", None)
+    if isinstance(body, dict):
+        return f"event: error\ndata: {json.dumps(body)}\n\n"
     message, status, _transient = upstream_error(exc)
     error = {"type": _ANTHROPIC_ERROR_TYPES.get(status, "api_error"), "message": message}
     return f"event: error\ndata: {json.dumps({'type': 'error', 'error': error})}\n\n"
 
 
-# --autocompact only accepts this range (per `claude --help`); a model with a
-# real window outside it can't be told via this flag at all, so Claude Code
-# is left on its own "auto" default for those rather than passed a value it
-# would reject.
+def _anthropic_error_response(exc: BaseException):
+    from fastapi.responses import JSONResponse
+
+    body = getattr(exc, "provider_error", None)
+    if isinstance(body, dict):
+        headers = {
+            key.lower(): value
+            for key, value in (getattr(exc, "provider_headers", None) or {}).items()
+            if key.lower()
+            in {"retry-after", "retry-after-ms", "x-should-retry", "request-id", "x-request-id"}
+        }
+        return JSONResponse(body, status_code=upstream_error(exc)[1], headers=headers)
+    return None
+
+
+# How Claude Code 2.1.251 sizes auto-compaction (read from its bundle and
+# measured against a mock backend):
+#
+#   window    = min(model window, --autocompact)
+#   threshold = window - min(max output, 20_000) - 13_000
+#
+# "model window" is 200K for a model name it does not recognise, whatever
+# --autocompact says, unless CLAUDE_CODE_MAX_CONTEXT_TOKENS gives it (honoured
+# only for names not starting with "claude-") or the name ends in "[1m]"
+# (1M; the suffix is stripped from the API request). --autocompact takes
+# 100K-1M; CLAUDE_CODE_AUTO_COMPACT_WINDOW is the same setting, raised to 100K
+# when lower. The window is passed with the reserve added back, so that
+# Claude Code compacts at the same fraction of the real limit as the native
+# harness (native_harness/compaction.py's COMPACT_THRESHOLD).
+_CLAUDE_CODE_DEFAULT_WINDOW = 200_000
+_CLAUDE_CODE_RESERVE = 20_000 + 13_000
 _AUTOCOMPACT_MIN_TOKENS = 100_000
 _AUTOCOMPACT_MAX_TOKENS = 1_000_000
-# --autocompact directly sets Claude Code's *effective* window (confirmed
-# against the CLI's own bundled strings: it feeds straight into the
-# used-tokens-vs-window comparison, not a separate trigger threshold below a
-# still-real max the way codex's model_context_window/
-# model_auto_compact_token_limit split works). Compacting at the exact real
-# limit would leave no headroom for the compaction call itself plus the next
-# turn's overhead, so shave the same margin native_harness/compaction.py's
-# own COMPACT_THRESHOLD already uses before handing the number over.
-_AUTOCOMPACT_SAFETY_MARGIN = 0.9
+_COMPACT_AT = 0.9
+
+
+def claude_code_window_settings(model: str, context_limit: int) -> "tuple[str, list[str], dict]":
+    """(--model value, extra argv, extra env) so that Claude Code compacts at
+    90% of `context_limit` (or as close as its limits allow)."""
+    window = int(context_limit * _COMPACT_AT) + _CLAUDE_CODE_RESERVE
+    argv: list[str] = []
+    env: dict[str, str] = {}
+    if model.startswith("claude-"):
+        if window > _CLAUDE_CODE_DEFAULT_WINDOW and "[" not in model:
+            model += "[1m]"
+    else:
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
+    if window > _AUTOCOMPACT_MAX_TOKENS:
+        window = _AUTOCOMPACT_MAX_TOKENS
+    if window >= _AUTOCOMPACT_MIN_TOKENS:
+        argv += ["--autocompact", str(window)]
+    else:
+        # Too small for --autocompact. The env form is raised to 100K, and
+        # the model window above (non-Claude names) then sets the threshold.
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(_AUTOCOMPACT_MIN_TOKENS)
+    return model, argv, env
 
 
 # -- Native session continuity ----------------------------------------------
@@ -275,6 +323,33 @@ def _stop_reason_to_anthropic(stop_reason: "str | None") -> str:
     return _STOP_REASON_TO_ANTHROPIC.get(stop_reason, stop_reason or "end_turn")
 
 
+def _native_response_fields(message: dict) -> tuple[dict, dict, dict]:
+    """Recover native response envelopes while rendering patchable content.
+
+    Refusal details, context edits and future provider fields are control
+    information for the CLI, not just logging metadata.
+    """
+    full, start, delta = {}, {}, {}
+    for block in message.get("blocks", []):
+        if block.get("type") != "metadata":
+            continue
+        data = block.get("data")
+        for fragment in data if isinstance(data, list) else [data]:
+            if not isinstance(fragment, dict):
+                continue
+            if fragment.get("type") == "message":
+                full.update(copy.deepcopy(fragment))
+            for event in fragment.get("raw_events", []):
+                raw = event.get("data")
+                if not isinstance(raw, dict):
+                    continue
+                if event.get("event") == "message_start":
+                    start.update(copy.deepcopy(raw))
+                elif event.get("event") == "message_delta":
+                    delta.update(copy.deepcopy(raw))
+    return full, start, delta
+
+
 def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
@@ -282,20 +357,22 @@ def _sse(event_type: str, data: dict) -> str:
 def _forward_usage_to_anthropic(
     usage: "dict | None", *, output_tokens: "int | None" = None
 ) -> dict:
-    """Full copy, plus Anthropic's own field names layered on top."""
+    """Full copy, plus Anthropic's own field names layered on top.
+
+    Claude Code sizes the conversation as input + cache_read + cache_creation,
+    Anthropic's convention, in which the three never overlap. Agency's usage
+    may follow OpenAI's instead (cache counts inside prompt_tokens), so the
+    split comes from `prompt_tokens()` rather than a field-by-field copy."""
+    prompt = prompt_tokens(usage)
     usage = dict(usage or {})
-    usage["input_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    usage["input_tokens"] = prompt.uncached
     usage["output_tokens"] = (
         output_tokens
         if output_tokens is not None
         else usage.get("completion_tokens", usage.get("output_tokens", 0))
     )
-    usage["cache_read_input_tokens"] = usage.get(
-        "cache_read_tokens", usage.get("cache_read_input_tokens", 0)
-    )
-    usage["cache_creation_input_tokens"] = usage.get(
-        "cache_write_tokens", usage.get("cache_creation_input_tokens", 0)
-    )
+    usage["cache_read_input_tokens"] = prompt.cache_read
+    usage["cache_creation_input_tokens"] = prompt.cache_write
     return usage
 
 
@@ -319,6 +396,7 @@ class ClaudeDriver(PtyDriver):
         self.started = False
         self._prior_blob = blob
         self._expected_prompt = None
+        self._expected_turn_id = None
         self._attempt_offset = None
         self._snapshot = None
         self._interrupt_offset = 0
@@ -343,13 +421,14 @@ class ClaudeDriver(PtyDriver):
             self.argv += ["--max-turns", str(max_steps)]
         context_limit = fetch_context_limit(runtime.harness_base_url, runtime.token)
         if context_limit is not None:
-            # Otherwise Claude Code's own auto-compaction is sized for
-            # whatever model name it thinks it's talking to, not the real
-            # (possibly much smaller) window of the model actually proxied
-            # behind agency.
-            autocompact_window = int(context_limit * _AUTOCOMPACT_SAFETY_MARGIN)
-            if _AUTOCOMPACT_MIN_TOKENS <= autocompact_window <= _AUTOCOMPACT_MAX_TOKENS:
-                self.argv += ["--autocompact", str(autocompact_window)]
+            # Otherwise Claude Code sizes auto-compaction for whatever it
+            # thinks the model name is (200K when it doesn't know it), not
+            # for the model actually proxied behind Agency.
+            model, argv, env = claude_code_window_settings(runtime.model, context_limit)
+            if model != runtime.model:
+                self.argv[self.argv.index("--model") + 1] = model
+            self.argv += argv
+            self.env.update(env)
 
     def _transcript(self):
         if self.session_id is None:
@@ -395,6 +474,13 @@ class ClaudeDriver(PtyDriver):
         # This driver fences turns by identity, so the marker needs no nonce.
         return f"[Agency {label}]"
 
+    def prompt_matches(self, prompt, expected):
+        if not isinstance(prompt, str) or not isinstance(expected, str):
+            return False
+        # Claude's composer expands pasted tabs to four spaces before its hook
+        # reports the accepted prompt. Keep this normalization out of LLM traffic.
+        return prompt.replace("\t", "    ") == expected.replace("\t", "    ")
+
     def begin_turn(self, prompt):
         self._expected_prompt = prompt
         if self._attempt_offset is None:
@@ -404,6 +490,7 @@ class ClaudeDriver(PtyDriver):
         temporary = state.with_suffix(".tmp")
         temporary.write_text(json.dumps({"turn_id": turn_id}))
         temporary.replace(state)
+        self._expected_turn_id = turn_id
         return turn_id
 
     def _event_from_payload(self, record):
@@ -415,6 +502,8 @@ class ClaudeDriver(PtyDriver):
             return None
         event = {"turn_id": record["turn_id"]}
         if kind == "UserPromptSubmit":
+            if self._expected_turn_id is None or record["turn_id"] != self._expected_turn_id:
+                return None
             event.update(kind="submit", prompt=payload.get("prompt"))
         elif kind == "Stop":
             event.update(kind="stop", text=payload.get("last_assistant_message") or "")
@@ -463,11 +552,32 @@ class ClaudeDriver(PtyDriver):
         input_tokens/output_tokens."""
         self._snapshot = blob
         usage: "dict[str, int]" = {"input_tokens": 0, "output_tokens": 0}
-        for row in self._rows(blob[self._attempt_offset :]):
-            row_usage = row.get("message", {}).get("usage") or {}
+        invalid_rows = 0
+        for line in blob[self._attempt_offset :].splitlines(keepends=True):
+            if not line.endswith(b"\n"):
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Native Stop is authoritative. A damaged accounting record
+                # must not discard completed work or rewrite the session blob.
+                invalid_rows += 1
+                continue
+            if not isinstance(row, dict):
+                continue
+            message = row.get("message")
+            if not isinstance(message, dict):
+                continue
+            row_usage = message.get("usage") or {}
+            if not isinstance(row_usage, dict):
+                continue
             for key, value in row_usage.items():
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
+        if invalid_rows:
+            print(
+                f"[claude] WARNING: usage is incomplete; skipped {invalid_rows} damaged transcript records"
+            )
         event.update(usage)
 
     def snapshot(self):
@@ -511,17 +621,27 @@ class ClaudeCodeAdapter(HarnessAdapter):
             hook_src = (Path(__file__).parent.parent / "_harness_permission_hook.py").read_bytes()
             hook_path = f"{config_home}/agpolicy_hook.py"
             Path(hook_path).write_bytes(hook_src)
-            hook_command = {"hooks": [{"type": "command", "command": f"python3 {hook_path}"}]}
+            hook_command = {
+                "hooks": [{"type": "command", "command": shlex.join([sys.executable, hook_path])}]
+            }
             lifecycle_path = config_home / "claude_lifecycle_hook.py"
             lifecycle_path.write_bytes(
                 (Path(__file__).parent / "pty" / "_claude_pty_hook.py").read_bytes()
             )
             lifecycle_hook = {
-                "hooks": [{"type": "command", "command": f"python3 {lifecycle_path}"}]
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": shlex.join([sys.executable, str(lifecycle_path)]),
+                    }
+                ]
             }
             (config_home / "events").mkdir()
             hooks_settings = json.dumps(
                 {
+                    # Newer Claude releases store this acknowledgment in
+                    # settings; older releases use .claude.json below.
+                    "skipDangerousModePermissionPrompt": True,
                     "hooks": {
                         "PreToolUse": [hook_command],
                         "PostToolUse": [hook_command],
@@ -537,7 +657,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                                 "Notification",
                             )
                         },
-                    }
+                    },
                 }
             )
 
@@ -648,7 +768,9 @@ class ClaudeCodeAdapter(HarnessAdapter):
 
                     return StreamingResponse(title_gen(), media_type="text/event-stream")
                 return JSONResponse(self._format_context_agency_to_harness(title_response, model))
-            agency_context = self._format_context_harness_to_agency(body)
+            agency_context = self._format_context_harness_to_agency(
+                body, request.headers, request.query_params
+            )
             if body.get("stream"):
                 frames = stream_response(
                     router,
@@ -659,11 +781,24 @@ class ClaudeCodeAdapter(HarnessAdapter):
                     keepalive_frame=_KEEPALIVE_FRAME,
                     keepalive_s=self.agconfig.harness_adapter.stream_keepalive_s,
                     error_frame=_anthropic_error_frame,
+                    wait_for_upstream=self.agconfig.llm.provider == "anthropic",
                 )
                 # Only the finalized message is published; see
                 # start_streaming_response for why the first frame comes first.
-                return await start_streaming_response(request, frames)
-            agency_response = await anyio.to_thread.run_sync(router.dispatch, token, agency_context)
+                return await start_streaming_response(
+                    request, frames, error_response=_anthropic_error_response
+                )
+            from ..clients.host_services_client import HostDispatchError
+
+            try:
+                agency_response = await anyio.to_thread.run_sync(
+                    router.dispatch, token, agency_context
+                )
+            except HostDispatchError as exc:
+                response = _anthropic_error_response(exc)
+                if response is not None:
+                    return response
+                raise
             return JSONResponse(self._format_context_agency_to_harness(agency_response, model))
 
         @app.post("/v1/messages/count_tokens")
@@ -677,7 +812,13 @@ class ClaudeCodeAdapter(HarnessAdapter):
             )
             return JSONResponse({"input_tokens": max(1, approx_chars // 4)})
 
-    def _format_context_harness_to_agency(self, raw_request: dict) -> dict:
+    def _format_context_harness_to_agency(
+        self, raw_request: dict, headers=None, query_params=None
+    ) -> dict:
+        if self.agconfig.llm.provider == "anthropic":
+            from ...llm.anthropic_native import request_to_agency
+
+            return request_to_agency(raw_request, headers, query_params)
         messages: "list[dict]" = []
         system_text = _anthropic_system_to_text(raw_request.get("system"))
 
@@ -790,6 +931,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
 
     def _format_context_agency_to_harness(self, agency_response: dict, model: str) -> dict:
         message = agency_response["message"]
+        native, _, _ = _native_response_fields(message)
         content_blocks: "list[dict]" = []
         for b in message.get("blocks", []):
             if b["type"] == "text":
@@ -813,11 +955,12 @@ class ClaudeCodeAdapter(HarnessAdapter):
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "role": "assistant",
-            "content": content_blocks,
             "model": model,
-            "stop_reason": _stop_reason_to_anthropic(agency_response.get("stop_reason")),
             "stop_sequence": None,
-            "usage": _forward_usage_to_anthropic(agency_response.get("usage")),
+            **native,
+            "content": content_blocks,
+            "stop_reason": _stop_reason_to_anthropic(agency_response.get("stop_reason")),
+            "usage": native.get("usage", _forward_usage_to_anthropic(agency_response.get("usage"))),
         }
 
     def _format_agency_stream_to_harness(self, agency_stream, model: str):
@@ -835,21 +978,27 @@ class ClaudeCodeAdapter(HarnessAdapter):
         # compaction on its own, no matter how large the real conversation is.
         items = [item for item in agency_stream if item["type"] != "delta"]
         final_usage = {}
+        native_start, native_delta = {}, {}
         for item in items:
             final_usage = item.get("usage") or {}
+            _, native_start, native_delta = _native_response_fields(item.get("message") or {})
         yield _sse(
             "message_start",
             {
+                **native_start,
                 "type": "message_start",
                 "message": {
                     "id": request_id,
                     "type": "message",
                     "role": "assistant",
-                    "content": [],
                     "model": model,
+                    **native_start.get("message", {}),
+                    "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": _forward_usage_to_anthropic(final_usage, output_tokens=0),
+                    "usage": native_start.get("message", {}).get(
+                        "usage", _forward_usage_to_anthropic(final_usage, output_tokens=0)
+                    ),
                 },
             },
         )
@@ -954,12 +1103,16 @@ class ClaudeCodeAdapter(HarnessAdapter):
             yield _sse(
                 "message_delta",
                 {
+                    **native_delta,
                     "type": "message_delta",
                     "delta": {
+                        **native_delta.get("delta", {}),
                         "stop_reason": _stop_reason_to_anthropic(item.get("stop_reason")),
-                        "stop_sequence": None,
+                        "stop_sequence": native_delta.get("delta", {}).get("stop_sequence"),
                     },
-                    "usage": _forward_usage_to_anthropic(item.get("usage")),
+                    "usage": native_delta.get(
+                        "usage", _forward_usage_to_anthropic(item.get("usage"))
+                    ),
                 },
             )
             yield _sse("message_stop", {"type": "message_stop"})

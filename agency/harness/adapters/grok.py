@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import anyio
+import os
 import shutil
 
 from fastapi import Request
@@ -31,6 +32,7 @@ class GrokDriver(_HookPtyDriver):
     _HOOK_PATH = ("hooks", "agency.json")
 
     def _configure(self, adapter, runtime, max_steps):
+        self._trusted_directory = False
         adapter._write_grok_config(
             self.root,
             runtime.harness_base_url,
@@ -48,9 +50,38 @@ class GrokDriver(_HookPtyDriver):
             self.argv += ["--resume", self.session_id]
         self._write_hooks()
 
-    def ready(self, handle):
+    def _composer_line(self, handle):
         lines, _x, y, _generation = handle.terminal_screen()
         current = lines[y].strip()
+        if current.startswith("│ ❯"):
+            return current
+        # Grok 1.0.77 can leave its terminal cursor on the login footer
+        # while the composer is ready. Find the actual bordered input row,
+        # rather than treating that cursor position as the input's location.
+        for i in range(len(lines) - 2, 0, -1):
+            if (
+                lines[i].strip().startswith("│ ❯")
+                and lines[i - 1].strip().startswith("╭")
+                and lines[i + 1].strip().startswith("╰")
+            ):
+                return lines[i].strip()
+        return ""
+
+    def ready(self, handle):
+        lines, _x, _y, _generation = handle.terminal_screen()
+        if any("Do you trust the contents of this directory?" in line for line in lines):
+            # This is the Agency-created sandbox workspace. Confirm only
+            # the directory we launched in, once, before submitting input.
+            cwd_variants = {self.cwd, os.path.realpath(self.cwd)}
+            if (
+                not self._trusted_directory
+                and any(line.strip() in cwd_variants for line in lines)
+                and any("Yes, proceed" in line for line in lines)
+            ):
+                self._trusted_directory = True
+                handle.write_terminal(b"y")
+            return False
+        current = self._composer_line(handle)
         return current.startswith("│ ❯") and not current.removeprefix("│ ❯").rstrip("│ ").strip()
 
     def _submitted_prompt(self, prompt):
@@ -67,27 +98,31 @@ class GrokDriver(_HookPtyDriver):
             return None
         return super()._stop_event(event, payload)
 
+    def begin_interrupt(self, handle):
+        self._interrupt_generation = handle.terminal_screen()[3]
+
     def interrupted(self, handle):
-        """Recognize Grok's restored composer draft as interrupt evidence."""
-        if self._last_prompt is None:
+        # Cancellation before the first response can restore the prompt
+        # without a turn-end hook. Require the *new* restored draft and the
+        # idle footer; the empty composer also exists during generation.
+        lines, _x, _y, generation = handle.terminal_screen()
+        if self._last_prompt is None or generation <= self._interrupt_generation:
             return False
+        current = self._composer_line(handle)
         marker = self._last_prompt.split("\n", 1)[0]
         pasted = f"│ ❯ [Pasted: {len(self._last_prompt.splitlines())} lines]"
-        lines, _x, y, _generation = handle.terminal_screen()
-        # Grok collapses a restored multiline paste into a token. The prompt
-        # marker then appears only in the old transcript.
-        return (
-            self.ready(handle)
-            or any("│ ❯ " + marker in line for line in lines)
-            or pasted in lines[y]
+        return any("Enter:send" in line for line in lines) and (
+            current.startswith("│ ❯ " + marker) or pasted in current
         )
 
     def clear_input(self, handle, wait_until):
+        # PtyExecution has observed a native cancellation event or the
+        # restored idle draft before calling this.
         # Grok restores a pre-response cancellation as a draft. Its idle
         # Ctrl+C clears that draft; Ctrl+U would trigger self-update.
         if self._last_prompt is None:
             return
-        wait_until(lambda: self.interrupted(handle), "restored Grok input")
+        wait_until(lambda: bool(self._composer_line(handle)), "restored Grok input")
         if not self.ready(handle):
             handle.write_terminal(b"\x03")
 
