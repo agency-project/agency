@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ...llm.context_fit import is_context_overflow
+
 
 _STREAM_END = object()
 
@@ -55,6 +57,7 @@ async def stream_response(
     keepalive_frame=None,
     keepalive_s: float = 0,
     error_frame=None,
+    wait_for_upstream: bool = False,
     **dispatch_kwargs,
 ):
     """A TUI interrupt must close the upstream request, not just its HTTP socket.
@@ -66,15 +69,20 @@ async def stream_response(
     stream = router.dispatch_stream_async(token, context, **dispatch_kwargs)
     items = with_keepalive(stream, keepalive_s if keepalive_frame else 0)
     sent_frame = False
+    upstream_started = False
     try:
         async for item in items:
             if item is None:
+                if wait_for_upstream and not upstream_started:
+                    continue
                 sent_frame = True
                 yield keepalive_frame
-            elif item.get("type") == "done":
-                for frame in formatter([item], model):
-                    sent_frame = True
-                    yield frame
+            else:
+                upstream_started = True
+                if item.get("type") == "done":
+                    for frame in formatter([item], model):
+                        sent_frame = True
+                        yield frame
     except Exception as exc:
         # Before any frame, start_streaming_response turns the error into an HTTP status.
         if not sent_frame or error_frame is None:
@@ -86,16 +94,40 @@ async def stream_response(
             await stream.aclose()
 
 
+def context_overflow_message(message: str) -> "str | None":
+    """For a context overflow, the provider's message worded so that every
+    harness takes it for one; None for any other error. Claude Code compacts
+    and retries on "prompt is too long"; Kimi and OpenCode match that or
+    "maximum context"/"context length" (and, with Codex, the
+    `context_length_exceeded` code `upstream_error_body` adds)."""
+    if not is_context_overflow(message):
+        return None
+    if "prompt is too long" in message.lower():
+        return message
+    return f"prompt is too long (context length exceeded): {message}"
+
+
 def upstream_error(exc: BaseException) -> "tuple[str, int, bool]":
     """(message, status_code, transient) for an upstream stream failure."""
     from ..clients.host_services_client import HostDispatchError
 
     if isinstance(exc, HostDispatchError):
-        return str(exc), exc.status_code, exc.transient
+        message = str(exc)
+        return context_overflow_message(message) or message, exc.status_code, exc.transient
     return str(exc) or f"upstream stream failed: {type(exc).__name__}", 502, True
 
 
-async def start_streaming_response(request, frames):
+def upstream_error_body(exc: BaseException) -> "tuple[dict, int]":
+    """The JSON error body and HTTP status for a failure before the first
+    frame. An overflow carries OpenAI's `context_length_exceeded` code."""
+    message, status, transient = upstream_error(exc)
+    error = {"message": message, "type": "upstream_error", "transient": transient}
+    if context_overflow_message(message) is not None:
+        error["code"] = "context_length_exceeded"
+    return {"error": error}, status
+
+
+async def start_streaming_response(request, frames, *, error_response=None):
     """Return a StreamingResponse only once `frames` has produced its first frame.
 
     Starlette commits HTTP 200 as soon as it starts a StreamingResponse, so an
@@ -126,16 +158,12 @@ async def start_streaming_response(request, frames):
         first = first_task.result()
         first_received = True
     except HostDispatchError as exc:
-        return JSONResponse(
-            {
-                "error": {
-                    "message": str(exc),
-                    "type": "upstream_error",
-                    "transient": exc.transient,
-                }
-            },
-            status_code=exc.status_code,
-        )
+        if error_response is not None:
+            response = error_response(exc)
+            if response is not None:
+                return response
+        body, status = upstream_error_body(exc)
+        return JSONResponse(body, status_code=status)
     except Exception as exc:
         # StopAsyncIteration (no events at all) lands here too.
         message = str(exc) or f"upstream stream failed: {type(exc).__name__}"

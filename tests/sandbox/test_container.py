@@ -1290,6 +1290,7 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
         run_cmd = run_retry.call_args.args[0]
         assert "--gpus" not in run_cmd
         assert "--device" not in run_cmd
+        assert "--cap-add=SYS_PTRACE" in run_cmd
 
     def test_cpu_only_docker_rejects_gpu_reservation(self):
         from agency.configs.agconfig import agconfig

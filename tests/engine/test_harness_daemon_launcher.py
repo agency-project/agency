@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import threading
 import time
 from types import SimpleNamespace
 
@@ -201,30 +200,26 @@ def test_ensure_harness_daemon_resets_deadline_on_fresh_progress_ping(monkeypatc
     monkeypatch.setattr(launcher, "_is_ready", lambda *a, **kw: False)
 
     progress = SimpleNamespace(last_bootstrap_ping_ts=None)
+    clock = SimpleNamespace(now=0.0)
 
-    def ping_after_a_bit():
-        time.sleep(0.15)
-        progress.last_bootstrap_ping_ts = time.monotonic()
+    def sleep(seconds):
+        clock.now += seconds
+        if clock.now >= 0.15 and progress.last_bootstrap_ping_ts is None:
+            progress.last_bootstrap_ping_ts = clock.now
 
-    thread = threading.Thread(target=ping_after_a_bit)
-    thread.start()
-    start = time.monotonic()
-    try:
-        with pytest.raises(RuntimeError):
-            launcher.ensure_harness_daemon(
-                sandbox,
-                "/tmp/host.sock",
-                "agent-1",
-                "claude_code",
-                timeout_s=0.2,
-                progress_source=progress,
-            )
-        elapsed = time.monotonic() - start
-    finally:
-        thread.join()
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    with pytest.raises(RuntimeError):
+        launcher.ensure_harness_daemon(
+            sandbox,
+            "/tmp/host.sock",
+            "agent-1",
+            "claude_code",
+            timeout_s=0.2,
+            progress_source=progress,
+        )
     # Without the reset this would time out at ~0.2s; the ping at ~0.15s
     # should push the deadline out to ~0.35s instead.
-    assert elapsed > 0.3
+    assert clock.now > 0.3
 
 
 def test_ensure_harness_daemon_ignores_progress_source_with_no_ping_yet(monkeypatch, tmp_path):
@@ -299,7 +294,7 @@ def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials(
         harnessadapterconfig(
             binary_path="/bin/claude", stream_keepalive_s=7.5, allow_subagents=True
         ),
-        llmconfig(api_key="secret"),
+        llmconfig(provider="anthropic", api_key="secret"),
         agentconfig(harness="claude_code"),
     )
 
@@ -309,8 +304,8 @@ def test_daemon_config_forwards_adapter_and_ptrace_settings_without_credentials(
     assert result["sandbox"]["harness_python_path"] is None
     assert result["harness_adapter"]["allow_subagents"] is True
     assert result["ptrace"]["syscalls"] == list(config.ptrace.syscalls)
-    # llmconfig isn't one of the three namespaces this function forwards at
-    # all -- its secret never has a chance to leak through here.
+    assert result["llm_provider"] == "anthropic"
+    # Only the provider identifier crosses this boundary, never credentials.
     assert "llm" not in result
     assert not any("secret" in json.dumps(section) for section in result.values())
 

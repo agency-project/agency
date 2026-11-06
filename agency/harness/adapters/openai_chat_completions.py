@@ -17,6 +17,7 @@ from fastapi import Request
 from ...llm.message_store import with_tool_schema
 from ..common import extract_bearer_token
 from .streaming import start_streaming_response, stream_response, upstream_error
+from ...native_harness.usage import prompt_tokens
 
 CHAT_KEEPALIVE_FRAME = ": keepalive\n\n"
 
@@ -71,11 +72,21 @@ def _flatten_unknown_data(data):
 
 
 def _forward_usage(usage: "dict | None") -> dict:
-    """Full copy of the usage dict, not a hand-picked subset."""
+    """Full copy of the usage dict, not a hand-picked subset, with the
+    Chat Completions fields in OpenAI's convention: `prompt_tokens` is the
+    whole prompt and `cached_tokens` a part of it. Grok compacts on
+    `total_tokens`, OpenCode on prompt + completion, Kimi on prompt_tokens with
+    top-level `cached_tokens` split out; an Anthropic-style `prompt_tokens`
+    (cache reads left out) would hide most of a cached prompt from all three."""
+    prompt = prompt_tokens(usage)
     usage = dict(usage or {})
-    usage["prompt_tokens"] = usage.get("prompt_tokens", 0)
-    usage["completion_tokens"] = usage.get("completion_tokens", 0)
-    usage["total_tokens"] = usage.get("total_tokens", 0)
+    completion = usage.get("completion_tokens", 0) or 0
+    usage["prompt_tokens"] = prompt.total
+    usage["completion_tokens"] = completion
+    usage["total_tokens"] = prompt.total + completion
+    if prompt.cache_read:
+        usage["cached_tokens"] = prompt.cache_read
+        usage["prompt_tokens_details"] = {"cached_tokens": prompt.cache_read}
     return usage
 
 
