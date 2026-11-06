@@ -772,6 +772,10 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
         terminal_screen=lambda: (["│ ❯   │"], 4, 0, 1),
         write_terminal=Mock(),
     )
+    # This same empty composer is visible during generation. Only a native
+    # cancellation event or a newly restored idle draft acknowledges Ctrl+C.
+    driver.begin_interrupt(handle)
+    assert not driver.interrupted(handle)
 
     def wait_until(predicate, description):
         assert predicate(), description
@@ -793,6 +797,33 @@ def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
     )
 
     assert driver.ready(handle)
+
+
+@pytest.mark.parametrize("directory", ["/workspace", "/workspace-other"])
+def test_grok_confirms_only_its_own_workspace_trust_dialog(runtime, tmp_path, directory):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            [
+                "Do you trust the contents of this directory?",
+                directory,
+                "Yes, proceed   y",
+                "No, quit   n",
+            ],
+            0,
+            0,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    assert not driver.ready(handle)
+    if directory == "/workspace":
+        handle.write_terminal.assert_called_once_with(b"y")
+    else:
+        handle.write_terminal.assert_not_called()
 
 
 def _codex_trust_dialog_screen(cwd_shown: str) -> "SimpleNamespace":
@@ -864,14 +895,21 @@ def test_opencode_acknowledges_native_trailing_whitespace(execution, suffix):
     assert execution._turn_id == "current"
 
 
-def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
+@pytest.mark.parametrize("cursor_in_composer", [True, False])
+def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path, cursor_in_composer):
     driver = driver_for(
         HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
     )
     driver._last_prompt = "\n".join(["[Agency run test]"] + ["previous line"] * 10)
     driver._last_turn_id = "turn"
+    lines = [
+        "╭──────────────────────╮",
+        "│ ❯ [Pasted: 11 lines]  │",
+        "╰──────────────────────╯",
+        "",
+    ]
     handle = SimpleNamespace(
-        terminal_screen=lambda: (["│ ❯ [Pasted: 11 lines]  │"], 24, 0, 1),
+        terminal_screen=lambda: (lines, 24, 1 if cursor_in_composer else 3, 1),
         write_terminal=Mock(),
     )
 
@@ -880,6 +918,49 @@ def test_grok_interrupt_clears_collapsed_multiline_paste(runtime, tmp_path):
 
     driver.clear_input(handle, wait_until)
     handle.write_terminal.assert_called_once_with(b"\x03")
+
+
+@pytest.mark.parametrize(
+    "generation,footer,interrupted",
+    [(1, "Enter:send", False), (2, "Enter:queue", False), (2, "Enter:send", True)],
+)
+def test_grok_interruption_requires_a_new_restored_idle_draft(
+    runtime, tmp_path, generation, footer, interrupted
+):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    driver._last_prompt = "[Agency run test]\nprevious prompt"
+    driver._interrupt_generation = 1
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (["│ ❯ [Pasted: 2 lines] │", footer], 4, 0, generation)
+    )
+    assert driver.interrupted(handle) is interrupted
+
+
+@pytest.mark.parametrize(
+    "draft,bordered,ready",
+    [
+        ("", True, True),
+        ("a draft", True, False),
+        ("[Pasted: 11 lines]", True, False),
+        ("", False, False),
+    ],
+)
+def test_grok_readiness_finds_the_composer_when_the_cursor_is_on_the_footer(
+    runtime, tmp_path, draft, bordered, ready
+):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    lines = [
+        "╭──────────────────────╮" if bordered else "history",
+        f"│ ❯ {draft}  │",
+        "╰──────────────────────╯" if bordered else "history",
+        "Logged in with API key",
+    ]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 3, 1))
+    assert driver.ready(handle) is ready
 
 
 def test_cow_success_closes_pty_at_invocation_boundary(runtime, tmp_path, monkeypatch):

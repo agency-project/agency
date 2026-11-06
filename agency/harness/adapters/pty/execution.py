@@ -197,7 +197,10 @@ class PtyExecution:
                 return
             self._check_alive()
             if now >= deadline:
-                raise RuntimeError(f"{self.driver.name} timed out waiting for {description}")
+                lines, _, _, _ = self.handle.terminal_screen()
+                detail = "\n".join(line.rstrip() for line in lines if line.strip())[-2000:]
+                message = f"{self.driver.name} timed out waiting for {description}"
+                raise RuntimeError(f"{message}\n{detail}" if detail else message)
             time.sleep(self.POLL_INTERVAL_S)
 
     def _submit(self, text, label):

@@ -34,7 +34,9 @@ def test_native_launch_uses_attempt_credential_and_lifecycle_hooks(tmp_path, mon
     assert env["ANTHROPIC_AUTH_TOKEN"] == env["AGPOLICY_TOKEN"] == "attempt-key"
     assert env["CLAUDE_CONFIG_DIR"] == str(config_home)
     assert env["IS_SANDBOX"] == "1"
-    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["skipDangerousModePermissionPrompt"] is True
+    hooks = settings["hooks"]
     assert set(hooks) >= {
         "PreToolUse",
         "PostToolUse",

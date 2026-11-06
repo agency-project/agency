@@ -639,6 +639,9 @@ class ClaudeCodeAdapter(HarnessAdapter):
             (config_home / "events").mkdir()
             hooks_settings = json.dumps(
                 {
+                    # Newer Claude releases store this acknowledgment in
+                    # settings; older releases use .claude.json below.
+                    "skipDangerousModePermissionPrompt": True,
                     "hooks": {
                         "PreToolUse": [hook_command],
                         "PostToolUse": [hook_command],
@@ -654,7 +657,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                                 "Notification",
                             )
                         },
-                    }
+                    },
                 }
             )
 

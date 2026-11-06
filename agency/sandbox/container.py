@@ -825,7 +825,7 @@ class _ContainerBackendBase(agsandbox_backend):
             if self._agconfig.resources.idle_memory is not None:
                 limit_flags.append(f"--memory={self._agconfig.resources.idle_memory}")
             if self._cfs_supported():
-                limit_flags.append(f"--cpus={self._agconfig.resources.idle_cpus}")
+                limit_flags.extend(self._cpu_limit_flags(self._agconfig.resources.idle_cpus))
             if self._agconfig.sandbox.cpuset_cpus is not None:
                 limit_flags.append(f"--cpuset-cpus={self._agconfig.sandbox.cpuset_cpus}")
             if self._agconfig.sandbox.cpuset_mems is not None:
@@ -1095,6 +1095,17 @@ class _ContainerBackendBase(agsandbox_backend):
         return self._name
 
     @staticmethod
+    def _cpu_limit_flags(cpus: float | None) -> list[str]:
+        if cpus is None:
+            return []
+        # Docker rejects --cpus above the daemon's CPU count, even though a
+        # CFS quota above physical capacity is valid (and simply nonbinding).
+        # Express the same cap directly so the default 8-CPU resting limit
+        # also works on smaller hosts. Use this for creation and live updates.
+        period = 100_000
+        return [f"--cpu-period={period}", f"--cpu-quota={int(cpus * period)}"]
+
+    @staticmethod
     def _cfs_supported() -> bool:
         """Return True if the kernel supports CFS CPU quota enforcement."""
         import os
@@ -1287,7 +1298,7 @@ class _ContainerBackendBase(agsandbox_backend):
             return
         cmd = [self._runtime, "update"]
         if cpus is not None and self._cfs_supported():
-            cmd.append(f"--cpus={cpus}")
+            cmd.extend(self._cpu_limit_flags(cpus))
         if memory is not None:
             cmd.append(f"--memory={memory}")
         if len(cmd) == 2:
