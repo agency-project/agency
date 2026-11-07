@@ -781,6 +781,29 @@ def test_grok_interrupt_accepts_an_already_cleared_input(runtime, tmp_path):
     handle.write_terminal.assert_not_called()
 
 
+def test_grok_empty_composer_is_not_interrupt_evidence_while_the_turn_runs(runtime, tmp_path):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    driver._last_prompt = "[Agency run test]\nprevious prompt"
+    driver._last_turn_id = "turn"
+    running = [
+        "  ⠙ Waiting for response… 0.2s   [stop]",
+        "  ╭──────╮",
+        "  │ ❯    │",
+        "  ╰──────╯",
+        "  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts",
+    ]
+    idle = running[:-1] + ["  Enter:send  │  Alt+Enter:newline  │  Ctrl+x:shortcuts"]
+    screen = {"lines": running}
+    handle = SimpleNamespace(terminal_screen=lambda: (screen["lines"], 0, 2, 1))
+
+    # The composer is empty while Grok waits for the model, before the cancel lands.
+    assert not driver.interrupted(handle)
+    screen["lines"] = idle
+    assert driver.interrupted(handle)
+
+
 @pytest.mark.parametrize("placeholder", ["┃  Ask anything...", "┃  Ask anything…"])
 def test_opencode_ready_accepts_ascii_and_unicode_ellipsis(placeholder):
     driver = OpencodeDriver.__new__(OpencodeDriver)
