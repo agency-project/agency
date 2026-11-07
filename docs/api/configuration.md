@@ -278,60 +278,88 @@ The tables below list dataclass fields and defaults, including fresh mutable def
 
 Process helper constants in the configuration module (e.g. Docker semaphore and minimum CPU/memory floors) are implementation constants, not configuration namespaces or tunable per-agent fields.
 
-## Source reference
+## Source signatures
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.agconfig`](../../agency/configs/agconfig.py#L354): `__init__`, `clone`, `update`, `safe_snapshot`.
+::: agency.configs.agconfig.agconfig
+    options:
+      members: ["__init__", "clone", "update", "safe_snapshot"]
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.confignamespace`](../../agency/configs/agconfig.py#L42): `clone`, `update`, `safe_snapshot`.
+::: agency.configs.agconfig.confignamespace
+    options:
+      members: ["clone", "update", "safe_snapshot"]
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.llmconfig`](../../agency/configs/agconfig.py#L78)
+::: agency.configs.agconfig.llmconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.sandboxconfig`](../../agency/configs/agconfig.py#L172): `add_mount`, `remove_mount`.
+::: agency.configs.agconfig.sandboxconfig
+    options:
+      members: ["add_mount", "remove_mount"]
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.orchestratorconfig`](../../agency/configs/agconfig.py#L249)
+::: agency.configs.agconfig.orchestratorconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.resourcesconfig`](../../agency/configs/agconfig.py#L259)
+::: agency.configs.agconfig.resourcesconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.agentconfig`](../../agency/configs/agconfig.py#L267)
+::: agency.configs.agconfig.agentconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.schemaconfig`](../../agency/configs/agconfig.py#L282)
+::: agency.configs.agconfig.schemaconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.skillconfig`](../../agency/configs/agconfig.py#L291)
+::: agency.configs.agconfig.skillconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.toolconfig`](../../agency/configs/agconfig.py#L301)
+::: agency.configs.agconfig.toolconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.harnessadapterconfig`](../../agency/configs/agconfig.py#L310)
+::: agency.configs.agconfig.harnessadapterconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.ptraceconfig`](../../agency/configs/agconfig.py#L322)
+::: agency.configs.agconfig.ptraceconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.dataloggerconfig`](../../agency/configs/agconfig.py#L333)
+::: agency.configs.agconfig.dataloggerconfig
+    options:
+      members: []
 
 [Source: agconfig.py](../../agency/configs/agconfig.py)
 
-[`agency.configs.agconfig.hostserverconfig`](../../agency/configs/agconfig.py#L344)
+::: agency.configs.agconfig.hostserverconfig
+    options:
+      members: []

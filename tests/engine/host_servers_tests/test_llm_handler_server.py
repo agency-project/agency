@@ -25,6 +25,7 @@ from agency.llm.message_store import (
     split_tool_schema,
     with_tool_schema,
 )
+from agency.llm.context_fit import CLEARED
 from agency.llm.usage_tracker import LlmUsageTracker
 from agency.observability.profiler import agprof
 
@@ -863,6 +864,29 @@ def test_dispatch_transient_error_raises_dispatch_error(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_provider_error_body_survives_host_dispatch(monkeypatch, stream):
+    monkeypatch.setattr(mod, "BAD_REQUEST_EXCS", (ValueError,))
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.1.output_config: unsupported",
+        },
+    }
+    error = ValueError("wrapped error")
+    error.body = body
+
+    def create(**kwargs):
+        raise error
+
+    server, _ = _make_server(create_fn=create)
+    with TestClient(server.build_app()) as client:
+        response = client.post("/dispatch", json={"messages": [], "stream": stream})
+    assert response.status_code == 400
+    assert response.json()["error"]["provider_error"] == body
+
+
 def test_dispatch_unclassified_exception_propagates_and_still_closes_client():
     def create(**kwargs):
         raise RuntimeError("boom")
@@ -1141,6 +1165,48 @@ def test_start_stream_no_chunks_at_all_is_an_error_not_a_finished_turn():
     assert len(calls) == 3  # the first ask plus unusable_response_retries
     handle._thread.join(timeout=2.0)
     assert client.closed is True
+
+
+def test_native_stream_interruption_is_returned_without_host_regeneration():
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return iter([])
+
+    server, client = _make_server(create_fn=create)
+    handle = server.start_stream(
+        {"messages": with_tool_schema([], extra={"anthropic_native_request": {}})}
+    )
+    items = _drain(handle)
+    assert [item["type"] for item in items] == ["error"]
+    assert "attempts=1" in items[0]["message"]
+    assert len(calls) == 1
+    handle._thread.join(timeout=2.0)
+    assert client.closed is True
+
+
+def test_provider_retry_headers_are_preserved_without_secret_headers():
+    error = RuntimeError("rate limited")
+    error.response = SimpleNamespace(
+        headers={
+            "Retry-After": "2",
+            "retry-after-ms": "2000",
+            "x-should-retry": "true",
+            "request-id": "req_fixture",
+            "set-cookie": "secret",
+            "authorization": "secret",
+        }
+    )
+    fields = mod._provider_error_fields(error)
+    assert fields == {
+        "provider_headers": {
+            "retry-after": "2",
+            "retry-after-ms": "2000",
+            "x-should-retry": "true",
+            "request-id": "req_fixture",
+        }
+    }
 
 
 def test_start_stream_no_chunks_passes_through_when_empty_is_allowed():
@@ -2097,3 +2163,259 @@ def test_cached_routes_do_not_retain_server_after_app_is_released():
     gc.collect()
     assert reference() is None, "cached endpoints must not retain completed requests"
     assert cached_endpoints
+
+
+def test_a_request_over_the_context_limit_reaches_the_backend_fitted():
+    """agency/llm/context_fit.py: the backend would reject it; the oldest tool
+    output is cleared instead, and the event is recorded."""
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs["messages"])
+        return _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")],
+            usage=_FakeUsage(5, 1),
+        )
+
+    server, _client = _make_server(create_fn=create, context_limit=2_000)
+    messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+    for i in range(4):
+        messages.append(
+            {
+                "role": "assistant",
+                "blocks": [
+                    {
+                        "type": "tool_use",
+                        "index": 0,
+                        "id": f"c{i}",
+                        "name": "bash",
+                        "arguments": "{}",
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "blocks": [
+                    {
+                        "type": "tool_result",
+                        "index": 0,
+                        "tool_call_id": f"c{i}",
+                        "text": "x" * 2_000,
+                    }
+                ],
+            }
+        )
+    server.dispatch({"messages": messages})
+    tool_texts = [m["content"] for m in sent[0] if m["role"] == "tool"]
+    assert tool_texts[0] == CLEARED and tool_texts[-1] == "x" * 2_000
+    assert any(event[0] == "context_fit" for event in server._data_logger.events)
+
+    server2, _ = _make_server(create_fn=create, context_limit=2_000, fit_to_context_limit=False)
+    sent.clear()
+    server2.dispatch({"messages": messages})
+    assert all(m["content"] == "x" * 2_000 for m in sent[0] if m["role"] == "tool")
+
+
+def test_the_next_request_after_a_fitted_one_is_fitted_too():
+    """The harness never learns what was cleared: its next request carries the
+    full history again plus a little more. The estimate must be calibrated on
+    what was sent, not on what the harness sent."""
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs["messages"])
+        size = sum(len(m.get("content") or "") for m in kwargs["messages"])
+        return _FakeResult(
+            [_FakeChoice(message=_FakeMessage(content="ok"), finish_reason="stop")],
+            usage=_FakeUsage(size, 1),  # one token per character
+        )
+
+    server, _client = _make_server(create_fn=create, context_limit=5_000)
+
+    def history(rounds):
+        messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+        for i in range(rounds):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "blocks": [
+                        {
+                            "type": "tool_use",
+                            "index": 0,
+                            "id": f"c{i}",
+                            "name": "b",
+                            "arguments": "{}",
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "blocks": [
+                        {
+                            "type": "tool_result",
+                            "index": 0,
+                            "tool_call_id": f"c{i}",
+                            "text": "x" * 1_800,
+                        }
+                    ],
+                }
+            )
+        return messages
+
+    for rounds in (2, 3, 4, 5):
+        server.dispatch({"messages": history(rounds)})
+    for request in sent:
+        assert sum(len(m.get("content") or "") for m in request) <= 5_000
+
+
+class _WindowBackend(_RecordingBackend):
+    """Rejects any request whose tool output exceeds `window` characters, the
+    way a provider rejects a prompt over its context window."""
+
+    def __init__(self, window: int) -> None:
+        super().__init__(final=True)
+        self.window = window
+
+    def _check(self, request: dict) -> None:
+        size = sum(
+            len(b.get("text") or "")
+            for m in request.get("messages", [])
+            for b in m.get("blocks") or []
+            if b.get("type") == "tool_result"
+        )
+        if size > self.window:
+            raise RuntimeError(
+                f"Error code: 400 - This model's maximum context length is {self.window} "
+                f"tokens. However, your messages resulted in {size} tokens."
+            )
+
+    def dispatch(self, request: dict) -> dict:
+        self._check(request)
+        return super().dispatch(request)
+
+    def dispatch_stream(self, request: dict, *, on_client=None):
+        self._check(request)
+        yield from super().dispatch_stream(request, on_client=on_client)
+
+
+def _history_of(results: int, size: int) -> "list[dict]":
+    messages = [{"role": "user", "blocks": [{"type": "text", "index": 0, "text": "task"}]}]
+    for i in range(results):
+        messages.append(
+            {
+                "role": "assistant",
+                "blocks": [
+                    {"type": "tool_use", "index": 0, "id": f"c{i}", "name": "b", "arguments": "{}"}
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "blocks": [
+                    {"type": "tool_result", "index": 0, "tool_call_id": f"c{i}", "text": "x" * size}
+                ],
+            }
+        )
+    return messages
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_a_request_the_backend_rejects_for_size_is_cut_and_sent_again(streaming):
+    """The estimate let it through (here: no limit known at all), the backend
+    said it is too long: the harness gets an answer, not that error."""
+    backend = _WindowBackend(window=3_000)
+    server = _controlled_server(backend)
+    request = {"messages": _history_of(5, 1_000)}
+    if streaming:
+        items = _drain(server.start_stream(request))
+        assert items[-1]["type"] == "done"
+    else:
+        result = server.dispatch(request)
+        assert result["stop_reason"] == "stop"
+    sizes = [
+        sum(len(b.get("text") or "") for m in r["messages"] for b in m.get("blocks") or [])
+        for _kind, r in backend.requests
+    ]
+    assert len(sizes) >= 1 and sizes[-1] <= 3_000 + 100
+    assert any(event[0] == "context_fit" for event in server._data_logger.events)
+
+
+@pytest.mark.parametrize(
+    "native_key", ["openai_responses_native_request", "anthropic_native_request"]
+)
+@pytest.mark.parametrize("stop_reason", ["tool_calls", "length"])
+def test_native_cli_receives_malformed_and_truncated_output_without_host_rewrite(
+    native_key, stop_reason
+):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return iter(
+            [
+                _FakeChunk(
+                    [
+                        _FakeChoice(
+                            delta=_FakeDelta(
+                                tool_calls=[_FakeToolCall(0, "call_1", "bash", '{"cut')]
+                            )
+                        )
+                    ]
+                ),
+                _finish(stop_reason),
+            ]
+        )
+
+    server, client = _make_server(create_fn=create)
+    handle = server.start_stream({"messages": with_tool_schema([], extra={native_key: {}})})
+    items = _drain(handle)
+    assert items[-1]["type"] == "done"
+    assert items[-1]["stop_reason"] == stop_reason
+    tool = next(b for b in items[-1]["message"]["blocks"] if b["type"] == "tool_use")
+    assert tool["arguments"] == '{"cut'
+    assert len(calls) == 1
+    handle._thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 529])
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_preserves_actual_provider_http_status_and_full_error_body(status, stream):
+    import httpx
+    import openai
+
+    body = {"error": {"message": "synthetic", "type": "native_error"}, "request_id": "real"}
+    response = httpx.Response(
+        status,
+        json=body,
+        headers={"retry-after": "7"},
+        request=httpx.Request("POST", "https://mock/v1/responses"),
+    )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        # The SDK's .body can contain only the inner error; the original HTTP
+        # response remains authoritative for the complete native envelope.
+        raise openai.APIStatusError("synthetic", response=response, body=body["error"])
+
+    server, _ = _make_server(create_fn=create)
+    request = {"messages": with_tool_schema([], extra={"openai_responses_native_request": {}})}
+    if stream:
+        handle = server.start_stream(request)
+        items = _drain(handle)
+        assert items[-1]["type"] == "error"
+        error = items[-1]
+        handle._thread.join(timeout=2)
+    else:
+        with pytest.raises(mod._DispatchError) as caught:
+            server.dispatch(request)
+        error = vars(caught.value)
+    assert error["status_code"] == status
+    assert error["provider_error"] == body
+    assert error["provider_headers"]["retry-after"] == "7"
+    assert len(calls) == 1

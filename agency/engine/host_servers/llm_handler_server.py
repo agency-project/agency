@@ -29,11 +29,20 @@ from ...llm.agllm import agllm, dispatch_attempt
 from ...llm.response_check import (
     EMPTY,
     TRUNCATED,
+    ResponseVerdict,
     inspect_response,
     mark_incomplete_tool_calls,
 )
 from ...llm.message_store import MessageStore, split_tool_schema
+from ...llm.context_fit import (
+    SizeEstimator,
+    fit_messages,
+    is_context_overflow,
+    message_chars,
+    shrink,
+)
 from ...llm.usage_tracker import LlmUsageTracker
+from ...native_harness.usage import prompt_tokens as whole_prompt_tokens
 
 if TYPE_CHECKING:
     from ...configs.agconfig import agconfig as agconfig_cls
@@ -46,6 +55,12 @@ TRANSIENT_DISPATCH_EXCS = (
 
 _STREAM_QUEUE_MAXSIZE = 256
 _STREAM_JOIN_TIMEOUT_S = 5.0
+
+
+# A request the backend rejects for its size is cut further and sent again at
+# most this many times (llm/context_fit.py).
+_OVERFLOW_REFITS = 3
+_CONTEXT_OVERFLOW = "context_overflow"
 
 
 def _annotate(span, **metadata) -> None:
@@ -112,9 +127,15 @@ def _tag_response_message_for_display(response_message: "dict | None", tag: str)
     return tagged
 
 
-def _classify_dispatch_exception(error: BaseException) -> "tuple[int, bool] | None":
+def _classify_dispatch_exception(
+    error: BaseException, *, native: bool = False
+) -> "tuple[int, bool] | None":
     """(status_code, transient) for a known LLM-backend failure category, or
     None if *error* isn't one of them (caller re-raises it unmodified)."""
+    if native:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        if isinstance(status, int) and 400 <= status <= 599:
+            return status, status in {408, 409, 425, 429} or status >= 500
     if isinstance(error, BAD_REQUEST_EXCS):
         return 400, False
     if isinstance(error, UnusableResponseError):
@@ -143,13 +164,28 @@ def _retry_in_place(error: BaseException) -> bool:
 class _ResponsePolicy:
     """llmconfig's handling of unusable responses, read once per request."""
 
-    def __init__(self, llm) -> None:
+    def __init__(self, llm, *, native: bool = False) -> None:
+        self.native = native
         self.unusable_retries = max(0, int(getattr(llm, "unusable_response_retries", 0) or 0))
         self.backoff_s = max(0.0, float(getattr(llm, "unusable_response_backoff_s", 0.0) or 0.0))
         self.fail_on_empty = bool(getattr(llm, "fail_on_empty_response", True))
         self.truncation_retries = max(0, int(getattr(llm, "truncation_retries", 0) or 0))
         self.multiplier = float(getattr(llm, "truncation_output_multiplier", 2.0) or 2.0)
         self.ceiling = getattr(llm, "truncation_max_output_tokens", None)
+        if native:
+            # A native CLI must see the original response and decide whether
+            # to retry. Host regeneration would silently change its attempt
+            # count, output budget, and handling of empty responses.
+            self.unusable_retries = 0
+            self.truncation_retries = 0
+            self.fail_on_empty = False
+
+    def inspect(self, message, stop_reason, *, empty_is_unusable=True):
+        # The native CLI owns malformed/truncated output handling too. Never
+        # turn the provider's original response into a host-generated error.
+        if self.native:
+            return ResponseVerdict(True)
+        return inspect_response(message, stop_reason, empty_is_unusable=empty_is_unusable)
 
     def next_output_cap(self, current: int) -> "int | None":
         """The larger limit to re-ask with after a cut-off response, or None
@@ -191,14 +227,57 @@ def _response_ids_of(message: "dict | None") -> dict:
     return {}
 
 
+def _provider_error_fields(error: BaseException) -> dict:
+    body = getattr(error, "provider_error", None)
+    if body is None:
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                body = response.json()
+            except (ValueError, AttributeError):
+                body = getattr(response, "text", None)
+        if body is None:
+            body = getattr(error, "body", None)
+    fields = {"provider_error": copy.deepcopy(body)} if isinstance(body, (dict, str)) else {}
+    headers = getattr(error, "provider_headers", None)
+    if headers is None:
+        headers = getattr(getattr(error, "response", None), "headers", {})
+    safe = {
+        key.lower(): value
+        for key, value in (headers or {}).items()
+        if key.lower()
+        in {
+            "content-type",
+            "retry-after",
+            "retry-after-ms",
+            "x-should-retry",
+            "request-id",
+            "x-request-id",
+        }
+    }
+    if safe:
+        fields["provider_headers"] = safe
+    return fields
+
+
 class _DispatchError(Exception):
     """Raised by the non-streaming path; carries what build_app()'s route
     needs to translate this into an HTTP response."""
 
-    def __init__(self, message: str, *, status_code: int, transient: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        transient: bool,
+        provider_error=None,
+        provider_headers=None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.transient = transient
+        self.provider_error = provider_error
+        self.provider_headers = provider_headers
 
 
 class _RequestAborted(Exception):
@@ -465,9 +544,12 @@ class LlmHandlerServer:
         *,
         ttft_ms: "float | None" = None,
         retries: "list[dict] | None" = None,
+        sent_chars: "tuple[int, bool] | None" = None,
     ) -> None:
         """Enrich this exchange's metadata block with its own new (non-
-        cumulative) prompt token count and the skill/request it belongs to."""
+        cumulative) prompt token count and the skill/request it belongs to.
+        `sent_chars`, the size of what the backend was sent and whether it
+        was fitted, calibrates context fitting against the backend's count."""
         blocks = message.get("blocks") or []
         metadata_block = next((b for b in blocks if b.get("type") == "metadata"), None)
         if metadata_block is None:
@@ -499,12 +581,16 @@ class LlmHandlerServer:
         metadata_block["new_prompt_tokens"] = self._usage_tracker.resolve_new_prompt_tokens(
             request_messages, message, prompt_tokens, completion_tokens
         )
+        if sent_chars:
+            self._fit_size.observe(sent_chars[0], whole_prompt_tokens(usage).total, sent_chars[1])
         metadata_block["request_id"] = self._request_id
         metadata_block["skill"] = self._skill_name
 
     def change_config(self, agconfig: "agconfig_cls") -> None:
         self._agconfig = agconfig
         self._backend = agllm.for_config(agconfig)
+        self._fit_limit: "int | None" = None
+        self._fit_size = SizeEstimator()
 
     def resolve_model(self) -> str:
         return self._backend.model or ""
@@ -577,10 +663,17 @@ class LlmHandlerServer:
         def aborted() -> bool:
             return abort_event is not None and abort_event.is_set()
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         backend = self._backend
         unusable_left = policy.unusable_retries
         truncation_left = policy.truncation_retries
+        overflow_left = _OVERFLOW_REFITS
         retries: "list[dict]" = []
         attempt = 0
         try:
@@ -625,21 +718,26 @@ class LlmHandlerServer:
                             and not aborted()
                         ):
                             retry = (error.reason, f"{type(error).__name__}: {error}")
+                        elif overflow_left > 0 and self._refit_after_overflow(request, error):
+                            retry = (_CONTEXT_OVERFLOW, f"{type(error).__name__}: {error}")
                         else:
                             complete_failure(error)
-                            classified = _classify_dispatch_exception(error)
+                            classified = _classify_dispatch_exception(error, native=policy.native)
                             if classified is None:
                                 raise
                             status_code, transient = classified
                             raise _DispatchError(
-                                str(error), status_code=status_code, transient=transient
+                                str(error),
+                                status_code=status_code,
+                                transient=transient,
+                                **_provider_error_fields(error),
                             ) from error
                     else:
                         ttft_ms = round((time.perf_counter() - t0) * 1000, 3)
                         output_complete = self._can_finish_empty(
                             result["stop_reason"], internal_kind
                         )
-                        verdict = inspect_response(
+                        verdict = policy.inspect(
                             result["message"],
                             result["stop_reason"],
                             empty_is_unusable=policy.fail_on_empty and not output_complete,
@@ -668,6 +766,7 @@ class LlmHandlerServer:
                                 result["message"],
                                 ttft_ms=ttft_ms,
                                 retries=retries,
+                                sent_chars=self._sent_chars(call_label),
                             )
                             with self._transcript_lock:
                                 self._transcript.append(
@@ -705,7 +804,10 @@ class LlmHandlerServer:
                             ) from error
                         retry = (verdict.reason, verdict.detail)
                 reason, detail = retry
-                if reason == TRUNCATED:
+                if reason == _CONTEXT_OVERFLOW:
+                    overflow_left -= 1
+                    retries.append(self._record_retry(call_label, attempt, reason, detail))
+                elif reason == TRUNCATED:
                     truncation_left -= 1
                     retries.append(
                         self._record_retry(
@@ -965,6 +1067,11 @@ class LlmHandlerServer:
                                 "error": {
                                     "message": item["message"],
                                     "transient": item["transient"],
+                                    **{
+                                        key: item[key]
+                                        for key in ("provider_error", "provider_headers")
+                                        if key in item
+                                    },
                                 }
                             },
                             status_code=item["status_code"],
@@ -989,7 +1096,13 @@ class LlmHandlerServer:
                 return JSONResponse(result.result())
             except _DispatchError as e:
                 return JSONResponse(
-                    {"error": {"message": str(e), "transient": e.transient}},
+                    {
+                        "error": {
+                            "message": str(e),
+                            "transient": e.transient,
+                            **_provider_error_fields(e),
+                        }
+                    },
                     status_code=e.status_code,
                 )
             except _RequestAborted as error:
@@ -1039,7 +1152,9 @@ class LlmHandlerServer:
             return
         with self._message_store:
             harness_message_hashes = self._message_store.add_messages(harness_messages)
-            patched_messages = self._message_store.materialize(harness_message_hashes)
+            patched_messages, fitted = self._fit_to_context(
+                self._message_store.materialize(harness_message_hashes), call_label
+            )
             patched_message_hashes = self._message_store.add_messages(patched_messages)
         prepared["messages"] = patched_messages
         with self._call_messages_lock:
@@ -1047,7 +1162,69 @@ class LlmHandlerServer:
                 "harness_message_hashes": harness_message_hashes,
                 "patched_message_hashes": patched_message_hashes,
                 "harness_messages": harness_messages,
+                # The size of what the backend is sent, for context fitting.
+                "sent_chars": sum(message_chars(m) for m in patched_messages),
+                "fitted": fitted,
             }
+
+    def _fit_to_context(self, messages: "list[dict]", call_label: str) -> "tuple[list[dict], bool]":
+        """A request the backend would reject for its size, with its oldest
+        tool output cleared until it fits (agency/llm/context_fit.py), and
+        whether anything was cleared."""
+        if not self._agconfig.llm.fit_to_context_limit:
+            return messages, False
+        if self._fit_limit is None:
+            try:
+                self._fit_limit = self.context_limit()
+            except Exception:  # noqa: S110 -- no limit known: send as is
+                return messages, False
+        budget = self._fit_size.budget(sum(message_chars(m) for m in messages), self._fit_limit)
+        fitted, cleared = fit_messages(messages, budget)
+        if cleared:
+            agname = getattr(self._data_logger, "_default_name", None)
+            self._data_logger.record_event(
+                type="context_fit",
+                payload={"cleared_tool_results": cleared, "context_limit": self._fit_limit},
+                call_label=call_label,
+                term_message=(
+                    f"[{agname}] LLM    ✂  request over the {self._fit_limit}-token context "
+                    f"limit: cleared {cleared} old tool result(s)"
+                ),
+                print_to_terminal=False,
+            )
+        return fitted, bool(cleared)
+
+    def _refit_after_overflow(self, request: dict, error: BaseException) -> bool:
+        """For a request the backend rejected for its size although context
+        fitting let it through, cut it further (in place) so that it can be
+        sent again, rather than handing the harness an error most harnesses
+        end their turn on. False if this is not that, or nothing is left."""
+        if not self._agconfig.llm.fit_to_context_limit or not is_context_overflow(str(error)):
+            return False
+        messages = request.get("messages")
+        if not isinstance(messages, list):
+            return False
+        shrunk, cleared = shrink(messages)
+        if not cleared:
+            return False
+        request["messages"] = shrunk
+        call_label = request.get("call_label")
+        agname = getattr(self._data_logger, "_default_name", None)
+        self._data_logger.record_event(
+            type="context_fit",
+            payload={"cleared_tool_results": cleared, "after_overflow": str(error)[:500]},
+            call_label=call_label,
+            term_message=f"[{agname}] LLM    ✂  backend rejected the size: cleared {cleared} more",
+            print_to_terminal=False,
+        )
+        return True
+
+    def _sent_chars(self, call_label: "str | None") -> "tuple[int, bool] | None":
+        """(characters sent, whether context fitting cleared any) for a call."""
+        call = self._call_messages_of(call_label)
+        if call is None or "sent_chars" not in call:
+            return None
+        return call["sent_chars"], call["fitted"]
 
     def _call_messages_of(self, call_label: "str | None") -> "dict | None":
         with self._call_messages_lock:
@@ -1214,6 +1391,7 @@ class LlmHandlerServer:
                     "message": str(exception),
                     "transient": getattr(exception, "transient", transient),
                     "status_code": getattr(exception, "status_code", status_code),
+                    **_provider_error_fields(exception),
                 },
                 **entry_fields,
             )
@@ -1223,8 +1401,15 @@ class LlmHandlerServer:
                 finalize_cancelled()
             return enqueued
 
-        policy = _ResponsePolicy(self._agconfig.llm)
+        policy = _ResponsePolicy(
+            self._agconfig.llm,
+            native=bool(
+                {"anthropic_native_request", "openai_responses_native_request"}
+                & split_tool_schema(request.get("messages") or [])[3].keys()
+            ),
+        )
         retries: "list[dict]" = []
+        overflow_left = [_OVERFLOW_REFITS]
 
         def run_attempt(attempt: int, backend) -> tuple:
             """One ask of the provider. Returns ("stop",) once this producer
@@ -1290,7 +1475,9 @@ class LlmHandlerServer:
                         # a transport failure before any answer is left to the
                         # SDK's own retries and to the harness.
                         return ("retry", e.reason, f"{type(e).__name__}: {e}", e)
-                    classified = _classify_dispatch_exception(e)
+                    if overflow_left[0] > 0 and self._refit_after_overflow(request, e):
+                        return ("overflow", f"{type(e).__name__}: {e}")
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(e, status_code=status_code, transient=transient)
                     return ("stop",)
@@ -1384,7 +1571,7 @@ class LlmHandlerServer:
                             f"{type(e).__name__}: {e}",
                             e,
                         )
-                    classified = _classify_dispatch_exception(e)
+                    classified = _classify_dispatch_exception(e, native=policy.native)
                     status_code, transient = classified if classified is not None else (500, False)
                     publish_error(
                         e,
@@ -1399,7 +1586,7 @@ class LlmHandlerServer:
                     finalize_cancelled()
                     return ("stop",)
                 message = _blocks_to_message(blocks)
-                verdict = inspect_response(
+                verdict = policy.inspect(
                     message,
                     stop_reason,
                     empty_is_unusable=(
@@ -1446,6 +1633,7 @@ class LlmHandlerServer:
                 message,
                 ttft_ms=ttft_ms,
                 retries=retries,
+                sent_chars=self._sent_chars(handle.call_label),
             )
             finalize_success(message)
 
@@ -1470,6 +1658,15 @@ class LlmHandlerServer:
                 if kind == "ok":
                     deliver(*outcome[1:5])
                     return
+                if kind == "overflow":
+                    overflow_left[0] -= 1
+                    retries.append(
+                        self._record_retry(
+                            handle.call_label, attempt, _CONTEXT_OVERFLOW, outcome[1]
+                        )
+                    )
+                    attempt += 1
+                    continue
                 if kind == "truncated":
                     _, message, usage, stop_reason, ttft_ms, verdict = outcome
                     next_cap = (

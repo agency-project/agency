@@ -503,6 +503,10 @@ class agProxyPtraceHandle:
     def resume(self) -> None:
         self._loop.resume()
 
+    def suspend_terminal(self) -> None:
+        """Main-thread shell job control for an inherited terminal launch."""
+        self._loop.suspend_terminal()
+
     def checkpoint_detach(self) -> None:
         self._loop.checkpoint_handoff("detach")
 
@@ -541,6 +545,9 @@ class agProxyPtrace:
         cwd: str = "",
         stdin_data: "bytes | None" = None,
         pty_size: "tuple[int, int] | None" = None,
+        inherit_stdio: bool = False,
+        on_spawn: "Callable[[int], None] | None" = None,
+        on_job_stop: "Callable[[int], None] | None" = None,
         policy: "agpolicy",
         ag: "agent | None" = None,
     ) -> agProxyPtraceHandle:
@@ -550,8 +557,12 @@ class agProxyPtrace:
         traced child is forked in the correct PID and mount namespaces. There
         is deliberately no host-to-container relay path here. ``stdin_data``
         is written through a dedicated pipe-writer thread; when omitted, the
-        child receives ``/dev/null`` on fd 0 rather than inheriting daemon stdin.
+        child receives ``/dev/null`` on fd 0 unless ``inherit_stdio`` explicitly
+        selects its caller's terminal. ``on_spawn`` runs before the initial
+        exec, allowing a host session to assign its child to a workload scope.
         """
+        if inherit_stdio and (stdin_data is not None or pty_size is not None):
+            raise ValueError("inherited stdio cannot be combined with PTY or piped input")
         syscalls = (
             self._agconfig.ptrace.syscalls
             if self._agconfig is not None
@@ -659,10 +670,18 @@ class agProxyPtrace:
                 _isolated_profiler_callback(process_profiler.on_exit),
                 include_exit_code=True,
             )
+        if on_spawn is not None:
+            handle.on_spawn(on_spawn)
+        if on_job_stop is not None:
+            if not inherit_stdio:
+                raise ValueError("job control callbacks require inherited stdio")
+            loop.on_job_stop(on_job_stop)
         try:
             kwargs = {"stdin_data": stdin_data}
             if pty_size is not None:
                 kwargs["pty_size"] = pty_size
+            if inherit_stdio:
+                kwargs["inherit_stdio"] = True
             loop.start(argv, envp, cwd, **kwargs)
         except BaseException:
             if process_profiler is not None:

@@ -86,6 +86,12 @@ def catalog(profile_dir: str, bucket: int = 0):
                 )
     configured = Path(profile_dir) / "agprof.trace.json"
     paths = [configured] if configured.is_file() else []
+    # agency_runs/<run>/profiler: the current run's siblings are history too,
+    # even when the runs directory is not the repository's own. Only that
+    # exact layout is matched, never a recursive walk of an unknown parent.
+    sibling_runs = Path(profile_dir).resolve().parent.parent
+    if sibling_runs != (ROOT / "agency_runs").resolve() and sibling_runs.is_dir():
+        paths.extend(sorted(sibling_runs.glob("*/profiler/agprof.trace.json")))
     for base in (ROOT / "agency_runs", ROOT / "artifacts", ROOT / "runs"):
         if base.exists():
             paths.extend(sorted(base.rglob("agprof.trace.json")))

@@ -25,6 +25,23 @@ def main(argv=None):
     run.add_argument(
         "python_args", nargs=argparse.REMAINDER, help="Python script or -m module and args"
     )
+    for name, label in (("claude", "Claude Code"), ("codex", "Codex")):
+        commands.add_parser(
+            name,
+            add_help=False,
+            help=f"Run {label} in your terminal with Agency observation (see: agency {name} --help)",
+        )
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] in (["claude"], ["codex"]):
+        # Their own options (and the CLI's, after --) are parsed by the
+        # session. They run as the invoking user with their own CLI login;
+        # never root.
+        if argv[0] == "claude":
+            from agency.sessions.claude_code import main as interactive_session
+        else:
+            from agency.sessions.codex import main as interactive_session
+
+        return interactive_session(argv[1:])
     args = parser.parse_args(argv)
     try:
         if args.command == "setup-host":

@@ -1290,6 +1290,7 @@ class TestEnsureStartedAttachesGpuRegardlessOfReserveOrder:
         run_cmd = run_retry.call_args.args[0]
         assert "--gpus" not in run_cmd
         assert "--device" not in run_cmd
+        assert "--cap-add=SYS_PTRACE" in run_cmd
 
     def test_cpu_only_docker_rejects_gpu_reservation(self):
         from agency.configs.agconfig import agconfig
@@ -1745,13 +1746,39 @@ class TestOwnHostPidsRealPodmanContainerIntegration:
             subprocess.run(["podman", "rm", "-f", name], capture_output=True, timeout=30)
 
 
-docker_gpu = pytest.mark.skipif(
-    not (
+def _docker_gpu_available() -> bool:
+    """Check Docker's GPU runtime independently of Agency's flag selection."""
+    if not (
         _docker_available()
         and _host_gpu_available()
         and _docker_has_image("docker.io/library/python:3.12-slim")
-    ),
-    reason="Docker daemon, NVIDIA GPU, or local docker.io/library/python:3.12-slim docker image not available",
+    ):
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--pull=never",
+                "--gpus",
+                "all",
+                "docker.io/library/python:3.12-slim",
+                "nvidia-smi",
+                "-L",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "GPU" in result.stdout
+
+
+docker_gpu = pytest.mark.skipif(
+    not _docker_gpu_available(),
+    reason="requires usable Docker NVIDIA passthrough and the local Python image",
 )
 
 

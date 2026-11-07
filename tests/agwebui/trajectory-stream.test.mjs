@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
 const source=await readFile(new URL('../../agency/observability/agwebui/static/trajectory-stream.js',import.meta.url),'utf8');
-const {changedTrajectoryActions,mergeTrajectory,mergeTrajectorySnapshot,boundTrajectory,TrajectoryStream}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const {executionControlState,changedTrajectoryActions,mergeTrajectory,mergeTrajectorySnapshot,boundTrajectory,TrajectoryStream}=await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('stale relay targets cannot keep an exited native agent active',()=>{
+  const run={id:'live',status:'running',agents:[{id:'native',status:'completed'},{id:'live',status:'paused'}]};
+  const state=executionControlState({run,transport:'connected',executionControls:{available:true,agents:['native','live']},agent:'native'});
+  assert.deepEqual(state.active.map(a=>a.id),['live']);
+  assert.equal(state.agentEnabled,false);
+  assert.equal(state.allCommand,'resume_all');
+});
 
 test('syscall floods cannot evict model and tool calls from the live window',()=>{
   const real=[{id:'model',kind:'model',start:0,outcome:'running'},

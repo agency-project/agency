@@ -1,0 +1,352 @@
+{
+  "kind": "historical artifact inspection; no experiment rerun",
+  "artifact_location": "local ignored results; not shipped in a clean checkout",
+  "cohorts": [
+    {
+      "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs",
+      "status": "completed",
+      "config": {
+        "backend": "docker",
+        "checkpoint_backend": "cow_zfs",
+        "model": "gpt-5.6-luna",
+        "provider": "openai",
+        "sandbox_cpus": 4,
+        "sandbox_memory": "8g",
+        "sample_hz": 5,
+        "sample_gpu": false,
+        "checkpoint_fast_resume": null
+      },
+      "source_identity": {
+        "checkpoint_backend": "cow_zfs",
+        "description": "Original measured snapshot is identified by the retained manifest; executing_source fields identify the current implementation used for this cohort",
+        "dirty": true,
+        "executing_runner_sha256": "8a1209d1733d2201784641052da0b317db796b338dbb8295a00b9d3e7690def8",
+        "executing_source_git_head": null,
+        "executing_source_sha256": "581526015367ca5fe03f4a3daa2a3cdb3d894fefbeb81bdcb95ac152294b8039",
+        "git_head": "ee7999fe6befea27e13f9db20b131e9c34bc2dc3",
+        "manifest_sha256": "d381de4aa0cc1bfdeba274d7de2821a326c84d441838c760fd70ef20b9cd0e2e",
+        "prior_measured_plan_sha256": "14e8a33a4ebecbb9fc74dd67d0539d3d2de4de0141ae623e841afad30d9c46c8"
+      },
+      "manifest_sha256": "0b40e83aabc68fab0c8f127780c4cf38f529d8d98d30a09faaec4cb6af1cd21d",
+      "checkpoint_total_seconds": {
+        "0": {
+          "n": 3,
+          "median": 0.322947476,
+          "min": 0.313945674,
+          "max": 0.333103171
+        },
+        "65536": {
+          "n": 3,
+          "median": 0.315347259,
+          "min": 0.310137078,
+          "max": 0.318204712
+        },
+        "134217728": {
+          "n": 3,
+          "median": 0.329864211,
+          "min": 0.30462099,
+          "max": 0.332671379
+        },
+        "1073741824": {
+          "n": 5,
+          "median": 0.366491901,
+          "min": 0.303040582,
+          "max": 0.370848811
+        }
+      },
+      "inspected_files": [
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-01-bytes-134217728-r3/run.json",
+          "sha256": "fd4ffdfaceb35a0197f916ad17c448d571819825433ffc16c63792d065c728aa"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-01-bytes-134217728-r3/records.json",
+          "sha256": "fdba1e83ea89874c46abf152ba683b445725d5ef1126b1c31c9f9de0c8ff7930"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-02-bytes-1073741824-r3/run.json",
+          "sha256": "c0faa25c3a5fab1870f84475f0bc23c146387bb670ae30430fb0da96aa2b2713"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-02-bytes-1073741824-r3/records.json",
+          "sha256": "cdff0e4d2ca879db0719d538f9e3ade99914e72ef14463228e39aee292a8fdc9"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-03-bytes-0-r1/run.json",
+          "sha256": "f5cdafe91c30f278d22976df4f2fa440b86761cdfb94df7b0b870809cb7c728a"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-03-bytes-0-r1/records.json",
+          "sha256": "de0a987bebfd6a3dd167ff3bb55849b9234b493a135cdc00dfc85dce631b0d3d"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-04-bytes-65536-r3/run.json",
+          "sha256": "cc5ab99d694bea280486a03ef18e95ff13a45ea9c9d3ad9aa65b0c5e702a7f61"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-04-bytes-65536-r3/records.json",
+          "sha256": "f8b3f6a2e4255d0d256d72c1d19535f189e2275fca6ced2a89c9b616a2b5a26b"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-05-bytes-0-r3/run.json",
+          "sha256": "8a69d6c3e8ff6787f7f1c90be4fc88c9fd36548e49a46abce721e92ec78389e2"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-05-bytes-0-r3/records.json",
+          "sha256": "1e8a51a35fb917a86f56792a81079a66783100997e4eabd16de63c57bc619b36"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-06-bytes-134217728-r2/run.json",
+          "sha256": "1b5227348ae75d52d5820c45445764e9e806eba3d4b357d9cf772bbc198cbdfb"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-06-bytes-134217728-r2/records.json",
+          "sha256": "6d72270f18b6e2f5b892be0063b0792317dea99564b9d67ef0990b99be99e803"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-07-bytes-134217728-r1/run.json",
+          "sha256": "b4e0d08d606bef363bd05d592925aa871a383505e86bb9135c58d3c382cdf608"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-07-bytes-134217728-r1/records.json",
+          "sha256": "b072a8eb7d0a558cef4f4f2a84a417808930a156d2d356a83934eff58dca8363"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-08-bytes-1073741824-r2/run.json",
+          "sha256": "44da0226ca7a824f9c0bf2e2763351aca4c55283a6978e9e957387ce7e31a4f2"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-08-bytes-1073741824-r2/records.json",
+          "sha256": "8f76623470509542813c3aa67b48bef3bf8dcc2033e6075379403fbbc2a2bbaa"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-09-bytes-0-r2/run.json",
+          "sha256": "dc0309e931b1c84fab5beba659a2aff4268f92889239871c0a2b438515da1b78"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-09-bytes-0-r2/records.json",
+          "sha256": "5c0d5dd8a018d7b202e2065771411935abf9d1b2f7d36b77a70318f69286d4f7"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-10-bytes-65536-r2/run.json",
+          "sha256": "92221fada03417f683c7a56632f31ebdc7785417a4cd1a4de36cb4a374c5338e"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-10-bytes-65536-r2/records.json",
+          "sha256": "adc508029848a477f5a1973a36376c0aac438eb33ea6c484c235b089e605e435"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-11-bytes-65536-r1/run.json",
+          "sha256": "ec0bddbb3b6c87a13340b3be8b6fea4d84d1fa375d75a674d1b31c83bd1ed325"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-11-bytes-65536-r1/records.json",
+          "sha256": "ee3e10ad180dcc402a5b0a2bffe195f28c464f2855cd0cbb4619abbb0a539bb2"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-12-bytes-1073741824-r1/run.json",
+          "sha256": "d0c3aabf42aed9fb643c47e6bb306455bcaaaf42d96629a6c9253ec7833be1d7"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-12-bytes-1073741824-r1/records.json",
+          "sha256": "995f7a793a695cf11ab37d6a95f6bec6b746349bf33fa60f70d8c937bad8cb06"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-13-bytes-1073741824-r5/run.json",
+          "sha256": "ab18f5b7fede566b6b705ffe74abda61443a279b3993877406aacd989e475234"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-13-bytes-1073741824-r5/records.json",
+          "sha256": "b4db3d5c73358f308d77f21038b7091538b42c3abd263b51666de676a723fc00"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-14-bytes-1073741824-r4/run.json",
+          "sha256": "84bf39f1eac51bae3e8437a2330f6e3bac09e5ee493c60f0e261b36faeddc037"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-docker-cow-zfs/runs/order-14-bytes-1073741824-r4/records.json",
+          "sha256": "ca313540fa35a6291f987964e652f17ad2239e3d334e78293a14e6b27eb7e073"
+        }
+      ]
+    },
+    {
+      "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs",
+      "status": "completed",
+      "config": {
+        "backend": "podman",
+        "checkpoint_backend": "cow_zfs",
+        "model": "gpt-5.6-luna",
+        "provider": "openai",
+        "sandbox_cpus": 4,
+        "sandbox_memory": "8g",
+        "sample_hz": 5,
+        "sample_gpu": false,
+        "checkpoint_fast_resume": null
+      },
+      "source_identity": {
+        "checkpoint_backend": "cow_zfs",
+        "description": "Original measured snapshot is identified by the retained manifest; executing_source fields identify the current implementation used for this cohort",
+        "dirty": true,
+        "executing_runner_sha256": "8a1209d1733d2201784641052da0b317db796b338dbb8295a00b9d3e7690def8",
+        "executing_source_git_head": null,
+        "executing_source_sha256": "581526015367ca5fe03f4a3daa2a3cdb3d894fefbeb81bdcb95ac152294b8039",
+        "git_head": "ee7999fe6befea27e13f9db20b131e9c34bc2dc3",
+        "manifest_sha256": "d381de4aa0cc1bfdeba274d7de2821a326c84d441838c760fd70ef20b9cd0e2e",
+        "prior_measured_plan_sha256": "14e8a33a4ebecbb9fc74dd67d0539d3d2de4de0141ae623e841afad30d9c46c8"
+      },
+      "manifest_sha256": "7a96af6db34f2b3d0bc4ce4caff45639c24c9209b6feb3d0dccd285bb850cb4a",
+      "checkpoint_total_seconds": {
+        "0": {
+          "n": 3,
+          "median": 0.581923321,
+          "min": 0.559296043,
+          "max": 0.592165629
+        },
+        "65536": {
+          "n": 3,
+          "median": 0.58492494,
+          "min": 0.560248213,
+          "max": 0.585443517
+        },
+        "134217728": {
+          "n": 3,
+          "median": 0.542402693,
+          "min": 0.531672123,
+          "max": 0.57737158
+        },
+        "1073741824": {
+          "n": 5,
+          "median": 0.574548186,
+          "min": 0.539478659,
+          "max": 0.610392692
+        }
+      },
+      "inspected_files": [
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-01-bytes-134217728-r3/run.json",
+          "sha256": "03493baedec3b7b3d5ba153bd3594ce31220aec09f9a3b5b8fd2eacebaf5bcca"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-01-bytes-134217728-r3/records.json",
+          "sha256": "4cf1258ef83fb84ac0298329b31bcd445cba963b83f18f98a8adeea92c9f3b57"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-02-bytes-1073741824-r3/run.json",
+          "sha256": "74448f58362f959d29f995910ac4c5f0601617506bf454d181fb854839e1f20c"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-02-bytes-1073741824-r3/records.json",
+          "sha256": "7f7478bacc26dcacb9d71819421a081edea0ba2548c931527122246d337169e8"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-03-bytes-0-r1/run.json",
+          "sha256": "db5f2e05bc5bf4ab2d1c97ccfcd86da60c6ccad2d75424c67c625556e2d14166"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-03-bytes-0-r1/records.json",
+          "sha256": "e5b4c9b539058d019c3e7c3d3f153c809c4f3902ed9aff7ccdc1147cb1de87de"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-04-bytes-65536-r3/run.json",
+          "sha256": "35a3455ebebe30eb271bd61b56960888c093041a67dc9d000ebba5e85697c63f"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-04-bytes-65536-r3/records.json",
+          "sha256": "766313b043ae0b8e4b4b50a42531d9ce64adadae9078dd6e678b8fe2e39c5b44"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-05-bytes-0-r3/run.json",
+          "sha256": "313898b410ec683e19b9c97abea8e24f8f5495f3d9c13458c1e76268d9fc0fab"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-05-bytes-0-r3/records.json",
+          "sha256": "4ba2b2d7fb009875734350e4a66314a2dfebaeff6dffb44515051f7024c4f316"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-06-bytes-134217728-r2/run.json",
+          "sha256": "7339ccabc249512ff1ffdd836e16c255d2c0e506ab48534aab33341ba59de1a4"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-06-bytes-134217728-r2/records.json",
+          "sha256": "03b72551a0d33e7cf7d0302799c67f7e3f7a7c5ddab551263b6c41498c334504"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-07-bytes-134217728-r1/run.json",
+          "sha256": "abfdb67247c0c023e1f5ff5307be885603f0e5176f699a1e48ebb9ec920d5410"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-07-bytes-134217728-r1/records.json",
+          "sha256": "315f8cf5c580bfd528731eefdd9fe2a0b3a7c270df38dd4e3da1d188493c57ac"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-08-bytes-1073741824-r2/run.json",
+          "sha256": "a0447aef74ba3e22d448c750938f14f8efe3ff0d3e550d77e9c55ec5fd76bdfa"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-08-bytes-1073741824-r2/records.json",
+          "sha256": "924eabc0a5cf6f13120a6cea0c0982b66f1bd370300f66aca94f375d55ebc309"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-09-bytes-0-r2/run.json",
+          "sha256": "703589200a97edb591f8131db7626e45d4a13b0930a33620d0b40ea86917fd98"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-09-bytes-0-r2/records.json",
+          "sha256": "bbbc773b27e3cf5b8f82eb99cca0027b1d76d7461f08581ff801e30d6201649b"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-10-bytes-65536-r2/run.json",
+          "sha256": "8f5c80b55a50781442276f57f0ef782f904d9d790301610da547493f545bd0b8"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-10-bytes-65536-r2/records.json",
+          "sha256": "7f2e5327637e6bce9835b7a37b390e97e850de50ec5d4a241c14853c3f93258a"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-11-bytes-65536-r1/run.json",
+          "sha256": "a16ddf7b60a359501753175e466415f333f75345346427cbeeda45288d282f1a"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-11-bytes-65536-r1/records.json",
+          "sha256": "b09edc61b9439ad6ff1121bf1e1fec05a2dd7aba5bb3099c60854b5dbd59a7e0"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-12-bytes-1073741824-r1/run.json",
+          "sha256": "9fa59b3d9a1d848829ea57f81ff1f5507b9f5b29cb774ba8e282dfcacefdc400"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-12-bytes-1073741824-r1/records.json",
+          "sha256": "c088f8bdff6aac01ad3ea9470219f042bbd6c7eb8cb4307e402049a30a3cce5d"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-13-bytes-1073741824-r5/run.json",
+          "sha256": "4cb9e1eb54915a765a16f611bbab2e2008c96c83cda8b1912158ff4123c31a58"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-13-bytes-1073741824-r5/records.json",
+          "sha256": "59ebab3f7ab0a823ac9e5a7e7a7370cfc0df7179652a69e6e5b88a5049e008d9"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-14-bytes-1073741824-r4/run.json",
+          "sha256": "fe01f7366a0ef63cee05693a69331fe661c6b989f29d8230cb0223f0972fe29d"
+        },
+        {
+          "path": "benchmarks/checkpoint_size_microbenchmark/results/fast-checkpoint-cow-only-20260913/bench-podman-cow-zfs/runs/order-14-bytes-1073741824-r4/records.json",
+          "sha256": "e35ec92fb864a9895b2c43a44d2495c5a3e62c40871ce2fe2cfd6834d5aa5a77"
+        }
+      ]
+    }
+  ],
+  "trajectory": {
+    "path": "docs/assets/figures/e1a1/pair_metrics.csv",
+    "sha256": "44c4f0312d6693c1777f5993afad5758e650eada4692f394f28d4709b3fe1748",
+    "pairs": 15,
+    "slower_contended": 15,
+    "median_wall_ratio": 1.7470206889777513,
+    "median_similarity_delta": -0.003289473684210509,
+    "same_patch_files": 15,
+    "same_patch_bytes": 0,
+    "raw_index_present": true,
+    "raw_integrity_report_present": true
+  }
+}

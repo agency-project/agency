@@ -649,7 +649,7 @@ class Trajectory:
         # UI/program startup includes setup and human input. Start elapsed
         # agent time only at an observed execution boundary; keep the original
         # trace origin so earlier resource samples and setup remain aligned.
-        if self.finished_at is None and (
+        if (self.finished_at is None or event["ts"] <= self.finished_at) and (
             kind in {"request_started", "skill_start", "tool_call"}
             or kind == "agent_state"
             and payload.get("state") in {"running", "waiting_llm"}
@@ -797,7 +797,18 @@ class Trajectory:
                     self._agent_status(agent, agent.get("execution_state", "unknown"))
             elif kind == "agent_state":
                 if event["ts"] >= agent.get("state_ts", 0):
-                    self._agent_status(agent, payload.get("state", "unknown"))
+                    state = payload.get("state", "unknown")
+                    if state == "agent_exit":
+                        code = payload.get("returncode")
+                        agent["returncode"] = code
+                        state = (
+                            "completed"
+                            if code == 0
+                            else "cancelled"
+                            if isinstance(code, int) and code < 0
+                            else "failed"
+                        )
+                    self._agent_status(agent, state)
                     agent["state_ts"] = event["ts"]
                 # The engine names the sandbox this agent executes in; resource
                 # series of that label are the agent's container measurements.
@@ -1409,6 +1420,7 @@ class LiveSource:
         markers = next((b for b in chains["response"] if b.get("error") or b.get("cancelled")), {})
         prompt = chains["prompt"] if full else chains["prompt"][:80]
         preview_limit = None if full else 1200
+        capture = metadata.get("capture") or {}
         return {
             "model": recorded_model if isinstance(recorded_model, str) else None,
             "model_response": model_response,
@@ -1431,7 +1443,16 @@ class LiveSource:
             # captured identity / usage timing, never the opaque native body.
             "metadata": {
                 key: metadata[key]
-                for key in ("request_id", "skill", "stop_reason", "ttft_ms", "new_prompt_tokens")
+                for key in (
+                    "request_id",
+                    "skill",
+                    "stop_reason",
+                    "ttft_ms",
+                    "new_prompt_tokens",
+                    # How a self-reported request was assigned to an agent
+                    # (agency/sessions): evidence, not content.
+                    "attribution",
+                )
                 if metadata.get(key) is not None
             },
             "context": {
@@ -1449,7 +1470,8 @@ class LiveSource:
                 ],
                 "chars": sum(len(text(b)) for b in chains["prompt"]),
                 "dropped": [],
-                "complete": True,
+                "complete": capture.get("complete", True),
+                "capture": capture,
                 "comparison_available": False,
                 "truncated": not full
                 and (len(chains["prompt"]) > 80 or any(len(text(b)) > 1200 for b in prompt)),

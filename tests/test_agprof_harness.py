@@ -56,6 +56,29 @@ _BARE_THREAD_ALLOWLIST = {
         "agwebui.run",
     ): (2, "UI command relay + periodic disk-flush loop"),
     ("agency/observability/profiler/agprof.py", "spawn_traced"): (2, "spawn_traced implementation"),
+    # Standalone interactive sessions: loopback endpoint, PTY reader and
+    # process-exit watcher; none of them runs agent work needing trace context.
+    (
+        "agency/sessions/session.py",
+        "CliSession._start_server",
+    ): (1, "session hook/telemetry/terminal endpoint"),
+    (
+        "agency/sessions/capture_proxy.py",
+        "ClaudeCaptureGateway.start",
+    ): (1, "session TLS proxy event loop; each captured model span is recorded explicitly"),
+    (
+        "agency/sessions/session.py",
+        "CliSession.attach_terminal",
+    ): (1, "session process-exit watcher"),
+    (
+        "agency/sessions/session.py",
+        "CliSession.launch_native",
+    ): (1, "native session process-exit watcher"),
+    (
+        "agency/sessions/process.py",
+        "NativeProcess.__init__",
+    ): (1, "native child reaper and job-stop observer"),
+    ("agency/sessions/terminal.py", "Terminal.__init__"): (1, "subprocess terminal reader"),
 }
 
 

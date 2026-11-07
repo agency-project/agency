@@ -6,6 +6,7 @@ Agency runs, controls, and inspects coding agents from Python.
 | --- | --- |
 | Run your first agent | [Getting started](getting-started.md) |
 | Configure models, harnesses, and mounts | [Configuration guide](guides/configuration.md) |
+| Run a native CLI with Agency observation | [Interactive runtime](guides/interactive-runtime.md) |
 | View a run or record a profile | [Profiling guide](guides/profiling.md) |
 | Look up a callable or default | [API reference](api/index.md) |
 | Understand the design and source packages | [Architecture](architecture/index.md) |

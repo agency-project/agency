@@ -1,0 +1,7 @@
+{
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "dataset_revision": "REPLACE_WITH_OFFICIAL_DATASET_COMMIT",
+  "replicated": false,
+  "profile": {"repo": "SELECT_ONE_REPOSITORY", "version": "SELECT_ONE_VERSION"},
+  "agents": [[], [], [], [], [], []]
+}

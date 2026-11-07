@@ -12,7 +12,8 @@ export function executionControlState({run, replay, transport, executionControls
     else if (selected.type === 'interval') id = run?.intervals.find(i => i.id === selected.id)?.agent || id;
   } else if (selected?.run === 'b') id = null;
   const target = run?.agents.find(a => a.id === id);
-  const active = (controls?.agents || []).map(id => run?.agents.find(a => a.id === id)).filter(Boolean);
+  const active = (controls?.agents || []).map(id => run?.agents.find(a => a.id === id))
+    .filter(a => a && !['completed','failed','cancelled','stopped','agent_exit'].includes(a.status));
   const enabled = live && transport === 'connected' && Boolean(controls?.available) && !['completed','failed','cancelled'].includes(run?.status);
   return {live, target, active, agentEnabled: enabled && active.includes(target), allEnabled: enabled && active.length > 0,
     agentCommand: target?.status === 'paused' ? 'resume' : 'pause',

@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -125,6 +126,10 @@ def _harness_problem(harness: str, image: str) -> "str | None":
             f"{proc.returncode}); supply an image with its runtime through "
             f"AGENCY_TEST_HARNESS_IMAGE. Output: {output}"
         )
+    if harness == "codex" and not re.search(
+        r"\bcodex-cli (?:0\.147\.0|0\.162\.1)\b", proc.stdout + proc.stderr
+    ):
+        return "golden Codex execution requires supported CLI version 0.147.0 or 0.162.1"
     return None
 
 
@@ -253,7 +258,7 @@ def _exercise_golden_lifecycle(harness, golden_image, directory, monkeypatch):
     _write_replay(replay)
     config = agconfig(
         agentconfig(harness=harness, log_dir=str(directory / "logs")),
-        sandboxconfig(backend=CONTAINER_BACKEND, base_image=golden_image),
+        sandboxconfig(backend=CONTAINER_BACKEND, base_image=golden_image, gpu_passthrough=False),
         resourcesconfig(idle_cpus=1, idle_memory="2g"),
         llmconfig(
             provider="mock",

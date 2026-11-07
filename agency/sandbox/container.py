@@ -801,12 +801,15 @@ class _ContainerBackendBase(agsandbox_backend):
         if self._gpu_count_requested > 0 and not self._gpu_ids and self._gpu_acquire_fn is not None:
             self._gpu_ids = self._gpu_acquire_fn(self._gpu_count_requested)
         gpu_flags = _gpu_flags(self._runtime) if self._agconfig.sandbox.gpu_passthrough else []
+        # Native harness supervision must also follow children that change UID
+        # (for example apt's _apt download worker). Parent/child ptrace alone
+        # does not permit reading their memory after the credential change.
+        gpu_flags += ["--cap-add=SYS_PTRACE"]
         if (
             storage is not None
             and self._agconfig.sandbox.checkpoint_fast_resume
             and storage.criu_ready
         ):
-            gpu_flags += ["--cap-add=SYS_PTRACE"]
             if self._runtime == "podman":
                 gpu_flags += [f"--init-path={storage.init_path}"]
             gpu_flags += ["--annotation", f"org.criu.config={storage.criu_config}"]
@@ -1096,7 +1099,14 @@ class _ContainerBackendBase(agsandbox_backend):
         """Return True if the kernel supports CFS CPU quota enforcement."""
         import os
 
-        return os.path.exists("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+        if os.path.exists("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
+            return True
+        # Unified cgroup hosts expose CPU quotas through their cpu controller,
+        # without the legacy cpu.cfs_quota_us path.
+        try:
+            return "cpu" in Path("/sys/fs/cgroup/cgroup.controllers").read_text().split()
+        except OSError:
+            return False
 
     def _run(
         self,

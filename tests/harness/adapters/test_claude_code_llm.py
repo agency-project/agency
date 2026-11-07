@@ -817,6 +817,58 @@ def test_messages_stream_transient_upstream_error_keeps_503():
     assert response.json()["error"]["transient"] is True
 
 
+def test_native_delayed_rejection_preserves_http_status_and_provider_body():
+    import asyncio
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from agency.configs.agconfig import harnessadapterconfig, llmconfig
+    from agency.harness.clients.host_services_client import HostDispatchError
+
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "messages.1.output_config: unsupported",
+        },
+    }
+
+    class Router(_StreamRouter):
+        async def dispatch_stream_async(self, token, request):
+            await asyncio.sleep(0.05)
+            raise HostDispatchError(
+                {
+                    "message": "wrapped",
+                    "status_code": 400,
+                    "transient": False,
+                    "provider_error": body,
+                    "provider_headers": {"retry-after": "2", "x-should-retry": "false"},
+                }
+            )
+            yield
+
+    router = Router([])
+    app = FastAPI()
+    adapter = ClaudeCodeAdapter(
+        agconfig(llmconfig(provider="anthropic"), harnessadapterconfig(stream_keepalive_s=0.005))
+    )
+    adapter.register(app, router)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            headers={"Authorization": "Bearer fake"},
+            json={
+                "model": "claude-sonnet-5-5",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert response.status_code == 400
+    assert response.json() == body
+    assert response.headers["retry-after"] == "2"
+    assert response.headers["x-should-retry"] == "false"
+
+
 def test_messages_stream_success_is_unchanged_sse():
     done = {
         "type": "done",

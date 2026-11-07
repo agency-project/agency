@@ -62,6 +62,9 @@ def _make_sandbox(**kwargs):
     passed_cfg = kwargs.pop("agconfig", None)
     cfg = passed_cfg.clone() if passed_cfg is not None else agconfig_cls()
     cfg.sandbox.backend = "docker"
+    # These lifecycle/IO checks do not execute GPU kernels. Device passthrough
+    # has dedicated integration coverage in tests/sandbox/test_container.py.
+    cfg.sandbox.gpu_passthrough = kwargs.pop("gpu_passthrough", False)
     # Configuration-only tests do not need a live daemon.  The production
     # selector now validates explicit runtimes eagerly, so isolate those unit
     # tests from the daemon probe while leaving @docker operations untouched.
@@ -833,7 +836,7 @@ class TestAgSandboxLifecycle:
         from agency.sandbox import agsandbox_backend
 
         agname = str(uuid.uuid4())
-        cfg = agconfig_cls(sandboxconfig(backend="docker"))
+        cfg = agconfig_cls(sandboxconfig(backend="docker", gpu_passthrough=False))
         sb_worker = agSandbox(agname, agconfig=cfg)  # "worker" — starts the container
         main_backend = agsandbox_backend.for_config(
             cfg,
@@ -2301,6 +2304,7 @@ class TestAgSandboxResourceLimits:
         self.sb.update_limits(cpus=1.0, memory="128m")
 
     def test_release_resources_clears_gpu(self):
+        self.sb.agconfig.sandbox.gpu_passthrough = True
         pool = agResourcePool(gpus=[0])
         pool.acquire_gpus(self.sb, 1)
         self.sb._gpu_count_requested = 1
@@ -2329,9 +2333,15 @@ class TestResourceTools:
     (not a sandbox/pool mechanic) were dropped, not ported -- there is no
     wrapper left to validate."""
 
+    @pytest.fixture(autouse=True)
+    def _emulated_gpu_devices(self, monkeypatch):
+        # This class leases synthetic IDs [0, 1] to verify scheduling and
+        # CUDA environment isolation, without requiring a GPU device/runtime.
+        monkeypatch.setattr("agency.sandbox.container._gpu_flags", lambda runtime: [])
+
     @docker
     def setup_method(self, _):
-        self.sb = _make_sandbox()
+        self.sb = _make_sandbox(gpu_passthrough=True)
         self.pool = agResourcePool(gpus=[0, 1], idle_cpus=1.0, idle_memory="1024m")
 
     @docker
@@ -2456,7 +2466,7 @@ class TestResourceTools:
         holder = _resource_sandbox()
         pool1.acquire_gpus(holder, 1)  # exhaust the only GPU
 
-        sb2 = _make_sandbox()
+        sb2 = _make_sandbox(gpu_passthrough=True)
         sb2._gpu_count_requested = 1
         sb2._gpu_acquire_fn = functools.partial(pool1.acquire_gpus, sb2)
         sb2._gpu_release_fn = functools.partial(pool1.release_gpus, sb2)

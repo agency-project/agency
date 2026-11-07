@@ -116,7 +116,7 @@ def test_real_external_interrupt_acknowledgment_and_resumed_session(
 
     monkeypatch.setattr(PtyDriver, "__init__", init)
 
-    def config_home(*args):
+    def config_home(*args, **kwargs):
         path = tmp_path / ("state-" + uuid.uuid4().hex[:8])
         path.mkdir()
         return path

@@ -40,6 +40,7 @@ from typing import Callable
 
 from . import _ctypes_defs as pt
 from . import _seccomp_filter
+from ..terminal import InheritedTerminal
 
 
 @dataclass
@@ -280,6 +281,8 @@ class TracerLoop:
 
         self.pty_master: int | None = None
         self._pty_size: tuple[int, int] | None = None
+        self._inherit_stdio = False
+        self._inherited_terminal = None
         self._terminal_write_lock = threading.Lock()
         self._output_limit = 1024 * 1024
         self._terminal_tail = b""
@@ -295,6 +298,7 @@ class TracerLoop:
         self._spawn_callbacks: "list[Callable[[int], None]]" = []
         self._exec_callbacks: "list[Callable[[int, str | None], None]]" = []
         self._exit_callbacks: "list[Callable[[int, int], None]]" = []
+        self._job_stop_callback = None
         self._spawn_log: "list[int]" = []
         self._exec_log: "list[tuple[int, str | None]]" = []
         self._exit_log: "list[tuple[int, int]]" = []
@@ -327,6 +331,14 @@ class TracerLoop:
         with self._lock:
             return set(self._known_pids)
 
+    def on_job_stop(self, callback: "Callable[[int], None]") -> None:
+        """Observe actual root job stops, separately from supervisor pause."""
+        self._job_stop_callback = callback
+
+    def suspend_terminal(self) -> None:
+        if self._inherited_terminal is not None:
+            self._inherited_terminal.suspend(self.root_pid)
+
     # -- lifecycle ----------------------------------------------------------
 
     def start(
@@ -337,6 +349,7 @@ class TracerLoop:
         *,
         stdin_data: "bytes | None" = None,
         pty_size: "tuple[int, int] | None" = None,
+        inherit_stdio: bool = False,
     ) -> None:
         """Starts the fork + trace loop on ONE dedicated thread and blocks
         until the child exists and its first executable image is confirmed
@@ -350,7 +363,14 @@ class TracerLoop:
         this thread was never the tracer of and fail with ESRCH."""
         if pty_size is not None and stdin_data is not None:
             raise ValueError("PTY input must use write_terminal")
+        if inherit_stdio and (stdin_data is not None or pty_size is not None):
+            raise ValueError("inherited stdio cannot be combined with PTY or piped input")
         self._pty_size = pty_size
+        self._inherit_stdio = inherit_stdio
+        if inherit_stdio:
+            # SEIZE provides distinguishable group-stop notifications and
+            # LISTEN preserves kernel SIGCONT behavior for native job control.
+            self._seize_mode = True
         if pty_size is not None:
             self._terminal_screen = _terminal_screen(*pty_size)
             import pyte
@@ -393,6 +413,8 @@ class TracerLoop:
         always issued by the same thread that attached."""
         if self._pty_size is not None:
             return self._fork_pty(argv, envp, cwd)
+        if self._inherit_stdio:
+            return self._fork_inherited(argv, envp, cwd)
         stdout_r, stdout_w = os.pipe()
         stderr_r, stderr_w = os.pipe()
         stdin_r, stdin_w = os.pipe() if stdin_data is not None else (None, None)
@@ -475,6 +497,38 @@ class TracerLoop:
                 os.close(stdin_w)
                 raise
             self._stdin_writer = writer
+
+    def _fork_inherited(self, argv, envp, cwd) -> None:
+        self._inherited_terminal = InheritedTerminal()
+        try:
+            pid = os.fork()
+        except BaseException:
+            self._inherited_terminal.restore()
+            raise
+        if pid == 0:
+            try:
+                # Keep the existing session/controlling terminal, but route
+                # terminal-generated signals to the CLI rather than Agency.
+                os.setpgid(0, 0)
+                self._exec_traced(argv, envp, cwd)
+            finally:
+                os._exit(127)
+        self.root_pid = pid
+        try:
+            self._remember_spawn(pid)
+            _, status = os.waitpid(pid, os.WUNTRACED if self._seize_mode else 0)
+            if not os.WIFSTOPPED(status):
+                raise RuntimeError("inherited child failed before trace setup")
+            self._attach_initial(pid)
+            with self._lock:
+                self._options_applied.add(pid)
+            self._inherited_terminal.claim(pid)
+            pt.ptrace(pt.PTRACE_CONT, pid, 0, 0)
+        except BaseException:
+            self.kill()
+            self._run()
+            self._inherited_terminal.restore()
+            raise
 
     def _fork_pty(self, argv, envp, cwd) -> None:
         master, slave = os.openpty()
@@ -771,7 +825,8 @@ class TracerLoop:
         event = (status >> 16) & 0xFF
 
         if event == pt.PTRACE_EVENT_STOP:
-            if pid not in self._options_applied:
+            newborn = pid not in self._options_applied
+            if newborn:
                 self._classify_pending_clone(pid)
                 pt.ptrace(pt.PTRACE_SETOPTIONS, pid, 0, pt.ALL_TRACE_OPTIONS)
                 self._options_applied.add(pid)
@@ -780,6 +835,24 @@ class TracerLoop:
                     self._parked_pids.add(pid)
                     self._state_changed.notify_all()
                     return
+            if (
+                self._inherit_stdio
+                and not newborn
+                and sig
+                in (
+                    signal.SIGSTOP,
+                    signal.SIGTSTP,
+                    signal.SIGTTIN,
+                    signal.SIGTTOU,
+                )
+            ):
+                # Unlike a signal-delivery or debugger stop, this means the
+                # kernel has actually stopped the job. LISTEN keeps it stopped
+                # until SIGCONT, without swallowing native shell job control.
+                _ptrace_ignoring_esrch(pt.PTRACE_LISTEN, pid)
+                if pid == self.root_pid and self._job_stop_callback is not None:
+                    self._job_stop_callback(sig)
+                return
             self._restart(pid)
             return
 
@@ -1148,6 +1221,8 @@ class TracerLoop:
             self._root_image_ready.set()
 
     def _forget(self, pid: int, exit_code: int) -> None:
+        if pid == self.root_pid and self._inherited_terminal is not None:
+            self._inherited_terminal.restore()
         with self._lock:
             self._known_pids.discard(pid)
             if pid in self._unannounced_pids:

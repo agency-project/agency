@@ -1031,6 +1031,115 @@ async def investigator_page():
     return FileResponse(_STATIC / "investigator.html")
 
 
+# ---------------------------------------------------------------------------
+# Interactive terminal (agency/sessions/)
+# ---------------------------------------------------------------------------
+#
+# The session's execution process (`agency claude`, `agency codex`) owns the
+# PTY and writes its loopback port and tokens to this 0600 file in the run
+# directory. This server relays one
+# browser WebSocket to it, so the browser needs a single origin and port
+# (also through an SSH tunnel). Terminal input runs commands as the user, so
+# unlike the read-only views above it always requires the session's UI token,
+# and rejects cross-site pages by Origin.
+
+# Written by agency/sessions/session.py (SESSION_FILE there).
+_TERMINAL_SESSION_FILE = "terminal_session.json"
+
+
+def _terminal_session() -> "dict | None":
+    try:
+        return json.loads((_run_dir / _TERMINAL_SESSION_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _loopback_origin(origin: "str | None") -> bool:
+    """Browsers always send Origin on WebSockets. Any other page could reach
+    a loopback port from the user's browser, so only loopback pages pass."""
+    from urllib.parse import urlsplit
+
+    if origin is None:
+        return True  # not a browser; the token still has to match
+    parts = urlsplit(origin)
+    return parts.scheme in {"http", "https"} and parts.hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+
+@app.get("/terminal")
+async def terminal_page():
+    return FileResponse(_STATIC / "terminal.html")
+
+
+@app.get("/api/terminal")
+async def terminal_available():
+    session = _terminal_session()
+    # Never the tokens: only whether there is a terminal, and of which CLI.
+    return {"available": session is not None, "label": (session or {}).get("label")}
+
+
+@app.websocket("/ws/terminal")
+async def terminal_relay(ws: WebSocket):
+    import hmac
+
+    from websockets.asyncio.client import connect
+
+    session = _terminal_session()
+    if session is None or not _loopback_origin(ws.headers.get("origin")):
+        await ws.close(code=4403)
+        return
+    await ws.accept()
+    try:
+        hello = json.loads(await asyncio.wait_for(ws.receive_text(), timeout=10))
+        authorized = hmac.compare_digest(str(hello.get("token", "")), session["ui_token"])
+        size = {"cols": int(hello["cols"]), "rows": int(hello["rows"])}
+    except (asyncio.TimeoutError, ValueError, KeyError, TypeError, WebSocketDisconnect):
+        authorized = False
+    if not authorized:
+        await ws.close(code=4401)
+        return
+    try:
+        async with connect(
+            f"ws://127.0.0.1:{session['host_port']}/terminal",
+            additional_headers={"X-Agency-Token": session["host_token"]},
+            max_size=None,
+        ) as upstream:
+            await upstream.send(json.dumps(size))
+
+            async def to_browser():
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await ws.send_bytes(message)
+                    else:
+                        await ws.send_text(message)
+
+            async def to_session():
+                while True:
+                    message = await ws.receive()
+                    if message["type"] == "websocket.disconnect":
+                        return
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            tasks = [asyncio.create_task(to_browser()), asyncio.create_task(to_session())]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in tasks:
+                task.cancel()
+    except Exception as exc:
+        # The session exited, the browser left, or the upstream handshake
+        # failed; the browser reconnects (or reports the exit) on its own.
+        print(f"[agwebui] terminal relay ended: {type(exc).__name__}: {exc}")
+    try:
+        await ws.close()
+    except RuntimeError:
+        pass  # already closed by the browser
+
+
 @app.get("/critical-path")
 async def critical_path_page():
     return FileResponse(_STATIC / "critical-path.html")

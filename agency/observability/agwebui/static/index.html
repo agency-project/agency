@@ -15,6 +15,7 @@
   <nav id="view-tabs" aria-label="Views">
     <a class="investigator-link" href="/profiler">Profiler</a>
     <a class="investigator-link" href="/critical-path">Critical Path Profiler</a>
+    <a class="investigator-link" id="terminal-link" href="/terminal" hidden>Terminal</a>
   </nav>
   <div id="app">
     <div id="left">
@@ -84,5 +85,11 @@
     </div>
   </div>
   <script type="module" src="/static/app.js"></script>
+  <script type="module">
+    // Only runs started by `agency claude` or `agency codex` have a terminal.
+    fetch('/api/terminal').then((r) => r.json())
+      .then((status) => { document.getElementById('terminal-link').hidden = !status.available; })
+      .catch(() => {});
+  </script>
 </body>
 </html>

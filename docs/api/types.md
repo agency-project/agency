@@ -62,32 +62,46 @@ Subclass `agtype` and put the class in the schema. `schema_type()` supplies the 
 
 `walk(type_hint, value, on_leaf)` transforms supported nested list/dict/tuple shapes and combines cleanup paths; its callback must return `(value, paths)` and handle its own errors. `in_hint` detects special types except agrawstring; `from_hint` resolves a direct marker or `list[marker]`, else `None`. Concrete markers override this same protocol; their behavior is specified in the table rather than repeated for every override.
 
-## Source reference
+## Source signatures
 
 [Source: agschema.py](../../agency/agschema.py)
 
-[`agency.agschema.agschema`](../../agency/agschema.py#L68): `__init__`, `to_json`, `check`, `check_field`, `validate_input`, `prepare_inputs_in_sandbox`, `recover_outputs`, `validate_outputs`, `validate_and_recover`, `raw_key`, `field_desc`, `get_return_tool_descriptions`.
+::: agency.agschema.agschema
+    options:
+      members: ["__init__", "to_json", "check", "check_field", "validate_input", "prepare_inputs_in_sandbox", "recover_outputs", "validate_outputs", "validate_and_recover", "raw_key", "field_desc", "get_return_tool_descriptions"]
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agtype`](../../agency/agtype.py#L13): `schema_type`, `needs_sandbox`, `prepare`, `recover`, `extra_input_prompt`, `extra_output_prompt`, `build_content_prompt`, `get_return_tool_description`, `get_return_tool_value_description`, `validate_output`, `validate_input_value`, `walk`, `in_hint`, `from_hint`.
+::: agency.agtype.agtype
+    options:
+      members: ["schema_type", "needs_sandbox", "prepare", "recover", "extra_input_prompt", "extra_output_prompt", "build_content_prompt", "get_return_tool_description", "get_return_tool_value_description", "validate_output", "validate_input_value", "walk", "in_hint", "from_hint"]
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agfile`](../../agency/agtype.py#L217)
+::: agency.agtype.agfile
+    options:
+      members: []
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agpath`](../../agency/agtype.py#L362)
+::: agency.agtype.agpath
+    options:
+      members: []
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agbinary`](../../agency/agtype.py#L525)
+::: agency.agtype.agbinary
+    options:
+      members: []
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agimage`](../../agency/agtype.py#L444)
+::: agency.agtype.agimage
+    options:
+      members: []
 
 [Source: agtype.py](../../agency/agtype.py)
 
-[`agency.agtype.agrawstring`](../../agency/agtype.py#L690)
+::: agency.agtype.agrawstring
+    options:
+      members: []

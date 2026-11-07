@@ -1113,7 +1113,7 @@ test('clock paints cannot move the slider while dragging and cancellation releas
 
 // Agent-scoped metrics: compact column status and column-to-dashboard selection.
 const usage=(p,agent)=>p.node('call-stack').children.find(c=>c.dataset.agentColumn===agent).querySelector('.agent-column-heading').querySelector('.column-usage');
-test('column status shows live per-agent sandbox CPU and compact tokens beside the existing in-flight count',()=>{
+test('column status shows live per-agent workload CPU and compact tokens beside the existing in-flight count',()=>{
   const p=page(),run=p.ui.state.run;
   p.receive({type:'patch',patches:[{agents:[{id:'a',label:'Agent A',status:'running',sandbox:'sandbox_a_0000'},{id:'b',label:'Agent B',status:'running'}],
     actions:[{id:'m',agent:'a',episode:'one',start:1,duration:1,kind:'model',outcome:'success',tokens:8000,output_tokens:200,files:[]},{id:'bt',agent:'b',episode:'b1',start:1,duration:1,kind:'tool',outcome:'running',files:[]}],
@@ -1121,18 +1121,18 @@ test('column status shows live per-agent sandbox CPU and compact tokens beside t
     counter_samples:{'workload:cpu_pct':[[2,640]],'host:cpu_pct':[[2,900]],'cg:sandbox_a_0000:cpu_pct':[[2,12.4]]},meta:{duration:2}}]});
   p.flush();p.ui.reconcile();
   assert.equal(usage(p,'a').textContent,'CPU 12% · RAM — · 8.2K tok');
-  assert.match(usage(p,'a').title,/sandbox container.*100% = one core.*8,000 input \+ 200 output/);
+  assert.match(usage(p,'a').title,/owned workload cgroup.*100% = one core.*8,000 input \+ 200 output/);
   // Missing measurements are dashes; the workload or host value is never shown as an agent's CPU.
-  assert.equal(usage(p,'b').textContent,'CPU — · RAM — · — tok');assert.match(usage(p,'b').title,/no sandbox measurement recorded.*no usage reported/);
+  assert.equal(usage(p,'b').textContent,'CPU — · RAM — · — tok');assert.match(usage(p,'b').title,/no workload measurement recorded.*no usage reported/);
   const heading=p.node('call-stack').children.find(c=>c.dataset.agentColumn==='b').querySelector('.agent-column-heading');
   assert.equal(heading.querySelector('.column-call-count').textContent,'1 active calls');
   // Values follow the existing stream; execution-wide counters win over the retained window.
   p.receive({type:'patch',patches:[{counter_samples:{'cg:sandbox_a_0000:cpu_pct':[[3,3.44]]},meta:{duration:3,metrics_by_agent:{a:{models:90,input:1390000,output:10000,input_samples:90,output_samples:90}}}}]});
   p.flush();p.ui.reconcile();
   assert.equal(usage(p,'a').textContent,'CPU 3.4% · RAM — · 1.4M tok');
-  // A container that stopped reporting has no current utilization.
+  // A workload that stopped reporting has no current utilization.
   p.receive({type:'patch',patches:[{meta:{duration:60}}]});p.flush();p.ui.reconcile();
-  assert.equal(usage(p,'a').textContent,'CPU — · RAM — · 1.4M tok');assert.match(usage(p,'a').title,/no current container sample/);
+  assert.equal(usage(p,'a').textContent,'CPU — · RAM — · 1.4M tok');assert.match(usage(p,'a').title,/no current workload sample/);
   assert.equal(run.agents.length>=2,true);
 });
 test('selecting a column header scopes the dashboard to that agent without changing columns or controls',()=>{

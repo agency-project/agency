@@ -247,16 +247,32 @@ def maybe_compact(
     llm: "LLMClient",
     model: str,
     previous_summary: "str | None",
+    measured: "tuple[int, int] | None" = None,
 ) -> "tuple[list, str | None]":
     """Compact `messages` if they're near `context_limit`. Returns
     `(messages, previous_summary)` -- both unchanged if compaction doesn't
     trigger or the summarization call itself fails (best-effort: a failed
     summary attempt must not crash the whole run; the next turn's own
     dispatch will surface a real error if the context truly is too large,
-    just one step later than agllm.py's own compact()-raises behavior)."""
+    just one step later than agllm.py's own compact()-raises behavior).
+
+    `measured`, when given, is the last call's real size (see below); without
+    it the size is the ~4-chars-per-token estimate of `messages`."""
     if context_limit is None:
         return messages, previous_summary
     token_count = estimate_messages_tokens(messages)
+    if measured is not None:
+        # `measured` is (the last call's prompt + completion tokens as the
+        # backend counted them, len(messages) once its reply was appended).
+        # The estimate alone misses tool schemas and undercounts dense text;
+        # the backend's count covers both, so only what came after is guessed,
+        # at the tokens-per-character rate that count implies (bounded to
+        # 1/4..1: tool schemas inflate it while the conversation is short).
+        tokens_then, count_then = measured
+        chars_then = estimate_messages_tokens(messages[:count_then]) * CHARS_PER_TOKEN
+        rate = min(1.0, max(1 / CHARS_PER_TOKEN, tokens_then / max(1, chars_then)))
+        new_chars = estimate_messages_tokens(messages[count_then:]) * CHARS_PER_TOKEN
+        token_count = max(token_count, tokens_then + int(new_chars * rate))
     if not should_compact(token_count, context_limit):
         return messages, previous_summary
     sys_msg, task_input, head, tail = split_for_compaction(messages, context_limit)

@@ -110,6 +110,41 @@ def test_live_workload_metadata_reaches_snapshot_and_incremental_patch():
         assert result["dataset"] == "SWE-bench Lite"
 
 
+def test_completed_run_recovers_execution_clock_from_later_read_actor_events():
+    trajectory = Trajectory("live", "Reopened native execution")
+    # The global database is read before per-agent databases on a fresh viewer.
+    trajectory.apply(event(0, "workload_started", ts=100, actor="webui"))
+    trajectory.apply(event(1, "workload_completed", ts=130, actor="webui"))
+    trajectory.apply(event(2, "done", ts=133, actor="webui", status="completed"))
+    trajectory.apply(event(3, "tool_call", ts=112, call_id="shell", tool="Bash"))
+    trajectory.apply(event(4, "agent_state", ts=110, state="waiting_llm"))
+    assert trajectory.run["execution_started_at"] == 110
+    assert trajectory.run["execution_wall_time"] == 20
+    assert trajectory.run["measurement"]["state"] == "ended"
+    # Finalization activity after the recorded finish is not a new execution.
+    trajectory.apply(event(5, "tool_call", ts=140, call_id="late", tool="Bash"))
+    trajectory.tick(10_000)
+    assert trajectory.run["execution_started_at"] == 110
+    assert trajectory.run["execution_wall_time"] == 20
+
+    empty = Trajectory("live", "No execution before finish")
+    empty.apply(event(0, "done", ts=133, status="completed"))
+    empty.apply(event(1, "agent_state", ts=140, state="waiting_llm"))
+    assert empty.run["execution_started_at"] is None
+    assert empty.run["execution_wall_time"] == 0
+
+
+def test_native_exit_records_terminal_agent_state_despite_older_telemetry():
+    for code, expected in ((0, "completed"), (7, "failed"), (-15, "cancelled"), (None, "failed")):
+        trajectory = model()
+        trajectory.apply(event(1, "agent_state", ts=20, state="agent_exit", returncode=code))
+        trajectory.apply(event(2, "agent_state", ts=10, state="waiting_llm"))
+        actor = trajectory.agents["worker"]
+        assert actor["status"] == expected
+        assert actor["execution_state"] == expected
+        assert actor["returncode"] == code
+
+
 def test_call_appears_running_then_keeps_its_action_and_episode_identity():
     trajectory = model()
     trajectory.apply(

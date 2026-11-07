@@ -61,20 +61,26 @@ Default `image_commit` uses runtime images. `cow_zfs` requires a local Linux roo
 
 Static `backend_for_image_kind(kind)` returns the implementation class. `tag_image(source, dest)`, `delete_image(tag, force=False)` and `import_image(image_bytes, timeout)` perform runtime operations and return `None`; `export_image(tag, timeout)` returns archive bytes. Use only compatible image-based backends; runtime errors propagate and image operations can be slow. These are infrastructure primitives, not cross-host portability promises.
 
-## Source reference
+## Source signatures
 
 [Source: agsandbox.py](../../agency/sandbox/agsandbox.py)
 
-[`agency.sandbox.agsandbox.agSandbox`](../../agency/sandbox/agsandbox.py#L37): `__init__`, `exec`, `exec_detached`, `read_file`, `read_file_bytes`, `write_file`, `write_file_bytes`, `update_limits`, `commit`, `checkpoint`, `delete_checkpoint`, `stop`, `rm_container`, `restore`, `release_daemon`, `get_live_pids`, `pid_status_summary`, `release_resources`, `remove_files`, `destroy`, `fork`, `image_kind`, `change_config`, `get_config_copy`, `current_gpu_ids`, `ensure_gpu_acquired`, `backend_for_image_kind`, `tag_image`, `delete_image`, `export_image`, `import_image`, `wait_for_processes`.
+::: agency.sandbox.agsandbox.agSandbox
+    options:
+      members: ["__init__", "exec", "exec_detached", "read_file", "read_file_bytes", "write_file", "write_file_bytes", "update_limits", "commit", "checkpoint", "delete_checkpoint", "stop", "rm_container", "restore", "release_daemon", "get_live_pids", "pid_status_summary", "release_resources", "remove_files", "destroy", "fork", "image_kind", "change_config", "get_config_copy", "current_gpu_ids", "ensure_gpu_acquired", "backend_for_image_kind", "tag_image", "delete_image", "export_image", "import_image", "wait_for_processes"]
 
 [Source: container.py](../../agency/sandbox/container.py)
 
-[`agency.sandbox.container.get_container_runtime`](../../agency/sandbox/container.py#L127)
+::: agency.sandbox.container.get_container_runtime
 
 [Source: checkpoint.py](../../agency/sandbox/checkpoint.py)
 
-[`agency.sandbox.checkpoint.CheckpointHandle`](../../agency/sandbox/checkpoint.py#L30)
+::: agency.sandbox.checkpoint.CheckpointHandle
+    options:
+      members: []
 
 [Source: checkpoint.py](../../agency/sandbox/checkpoint.py)
 
-[`agency.sandbox.checkpoint.CheckpointCapabilityError`](../../agency/sandbox/checkpoint.py#L25)
+::: agency.sandbox.checkpoint.CheckpointCapabilityError
+    options:
+      members: []

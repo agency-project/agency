@@ -142,6 +142,10 @@ _CGROUP_USER_REEXEC_ENV = "AGENCY_PROFILE_CGROUP_USER_REEXEC"
 # start (docker + podman)
 _cg_registry: "dict[str, str]" = {}  # label (agname) -> cgroup dir
 _daemon_cg: "dict[str, str]" = {}  # cgroup dir -> agg kind ("conmon"/"dockerd")
+# Labels whose processes share the host's network namespace (e.g. a
+# standalone session's systemd scope). Their /proc/<pid>/net/dev is the
+# whole machine's traffic, so it must not be reported as theirs.
+_cg_host_network: "set[str]" = set()
 _cg_lock = threading.Lock()
 
 # Pseudo thread-id lane for spans observed outside a local calling thread.
@@ -339,7 +343,12 @@ def _ensure_environment_cgroup() -> None:
 
 
 def container_started(
-    label: str, cgroup_dir: str, daemon_cgroup_dir: "str | None" = None, daemon_kind: str = "conmon"
+    label: str,
+    cgroup_dir: str,
+    daemon_cgroup_dir: "str | None" = None,
+    daemon_kind: str = "conmon",
+    *,
+    host_network: bool = False,
 ) -> None:
     """Register a container's cgroup for sampling (called by sandbox backends).
 
@@ -347,7 +356,9 @@ def container_started(
     container (from /proc/<pid>/cgroup). Raises while a session is active if
     the directory has no cpu.stat — only docker/podman on cgroup v2 are
     supported, and a profiled run on anything else should fail loudly rather
-    than silently produce no container metrics.
+    than silently produce no container metrics. Pass *host_network* for a
+    cgroup whose processes are not in their own network namespace, so no
+    network counters are attributed to it.
     """
     if _session is not None and not os.path.isfile(f"{cgroup_dir}/cpu.stat"):
         raise RuntimeError(
@@ -356,6 +367,10 @@ def container_started(
         )
     with _cg_lock:
         _cg_registry[label] = cgroup_dir
+        if host_network:
+            _cg_host_network.add(label)
+        else:
+            _cg_host_network.discard(label)
         if daemon_cgroup_dir is not None:
             _daemon_cg[daemon_cgroup_dir] = daemon_kind
 
@@ -364,6 +379,7 @@ def container_stopped(label: str) -> None:
     """Drop a stopped or removed container from the sampling registry."""
     with _cg_lock:
         _cg_registry.pop(label, None)
+        _cg_host_network.discard(label)
 
 
 def container_registered(label: str) -> bool:
@@ -812,7 +828,10 @@ def span(name: str, *, parent_context=None):
     return s.span(name, parent_context=parent_context)
 
 
-def register_engine(engine: str) -> None:
+def register_engine(engine: str, **coverage: str) -> None:
+    """Record that *engine* ran in this session. *coverage* overrides the
+    defaults below for an engine observed some other way (e.g. a standalone
+    session whose model requests are self-reported, not host-observed)."""
     if not enabled():
         return
     _engine_coverage[str(engine)] = {
@@ -822,6 +841,7 @@ def register_engine(engine: str) -> None:
         "retries": "unavailable",
         "automatic_functions": "host_only",
         "reason": "External harness internals require cooperative events; no transcript timing inference.",
+        **coverage,
     }
 
 
@@ -1953,6 +1973,10 @@ class _Sampler(threading.Thread):
             if io_seen:
                 _samples.append((t, f"cg:{label}:io_r", float(io_r)))
                 _samples.append((t, f"cg:{label}:io_w", float(io_w)))
+        with _cg_lock:
+            host_network = label in _cg_host_network
+        if host_network:
+            return
         for pid in pids:
             sampled_network = False
             with suppress(Exception):

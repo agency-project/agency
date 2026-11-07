@@ -66,20 +66,28 @@ from agency.agpolicy import agpolicy
 policy = agpolicy(tool_hooks={"double": lambda args: (args["value"] >= 0, "nonnegative only")})
 ```
 
-## Source reference
+## Source signatures
 
 [Source: agskill.py](../../agency/agskill.py)
 
-[`agency.agskill.agskill`](../../agency/agskill.py#L237): `__init__`, `build_user_content`, `run`, `asyncio_run`.
+::: agency.agskill.agskill
+    options:
+      members: ["__init__", "build_user_content", "run", "asyncio_run"]
 
 [Source: agtool.py](../../agency/agtool.py)
 
-[`agency.agtool.agtool`](../../agency/agtool.py#L9): `__init__`, `__call__`, `log`, `to_openai_tool`.
+::: agency.agtool.agtool
+    options:
+      members: ["__init__", "__call__", "log", "to_openai_tool"]
 
 [Source: agpolicy.py](../../agency/agpolicy.py)
 
-[`agency.agpolicy.agpolicy`](../../agency/agpolicy.py#L11)
+::: agency.agpolicy.agpolicy
+    options:
+      members: []
 
 [Source: _syscall_event.py](../../agency/harness/_syscall_event.py)
 
-[`agency.harness._syscall_event.agsyscallevent`](../../agency/harness/_syscall_event.py#L9)
+::: agency.harness._syscall_event.agsyscallevent
+    options:
+      members: []
