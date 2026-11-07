@@ -13,6 +13,8 @@ nav:
   - Getting started: getting-started.md
   - Guides:
       - Configuration and providers: guides/configuration.md
+      - Interactive CLI runtime: guides/interactive-runtime.md
+      - Interactive context capture: guides/interactive-capture.md
       - Context windows: Context_Window.md
       - Message patches: Message_Patches.md
       - Profiling and viewing runs: guides/profiling.md

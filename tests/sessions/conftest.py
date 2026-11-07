@@ -16,6 +16,11 @@ def make_session(tmp_path):
         session_class=ClaudeCodeSession,
         binary=FIXTURES / "fake_claude_session.py",
         use_scope=False,
+        capture=None,
+        cli_args=None,
+        terminal_mode="browser",
+        trace=False,
+        policy=None,
     ):
         run_dir = tmp_path / f"run{len(created)}" / "logs"
         run_dir.mkdir(parents=True)
@@ -26,10 +31,14 @@ def make_session(tmp_path):
         session = session_class(
             cwd=tmp_path,
             binary=str(binary),
-            cli_args=[],
+            cli_args=cli_args or [],
             run_dir=run_dir,
             ui_port=0,
             use_scope=use_scope,
+            capture=capture,
+            terminal_mode=terminal_mode,
+            trace=trace,
+            policy=policy,
         )
         session.start(global_logger=global_logger)
         created.append((session, global_logger))

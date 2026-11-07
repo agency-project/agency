@@ -66,6 +66,14 @@ _BARE_THREAD_ALLOWLIST = {
         "agency/sessions/session.py",
         "CliSession.attach_terminal",
     ): (1, "session process-exit watcher"),
+    (
+        "agency/sessions/session.py",
+        "CliSession.launch_native",
+    ): (1, "native session process-exit watcher"),
+    (
+        "agency/sessions/process.py",
+        "NativeProcess.__init__",
+    ): (1, "native child reaper and job-stop observer"),
     ("agency/sessions/terminal.py", "Terminal.__init__"): (1, "subprocess terminal reader"),
 }
 

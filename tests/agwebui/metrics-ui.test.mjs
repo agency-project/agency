@@ -276,20 +276,20 @@ test('a selection is kept while agents spawn, terminate and report live updates'
   assert.equal(view.label(),'No agents selected');assert.deepEqual(view.checked(),[]);assert.equal(view.list().boxes.length,4);
   setMetricScope(null);
 });
-test('system cards keep entire-system meaning while agent sandbox cards follow the scope',()=>{
+test('system cards keep entire-system meaning while owned workload cards follow the scope',()=>{
   press([],{metricCategory:'Systems'});if(!metricsSummary(team()).includes('View detailed Systems'))press(['data-metric-toggle']);
   const run=team();
   const all=metricsSummary(run);
   // "All agents" is the agents' own containers; the workload series is the entire system.
-  assert.match(all,/CPU · agent sandboxes<\/small><strong>162\.5 %/);assert.match(all,/CPU · Workload<\/small><strong>300 %/);
-  assert.match(all,/Sum of 2 of 2 sandbox containers of all agents/);assert.match(all,/excludes orchestrator, host services, runtime daemons and model inference/);
+  assert.match(all,/CPU · agent workloads<\/small><strong>162\.5 %/);assert.match(all,/CPU · Workload<\/small><strong>300 %/);
+  assert.match(all,/Sum of 2 of 2 workload cgroups of all agents/);assert.match(all,/excludes orchestrator, host services, runtime daemons and model inference/);
   setMetricScope(['a']);const one=metricsSummary(run);
-  assert.match(one,/CPU · agent sandboxes<\/small><strong>12\.5 %/);assert.match(one,/RAM · agent sandboxes<\/small><strong>256 MiB/);
+  assert.match(one,/CPU · agent workloads<\/small><strong>12\.5 %/);assert.match(one,/RAM · agent workloads<\/small><strong>256 MiB/);
   assert.match(one,/data-metric-card="system:workload:cpu_pct" data-unscoped="true"/);assert.match(one,/Not filtered by the agent selection · Workload/);
   assert.match(one,/CPU · Workload<\/small><strong>300 %/);assert.match(one,/Scope: Agent A/);
   // No sandbox recorded for the selected agent: marked unavailable, never borrowed from the system.
   setMetricScope(['c']);const none=metricsSummary(run);
-  assert.match(none,/CPU · agent sandboxes<\/small><strong>Unavailable/);assert.match(none,/No sandbox recorded for these agents/);
+  assert.match(none,/CPU · agent workloads<\/small><strong>Unavailable/);assert.match(none,/No workload cgroup recorded for these agents/);
   setMetricScope(null);press([],{metricCategory:'Activity'});
 });
 

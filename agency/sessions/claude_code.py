@@ -5,7 +5,7 @@ Claude Code specifics:
 * Hooks are HTTP hooks in a `--settings` file, which Claude Code merges with
   the user's own settings. The token reaches the header by environment
   interpolation, so it never appears in a command line.
-* Model requests come from the OpenTelemetry `api_request`/`api_error` log
+* Without capture, model requests come from the OpenTelemetry `api_request`/`api_error` log
   events, which carry the request's measured duration, tokens and cost.
 * A rejected or cancelled tool fires no completion hook; its `tool_decision`
   or `tool_result` log event closes it instead.
@@ -13,7 +13,14 @@ Claude Code specifics:
 
 from __future__ import annotations
 
-from .session import HOOK_TIMEOUT_S, TOKEN_VARIABLE, CliSession, main as run_session, number
+from .session import (
+    HOOK_TIMEOUT_S,
+    TOKEN_VARIABLE,
+    CliSession,
+    hook_command,
+    main as run_session,
+    number,
+)
 from .session import otlp_log_records
 
 SETTINGS_FILE = "claude_settings.json"
@@ -66,6 +73,20 @@ class ClaudeCodeSession(CliSession):
             "allowedEnvVars": [TOKEN_VARIABLE],
         }
         settings = {"hooks": {event: [{"hooks": [hook]}] for event in HOOK_EVENTS}}
+        if self.policy.tool_hooks or self.policy.default_to_deny:
+            # Command hooks can fail closed on relay outages (exit 2).
+            # HTTP hook errors alone do not guarantee a native denial.
+            settings["hooks"]["PreToolUse"] = [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command(),
+                            "timeout": HOOK_TIMEOUT_S,
+                        }
+                    ]
+                }
+            ]
         self._write_private_json(SETTINGS_FILE, settings)
 
     def _cli_argv(self) -> "list[str]":
@@ -79,6 +100,22 @@ class ClaudeCodeSession(CliSession):
         ]
 
     def _cli_environment(self, env: dict) -> None:
+        if self.capture is not None:
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env.update(
+                ANTHROPIC_BASE_URL=f"http://127.0.0.1:{self.port}/capture",
+                ANTHROPIC_AUTH_TOKEN=self.host_token,
+                ANTHROPIC_MODEL=self.capture.model,
+                ANTHROPIC_DEFAULT_OPUS_MODEL=self.capture.model,
+                ANTHROPIC_DEFAULT_SONNET_MODEL=self.capture.model,
+                ANTHROPIC_DEFAULT_HAIKU_MODEL=self.capture.model,
+                CLAUDE_CODE_SUBAGENT_MODEL=self.capture.model,
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+                CLAUDE_CODE_USE_BEDROCK="0",
+                CLAUDE_CODE_USE_VERTEX="0",
+                CLAUDE_CODE_USE_FOUNDRY="0",
+            )
         overridden = [name for name in _USER_OTEL_LOG_VARIABLES if name in env]
         if overridden:
             print(

@@ -1,25 +1,30 @@
 """A normal interactive coding-agent CLI, observed and controlled by Agency.
 
-`agency claude` / `agency codex` run the user's own CLI -- their login,
-settings, plugins and MCP servers -- on a PTY that the web UI embeds. No
-workflow, sandbox or model gateway is involved. This process is the run's
-execution process, exactly like a workflow script under `agwebui.run()`, so
-the web UI, profiler sampling and control relay come from there unchanged.
+`agency claude` / `agency codex` inherit the user's terminal and native CLI
+settings. The shared tracer, collectors and control service stay outside the
+CLI workload scope. An opt-in gateway archives native model traffic without
+a workflow or Agency sandbox. An explicit browser mode retains the existing
+PTY and terminal page. Both modes reuse `agwebui.run()` for the dashboard,
+profiler sampling and control relay.
 
 What Agency adds to the CLI, and why each is needed:
 
 * Lifecycle hooks (merged with the user's own). They give live tool starts
   and ends, permission prompts and turn boundaries, recorded through the same
-  HostInteractionServer that external harnesses report to. Agency's hook
-  replies are always empty, so the CLI's own permission flow is unchanged:
-  Agency observes, it never approves or denies.
+  HostInteractionServer that external harnesses report to. Optional Agency
+  policy can deny a tool; an allow returns no forced permission decision so
+  the CLI's own permission flow still applies.
 * OpenTelemetry log export to this process. No hook reports model requests;
   the CLIs' own telemetry carries each request's measured timing and tokens,
-  delivered in batches shortly after the request ends.
+  delivered in batches shortly after the request ends. With --capture, native
+  HTTP requests/responses supply model records instead; model OTel is ignored
+  to avoid duplicates, while tool and lifecycle telemetry is retained.
 * Its own systemd scope (cgroup). The profiler samples that scope's CPU,
   memory and processes, pause/resume freezes it, and stop kills everything
   the session started, including background processes outside its process
   group.
+* Optional shared ptrace supervision follows local child processes and applies
+  selected syscall policy without reading or replacing terminal input/output.
 
 Each CLI's module (claude_code.py, codex.py) supplies how to launch it and
 how to read its telemetry; everything else lives here. Linux only.
@@ -33,13 +38,17 @@ import hmac
 import json
 import os
 import re
+import runpy
 import secrets
+import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -52,8 +61,15 @@ from fastapi.responses import JSONResponse, Response
 
 # Read by the web UI server (agwebui/server.py) to relay its terminal page.
 SESSION_FILE = "terminal_session.json"
+SESSION_INFO_FILE = "interactive_session.json"
 TOKEN_VARIABLE = "AGENCY_SESSION_TOKEN"
 _SCOPED_VARIABLE = "AGENCY_SESSION_SCOPED"
+
+
+def hook_command() -> str:
+    """Stable command hook; per-session credentials stay in the environment."""
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).with_name('_hook_relay.py')))}"
+
 
 # Set by a coding-agent process for its own children. When Agency itself is
 # launched from inside one they describe that *other* session, and the CLI
@@ -69,6 +85,18 @@ _PARENT_SESSION_VARIABLES = (
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_CODE_EXECPATH",
     "CLAUDE_PID",
+    # Desktop Codex injects its current chat's tool pipe and identity. A new
+    # interactive CLI must create its own tools/session, rather than inherit
+    # this process's desktop tool routing and permission profile.
+    "CODEX_APP_TOOLS_PIPE_PATH",
+    "CODEX_APP_RUNTIME_CLI_PATH",
+    "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_TOOL_CALL_ID",
+    "CODEX_PERMISSION_PROFILE",
+    "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "AGENCY_SESSION_ENFORCE_POLICY",
 )
 
 # PreToolUse blocks the tool until answered. Keep a wedged Agency from
@@ -136,6 +164,11 @@ class CliSession:
         run_dir: Path,
         ui_port: int,
         use_scope: bool,
+        capture=None,
+        terminal_mode: str = "native",
+        trace: bool = True,
+        policy=None,
+        ptrace_config=None,
     ) -> None:
         self.cwd = cwd
         self.binary = binary
@@ -143,6 +176,33 @@ class CliSession:
         self.run_dir = run_dir
         self.ui_port = ui_port
         self.use_scope = use_scope
+        self.capture = capture
+        if terminal_mode not in {"native", "browser"}:
+            raise ValueError("terminal_mode must be native or browser")
+        from ..agpolicy import agpolicy
+        from ..configs.agconfig import agconfig, ptraceconfig
+
+        self.terminal_mode = terminal_mode
+        self.trace = trace
+        self.policy = policy if policy is not None else agpolicy()
+        self.runtime_config = agconfig(ptrace_config or ptraceconfig())
+        self.runtime_config.ptrace.syscalls = tuple(
+            dict.fromkeys(
+                (
+                    *self.runtime_config.ptrace.syscalls,
+                    *(self.policy.syscall_hooks or {}),
+                )
+            )
+        )
+        if (self.policy.syscall_hooks or self.policy.default_to_deny) and not trace:
+            raise ValueError("syscall policy requires tracing")
+        if terminal_mode == "browser" and trace:
+            raise ValueError("tracing requires the native terminal mode")
+        self._capture_gateway = None
+        if capture is not None:
+            from .capture import CaptureGateway
+
+            self._capture_gateway = CaptureGateway(self, capture)
         self.session_id = str(uuid.uuid4())
         self.host_token = secrets.token_urlsafe(32)
         self.ui_token = secrets.token_urlsafe(32)
@@ -189,16 +249,29 @@ class CliSession:
 
     def run(self) -> None:
         """agwebui.run() workload: lasts exactly as long as the CLI."""
-        self.start()
-        print(
-            f"[agency] {self.label} session ready: http://127.0.0.1:{self.ui_port}/terminal"
-            f"#token={self.ui_token}",
-            flush=True,
-        )
-        print(f"[agency] {self.label} starts when the terminal page first connects.", flush=True)
         try:
-            while not self.ended.wait(0.5):
-                pass
+            self.start()
+            if self.terminal_mode == "native":
+                print(
+                    f"[agency] Dashboard: http://127.0.0.1:{self.ui_port}/profiler?run=live",
+                    flush=True,
+                )
+                self.launch_native()
+            else:
+                print(
+                    f"[agency] {self.label} session ready: http://127.0.0.1:{self.ui_port}/terminal"
+                    f"#token={self.ui_token}",
+                    flush=True,
+                )
+                print(
+                    f"[agency] {self.label} starts when the terminal page first connects.",
+                    flush=True,
+                )
+            while not self.ended.wait(0.05 if self.terminal_mode == "native" else 0.5):
+                if self.terminal_mode == "native" and self.terminal is not None:
+                    self.terminal.poll_job_control()
+            if getattr(self, "_process_error", None) is not None:
+                raise RuntimeError("CLI supervision failed") from self._process_error
         finally:
             self.close()
 
@@ -209,30 +282,75 @@ class CliSession:
         from ..orchestrator import get_orchestrator
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        if self.capture is not None:
+            # The SQLite projection contains the same complete context as
+            # the private wire archive, including opaque provider state.
+            self.run_dir.chmod(0o700)
         self._global_logger = global_logger or get_orchestrator().data_logger
         self._main = self._open_actor(
             self.agent_name,
             f"{self.agent_name}_data.sqlite3",
-            {"cwd": str(self.cwd), "interactive_session_id": self.session_id},
+            {
+                "cwd": str(self.cwd),
+                "interactive_session_id": self.session_id,
+                "terminal_mode": self.terminal_mode,
+                "trace": self.trace,
+            },
         )
         self._agent_logger = self._main.logger
         self._host = self._main.host
         self._set_state("agent_idle")
-        agprof.register_engine(self.harness, **self.engine_coverage)
+        coverage = dict(self.engine_coverage)
+        coverage.update(
+            terminal=self.terminal_mode,
+            syscalls="ptrace_selected" if self.trace else "unavailable",
+            processes="ptrace_lifecycle" if self.trace else "sampled",
+        )
+        if self.capture is not None:
+            coverage.update(
+                llm="wire_capture",
+                reason="Native HTTP bodies archived through the opt-in capture gateway; hooks observe tools.",
+            )
+        agprof.register_engine(self.harness, **coverage)
         self._start_server()
         self._prepare()
+        if self.terminal_mode == "browser":
+            self._write_private_json(
+                SESSION_FILE,
+                {
+                    "host_port": self.port,
+                    "host_token": self.host_token,
+                    "ui_token": self.ui_token,
+                    "label": self.label,
+                    "session_id": self.session_id,
+                    "cwd": str(self.cwd),
+                    "capture": {
+                        "model": self.capture.model,
+                        "gateway": f"http://127.0.0.1:{self.port}/capture",
+                    }
+                    if self.capture is not None
+                    else None,
+                },
+            )
+        register_standalone_target(self.agent_name, self)
+        self._write_session_info()
+
+    def _write_session_info(self) -> None:
+        """Durable, credential-free identity for the dashboard and run export."""
         self._write_private_json(
-            SESSION_FILE,
+            SESSION_INFO_FILE,
             {
-                "host_port": self.port,
-                "host_token": self.host_token,
-                "ui_token": self.ui_token,
-                "label": self.label,
                 "session_id": self.session_id,
-                "cwd": str(self.cwd),
+                "cli": self.agent_name,
+                "terminal_mode": self.terminal_mode,
+                "trace": self.trace,
+                "runtime_pid": os.getpid(),
+                "cli_pid": getattr(self.terminal, "pid", None),
+                "scope": self.scope_unit if self.scope_dir is not None else None,
+                "returncode": getattr(self.terminal, "returncode", None),
+                "capture_model": self.capture.model if self.capture else None,
             },
         )
-        register_standalone_target(self.agent_name, self)
 
     def close(self) -> None:
         from ..observability.agwebui.relay import unregister_standalone_target
@@ -253,7 +371,8 @@ class CliSession:
         (self.run_dir / SESSION_FILE).unlink(missing_ok=True)
         if self._server is not None:
             self._server.should_exit = True
-            self._server_thread.join(timeout=5)
+            if self._server_thread is not None and self._server_thread.ident is not None:
+                self._server_thread.join(timeout=5)
         for actor in [*self._subagent_actors(), self._main]:
             if actor is None:
                 continue
@@ -265,7 +384,6 @@ class CliSession:
     def _open_actor(self, name: str, db_name: str, created: dict, parent=None) -> _Actor:
         """A new column: its own logger and telemetry server, registered with
         the run (and with its parent, for a subagent)."""
-        from ..agpolicy import agpolicy
         from ..configs.agconfig import agconfig, dataloggerconfig
         from ..engine.host_servers.host_interaction_server import HostInteractionServer
         from ..observability.agdatalogger import agDataLogger
@@ -279,10 +397,12 @@ class CliSession:
         attributes = {"harness": self.harness, "agency.interactive_session_id": self.session_id}
         if parent is not None:
             attributes["agency.parent_agent_id"] = parent
-        # Only HostInteractionServer's telemetry is used: its policy allows
-        # everything, and its admission answer is never returned to the CLI.
         host = HostInteractionServer(
-            SimpleNamespace(policy=agpolicy()), logger, name, profile_attributes=attributes
+            SimpleNamespace(policy=self.policy),
+            logger,
+            name,
+            profile_attributes=attributes,
+            is_cancelled=self.ended.is_set,
         )
         actor = _Actor(name, logger, host)
         logger.record_event(
@@ -378,9 +498,66 @@ class CliSession:
 
     # -- The CLI process -----------------------------------------------------
 
+    def launch_native(self) -> None:
+        """Use the caller's actual terminal; tracing owns no extra PTY."""
+        from .process import NativeProcess
+        from ..engine.host_servers.interaction_policy import InteractionSyscallPolicy
+
+        with self._spawn_lock:
+            if self.terminal is not None:
+                raise RuntimeError("session process already started")
+            self.terminal = NativeProcess(
+                self._cli_argv(),
+                self._environment(),
+                str(self.cwd),
+                trace=self.trace,
+                config=self.runtime_config,
+                policy=InteractionSyscallPolicy(self._host),
+                on_spawn=self._create_scope if self.use_scope else None,
+                agent=SimpleNamespace(agname=self.agent_name),
+            )
+            self._watcher = threading.Thread(
+                target=self._watch_process, name="cli-session-exit", daemon=True
+            )
+            self._write_session_info()
+            self._watcher.start()
+
+    def _create_scope(self, pid: int) -> None:
+        """Move the stopped launch child into its own transient scope."""
+        subprocess.run(
+            [
+                "busctl",
+                "--user",
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                f"{self.scope_unit}.scope",
+                "fail",
+                "2",
+                "PIDs",
+                "au",
+                "1",
+                str(pid),
+                "CollectMode",
+                "s",
+                "inactive-or-failed",
+                "0",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self._register_scope(pid)
+
     def attach_terminal(self, columns: int, rows: int, listener):
         """Start the CLI on first attach, at the first viewer's size, so its
         startup terminal queries reach a real terminal that can answer them."""
+        if self.terminal_mode != "browser":
+            raise ValueError("This CLI uses the local terminal; open the dashboard to inspect it.")
         from .terminal import Terminal
 
         with self._spawn_lock:
@@ -410,32 +587,57 @@ class CliSession:
         env = dict(os.environ)
         for name in (*_PARENT_SESSION_VARIABLES, _SCOPED_VARIABLE):
             env.pop(name, None)
-        env.update(
-            TERM="xterm-256color",
-            COLORTERM="truecolor",
-            **{TOKEN_VARIABLE: self.host_token},
-        )
+        if self.terminal_mode == "browser":
+            env.update(TERM="xterm-256color", COLORTERM="truecolor")
+        env[TOKEN_VARIABLE] = self.host_token
+        env["AGENCY_SESSION_HOOK_URL"] = f"http://127.0.0.1:{self.port}/hooks"
+        if self.policy.tool_hooks or self.policy.default_to_deny:
+            env["AGENCY_SESSION_ENFORCE_POLICY"] = "1"
         self._cli_environment(env)
+        if self.capture is not None:
+            # The upstream credential belongs only to the gateway process.
+            env.pop(self.capture.key_env, None)
         return env
 
     def _watch_process(self) -> None:
         terminal = self.terminal
-        if self.use_scope:
-            self._register_scope(terminal.pid)
-        returncode = terminal.wait()
-        self._agent_logger.record_event(
-            "agent_state",
-            {"state": "agent_exit", "returncode": returncode},
-            update_latest_snapshot=True,
-            term_message=f"[{self.agent_name}] EXITED ({returncode})",
-            print_to_terminal=False,
-            flush=True,
-        )
-        self._finish_subagents("cancelled")
-        # Whatever the session left running (a dev server started with `&`)
-        # belongs to it and ends with it.
-        self._kill_tree()
-        self.ended.set()
+        returncode = None
+        try:
+            if self.use_scope and self.terminal_mode == "browser":
+                self._register_scope(terminal.pid)
+            returncode = terminal.wait()
+        except Exception as exc:
+            self._process_error = exc
+        finally:
+            try:
+                self._write_session_info()
+                self._agent_logger.record_event(
+                    "agent_state",
+                    {
+                        "state": "agent_exit",
+                        "returncode": returncode,
+                        **(
+                            {"error": type(self._process_error).__name__}
+                            if getattr(self, "_process_error", None) is not None
+                            else {}
+                        ),
+                    },
+                    update_latest_snapshot=True,
+                    term_message=f"[{self.agent_name}] EXITED ({returncode})",
+                    print_to_terminal=False,
+                    flush=True,
+                )
+                self._finish_subagents("cancelled")
+            except Exception as exc:
+                self._process_error = exc
+            finally:
+                try:
+                    # Retire background work even if waiting/logging failed.
+                    self._kill_tree()
+                except Exception as exc:
+                    self._process_error = exc
+                finally:
+                    self.ended.set()
 
     def _register_scope(self, pid: int) -> None:
         """Find the scope systemd moved the CLI into, then start sampling it."""
@@ -476,7 +678,8 @@ class CliSession:
     def pause(self) -> None:
         if self._paused or not self._process_running():
             return
-        if not self._write_scope("cgroup.freeze", "1"):
+        self._pause_via_process = not self._write_scope("cgroup.freeze", "1")
+        if self._pause_via_process:
             self.terminal.signal_group(signal.SIGSTOP)
         self._paused = True
         self._agent_logger.record_event("agent_paused", {}, update_latest_snapshot=True, flush=True)
@@ -484,8 +687,14 @@ class CliSession:
     def resume(self) -> None:
         if not self._paused:
             return
-        if not self._write_scope("cgroup.freeze", "0") and self.terminal is not None:
+        thawed = self._write_scope("cgroup.freeze", "0")
+        if getattr(self, "_pause_via_process", False) and self.terminal is not None:
             self.terminal.signal_group(signal.SIGCONT)
+        elif not thawed:
+            # SIGCONT cannot thaw a frozen cgroup. Keep the paused state so
+            # the user can retry rather than falsely reporting a resume.
+            raise RuntimeError("Cannot unfreeze the CLI workload scope")
+        self._pause_via_process = False
         self._paused = False
         self._agent_logger.record_event(
             "agent_resumed", {}, update_latest_snapshot=True, flush=True
@@ -510,6 +719,10 @@ class CliSession:
 
     def interrupt(self) -> None:
         """What pressing Escape in the CLI's own terminal does."""
+        if self.terminal_mode != "browser":
+            raise ValueError(
+                "Interrupt the CLI from its local terminal; Agency cannot inject keys into it."
+            )
         if self._process_running():
             self.terminal.write(b"\x1b")
 
@@ -580,7 +793,7 @@ class CliSession:
         ]
         return candidates[0] if len(candidates) == 1 else None
 
-    def handle_hook(self, payload: dict) -> None:
+    def handle_hook(self, payload: dict) -> "dict | None":
         """Claude Code and Codex share these hook names and field names; an
         event one CLI never sends is simply never matched."""
         event = payload.get("hook_event_name")
@@ -601,7 +814,11 @@ class CliSession:
             )
             self._set_state("running_harness", actor)
         elif event == "PreToolUse":
-            self._tool_started(actor, payload)
+            admission = self._tool_started(actor, payload)
+            if not admission["allowed"]:
+                from ..harness._native_hooks import decision_to_hook_response
+
+                return decision_to_hook_response((False, admission["reason"]))
         elif event == "PermissionRequest":
             self._await_input(
                 f"{self.label} asks permission to use {payload.get('tool_name')}", actor
@@ -662,7 +879,7 @@ class CliSession:
         with self._telemetry_lock:
             return list(self._pending_tools)
 
-    def _tool_started(self, actor: _Actor, payload: dict) -> None:
+    def _tool_started(self, actor: _Actor, payload: dict) -> dict:
         tool_use_id = payload.get("tool_use_id")
         tool_name = str(payload.get("tool_name") or "unknown")
         tool_input = payload.get("tool_input")
@@ -678,9 +895,10 @@ class CliSession:
         admission = actor.host.admit_tool_call(
             tool_name, tool_input, {"model_tool_call_id": tool_use_id}
         )
-        if tool_use_id:
+        if tool_use_id and admission["allowed"]:
             with self._telemetry_lock:
                 self._pending_tools[tool_use_id] = (actor, admission["call_id"])
+        return admission
 
     def _tool_finished(self, tool_use_id, *, result=None, error=None, duration_ms=None) -> bool:
         """Close a pending call; False when none was pending for this id."""
@@ -734,6 +952,8 @@ class CliSession:
     ) -> None:
         """One completed model request, placed where it actually ran. The
         CLIs report a request only after it ends, so this is always late."""
+        if self.capture is not None:
+            return  # The gateway is authoritative; retain OTel tool/lifecycle events.
         actor = actor or self._main
         call_label = uuid.uuid4().hex[:12]
         metadata = {
@@ -797,15 +1017,32 @@ class CliSession:
     def _build_app(self) -> FastAPI:
         app = FastAPI()
 
+        if self._capture_gateway is not None:
+
+            @app.api_route("/capture/{path:path}", methods=["GET", "POST", "DELETE"])
+            async def capture_request(request: Request, path: str):
+                return await self._capture_gateway.forward(request, path)
+
         @app.post("/hooks")
         def hooks(payload: dict, request: Request):
             header = request.headers.get("authorization", "")
             if not self._authorized(header.removeprefix("Bearer ")):
                 return Response(status_code=401)
             try:
-                self.handle_hook(payload)
+                decision = self.handle_hook(payload)
             except Exception as exc:
-                print(f"[agency] WARNING: hook telemetry dropped: {type(exc).__name__}: {exc}")
+                print(f"[agency] WARNING: hook failed: {type(exc).__name__}")
+                if payload.get("hook_event_name") == "PreToolUse" and (
+                    self.policy.tool_hooks or self.policy.default_to_deny
+                ):
+                    from ..harness._native_hooks import decision_to_hook_response
+
+                    return JSONResponse(
+                        decision_to_hook_response((False, "Agency policy check failed"))
+                    )
+                decision = None
+            if decision:
+                return JSONResponse(decision)
             # An empty 2xx body is "no decision": the CLI continues with its
             # normal permission flow.
             return Response(status_code=200)
@@ -822,6 +1059,9 @@ class CliSession:
 
         @app.websocket("/terminal")
         async def terminal(websocket: WebSocket):
+            if self.terminal_mode != "browser":
+                await websocket.close(code=4404)
+                return
             if not self._authorized(websocket.headers.get("x-agency-token")):
                 await websocket.close(code=4401)
                 return
@@ -907,7 +1147,13 @@ class CliSession:
         import uvicorn
 
         server = uvicorn.Server(
-            uvicorn.Config(self._build_app(), host="127.0.0.1", port=0, log_level="warning")
+            uvicorn.Config(
+                self._build_app(),
+                host="127.0.0.1",
+                port=0,
+                log_level="warning",
+                timeout_graceful_shutdown=3,
+            )
         )
         self._server = server
         self._server_thread = threading.Thread(
@@ -1020,15 +1266,59 @@ def _user_scope_available() -> bool:
     return probe()
 
 
+@contextmanager
+def _post_cli_sigint(session, *, enabled: bool):
+    """Finish native CLI cleanup if another Ctrl-C arrives after it exits."""
+    if not enabled or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGINT)
+
+    def interrupt(signum, frame):
+        if getattr(session.terminal, "returncode", None) is not None:
+            return
+        if callable(previous):
+            previous(signum, frame)
+        elif previous == signal.SIG_DFL:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
+
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def main(session_class, command: str, argv) -> int:
-    """`agency <command>`: run *session_class* inside the web UI."""
+    """`agency <command>`: run a native CLI with the shared Agency runtime."""
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog=f"agency {command}",
-        description=f"Run an interactive {session_class.label} session inside Agency's web UI.",
+        description=f"Run {session_class.label} in your terminal with Agency observation and controls.",
     )
     parser.add_argument("--cwd", default=".", help=f"Directory {session_class.label} works in")
     parser.add_argument("--port", type=int, default=7860, help="Web UI port (127.0.0.1 only)")
+    parser.add_argument(
+        "--terminal",
+        choices=["native", "browser"],
+        default="native",
+        help="Use your current terminal (default), or the optional browser terminal",
+    )
+    parser.add_argument(
+        "--trace",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Trace local CLI processes/syscalls (default: on for native terminal)",
+    )
+    parser.add_argument(
+        "--trace-file-access",
+        action="store_true",
+        help="Record file-access metadata using the shared tracer",
+    )
+    parser.add_argument(
+        "--policy", type=Path, help="Python configuration file exporting policy = agpolicy(...)"
+    )
     parser.add_argument(
         f"--{command}",
         dest="binary",
@@ -1046,6 +1336,16 @@ def main(session_class, command: str, argv) -> int:
         help=f"Exit when {session_class.label} exits instead of keeping the UI",
     )
     parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="Route native model HTTP requests through Agency and archive full context (opt-in)",
+    )
+    parser.add_argument(
+        "--capture-model",
+        choices=["gpt-6-luna", "claude-haiku-5-5"],
+        help="Capture model on LiteLLM (default: gpt-6-luna, validated with both CLIs)",
+    )
+    parser.add_argument(
         "cli_args", nargs=argparse.REMAINDER, help=f"Arguments after -- go to {command}"
     )
     args = parser.parse_args(argv)
@@ -1054,6 +1354,28 @@ def main(session_class, command: str, argv) -> int:
     if not sys.platform.startswith("linux"):
         print(f"agency {command}: Linux only", file=sys.stderr)
         return 1
+    trace = args.trace if args.trace is not None else args.terminal == "native"
+    if args.terminal == "native" and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error(
+            "native mode requires your terminal on stdin/stdout; use --terminal browser for remote viewing"
+        )
+    if args.terminal == "browser" and trace:
+        parser.error("--trace requires --terminal native")
+    if args.trace_file_access and not trace:
+        parser.error("--trace-file-access requires --trace")
+    from ..agpolicy import agpolicy
+    from ..configs.agconfig import ptraceconfig
+
+    policy = agpolicy()
+    if args.policy:
+        try:
+            policy = runpy.run_path(str(args.policy.resolve()))["policy"]
+        except (OSError, KeyError) as exc:
+            parser.error(f"cannot load policy: {exc}")
+        if not isinstance(policy, agpolicy):
+            parser.error("policy file must export an agpolicy instance named policy")
+    if not trace and (policy.syscall_hooks or policy.default_to_deny):
+        parser.error("syscall policy requires --trace")
     binary = args.binary or shutil.which(command)
     if not binary:
         print(f"agency {command}: `{command}` not found on PATH (use --{command})", file=sys.stderr)
@@ -1062,6 +1384,15 @@ def main(session_class, command: str, argv) -> int:
     if not cwd.is_dir():
         print(f"agency {command}: {cwd} is not a directory", file=sys.stderr)
         return 1
+    capture = None
+    if args.capture_model and not args.capture:
+        parser.error("--capture-model requires --capture")
+    if args.capture:
+        from .capture import CaptureConfig
+
+        if not os.environ.get("LITE_LLM_KEY"):
+            parser.error("--capture requires LITE_LLM_KEY in the environment")
+        capture = CaptureConfig(args.capture_model or "gpt-6-luna")
     use_scope = not args.no_scope and _user_scope_available()
     if use_scope and os.environ.get(_SCOPED_VARIABLE) != "1":
         # Run this process in its own scope too, so the profiler's workload
@@ -1102,10 +1433,30 @@ def main(session_class, command: str, argv) -> int:
         run_dir=_DEFAULT_LOG_DIR,
         ui_port=args.port,
         use_scope=use_scope,
+        capture=capture,
+        terminal_mode=args.terminal,
+        trace=trace,
+        policy=policy,
+        ptrace_config=ptraceconfig(file_access=args.trace_file_access),
     )
 
     def interactive_session():
-        session.run()
+        try:
+            session.run()
+        except Exception as exc:
+            # agwebui records workload failures before returning to its
+            # caller; preserve a failing exit status for the CLI wrapper.
+            session._process_error = exc
+            raise
 
-    agwebui.run(interactive_session, port=args.port, host="127.0.0.1", linger=not args.no_linger)
-    return 0
+    with _post_cli_sigint(session, enabled=args.terminal == "native"):
+        agwebui.run(
+            interactive_session,
+            port=args.port,
+            host="127.0.0.1",
+            linger=args.terminal == "browser" and not args.no_linger,
+        )
+    if getattr(session, "_process_error", None) is not None:
+        return 1
+    returncode = getattr(session.terminal, "returncode", None)
+    return (128 - returncode if returncode < 0 else returncode) if returncode is not None else 0

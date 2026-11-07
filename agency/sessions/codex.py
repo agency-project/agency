@@ -8,7 +8,7 @@ Codex specifics, each checked against Codex CLI 0.162.1:
   Codex itself asks ("Hooks need review"). The hook command is therefore the
   same in every session -- per-session endpoint and token come from the
   environment -- so one approval lasts.
-* Model requests come from OpenTelemetry log events: `codex.api_request` ends
+* Without capture, model requests come from OpenTelemetry log events: `codex.api_request` ends
   when response headers arrive (its duration_ms covers request start to
   headers), and the following `codex.sse_event` of kind `response.completed`
   ends the response and carries its tokens. Codex records times only in the
@@ -24,15 +24,19 @@ Codex specifics, each checked against Codex CLI 0.162.1:
 from __future__ import annotations
 
 import json
-import shlex
-import sys
 import threading
 import tomllib
 from pathlib import Path
 
-from .session import CliSession, main as run_session, number, otlp_log_records
+from .session import (
+    TOKEN_VARIABLE,
+    CliSession,
+    hook_command,
+    main as run_session,
+    number,
+    otlp_log_records,
+)
 
-_HOOK_RELAY = Path(__file__).with_name("_hook_relay.py")
 
 HOOK_EVENTS = (
     "SessionStart",
@@ -51,11 +55,6 @@ HOOK_EVENTS = (
 _HOOK_TIMEOUT_S = 3
 # Codex reports an approval prompt answered "no" (or cancelled) like this.
 _REJECTED_DECISIONS = {"denied", "abort"}
-
-
-def hook_command() -> str:
-    """The exact command every Codex hook runs; see the module docstring."""
-    return f"{shlex.quote(sys.executable)} {shlex.quote(str(_HOOK_RELAY))}"
 
 
 class CodexSession(CliSession):
@@ -94,7 +93,30 @@ class CodexSession(CliSession):
             "-c",
             f'otel.exporter={{"otlp-http"={{endpoint="{endpoint}",protocol="json"}}}}',
         ]
-        return [self.binary, *overrides, *self.cli_args]
+        capture = []
+        if self.capture is not None:
+            capture = [
+                "-c",
+                'model_provider="agency_capture"',
+                "-c",
+                f"model={json.dumps(self.capture.model)}",
+                "-c",
+                'model_providers.agency_capture.name="Agency capture"',
+                "-c",
+                f'model_providers.agency_capture.base_url="http://127.0.0.1:{self.port}/capture/v1"',
+                "-c",
+                f'model_providers.agency_capture.env_key="{TOKEN_VARIABLE}"',
+                "-c",
+                'model_providers.agency_capture.wire_api="responses"',
+                "-c",
+                "model_providers.agency_capture.requires_openai_auth=false",
+                "-c",
+                "model_providers.agency_capture.supports_websockets=false",
+            ]
+        # A shared daemon would run the actual tools outside this session's
+        # tracing and workload scope. Keep the native TUI and local server
+        # together; this does not change approval or sandbox settings.
+        return [self.binary, "--no-daemon", *overrides, *self.cli_args, *capture]
 
     def _cli_environment(self, env: dict) -> None:
         exporter = _configured_otel_exporter(env)
@@ -105,7 +127,6 @@ class CodexSession(CliSession):
                 flush=True,
             )
         env.update(
-            AGENCY_SESSION_HOOK_URL=f"http://127.0.0.1:{self.port}/hooks",
             OTEL_EXPORTER_OTLP_LOGS_HEADERS=f"x-agency-token={self.host_token}",
         )
 
@@ -115,7 +136,7 @@ class CodexSession(CliSession):
             attributes = record["attributes"]
             at = record["time"]
             if name == "conversation_starts" and attributes.get("model"):
-                self._register(model=attributes["model"])
+                self._register(self._main, model=attributes["model"])
             elif name == "api_request":
                 self._api_request(attributes, at)
             elif name == "sse_event":

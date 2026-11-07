@@ -29,7 +29,7 @@ def main(argv=None):
         commands.add_parser(
             name,
             add_help=False,
-            help=f"Run an interactive {label} session in the web UI (see: agency {name} --help)",
+            help=f"Run {label} in your terminal with Agency observation (see: agency {name} --help)",
         )
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] in (["claude"], ["codex"]):

@@ -26,11 +26,11 @@ function descriptors(m,run,includeSystems=false,latestSystems=false){const wall=
  if(includeSystems){
   // Recorded series keep their own scope: Host and Workload cover the entire system, never the agent selection.
   for(const metric of systemMeasurements(run,{latestOnly:latestSystems})){rows['system:'+metric.name]=[`${metric.label} · ${metric.scope}`,`${num(metric.latest[1])} ${metric.unit==='MB'?'MiB':metric.unit==='MB/s'?'MiB/s':metric.unit}`,`${m.scoped?'Not filtered by the agent selection · ':''}${metric.scope} · ${metric.name} · at ${sec(metric.latest[0])}${metric.statusLabel?` · ${metric.statusLabel}`:''}${metric.label==='CPU'?' · 100% = one core':''}`,'systems',undefined,undefined,m.scoped];}
-  // Agent-level resources are the selected agents' own sandbox containers and nothing else.
+  // Agent-level resources come only from the selected agents' owned workload cgroups.
   const resources=agentResources(run,m.agents.map(a=>a.id)),who=m.scoped?'selected agents':'all agents';
   if(m.scoped||resources.sandboxes||resources.shared)for(const [key,label,measured,unit,extra] of [['cpu','CPU',resources.cpu,'%',' · 100% = one core'],['mem','RAM',resources.memory,'MiB','']]){
-   const missing=!resources.sandboxes?(resources.shared?'Sandbox is shared with agents outside the selection':'No sandbox recorded for these agents'):'No current container sample';
-   rows['scope:'+key]=[`${label} · agent sandboxes`,measured?`${num(measured.value)} ${unit}`:'Unavailable',`${measured?`Sum of ${measured.sandboxes} of ${resources.sandboxes} sandbox containers of ${who}`:missing}${extra}${resources.shared&&resources.sandboxes?` · ${resources.shared} shared sandbox${resources.shared===1?'':'es'} excluded`:''} · excludes orchestrator, host services, runtime daemons and model inference`,'systems'];
+   const missing=!resources.sandboxes?(resources.shared?'Workload is shared with agents outside the selection':'No workload cgroup recorded for these agents'):'No current workload sample';
+   rows['scope:'+key]=[`${label} · agent workloads`,measured?`${num(measured.value)} ${unit}`:'Unavailable',`${measured?`Sum of ${measured.sandboxes} of ${resources.sandboxes} workload cgroups of ${who}`:missing}${extra}${resources.shared&&resources.sandboxes?` · ${resources.shared} shared workload${resources.shared===1?'':'s'} excluded`:''} · excludes orchestrator, host services, runtime daemons and model inference`,'systems'];
   }
  }
  return rows;

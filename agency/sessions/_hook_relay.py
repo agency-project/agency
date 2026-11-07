@@ -1,8 +1,9 @@
 """Forward one CLI hook payload to the Agency session that launched the CLI.
 
-For CLIs that run only command hooks (Codex). Deliberately stdlib-only and
-silent: it runs as a subprocess of the CLI, and printing nothing means "no
-decision", so the CLI's own approval flow always proceeds unchanged.
+Used by Codex hooks and Claude Code's explicit-policy PreToolUse hook.
+Deliberately stdlib-only: an empty successful reply leaves the CLI's native
+permission flow in charge; a policy denial is forwarded as native hook JSON.
+An unavailable policy service blocks enforced PreToolUse calls with exit 2.
 
 The command line that runs this file must be identical in every session --
 Codex trusts a hook by the hash of its definition -- so everything
@@ -11,6 +12,7 @@ Outside an Agency session those variables are absent and it does nothing.
 """
 
 import os
+import json
 import sys
 import urllib.request
 
@@ -33,9 +35,19 @@ def main() -> int:
     )
     try:
         with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
-            response.read()
+            decision = response.read()
+        if decision:
+            sys.stdout.buffer.write(decision)
+            sys.stdout.buffer.flush()
     except Exception as exc:
         print(f"[agency hook relay] {type(exc).__name__}: {exc}", file=sys.stderr)
+        if os.environ.get("AGENCY_SESSION_ENFORCE_POLICY") == "1":
+            try:
+                event = json.loads(payload).get("hook_event_name")
+            except (ValueError, AttributeError):
+                event = "PreToolUse"
+            if event == "PreToolUse":
+                return 2
     return 0
 
 
