@@ -20,7 +20,7 @@ import pytest
 from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import CodexAdapter
 from agency.observability.agdatalogger import read_llm_exchanges
-from agency.sessions.capture import CaptureConfig
+from agency.sessions.capture import CaptureConfig, NativeCaptureConfig
 from agency.sessions.claude_code import ClaudeCodeSession
 from agency.sessions.codex import CodexSession
 
@@ -65,7 +65,11 @@ class NativeUpstream:
                 pass
 
             def do_GET(self):
+                # A native WebSocket-capable client can fall back to SSE after
+                # a valid HTTP rejection; this fixture only implements SSE.
+                self.protocol_version = "HTTP/1.1"
                 self.send_response(404)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
             def do_POST(self):
@@ -179,8 +183,12 @@ class NativeUpstream:
                                 break
                         except socket.timeout:
                             pass
+                        except ConnectionResetError:
+                            owner.cancelled.set()
+                            break
                     return
                 text = json.dumps(history)
+                title_request = "Generate a concise, single-line task title" in text
                 turn = 2 if "CAPTURE_SECOND_PROMPT" in text else 1
                 marker = f"CAPTURE_TOOL_{turn}"
                 tools = body.get("tools", [])
@@ -238,6 +246,8 @@ class NativeUpstream:
                     }
                 else:
                     block = {"type": "text", "index": 0, "text": f"CAPTURE_TURN_{turn}_DONE"}
+                if title_request:
+                    block = {"type": "text", "index": 0, "text": "Capture fixture title"}
                 if len(owner.requests) > 20:
                     block = {"type": "text", "index": 0, "text": "SCRIPTED_UPSTREAM_TOOL_LOOP"}
                 if protocol == "responses":
@@ -317,13 +327,143 @@ class NativeUpstream:
 
     def close(self):
         self.closing.set()
+        if hasattr(self, "_websocket_server"):
+            self._websocket_server.should_exit = True
+            self._websocket_thread.join(5)
         self.server.shutdown()
         self.server.server_close()
 
+    def enable_websocket(self):
+        """Native WS fixture over the same scripted provider, with stored state.
 
-@pytest.mark.parametrize("protocol", ["messages", "responses"])
+        The CLI sends incremental input after previous_response_id. Hydration
+        happens inside this fake provider, never inside Agency's capture path.
+        """
+        import anyio
+        import httpx
+        import uvicorn
+        from fastapi import FastAPI, Request, WebSocket
+        from fastapi.responses import Response
+        from starlette.websockets import WebSocketDisconnect
+
+        app, original_url = FastAPI(), self.url
+        self.native_auth_seen = []
+
+        @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE"])
+        async def http(request: Request, path: str):
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.request(
+                    request.method, original_url + "/" + path, content=await request.body()
+                )
+                return Response(
+                    response.content,
+                    status_code=response.status_code,
+                    headers={
+                        "content-type": response.headers.get("content-type", "application/json")
+                    },
+                )
+
+        @app.websocket("/{path:path}")
+        async def websocket(ws: WebSocket, path: str):
+            self.native_auth_seen.append(
+                (
+                    ws.headers.get("authorization") == "Bearer fixture-native-bearer",
+                    ws.headers.get("chatgpt-account-id") == "fixture-account",
+                    ws.headers.get("x-agency-token") is None,
+                )
+            )
+            await ws.accept()
+            history = []
+            active = {"scope": None, "response_id": None}
+            sender, receiver = anyio.create_memory_object_stream(1)
+            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+                async with anyio.create_task_group() as group:
+
+                    async def receive():
+                        try:
+                            while True:
+                                body = await ws.receive_json()
+                                if body.get("type") == "response.interrupt":
+                                    if active["scope"] is not None:
+                                        active["scope"].cancel()
+                                    await ws.send_json(
+                                        {
+                                            "type": "response.cancelled",
+                                            "response_id": active["response_id"]
+                                            or body.get("response_id"),
+                                        }
+                                    )
+                                else:
+                                    await sender.send(body)
+                        except WebSocketDisconnect:
+                            pass
+                        finally:
+                            group.cancel_scope.cancel()
+
+                    async def generate():
+                        nonlocal history
+                        async with receiver:
+                            async for body in receiver:
+                                if body.get("generate") is False:
+                                    await ws.send_json(
+                                        {
+                                            "type": "response.completed",
+                                            "response": {
+                                                "id": "fixture-prewarm",
+                                                "status": "completed",
+                                                "output": [],
+                                            },
+                                        }
+                                    )
+                                    continue
+                                context = (
+                                    [*history, *body.get("input", [])]
+                                    if body.get("previous_response_id")
+                                    else body.get("input", [])
+                                )
+                                request_body = {**body, "input": context}
+                                with anyio.CancelScope() as scope:
+                                    active["scope"] = scope
+                                    async with client.stream(
+                                        "POST", original_url + "/responses", json=request_body
+                                    ) as response:
+                                        async for line in response.aiter_lines():
+                                            if line.startswith("data: ") and line != "data: [DONE]":
+                                                event = json.loads(line[6:])
+                                                if event.get("type") == "response.created":
+                                                    active["response_id"] = event["response"]["id"]
+                                                await ws.send_text(line[6:])
+                                                if event.get("type") == "response.completed":
+                                                    history = [
+                                                        *context,
+                                                        *event["response"].get("output", []),
+                                                    ]
+                                active["scope"] = None
+
+                    group.start_soon(receive)
+                    group.start_soon(generate)
+
+        self._websocket_server = uvicorn.Server(
+            uvicorn.Config(
+                app, host="127.0.0.1", port=0, log_level="warning", timeout_graceful_shutdown=2
+            )
+        )
+        self._websocket_thread = threading.Thread(target=self._websocket_server.run, daemon=True)
+        self._websocket_thread.start()
+        deadline = time.monotonic() + 10
+        while not self._websocket_server.started:
+            assert time.monotonic() < deadline, "native WS fixture did not start"
+            time.sleep(0.01)
+        self.url = (
+            f"http://127.0.0.1:{self._websocket_server.servers[0].sockets[0].getsockname()[1]}"
+        )
+
+
+@pytest.mark.parametrize("protocol", ["messages", "responses", "responses-native"])
 def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol):
     claude = protocol == "messages"
+    native = protocol == "responses-native"
+    protocol = "responses" if native else protocol
     binary = os.environ.get("AGENCY_CAPTURE_TEST_CLAUDE" if claude else "AGENCY_CAPTURE_TEST_CODEX")
     if not binary:
         pytest.skip("set AGENCY_CAPTURE_TEST_CLAUDE / AGENCY_CAPTURE_TEST_CODEX to opt in")
@@ -335,11 +475,21 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
     upstream = None
     if live:
         assert os.environ.get("LITE_LLM_KEY"), "live test requires LITE_LLM_KEY"
-        config = CaptureConfig(model)
+        config = (
+            NativeCaptureConfig(api_base_url="https://router.js-park.info/v1")
+            if native
+            else CaptureConfig(model)
+        )
     else:
         monkeypatch.setenv("LITE_LLM_KEY", "scripted-upstream-fixture-key")
         upstream = NativeUpstream(protocol, model)
-        config = CaptureConfig(model, upstream.url)
+        if native:
+            upstream.enable_websocket()
+        config = (
+            NativeCaptureConfig(api_base_url=upstream.url, chatgpt_base_url=upstream.url)
+            if native
+            else CaptureConfig(model, upstream.url)
+        )
     if claude:
         state = tmp_path / "claude-state"
         state.mkdir()
@@ -358,11 +508,27 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
         cli_args = [
             "--no-alt-screen",
             "--sandbox",
-            "workspace-write",
+            # A user network namespace hides host-root ownership of bwrap.
+            # The offline native fixture runs only scripted printf commands.
+            "danger-full-access" if native and not live else "workspace-write",
             "-a",
             "never",
             "--dangerously-bypass-hook-trust",
         ]
+        if native:
+            # Exercise Codex-owned API authentication without real subscription
+            # credentials or account-discovery requests. Live mode is LiteLLM
+            # only; the native subscription bearer path is covered offline.
+            state = tmp_path / "codex-state"
+            state.mkdir(mode=0o700)
+            with os.fdopen(
+                os.open(state / "auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w"
+            ) as credential_file:
+                json.dump({"OPENAI_API_KEY": os.environ["LITE_LLM_KEY"]}, credential_file)
+            monkeypatch.setenv("CODEX_HOME", str(state))
+            monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+            monkeypatch.setenv("OPENAI_API_KEY", os.environ["LITE_LLM_KEY"])
+            cli_args += ["--model", model, "-c", 'cli_auth_credentials_store="file"']
     session = make_session(
         session_class=ClaudeCodeSession if claude else CodexSession,
         binary=binary,
@@ -394,10 +560,13 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
                 viewer.pump()
                 session._agent_logger.flush()
                 exchanges = read_llm_exchanges(session._agent_logger.db_path)
-                if any(
-                    b.get("type") == "text" and f"CAPTURE_TURN_{turn}_DONE" in b.get("text", "")
-                    for e in exchanges
-                    for b in e["response"]
+                if (
+                    any(
+                        b.get("type") == "text" and f"CAPTURE_TURN_{turn}_DONE" in b.get("text", "")
+                        for e in exchanges
+                        for b in e["response"]
+                    )
+                    and session._main.state == "agent_idle"
                 ):
                     break
             else:
@@ -423,13 +592,13 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
             json.loads(p.read_text()) for p in (session.run_dir / "capture").glob("*/manifest.json")
         ]
         assert all(not a["cancelled"] for a in archives)
-        assert all(a["status"] == 200 for a in archives)
+        assert all(a["status"] in ({200, 101, 404} if native else {200}) for a in archives)
         assert session.scope_dir is not None
         if not live:
             viewer.type("CAPTURE_CANCEL_PROMPT: stream until I interrupt")
             viewer.pump()
             viewer.type("\r")
-            if claude:
+            if claude or native:
                 # Claude can defer rendering a text block until block_stop;
                 # interrupt while the native stream is still inside it.
                 def partial_received():
@@ -483,7 +652,7 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
             screen_path.chmod(0o600)
             print(f"{protocol}: /compact captured; paths={sorted({r['path'] for r in records})}")
         print(
-            f"{protocol}: {len(models)} model exchanges, {len(tools)} tools, {len(archives)} wire archives; scope={session.scope_unit}; live={live}"
+            f"{protocol}: {len(models)} model exchanges, {len(tools)} tools, {len(archives)} wire archives; scope={session.scope_unit}; live={live}; native_auth={native}"
         )
     finally:
         viewer.close()

@@ -71,7 +71,7 @@ requires-dist = [
     { name = "pytest-timeout", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.20.0" },
-    { name = "websockets", specifier = ">=14" },
+    { name = "websockets", specifier = ">=15" },
 ]
 provides-extras = ["dev"]
 

@@ -738,8 +738,8 @@ def test_scope_reexec_keeps_capture_options_and_credential_out_of_argv(
     not sys.platform.startswith("linux") or not session_module._user_scope_available(),
     reason="needs systemd user scopes",
 )
-@pytest.mark.parametrize("command", ["claude", "codex"])
-def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command):
+@pytest.mark.parametrize("command,native", [("claude", False), ("codex", False), ("codex", True)])
+def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command, native):
     from websockets.sync.client import connect
     from agency.sessions.terminal import _Screen
 
@@ -754,6 +754,12 @@ def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command):
         AGENCY_PROFILE="0",
     )
     env.pop(session_module._SCOPED_VARIABLE, None)
+    if native:
+        state = tmp_path / "codex-home"
+        state.mkdir()
+        env["CODEX_HOME"] = str(state)
+        env.pop("OPENAI_BASE_URL", None)
+        env.pop("LITE_LLM_KEY", None)
     log = tmp_path / "scope.log"
     with log.open("wb") as output:
         process = subprocess.Popen(
@@ -770,7 +776,7 @@ def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command):
                 str(FIXTURES / f"fake_{command}_session.py"),
                 "--port",
                 str(port),
-                "--capture",
+                "--capture-native" if native else "--capture",
                 "--no-linger",
             ],
             env=env,
@@ -787,7 +793,8 @@ def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command):
             assert process.poll() is None, "scoped entry exited before session startup"
             assert time.monotonic() < deadline, "scoped entry failed to start"
             time.sleep(0.1)
-        assert private["capture"]["model"] == "gpt-6-luna"
+        assert private["capture"]["model"] == (None if native else "gpt-6-luna")
+        assert private["capture"]["authentication"] == ("native" if native else "litellm")
         with connect(
             f"ws://127.0.0.1:{private['host_port']}/terminal",
             additional_headers={"X-Agency-Token": private["host_token"]},

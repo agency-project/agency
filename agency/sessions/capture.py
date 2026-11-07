@@ -2,7 +2,8 @@
 
 The gateway never translates, retries, fits, or edits a provider request. Raw
 bodies are authoritative; Agency blocks are an additional inspection projection.
-Authentication is replaced at the boundary and is never written to the archive.
+LiteLLM mode replaces authentication; native Codex mode forwards the CLI's own
+authentication to its original provider. Credentials are never archived.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import math
 import os
 import re
+import ssl
 import time
 import uuid
 import zlib
@@ -24,8 +26,11 @@ from urllib.parse import urlsplit
 
 import anyio
 import httpx
-from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Request, WebSocket
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 from agency.llm.message_store import MessageStore, with_tool_schema
 
@@ -59,6 +64,7 @@ class CaptureConfig:
     model: str
     base_url: str = "https://router.js-park.info"
     key_env: str = "LITE_LLM_KEY"
+    native = False
 
     def __post_init__(self):
         url = urlsplit(self.base_url)
@@ -66,6 +72,45 @@ class CaptureConfig:
             raise ValueError("capture upstream must be an HTTP(S) URL without credentials")
         if url.query or url.fragment or not self.model or not self.key_env:
             raise ValueError("invalid capture configuration")
+
+
+@dataclass(frozen=True)
+class NativeCaptureConfig:
+    """Fixed upstreams, selected by Codex's native account header, never a URL
+    supplied by an incoming request. Loopback HTTP is useful for offline tests.
+    Login, token persistence and refresh remain entirely owned by Codex.
+    """
+
+    api_base_url: str = "https://api.openai.com/v1"
+    chatgpt_base_url: str = "https://chatgpt.com/backend-api/codex"
+    native = True
+    model = None
+    key_env = None
+
+    def __post_init__(self):
+        for base in (self.api_base_url, self.chatgpt_base_url):
+            if not isinstance(base, str):
+                raise ValueError("native capture upstream must be a URL string")
+            url = urlsplit(base)
+            if (
+                not url.hostname
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or not (
+                    url.scheme == "https"
+                    or url.scheme == "http"
+                    and url.hostname in {"127.0.0.1", "::1", "localhost"}
+                )
+            ):
+                raise ValueError(
+                    "native capture upstream must be HTTPS without credentials (or loopback HTTP)"
+                )
+
+    def upstream(self, headers, path, query):
+        base = self.chatgpt_base_url if headers.get("chatgpt-account-id") else self.api_base_url
+        return base.rstrip("/") + "/" + path.removeprefix("v1/") + ("?" + query if query else "")
 
 
 def _headers(headers, *, archive=False):
@@ -110,8 +155,8 @@ def _events(raw: bytes):
             yield value
 
 
-def _response(raw: bytes, content_type: str, protocol: str):
-    if "text/event-stream" not in content_type:
+def _response(raw: bytes, content_type: str, protocol: str, *, events=None):
+    if events is None and "text/event-stream" not in content_type:
         value = json.loads(raw)
         failed = isinstance(value, dict) and (
             value.get("error") or value.get("status") in {"failed", "incomplete"}
@@ -119,7 +164,7 @@ def _response(raw: bytes, content_type: str, protocol: str):
         return value, True, bool(failed)
     result, blocks, arguments = {}, {}, {}
     terminal = failed = False
-    for event in _events(raw):
+    for event in _events(raw) if events is None else events:
         kind = event.get("type")
         if protocol == "responses":
             if isinstance(event.get("response"), dict):
@@ -147,9 +192,11 @@ def _response(raw: bytes, content_type: str, protocol: str):
                 "error",
             }:
                 terminal = True
-                failed = kind != "response.completed"
+                failed = kind not in {"response.completed", "response.cancelled"}
                 if kind == "error":
                     result["error"] = event.get("error", event)
+                elif kind == "response.cancelled":
+                    result["status"] = "cancelled"
         else:
             if kind == "message_start":
                 result = copy.deepcopy(event.get("message", {}))
@@ -322,6 +369,7 @@ def _prompt(body, protocol):
 class _Recording:
     def __init__(self, session, config, method, path, query, headers, raw, body):
         self.session, self.config, self.body = session, config, body
+        self.model = body.get("model") or config.model
         self.actor = session._main
         self.label = uuid.uuid4().hex
         self.started = time.time()
@@ -337,6 +385,8 @@ class _Recording:
         self.error = None
         self.status = None
         self.response_headers = httpx.Headers()
+        self.frames = None
+        self.frame_index = None
         self.directory = session.run_dir / "capture" / self.label
         self.directory.mkdir(parents=True, mode=0o700)
         (session.run_dir / "capture").chmod(0o700)
@@ -358,7 +408,7 @@ class _Recording:
         if self.is_model:
             self.actor.logger.record_event(
                 "agent_state",
-                {"state": "waiting_llm", "model": config.model},
+                {"state": "waiting_llm", "model": self.model},
                 call_label=self.label,
                 timestamp=self.started,
                 flush=True,
@@ -371,11 +421,37 @@ class _Recording:
             json.dump(self.manifest, f)
         temporary.replace(self.directory / "manifest.json")
 
+    def websocket_frame(self, data):
+        raw = data.encode() if isinstance(data, str) else data
+        frame = {
+            "offset": self.output.tell(),
+            "length": len(raw),
+            "binary": isinstance(data, bytes),
+        }
+        self.frames.append(frame)
+        self.output.write(raw)
+        self.output.flush()
+        if self.frame_index is None:
+            self.frame_index = _private_file(self.directory / "response.frames.jsonl", "w")
+        self.frame_index.write(json.dumps(frame) + "\n")
+        self.frame_index.flush()
+
+    def _websocket_events(self, raw):
+        for frame in self.frames:
+            try:
+                value = json.loads(raw[frame["offset"] : frame["offset"] + frame["length"]])
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(value, dict):
+                yield value
+
     def finish(self):
         if self.finished:
             return
         self.finished = True
         self.output.close()
+        if self.frame_index is not None:
+            self.frame_index.close()
         ended = time.time()
         raw = (self.directory / "response.bin").read_bytes()
         response, terminal, failed = {}, False, False
@@ -384,7 +460,10 @@ class _Recording:
             decoded = _decode(raw, self.response_headers.get("content-encoding", ""))
             if decoded:
                 response, terminal, failed = _response(
-                    decoded, self.response_headers.get("content-type", ""), self.protocol
+                    decoded,
+                    self.response_headers.get("content-type", ""),
+                    self.protocol,
+                    events=self._websocket_events(raw) if self.frames is not None else None,
                 )
         except (
             ValueError,
@@ -447,6 +526,8 @@ class _Recording:
             projection_error=projection_error,
             coverage=coverage,
         )
+        if self.frames is not None:
+            self.manifest.update(transport="websocket", response_frames=self.frames)
         self._save_manifest()
         if not self.is_model:
             self.actor.logger.record_event(
@@ -485,7 +566,7 @@ class _Recording:
         blocks = messages[-1]["blocks"]
         metadata = {
             "type": "metadata",
-            "model": self.config.model,
+            "model": self.model,
             "usage": usage,
             "request_id": self.response_headers.get("x-request-id")
             or self.response_headers.get("request-id"),
@@ -532,11 +613,11 @@ class _Recording:
             print_to_terminal=False,
         )
         self.actor.host.record_span(
-            f"llm:{self.config.model}",
+            f"llm:{self.model}",
             self.started,
             ended,
             {
-                "model": self.config.model,
+                "model": self.model,
                 "provenance": "interactive_capture",
                 "outcome": "cancelled" if self.cancelled else "failure" if failed else "success",
             },
@@ -607,19 +688,54 @@ class _CaptureResponse(StreamingResponse):
 
 
 class CaptureGateway:
-    def __init__(self, session, config: CaptureConfig):
+    def __init__(self, session, config: CaptureConfig | NativeCaptureConfig):
         self.session, self.config = session, config
-        self._key = os.environ.get(config.key_env)
-        if not self._key:
+        self._key = os.environ.get(config.key_env) if config.key_env else None
+        if not config.native and not self._key:
             raise ValueError(f"capture requires {config.key_env}")
+        self._tls = None
+        if config.native:
+            try:
+                self._tls = ssl.create_default_context(
+                    cafile=os.environ.get("CODEX_CA_CERTIFICATE") or os.environ.get("SSL_CERT_FILE")
+                )
+            except OSError as exc:
+                raise ValueError("cannot load the Codex capture CA bundle") from exc
+
+    def _authorized(self, headers):
+        token = (
+            headers.get("x-agency-token")
+            if self.config.native
+            else (
+                headers.get("authorization", "").removeprefix("Bearer ") or headers.get("x-api-key")
+            )
+        )
+        return self.session._authorized(token)
+
+    def _upstream(self, headers, path, query):
+        if self.config.native:
+            return self.config.upstream(headers, path, query)
+        base = self.config.base_url.rstrip("/").removesuffix("/v1")
+        return base + "/" + path + ("?" + query if query else "")
+
+    def _forward_headers(self, headers):
+        if self.config.native:
+            return [(k, v) for k, v in _headers(headers) if k.lower() != "x-agency-token"]
+        result = [
+            (k, v)
+            for k, v in _headers(headers)
+            if k.lower() not in _PRIVATE_HEADERS | {"accept-encoding"}
+        ]
+        return result + [("authorization", "Bearer " + self._key), ("accept-encoding", "identity")]
 
     async def forward(self, request: Request, path: str):
-        token = request.headers.get("authorization", "").removeprefix(
-            "Bearer "
-        ) or request.headers.get("x-api-key")
-        if not self.session._authorized(token):
+        if not self._authorized(request.headers):
             return JSONResponse({"error": {"message": "invalid capture token"}}, status_code=401)
-        if not _PATH.fullmatch(path):
+        if (
+            not _PATH.fullmatch(path)
+            or self.config.native
+            and not path.startswith(("v1/responses", "v1/models"))
+        ):
             return JSONResponse(
                 {"error": {"message": "unsupported capture endpoint"}}, status_code=404
             )
@@ -656,25 +772,26 @@ class CaptureGateway:
             raw,
             body,
         )
-        if (record.is_model or body.get("model")) and body.get("model") != self.config.model:
+        if (
+            not self.config.native
+            and (record.is_model or body.get("model"))
+            and body.get("model") != self.config.model
+        ):
             record.status, record.error = 400, "capture_model_mismatch"
             record.finish()
             return JSONResponse(
                 {"error": {"message": "model differs from the configured capture model"}},
                 status_code=400,
             )
-        base = self.config.base_url.rstrip("/").removesuffix("/v1")
-        url = base + "/" + path + ("?" + request.url.query if request.url.query else "")
-        headers = [
-            (k, v)
-            for k, v in _headers(request.headers)
-            if k.lower() not in _PRIVATE_HEADERS | {"accept-encoding"}
-        ]
-        headers += [("authorization", "Bearer " + self._key), ("accept-encoding", "identity")]
-        if path.startswith("v1/messages"):
+        url = self._upstream(request.headers, path, request.url.query)
+        headers = self._forward_headers(request.headers)
+        if not self.config.native and path.startswith("v1/messages"):
             headers.append(("x-api-key", self._key))
         client = httpx.AsyncClient(
-            timeout=httpx.Timeout(1200, connect=10), follow_redirects=False, trust_env=False
+            timeout=httpx.Timeout(1200, connect=10),
+            follow_redirects=False,
+            trust_env=self.config.native,
+            **({"verify": self._tls} if self.config.native else {}),
         )
         try:
             upstream, error = None, None
@@ -720,3 +837,207 @@ class CaptureGateway:
             )
         record.status, record.response_headers = upstream.status_code, upstream.headers
         return _CaptureResponse(record, upstream, client)
+
+    async def websocket(self, downstream: WebSocket, path: str):
+        """Relay native Responses messages without changing their JSON or opcode.
+
+        Each create request has an exchange; response frames are concatenated
+        byte-for-byte with offsets in its manifest. Unmatched protocol messages
+        are auxiliary captures. Native token refresh/reconnect stays with Codex.
+        """
+        if not self.config.native or not self._authorized(downstream.headers):
+            await downstream.send_denial_response(Response(status_code=401))
+            return
+        if path != "v1/responses":
+            await downstream.send_denial_response(Response(status_code=404))
+            return
+        url = self._upstream(downstream.headers, path, downstream.url.query)
+        parts = urlsplit(url)
+        url = parts._replace(scheme="wss" if parts.scheme == "https" else "ws").geturl()
+        headers = [
+            (k, v)
+            for k, v in self._forward_headers(downstream.headers)
+            if not k.lower().startswith("sec-websocket-")
+        ]
+        records, by_id = [], {}
+        last_model = None
+        auxiliary = None
+        client_left = False
+
+        def recording(raw, body, *, model_call):
+            nonlocal last_model
+            record = _Recording(
+                self.session,
+                self.config,
+                "POST" if model_call else "WS",
+                path,
+                downstream.url.query,
+                downstream.headers,
+                raw,
+                body,
+            )
+            record.frames = []
+            record.manifest["transport"] = "websocket"
+            record.manifest["method"] = "WS"
+            record.status = 101
+            record.response_headers = httpx.Headers(list(upstream.response.headers.raw_items()))
+            last_model = body.get("model") or last_model
+            record.model = record.model or last_model
+            return record
+
+        def event(data):
+            try:
+                value = json.loads(data)
+                return value if isinstance(value, dict) else {}
+            except (ValueError, UnicodeError):
+                return {}
+
+        try:
+            async with websocket_connect(
+                url,
+                additional_headers=headers,
+                proxy=True
+                if urlsplit(url).hostname not in {"127.0.0.1", "::1", "localhost"}
+                else None,
+                max_size=None,
+                subprotocols=downstream.scope.get("subprotocols") or None,
+                **({"ssl": self._tls} if url.startswith("wss:") else {}),
+            ) as upstream:
+                response_headers = httpx.Headers(list(upstream.response.headers.raw_items()))
+                await downstream.accept(
+                    subprotocol=upstream.subprotocol,
+                    headers=[
+                        (k.lower().encode("latin-1"), v.encode("latin-1"))
+                        for k, v in _headers(response_headers)
+                        if not k.lower().startswith("sec-websocket-")
+                    ],
+                )
+                async with anyio.create_task_group() as group:
+
+                    async def client_messages():
+                        nonlocal client_left
+                        try:
+                            while True:
+                                message = await downstream.receive()
+                                if message["type"] == "websocket.disconnect":
+                                    client_left = True
+                                    break
+                                data = message.get("text")
+                                data = data if data is not None else message["bytes"]
+                                body = event(data)
+                                raw = data.encode() if isinstance(data, str) else data
+                                model_call = (
+                                    body.get("type") == "response.create"
+                                    and body.get("generate") is not False
+                                )
+                                record = recording(raw, body, model_call=model_call)
+                                if body.get("type") == "response.create":
+                                    records.append(record)
+                                else:
+                                    record.finish()
+                                await upstream.send(data)
+                        except WebSocketDisconnect:
+                            client_left = True
+                        except ConnectionClosed:
+                            pass
+                        finally:
+                            group.cancel_scope.cancel()
+
+                    async def provider_messages():
+                        nonlocal auxiliary, client_left
+                        try:
+                            async for data in upstream:
+                                value = event(data)
+                                response = value.get("response")
+                                response_id = (
+                                    response.get("id") if isinstance(response, dict) else None
+                                ) or value.get("response_id")
+                                record = by_id.get(response_id) or next(
+                                    (r for r in records if not r.finished), None
+                                )
+                                if record is None:
+                                    if auxiliary is None:
+                                        auxiliary = recording(b"", {}, model_call=False)
+                                    record = auxiliary
+                                elif response_id:
+                                    by_id[response_id] = record
+                                record.websocket_frame(data)
+                                if value.get("type") in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.incomplete",
+                                    "response.cancelled",
+                                    "error",
+                                }:
+                                    record.finish()
+                                    for key in [k for k, r in by_id.items() if r is record]:
+                                        del by_id[key]
+                                    if record in records:
+                                        records.remove(record)
+                                    if record is auxiliary:
+                                        auxiliary = None
+                                if isinstance(data, str):
+                                    await downstream.send_text(data)
+                                else:
+                                    await downstream.send_bytes(data)
+                            for record in records:
+                                record.error = record.error or "upstream_response_incomplete"
+                            await downstream.close(code=upstream.close_code or 1000)
+                        except ConnectionClosed as exc:
+                            code = exc.rcvd.code if exc.rcvd else 1006
+                            if code not in (1000, 1001):
+                                for record in records:
+                                    if not record.finished:
+                                        record.error = "upstream_websocket_closed"
+                            await downstream.close(
+                                code=code if code not in (1005, 1006, 1015) else 1011
+                            )
+                        except (WebSocketDisconnect, OSError):
+                            client_left = True
+                        finally:
+                            group.cancel_scope.cancel()
+
+                    group.start_soon(client_messages)
+                    group.start_soon(provider_messages)
+        except InvalidStatus as exc:
+            response = exc.response
+            record = _Recording(
+                self.session,
+                self.config,
+                "GET",
+                path,
+                downstream.url.query,
+                downstream.headers,
+                b"",
+                {},
+            )
+            record.status = response.status_code
+            record.response_headers = httpx.Headers(list(response.headers.raw_items()))
+            record.output.write(response.body or b"")
+            record.finish()
+            await downstream.send_denial_response(
+                Response(
+                    content=bytes(response.body or b""),
+                    status_code=response.status_code,
+                    headers=dict(_headers(record.response_headers)),
+                )
+            )
+        except (OSError, TimeoutError, InvalidHandshake):
+            record = _Recording(
+                self.session,
+                self.config,
+                "GET",
+                path,
+                downstream.url.query,
+                downstream.headers,
+                b"",
+                {},
+            )
+            record.status, record.error = 502, "capture_upstream_connection_error"
+            record.finish()
+            await downstream.send_denial_response(Response(status_code=502))
+        finally:
+            for record in [*records, auxiliary]:
+                if record is not None and not record.finished:
+                    record.cancelled = client_left and not record.error
+                    record.finish()

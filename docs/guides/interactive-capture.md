@@ -1,5 +1,9 @@
 # Interactive model context capture
 
+For Codex capture that retains your existing OpenAI sign-in and model selection,
+use [`--capture-native`](codex-native-capture.md). The `--capture` examples below
+describe the separate LiteLLM route.
+
 `agency claude` and `agency codex` launch the real interactive CLI in your
 existing terminal. Capture is optional and independent of the terminal mode:
 

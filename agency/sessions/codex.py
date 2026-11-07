@@ -24,8 +24,10 @@ Codex specifics, each checked against Codex CLI 0.162.1:
 from __future__ import annotations
 
 import json
+import os
 import threading
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 from .session import (
@@ -73,6 +75,9 @@ class CodexSession(CliSession):
     }
 
     def __init__(self, **kwargs) -> None:
+        capture = kwargs.get("capture")
+        if capture is not None and capture.native:
+            kwargs["capture"] = _native_capture_config(capture, kwargs.get("cli_args", []))
         super().__init__(**kwargs)
         # conversation id -> start of its in-flight model request. Codex runs
         # one request at a time per conversation; subagents are their own.
@@ -94,7 +99,27 @@ class CodexSession(CliSession):
             f'otel.exporter={{"otlp-http"={{endpoint="{endpoint}",protocol="json"}}}}',
         ]
         capture = []
-        if self.capture is not None:
+        if self.capture is not None and self.capture.native:
+            provider = {
+                "name": "OpenAI (Agency capture)",
+                "base_url": f"http://127.0.0.1:{self.port}/capture/v1",
+                "wire_api": "responses",
+                "requires_openai_auth": True,
+                "supports_websockets": True,
+                "env_http_headers": {"x-agency-token": TOKEN_VARIABLE},
+            }
+            capture = ["-c", 'model_provider="agency_native_capture"']
+            for key, value in provider.items():
+                # JSON strings/bools are TOML scalars; header maps need TOML '='.
+                literal = (
+                    "{"
+                    + ",".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in value.items())
+                    + "}"
+                    if isinstance(value, dict)
+                    else json.dumps(value)
+                )
+                capture += ["-c", f"model_providers.agency_native_capture.{key}={literal}"]
+        elif self.capture is not None:
             capture = [
                 "-c",
                 'model_provider="agency_capture"',
@@ -207,6 +232,89 @@ def _configured_otel_exporter(env: dict) -> "str | None":
     if isinstance(exporter, dict):
         return next(iter(exporter), None)
     return exporter
+
+
+def _native_capture_config(capture, cli_args):
+    """Resolve only routing inputs; never open Codex's credential store.
+
+    Codex still resolves its own models, permissions and other configuration.
+    Refuse other providers instead of silently changing their authentication.
+    """
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+    def read(path):
+        try:
+            return tomllib.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError(f"cannot resolve Codex capture routing from {path}") from exc
+
+    config = read(home / "config.toml")
+    overrides, profile = {}, config.get("profile")
+
+    def merge(target, source):
+        for key, value in source.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = value
+
+    args = iter(cli_args)
+    for arg in args:
+        if arg == "--":
+            break
+        if arg == "--oss" or arg.startswith("--local-provider"):
+            raise ValueError(
+                "--capture-native requires the OpenAI provider; omit --oss/--local-provider"
+            )
+        if arg in {"-c", "--config"}:
+            value = next(args, "")
+        elif arg.startswith("--config="):
+            value = arg.split("=", 1)[1]
+        elif arg.startswith("-c"):
+            value = arg[2:]
+        elif arg in {"-p", "--profile"}:
+            profile = next(args, "")
+            continue
+        elif arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+            continue
+        elif arg.startswith("-p"):
+            profile = arg[2:]
+            continue
+        else:
+            continue
+        try:
+            try:
+                parsed = tomllib.loads(value)
+            except tomllib.TOMLDecodeError:
+                key, literal = value.split("=", 1)
+                parsed = tomllib.loads(key + "=" + json.dumps(literal))
+            merge(overrides, parsed)
+        except (tomllib.TOMLDecodeError, ValueError) as exc:
+            raise ValueError("--capture-native requires valid TOML -c/--config overrides") from exc
+    profile = overrides.get("profile", profile)
+    merge(config, overrides)
+    if profile:
+        if not isinstance(profile, str) or Path(profile).name != profile:
+            raise ValueError("invalid Codex capture profile")
+        merge(config, config.get("profiles", {}).get(profile, {}))
+        merge(config, read(home / f"{profile}.config.toml"))
+    merge(config, overrides)
+    if config.get("model_provider", "openai") != "openai":
+        raise ValueError("--capture-native currently requires model_provider='openai'")
+    if "agency_native_capture" in config.get("model_providers", {}):
+        raise ValueError("agency_native_capture is reserved for this capture session")
+    if (
+        config.get("chatgpt_base_url", "https://chatgpt.com/backend-api/").rstrip("/")
+        != "https://chatgpt.com/backend-api"
+    ):
+        raise ValueError("--capture-native does not yet support custom ChatGPT service routing")
+    base = config.get("openai_base_url") or os.environ.get("OPENAI_BASE_URL")
+    # An explicit built-in provider base overrides the native default for either
+    # auth type. Preserve it; never route its credential to a guessed destination.
+    return replace(capture, api_base_url=base, chatgpt_base_url=base) if base else capture
 
 
 def main(argv=None) -> int:

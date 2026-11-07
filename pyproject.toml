@@ -14,7 +14,7 @@ dependencies = [
     "podman>=5.8.0",
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.20.0",
-    "websockets>=14",
+    "websockets>=15",
     "pyseccomp",
     "pyte>=0.8.2",
     "mcp",
