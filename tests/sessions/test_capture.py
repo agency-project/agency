@@ -738,7 +738,9 @@ def test_scope_reexec_keeps_capture_options_and_credential_out_of_argv(
     not sys.platform.startswith("linux") or not session_module._user_scope_available(),
     reason="needs systemd user scopes",
 )
-@pytest.mark.parametrize("command,native", [("claude", False), ("codex", False), ("codex", True)])
+@pytest.mark.parametrize(
+    "command,native", [("claude", False), ("codex", False), ("codex", True), ("claude", True)]
+)
 def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command, native):
     from websockets.sync.client import connect
     from agency.sessions.terminal import _Screen
@@ -760,6 +762,15 @@ def test_real_cli_entry_reexec_preserves_capture_mode(tmp_path, command, native)
         env["CODEX_HOME"] = str(state)
         env.pop("OPENAI_BASE_URL", None)
         env.pop("LITE_LLM_KEY", None)
+        if command == "claude":
+            env["CLAUDE_CONFIG_DIR"] = str(state)
+            for variable in (
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+            ):
+                env.pop(variable, None)
     log = tmp_path / "scope.log"
     with log.open("wb") as output:
         process = subprocess.Popen(

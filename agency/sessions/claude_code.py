@@ -103,8 +103,14 @@ class ClaudeCodeSession(CliSession):
     }
 
     def __init__(self, **kwargs):
+        self._claude_settings, self._claude_cli_args = _additional_settings(
+            kwargs.get("cli_args", []), kwargs["cwd"]
+        )
+        if kwargs.get("capture") is not None and kwargs["capture"].native:
+            self._capture_network_environment = _validate_native_capture(
+                kwargs["cwd"], self._claude_settings, self._claude_cli_args
+            )
         super().__init__(**kwargs)
-        self._claude_settings, self._claude_cli_args = _additional_settings(self.cli_args, self.cwd)
         arguments = self._claude_cli_args
         if "--" in arguments:
             arguments = arguments[: arguments.index("--")]
@@ -171,7 +177,17 @@ class ClaudeCodeSession(CliSession):
         ]
 
     def _cli_environment(self, env: dict) -> None:
-        if self.capture is not None:
+        if self.capture is not None and self.capture.native:
+            self._capture_gateway.configure_environment(env)
+            # Pin the supported native destination, including against settings
+            # env layers that would otherwise bypass this opt-in capture mode.
+            env.update(
+                ANTHROPIC_BASE_URL="https://api.anthropic.com",
+                CLAUDE_CODE_USE_BEDROCK="0",
+                CLAUDE_CODE_USE_VERTEX="0",
+                CLAUDE_CODE_USE_FOUNDRY="0",
+            )
+        elif self.capture is not None:
             env.pop("ANTHROPIC_API_KEY", None)
             env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             env.update(
@@ -276,6 +292,69 @@ class ClaudeCodeSession(CliSession):
                 **attribution,
             },
         )
+
+
+def _validate_native_capture(cwd, additional, cli_args):
+    effective = {}
+    state = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    sources = {"user", "project", "local"}
+    arguments = iter(cli_args)
+    for argument in arguments:
+        if argument == "--":
+            break
+        if argument == "--settings-sources":
+            sources = set(filter(None, next(arguments, "").split(",")))
+        elif argument.startswith("--settings-sources="):
+            sources = set(filter(None, argument.split("=", 1)[1].split(",")))
+    if not sources <= {"user", "project", "local"}:
+        raise ValueError("cannot resolve Claude --settings-sources for native capture")
+    paths = [state / "settings.json"] if "user" in sources else []
+    ancestors = []
+    directory = Path(cwd)
+    while True:
+        ancestors.append(directory)
+        if (directory / ".git").exists() or directory.parent == directory:
+            break
+        directory = directory.parent
+    for directory in reversed(ancestors):
+        if "project" in sources:
+            paths.append(directory / ".claude/settings.json")
+        if "local" in sources:
+            paths.append(directory / ".claude/settings.local.json")
+
+    def read_environment(path):
+        try:
+            settings = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise ValueError("cannot resolve Claude native capture settings") from exc
+        if isinstance(settings, dict) and isinstance(settings.get("env"), dict):
+            return settings["env"]
+        return {}
+
+    for path in paths:
+        effective.update(read_environment(path))
+    effective.update(additional.get("env") or {})
+    effective.update(read_environment(Path("/etc/claude-code/managed-settings.json")))
+    for path in sorted(Path("/etc/claude-code/managed-settings.d").glob("*.json")):
+        effective.update(read_environment(path))
+    effective.update(os.environ)
+    for name in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+        if str(effective.get(name, "")).lower() in {"1", "true"}:
+            raise ValueError("--capture-native requires Claude's native Anthropic provider")
+    if (
+        str(effective.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+        != "https://api.anthropic.com"
+    ):
+        raise ValueError(
+            "--capture-native requires https://api.anthropic.com as the Claude API endpoint"
+        )
+    if str(effective.get("NODE_TLS_REJECT_UNAUTHORIZED", "1")) == "0":
+        raise ValueError("--capture-native requires TLS certificate verification")
+    from .capture_proxy import _network_environment
+
+    return _network_environment(effective, cwd)
 
 
 def main(argv=None) -> int:

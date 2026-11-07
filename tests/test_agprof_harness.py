@@ -63,6 +63,10 @@ _BARE_THREAD_ALLOWLIST = {
         "CliSession._start_server",
     ): (1, "session hook/telemetry/terminal endpoint"),
     (
+        "agency/sessions/capture_proxy.py",
+        "ClaudeCaptureGateway.start",
+    ): (1, "session TLS proxy event loop; each captured model span is recorded explicitly"),
+    (
         "agency/sessions/session.py",
         "CliSession.attach_terminal",
     ): (1, "session process-exit watcher"),

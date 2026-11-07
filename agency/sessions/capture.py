@@ -2,7 +2,7 @@
 
 The gateway never translates, retries, fits, or edits a provider request. Raw
 bodies are authoritative; Agency blocks are an additional inspection projection.
-LiteLLM mode replaces authentication; native Codex mode forwards the CLI's own
+LiteLLM mode replaces authentication; native capture forwards the CLI's own
 authentication to its original provider. Credentials are never archived.
 """
 
@@ -84,33 +84,40 @@ class NativeCaptureConfig:
     api_base_url: str = "https://api.openai.com/v1"
     chatgpt_base_url: str = "https://chatgpt.com/backend-api/codex"
     native = True
+    harness = "codex"
     model = None
     key_env = None
 
     def __post_init__(self):
         for base in (self.api_base_url, self.chatgpt_base_url):
-            if not isinstance(base, str):
-                raise ValueError("native capture upstream must be a URL string")
-            url = urlsplit(base)
-            if (
-                not url.hostname
-                or url.username
-                or url.password
-                or url.query
-                or url.fragment
-                or not (
-                    url.scheme == "https"
-                    or url.scheme == "http"
-                    and url.hostname in {"127.0.0.1", "::1", "localhost"}
-                )
-            ):
-                raise ValueError(
-                    "native capture upstream must be HTTPS without credentials (or loopback HTTP)"
-                )
+            _validate_native_upstream(base)
 
     def upstream(self, headers, path, query):
         base = self.chatgpt_base_url if headers.get("chatgpt-account-id") else self.api_base_url
         return base.rstrip("/") + "/" + path.removeprefix("v1/") + ("?" + query if query else "")
+
+
+def _validate_native_upstream(base):
+    if not isinstance(base, str):
+        raise ValueError("native capture upstream must be a URL string")
+    url = urlsplit(base)
+    if (
+        not url.hostname
+        or url.username
+        or url.password
+        or url.query
+        or url.fragment
+        or not (
+            url.scheme == "https"
+            or url.scheme == "http"
+            and url.hostname in {"127.0.0.1", "::1", "localhost"}
+        )
+    ):
+        raise ValueError(
+            "native capture upstream must be HTTPS without credentials (or loopback HTTP)"
+        )
+    # Accessing port also validates malformed or out-of-range authorities.
+    _ = url.port
 
 
 def _headers(headers, *, archive=False):
@@ -688,13 +695,13 @@ class _CaptureResponse(StreamingResponse):
 
 
 class CaptureGateway:
-    def __init__(self, session, config: CaptureConfig | NativeCaptureConfig):
+    def __init__(self, session, config, *, tls_context=None):
         self.session, self.config = session, config
         self._key = os.environ.get(config.key_env) if config.key_env else None
         if not config.native and not self._key:
             raise ValueError(f"capture requires {config.key_env}")
-        self._tls = None
-        if config.native:
+        self._tls = tls_context
+        if config.native and self._tls is None:
             try:
                 self._tls = ssl.create_default_context(
                     cafile=os.environ.get("CODEX_CA_CERTIFICATE") or os.environ.get("SSL_CERT_FILE")
@@ -728,14 +735,20 @@ class CaptureGateway:
         ]
         return result + [("authorization", "Bearer " + self._key), ("accept-encoding", "identity")]
 
+    def _client_options(self, url):
+        return (
+            {"trust_env": True, "verify": self._tls} if self.config.native else {"trust_env": False}
+        )
+
     async def forward(self, request: Request, path: str):
         if not self._authorized(request.headers):
             return JSONResponse({"error": {"message": "invalid capture token"}}, status_code=401)
-        if (
-            not _PATH.fullmatch(path)
-            or self.config.native
-            and not path.startswith(("v1/responses", "v1/models"))
-        ):
+        native_paths = (
+            ("v1/messages",)
+            if getattr(self.config, "harness", None) == "claude_code"
+            else ("v1/responses", "v1/models")
+        )
+        if not _PATH.fullmatch(path) or self.config.native and not path.startswith(native_paths):
             return JSONResponse(
                 {"error": {"message": "unsupported capture endpoint"}}, status_code=404
             )
@@ -790,8 +803,7 @@ class CaptureGateway:
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(1200, connect=10),
             follow_redirects=False,
-            trust_env=self.config.native,
-            **({"verify": self._tls} if self.config.native else {}),
+            **self._client_options(url),
         )
         try:
             upstream, error = None, None
@@ -845,7 +857,11 @@ class CaptureGateway:
         byte-for-byte with offsets in its manifest. Unmatched protocol messages
         are auxiliary captures. Native token refresh/reconnect stays with Codex.
         """
-        if not self.config.native or not self._authorized(downstream.headers):
+        if (
+            not self.config.native
+            or getattr(self.config, "harness", None) != "codex"
+            or not self._authorized(downstream.headers)
+        ):
             await downstream.send_denial_response(Response(status_code=401))
             return
         if path != "v1/responses":

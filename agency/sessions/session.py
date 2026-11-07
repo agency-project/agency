@@ -177,8 +177,8 @@ class CliSession:
         self.ui_port = ui_port
         self.use_scope = use_scope
         self.capture = capture
-        if capture is not None and capture.native and self.harness != "codex":
-            raise ValueError("native-auth capture is currently supported only for Codex")
+        if capture is not None and capture.native and self.harness != capture.harness:
+            raise ValueError("native capture configuration does not match this CLI")
         if terminal_mode not in {"native", "browser"}:
             raise ValueError("terminal_mode must be native or browser")
         from ..agpolicy import agpolicy
@@ -204,7 +204,12 @@ class CliSession:
         if capture is not None:
             from .capture import CaptureGateway
 
-            self._capture_gateway = CaptureGateway(self, capture)
+            if capture.native and self.harness == "claude_code":
+                from .capture_proxy import ClaudeCaptureGateway
+
+                self._capture_gateway = ClaudeCaptureGateway(self, capture)
+            else:
+                self._capture_gateway = CaptureGateway(self, capture)
         self.session_id = str(uuid.uuid4())
         self.host_token = secrets.token_urlsafe(32)
         self.ui_token = secrets.token_urlsafe(32)
@@ -315,6 +320,8 @@ class CliSession:
             )
         agprof.register_engine(self.harness, **coverage)
         self._start_server()
+        if self.capture is not None and self.capture.native and self.harness == "claude_code":
+            self._capture_gateway.start()
         self._prepare()
         if self.terminal_mode == "browser":
             self._write_private_json(
@@ -329,7 +336,11 @@ class CliSession:
                     "capture": {
                         "model": self.capture.model,
                         "authentication": "native" if self.capture.native else "litellm",
-                        "gateway": f"http://127.0.0.1:{self.port}/capture",
+                        "gateway": getattr(
+                            self._capture_gateway,
+                            "endpoint",
+                            f"http://127.0.0.1:{self.port}/capture",
+                        ),
                     }
                     if self.capture is not None
                     else None,
@@ -372,6 +383,8 @@ class CliSession:
             # It records the exit; the logger must still be open for that.
             self._watcher.join(timeout=10)
         self._finish_scope()
+        if self.capture is not None and self.capture.native and self.harness == "claude_code":
+            self._capture_gateway.close()
         # The tokens stop meaning anything once the server is gone; do not
         # leave them lying in the run directory.
         (self.run_dir / SESSION_FILE).unlink(missing_ok=True)
@@ -1023,7 +1036,9 @@ class CliSession:
     def _build_app(self) -> FastAPI:
         app = FastAPI()
 
-        if self._capture_gateway is not None:
+        if self._capture_gateway is not None and not (
+            self.capture.native and self.harness == "claude_code"
+        ):
 
             @app.api_route("/capture/{path:path}", methods=["GET", "POST", "DELETE"])
             async def capture_request(request: Request, path: str):
@@ -1356,12 +1371,11 @@ def main(session_class, command: str, argv) -> int:
         action="store_true",
         help="Route native model HTTP requests through Agency and archive full context (opt-in)",
     )
-    if command == "codex":
-        capture_modes.add_argument(
-            "--capture-native",
-            action="store_true",
-            help="Capture Codex HTTP/WebSocket traffic while retaining native OpenAI login and model selection",
-        )
+    capture_modes.add_argument(
+        "--capture-native",
+        action="store_true",
+        help=f"Capture {session_class.label} model traffic while retaining native login and model selection",
+    )
     parser.add_argument(
         "--capture-model",
         choices=["gpt-6-luna", "claude-haiku-5-5"],
@@ -1416,9 +1430,14 @@ def main(session_class, command: str, argv) -> int:
             parser.error("--capture requires LITE_LLM_KEY in the environment")
         capture = CaptureConfig(args.capture_model or "gpt-6-luna")
     elif getattr(args, "capture_native", False):
-        from .capture import NativeCaptureConfig
+        if command == "claude":
+            from .capture_proxy import ClaudeNativeCaptureConfig
 
-        capture = NativeCaptureConfig()
+            capture = ClaudeNativeCaptureConfig()
+        else:
+            from .capture import NativeCaptureConfig
+
+            capture = NativeCaptureConfig()
     use_scope = not args.no_scope and _user_scope_available()
     if use_scope and os.environ.get(_SCOPED_VARIABLE) != "1":
         # Run this process in its own scope too, so the profiler's workload

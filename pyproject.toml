@@ -5,6 +5,9 @@ requires-python = ">=3.12"
 dependencies = [
     "openai",
     "httpx",
+    "h11>=0.16",
+    "cryptography",
+    "certifi",
     "httpx2",
     "html2text",
     "cloudpickle",

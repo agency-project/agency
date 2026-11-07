@@ -21,6 +21,7 @@ from agency.configs.agconfig import agconfig
 from agency.harness.adapters.codex import CodexAdapter
 from agency.observability.agdatalogger import read_llm_exchanges
 from agency.sessions.capture import CaptureConfig, NativeCaptureConfig
+from agency.sessions.capture_proxy import ClaudeNativeCaptureConfig
 from agency.sessions.claude_code import ClaudeCodeSession
 from agency.sessions.codex import CodexSession
 
@@ -459,15 +460,19 @@ class NativeUpstream:
         )
 
 
-@pytest.mark.parametrize("protocol", ["messages", "responses", "responses-native"])
+@pytest.mark.parametrize(
+    "protocol", ["messages", "responses", "responses-native", "messages-native"]
+)
 def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol):
-    claude = protocol == "messages"
-    native = protocol == "responses-native"
-    protocol = "responses" if native else protocol
+    claude = protocol.startswith("messages")
+    native = protocol.endswith("-native")
+    protocol = protocol.removesuffix("-native")
     binary = os.environ.get("AGENCY_CAPTURE_TEST_CLAUDE" if claude else "AGENCY_CAPTURE_TEST_CODEX")
     if not binary:
         pytest.skip("set AGENCY_CAPTURE_TEST_CLAUDE / AGENCY_CAPTURE_TEST_CODEX to opt in")
     live = os.environ.get("AGENCY_CAPTURE_LIVE") == "1"
+    if live and claude and native:
+        pytest.skip("native Claude acceptance uses offline fixtures, never subscription inference")
     model = "claude-haiku-5-5" if claude and not live else "gpt-6-luna"
     if live and claude:
         model = os.environ.get("AGENCY_CAPTURE_TEST_CLAUDE_MODEL", model)
@@ -483,13 +488,16 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
     else:
         monkeypatch.setenv("LITE_LLM_KEY", "scripted-upstream-fixture-key")
         upstream = NativeUpstream(protocol, model)
-        if native:
+        if native and not claude:
             upstream.enable_websocket()
-        config = (
-            NativeCaptureConfig(api_base_url=upstream.url, chatgpt_base_url=upstream.url)
-            if native
-            else CaptureConfig(model, upstream.url)
-        )
+        if native:
+            config = (
+                ClaudeNativeCaptureConfig(api_base_url=upstream.url)
+                if claude
+                else NativeCaptureConfig(api_base_url=upstream.url, chatgpt_base_url=upstream.url)
+            )
+        else:
+            config = CaptureConfig(model, upstream.url)
     if claude:
         state = tmp_path / "claude-state"
         state.mkdir()
@@ -503,6 +511,25 @@ def test_real_interactive_capture(make_session, monkeypatch, tmp_path, protocol)
             )
         )
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(state))
+        if native:
+            for variable in (
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ):
+                monkeypatch.delenv(variable, raising=False)
+            monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "fixture-native-oauth")
+            monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            monkeypatch.setenv("DISABLE_AUTOUPDATER", "1")
         cli_args = ["--model", model, "--allowedTools", "Bash(printf *)"]
     else:
         cli_args = [
