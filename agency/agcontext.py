@@ -2,7 +2,7 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING
 
-from .llm.message_store import MessageStore
+from .llm.message_store import MESSAGE_STORE_VERSION, MessageStore
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -23,7 +23,8 @@ class agcontext:
                            ``message_block_lookup`` (block hash -> block
                            payload) and ``message_patch_lookup`` (original
                            block hash -> ordered hashes of the blocks that
-                           replace it); the lookups are kept across skill runs
+                           replace it), plus ``message_patch_origin`` (who
+                           made each patch); the lookups are kept across skill runs
     harness_sessions    : per-harness session continuity, e.g.
                            {"claude_code": {"session_id": ..., "blob_b64": ...}}
     retained_messages   : ordered user/system messages retained independently
@@ -106,10 +107,12 @@ class agcontext:
         store = self.message_store
         with store:
             return {
+                "message_store_version": MESSAGE_STORE_VERSION,
                 "message_hash_list": list(self.message_hash_list),
                 "message_block_lookup": dict(store.message_block_lookup),
                 "message_structure_lookup": dict(store.message_structure_lookup),
                 "message_patch_lookup": {k: list(v) for k, v in store.message_patch_lookup.items()},
+                "message_patch_origin": dict(store.message_patch_origin),
             }
 
     @classmethod
@@ -117,13 +120,21 @@ class agcontext:
         """Constructor keywords for a ``message_state`` -- or for a checkpoint
         from before the lookups, which kept a plain message list as "history"."""
         if "message_hash_list" in state:
+            version = state.get("message_store_version")
+            if version not in (None, MESSAGE_STORE_VERSION):
+                raise ValueError(f"unsupported checkpoint message_store_version: {version!r}")
+            store = MessageStore(
+                dict(state.get("message_block_lookup") or {}),
+                dict(state.get("message_structure_lookup") or {}),
+                {k: list(v) for k, v in (state.get("message_patch_lookup") or {}).items()},
+                dict(state.get("message_patch_origin") or {}),
+            )
+            hashes = list(state["message_hash_list"])
+            if version is None:
+                store, hashes = store.migrate_hashes(hashes)
             return {
-                "message_hash_list": list(state["message_hash_list"]),
-                "message_store": MessageStore(
-                    dict(state.get("message_block_lookup") or {}),
-                    dict(state.get("message_structure_lookup") or {}),
-                    {k: list(v) for k, v in (state.get("message_patch_lookup") or {}).items()},
-                ),
+                "message_hash_list": hashes,
+                "message_store": store,
             }
         store = MessageStore()
         return {

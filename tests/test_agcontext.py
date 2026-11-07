@@ -312,3 +312,144 @@ def test_repr_pending():
     f: Future[agcontext] = Future()
     context = agcontext(_future=f)
     assert "(pending)" in repr(context)
+
+
+# Checkpoints written before block hashes stopped including their index.
+def _indexed_checkpoint(messages, patches=()):
+    import copy
+    from agency.llm.message_store import content_hash
+
+    blocks, structures, hashes, edits = {}, {}, [], {}
+
+    def intern(role, block):
+        payload = {"role": role, **copy.deepcopy(block)}
+        digest = content_hash(payload)
+        blocks[digest] = payload
+        return digest
+
+    for message in messages:
+        record = {
+            "role": message["role"],
+            "blocks": [intern(message["role"], b) for b in message["blocks"]],
+        }
+        extra = {k: v for k, v in message.items() if k not in ("role", "blocks")}
+        if extra:
+            record["extra"] = extra
+        digest = content_hash(record)
+        structures[digest] = record
+        hashes.append(digest)
+    for message_index, block_index, replacements in patches:
+        record = structures[hashes[message_index]]
+        edits[record["blocks"][block_index]] = [intern(record["role"], b) for b in replacements]
+    return {
+        "message_hash_list": hashes,
+        "message_block_lookup": blocks,
+        "message_structure_lookup": structures,
+        "message_patch_lookup": edits,
+    }
+
+
+def _indexed_text(value, index):
+    return {"type": "text", "text": value, "index": index}
+
+
+def test_legacy_checkpoint_patch_survives_resent_history_and_can_be_reverted():
+    import copy
+    from agency.llm.message_store import MessageBlock
+
+    original = [{"role": "user", "name": "request", "blocks": [_indexed_text("original", 7)]}]
+    state = _indexed_checkpoint(original, [(0, 0, [_indexed_text("replacement", 3)])])
+    before = copy.deepcopy(state)
+    restored = agcontext(**agcontext.message_state_fields(state))
+    store = restored.message_store
+    assert store.materialize(restored.message_hash_list)[0]["blocks"][0]["text"] == "replacement"
+    resent = store.add_messages(original)
+    assert resent == restored.message_hash_list
+    assert store.materialize(resent)[0]["blocks"][0]["text"] == "replacement"
+    shifted = [{"role": "user", "blocks": [_indexed_text("original", 9)]}]
+    assert store.materialize(store.add_messages(shifted))[0]["blocks"][0]["text"] == "replacement"
+    key = MessageBlock("user", original[0]["blocks"][0]).hash
+    assert store.patch_origin(key) == "operator"
+    assert store.remove_patch(key)
+    assert restored.get_resolved_transcript() == original
+    assert state == before
+    saved = restored.message_state()
+    assert saved["message_store_version"] == 2
+    assert agcontext(**agcontext.message_state_fields(saved)).message_state() == saved
+
+
+def test_legacy_checkpoint_keeps_deletions_multi_block_edits_and_origins():
+    original = [{"role": "user", "blocks": [_indexed_text("a", 4), _indexed_text("b", 8)]}]
+    state = _indexed_checkpoint(
+        original,
+        [
+            (0, 0, []),
+            (0, 1, [_indexed_text("summary", 0), _indexed_text("detail", 1)]),
+        ],
+    )
+    second = state["message_structure_lookup"][state["message_hash_list"][0]]["blocks"][1]
+    state["message_patch_origin"] = {second: "model"}
+    restored = agcontext(**agcontext.message_state_fields(state))
+    blocks = restored.message_store.materialize(restored.message_store.add_messages(original))[0][
+        "blocks"
+    ]
+    assert blocks == [_indexed_text("summary", 0), _indexed_text("detail", 1)]
+    assert sorted(
+        restored.message_store.patch_origin(k) for k in restored.message_store.message_patch_lookup
+    ) == ["model", "operator"]
+    restored.message_store.clear_patches()
+    assert restored.get_resolved_transcript() == original
+
+
+@pytest.mark.parametrize("second_patch", [None, "other"])
+def test_legacy_checkpoint_rejects_edits_that_would_change_scope(second_patch):
+    original = [{"role": "user", "blocks": [_indexed_text("same", 0), _indexed_text("same", 1)]}]
+    patches = [(0, 0, [_indexed_text("first", 0)])]
+    if second_patch is not None:
+        patches.append((0, 1, [_indexed_text(second_patch, 1)]))
+    with pytest.raises(ValueError, match="conflicting patches"):
+        agcontext.message_state_fields(_indexed_checkpoint(original, patches))
+
+
+def test_legacy_checkpoint_merges_equivalent_patches():
+    original = [{"role": "user", "blocks": [_indexed_text("same", 0), _indexed_text("same", 1)]}]
+    state = _indexed_checkpoint(
+        original,
+        [
+            (0, 0, [_indexed_text("edited", 0)]),
+            (0, 1, [_indexed_text("edited", 1)]),
+        ],
+    )
+    restored = agcontext(**agcontext.message_state_fields(state))
+    assert len(restored.message_store.message_patch_lookup) == 1
+    assert restored.get_resolved_transcript() == [
+        {"role": "user", "blocks": [_indexed_text("edited", 0), _indexed_text("edited", 1)]}
+    ]
+
+
+def test_legacy_checkpoint_rejects_a_patch_with_no_original_payload():
+    state = _indexed_checkpoint([])
+    state["message_patch_lookup"]["missing"] = []
+    with pytest.raises(ValueError, match="original blocks are missing"):
+        agcontext.message_state_fields(state)
+
+
+def test_unversioned_current_checkpoint_is_normalized_without_changing_it():
+    from agency.llm.message_store import MessageBlock
+
+    original = [{"role": "user", "blocks": [_indexed_text("original", 7)]}]
+    context = agcontext.from_messages(original)
+    store = context.message_store
+    key = store.add_block(MessageBlock("user", original[0]["blocks"][0]))
+    store.add_patch(key, [], origin="model")
+    state = context.message_state()
+    state.pop("message_store_version")
+    restored = agcontext(**agcontext.message_state_fields(state))
+    assert restored.message_state() == {"message_store_version": 2, **state}
+
+
+def test_checkpoint_rejects_an_unknown_message_store_version():
+    state = agcontext().message_state()
+    state["message_store_version"] = 999
+    with pytest.raises(ValueError, match="unsupported checkpoint message_store_version"):
+        agcontext.message_state_fields(state)

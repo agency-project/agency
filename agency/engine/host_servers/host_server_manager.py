@@ -112,6 +112,10 @@ class HostServerManager:
         self._llm_handler_server._profile_context_provider = (
             self._interaction_server.current_open_context
         )
+        from ...tools.context_tools import ContextView
+
+        # What the context tools (agency/tools/context_tools.py) read and edit.
+        self._context_view = ContextView(self._llm_handler_server)
         self._host_mcp_server = HostMcpServer(
             sandbox,
             skill,
@@ -120,6 +124,7 @@ class HostServerManager:
             live_session=agent.agconfig.sandbox.checkpoint_fast_resume,
             # Native tools have already passed the loop's admission fence.
             is_cancelled=is_cancelled if getattr(agent, "harness", None) != "native" else None,
+            context_view=self._context_view,
         )
         self.change_config(agent.agconfig)
 
@@ -380,6 +385,9 @@ class HostServerManager:
                         )
 
             self._interaction_server.finalize_profile()
+            # The skill run is over: withdraw the model's context edits that were
+            # not made to persist past it.
+            self._context_view.close()
             if server_error is not None:
                 raise server_error
             if lease_error is not None:

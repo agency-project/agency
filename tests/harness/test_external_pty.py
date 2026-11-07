@@ -1091,3 +1091,67 @@ def test_stream_response_still_raises_errors_before_any_frame():
 
     with pytest.raises(RuntimeError, match="bad request"):
         asyncio.run(run())
+
+
+@pytest.mark.parametrize("directory", ["/workspace", "/workspace-other"])
+def test_grok_confirms_only_its_own_workspace_trust_dialog(runtime, tmp_path, directory):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    handle = SimpleNamespace(
+        terminal_screen=lambda: (
+            [
+                "Do you trust the contents of this directory?",
+                directory,
+                "Yes, proceed   y",
+                "No, quit   n",
+            ],
+            0,
+            0,
+            1,
+        ),
+        write_terminal=Mock(),
+    )
+    assert not driver.ready(handle)
+    assert not driver.ready(handle)
+    if directory == "/workspace":
+        handle.write_terminal.assert_called_once_with(b"y")
+    else:
+        handle.write_terminal.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "draft,bordered,ready",
+    [
+        ("", True, True),
+        ("a draft", True, False),
+        ("[Pasted: 11 lines]", True, False),
+        ("", False, False),
+    ],
+)
+def test_grok_readiness_finds_the_composer_when_the_cursor_is_on_the_footer(
+    runtime, tmp_path, draft, bordered, ready
+):
+    driver = driver_for(
+        HarnessAdapter.for_config("grok", runtime.agconfig), runtime, tmp_path, None, None, None
+    )
+    lines = [
+        "╭──────────────────────╮" if bordered else "history",
+        f"│ ❯ {draft}  │",
+        "╰──────────────────────╯" if bordered else "history",
+        "Logged in with API key",
+    ]
+    handle = SimpleNamespace(terminal_screen=lambda: (lines, 0, 3, 1))
+    assert driver.ready(handle) is ready
+
+
+def test_harness_readiness_timeout_includes_the_terminal_screen(runtime, tmp_path):
+    execution = PtyExecution(FakeDriver(tmp_path), runtime)
+    execution.handle = Mock(returncode=None)
+    execution.handle.is_paused.return_value = False
+    execution.handle.terminal_screen.return_value = (["", "Directory trust dialog", ""], 0, 0, 1)
+    execution._poll = Mock()
+    with pytest.raises(
+        RuntimeError, match="timed out waiting for startup input\nDirectory trust dialog"
+    ):
+        execution._wait_until(lambda: False, "startup input", timeout=0)

@@ -54,6 +54,14 @@ def _load_replay_exchanges(db_path: str) -> "list[list[dict]]":
     exchange also carries in the source db is never read -- this backend
     only ever needs to reproduce what the model said."""
     exchanges = read_llm_exchanges(db_path, exchange_type="llm_block")
+    # Stored blocks have no ``index`` (the message records keep it); a reply is
+    # numbered by position, as the backend that produced it did.
+    for exchange in exchanges:
+        content = [b for b in exchange["response"] if b.get("type") != "metadata"]
+        for position, block in enumerate(content):
+            block.setdefault("index", position)
+        for block in exchange["response"]:
+            block.setdefault("index", _METADATA_BLOCK_INDEX)
     return [exchange["response"] for exchange in exchanges]
 
 

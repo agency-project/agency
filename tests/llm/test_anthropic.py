@@ -804,6 +804,23 @@ class TestAgencyToolChoiceToAnthropic:
 # ---------------------------------------------------------------------------
 
 
+def _thinking_tool_loop() -> "list[dict]":
+    return [
+        _text_msg("user", "call f"),
+        {
+            "role": "assistant",
+            "blocks": [
+                {"type": "thinking", "index": 0, "text": "", "signature": "sig"},
+                {"type": "tool_use", "index": 1, "id": "t1", "name": "f", "arguments": "{}"},
+            ],
+        },
+        {
+            "role": "tool",
+            "blocks": [{"type": "tool_result", "index": 0, "tool_call_id": "t1", "text": "ok"}],
+        },
+    ]
+
+
 class TestFormatContextAgencyToBackend:
     def test_builds_kwargs_with_system_and_cache_control(self):
         backend = _AnthropicBackend(
@@ -906,6 +923,38 @@ class TestFormatContextAgencyToBackend:
             "thinking": "",
             "signature": "sig",
         }
+
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    )
+    def test_replayed_thinking_drops_instead_of_400_on_preserved_thinking_models(self, model):
+        """A message patch, or a harness rewriting its own history, changes the
+        conversation a replayed thinking block is bound to. Enforced accounts
+        reject that unless the request asks for the block to be dropped."""
+        backend = _AnthropicBackend(_cfg(model=model))
+        kwargs = backend._format_context_agency_to_backend({"messages": _thinking_tool_loop()})
+        assert kwargs["extra_headers"] == {"anthropic-beta": "thinking-binding-controls-2026-08-01"}
+        assert kwargs["extra_body"] == {
+            "thinking": {
+                "type": "adaptive",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            }
+        }
+        assert "thinking" not in kwargs
+
+    @pytest.mark.parametrize("model", ["claude-opus-4-7", "claude-mythos-5-1", "m"])
+    def test_other_models_get_no_thinking_binding_controls(self, model):
+        backend = _AnthropicBackend(_cfg(model=model))
+        kwargs = backend._format_context_agency_to_backend({"messages": _thinking_tool_loop()})
+        assert "extra_headers" not in kwargs and "extra_body" not in kwargs
+
+    def test_no_replayed_thinking_gets_no_thinking_binding_controls(self):
+        backend = _AnthropicBackend(_cfg(model="claude-sonnet-5-5"))
+        kwargs = backend._format_context_agency_to_backend(
+            {"messages": [_text_msg("user", "hi"), _text_msg("assistant", "hello")]}
+        )
+        assert "extra_headers" not in kwargs and "extra_body" not in kwargs
 
     def test_no_messages_omits_last_message_cache_control(self):
         backend = _AnthropicBackend(_cfg(model="m"))
