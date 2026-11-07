@@ -23,6 +23,16 @@ from agency.harness.ptrace.supervisor import agProxyPtrace, ptrace_available
 
 ptrace = pytest.mark.skipif(not ptrace_available(), reason="ptrace not usable on this host")
 
+
+@pytest.fixture
+def target_file(tmp_path):
+    """A readable file for the traced ``cat`` to open. Not /etc/hostname, which
+    hosts without one (minimal containers, some CI images) do not have."""
+    path = tmp_path / "ptrace-target.txt"
+    path.write_text("ptrace target\n")
+    return str(path)
+
+
 _SPAWN_CHILD_SCRIPT = str(
     # tests/fixtures/ stays a shared top-level directory (not moved into
     # harness/ -- it's not module-specific), so this now goes up
@@ -958,7 +968,7 @@ def test_on_exit_callback_fires():
 
 
 @ptrace
-def test_launch_resolves_openat_path():
+def test_launch_resolves_openat_path(target_file):
     from agency.configs.agconfig import agconfig, ptraceconfig
 
     events = []
@@ -970,12 +980,12 @@ def test_launch_resolves_openat_path():
 
     cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
     px = agProxyPtrace(cfg)
-    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=RecordingPolicy())
+    handle = px.launch(["/bin/cat", target_file], {}, cwd="/tmp", policy=RecordingPolicy())
     stdout, stderr, rc = handle.wait(timeout=10)
     assert rc == 0
 
     openat_events = [e for e in events if e.syscall in ("openat", "open")]
-    assert any(e.path and "hostname" in e.path for e in openat_events), [
+    assert any(e.path and "ptrace-target" in e.path for e in openat_events), [
         (e.syscall, e.path) for e in openat_events
     ]
 
@@ -1025,7 +1035,7 @@ def test_launch_decodes_connect_bind_and_sendto_address_and_port():
 
 
 @ptrace
-def test_admitted_syscall_reports_completion_with_return_value_and_call_id():
+def test_admitted_syscall_reports_completion_with_return_value_and_call_id(target_file):
     from agency.configs.agconfig import agconfig, ptraceconfig
 
     completions = []
@@ -1039,7 +1049,7 @@ def test_admitted_syscall_reports_completion_with_return_value_and_call_id():
 
     cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
     px = agProxyPtrace(cfg)
-    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=CompletionPolicy())
+    handle = px.launch(["/bin/cat", target_file], {}, cwd="/tmp", policy=CompletionPolicy())
     stdout, stderr, rc = handle.wait(timeout=10)
     assert rc == 0
 
@@ -1052,14 +1062,14 @@ def test_admitted_syscall_reports_completion_with_return_value_and_call_id():
 
 
 @ptrace
-def test_denied_syscall_reports_no_completion():
+def test_denied_syscall_reports_no_completion(target_file):
     class DenyAndRecordPolicy:
         def __init__(self):
             self.completions = []
 
         def check(self, ag, event):
-            if event.syscall in ("openat", "open") and event.path and "hostname" in event.path:
-                return (False, "denied", "call-for-denied-hostname-open")
+            if event.syscall in ("openat", "open") and event.path and "ptrace-target" in event.path:
+                return (False, "denied", "call-for-denied-target-open")
             return (True, None, f"call-{event.syscall}-{event.pid}")
 
         def check_completion(self, ag, call_id, return_value):
@@ -1070,28 +1080,28 @@ def test_denied_syscall_reports_no_completion():
     cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
     policy = DenyAndRecordPolicy()
     px = agProxyPtrace(cfg)
-    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=policy)
+    handle = px.launch(["/bin/cat", target_file], {}, cwd="/tmp", policy=policy)
     stdout, stderr, rc = handle.wait(timeout=10)
     assert rc != 0
     # A deny-decision's call_id (even though this policy still returned one)
     # never reaches completion -- the tracer loop only tracks a pending exit
     # for an admitted (non-deny) syscall in the first place.
-    assert "call-for-denied-hostname-open" not in [cid for cid, _rv in policy.completions]
+    assert "call-for-denied-target-open" not in [cid for cid, _rv in policy.completions]
 
 
 @ptrace
-def test_deny_openat_blocks_file_read():
-    class DenyHostnamePolicy:
+def test_deny_openat_blocks_file_read(target_file):
+    class DenyTargetPolicy:
         def check(self, ag, event):
-            if event.syscall in ("openat", "open") and event.path and "hostname" in event.path:
-                return (False, "no reading /etc/hostname")
+            if event.syscall in ("openat", "open") and event.path and "ptrace-target" in event.path:
+                return (False, "no reading the target file")
             return True
 
     from agency.configs.agconfig import agconfig, ptraceconfig
 
     cfg = agconfig(ptraceconfig(syscalls=("execve", "execveat", "openat", "open")))
     px = agProxyPtrace(cfg)
-    handle = px.launch(["/bin/cat", "/etc/hostname"], {}, cwd="/tmp", policy=DenyHostnamePolicy())
+    handle = px.launch(["/bin/cat", target_file], {}, cwd="/tmp", policy=DenyTargetPolicy())
     stdout, stderr, rc = handle.wait(timeout=10)
     assert rc != 0
     assert stdout == ""
