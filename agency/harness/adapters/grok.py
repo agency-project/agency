@@ -77,7 +77,9 @@ class GrokDriver(_HookPtyDriver):
         # Grok collapses a restored multiline paste into a token. The prompt
         # marker then appears only in the old transcript.
         return (
-            self.ready(handle)
+            # The composer is empty while a turn waits for its response, so an
+            # empty one proves the interrupt only once the cancel footer is gone.
+            (self.ready(handle) and not any("Ctrl+c:cancel" in line for line in lines))
             or any("│ ❯ " + marker in line for line in lines)
             or pasted in lines[y]
         )
