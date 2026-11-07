@@ -309,7 +309,7 @@ class CliSession:
         if self.capture is not None:
             coverage.update(
                 llm="wire_capture",
-                reason="Native HTTP bodies archived through the opt-in capture gateway; hooks observe tools.",
+                reason="Native HTTP bodies archived through the opt-in capture gateway; process/tool coverage reported separately.",
             )
         agprof.register_engine(self.harness, **coverage)
         self._start_server()
@@ -1426,19 +1426,22 @@ def main(session_class, command: str, argv) -> int:
     from ..observability.agwebui import agwebui
     from ..utils.agutil import _DEFAULT_LOG_DIR
 
-    session = session_class(
-        cwd=cwd,
-        binary=binary,
-        cli_args=args.cli_args,
-        run_dir=_DEFAULT_LOG_DIR,
-        ui_port=args.port,
-        use_scope=use_scope,
-        capture=capture,
-        terminal_mode=args.terminal,
-        trace=trace,
-        policy=policy,
-        ptrace_config=ptraceconfig(file_access=args.trace_file_access),
-    )
+    try:
+        session = session_class(
+            cwd=cwd,
+            binary=binary,
+            cli_args=args.cli_args,
+            run_dir=_DEFAULT_LOG_DIR,
+            ui_port=args.port,
+            use_scope=use_scope,
+            capture=capture,
+            terminal_mode=args.terminal,
+            trace=trace,
+            policy=policy,
+            ptrace_config=ptraceconfig(file_access=args.trace_file_access),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     def interactive_session():
         try:

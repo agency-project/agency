@@ -144,6 +144,26 @@ def test_entry_preserves_native_exit_status(monkeypatch, tmp_path, code, expecte
     )
 
 
+def test_entry_configuration_error_has_native_cli_usage_without_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    class Session:
+        label = "Fixture"
+
+        def __init__(self, **kwargs):
+            raise ValueError("Claude Code tool policy requires native hooks to be enabled")
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(module, "_user_scope_available", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        module.main(Session, "claude", ["--claude", sys.executable, "--cwd", str(tmp_path)])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "tool policy requires native hooks" in error
+    assert "Traceback" not in error
+
+
 def test_entry_reports_launch_failure_even_if_webui_records_and_swallows_it(monkeypatch, tmp_path):
     from agency.observability.agwebui import agwebui
 

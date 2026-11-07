@@ -5,6 +5,10 @@ The unmodified CLI inherits stdin, stdout, stderr, and the controlling
 terminal. Agency does not allocate another PTY, read the keyboard, parse the
 screen to submit prompts, or inject terminal input in native mode.
 
+Live comparisons and terminal checks are recorded separately for
+[Codex](inherited-terminal-validation.md) and
+[Claude Code](claude-interactive-validation.md).
+
 ```text
 user terminal <== original stdio ==> real Claude Code / Codex
                                           |
@@ -80,6 +84,17 @@ and sandbox rules still apply. Syscall policy uses the same
 `HostInteractionServer` admission/completion logic as managed execution.
 Syscall rules and `default_to_deny` require tracing; the CLI rejects those
 configurations with `--no-trace`.
+
+Claude Code tool policy and hook-based tool/turn collection require native
+hooks to be enabled. Agency preserves deliberate hook opt-outs such as
+`--bare`, `--safe-mode`, their environment settings, and explicit
+`disableAllHooks`. Those sessions report hook coverage unavailable; combining
+these known opt-outs with Agency tool policy is rejected. Model capture,
+process profiling and independent syscall policy remain available. Agency
+does not reproduce Claude's complete user/project/managed settings resolver;
+hook disabling in another native configuration layer can also prevent hook
+collection and tool gates. These gates supplement native controls and are
+not an OS security boundary.
 
 The shared supervisor follows local descendants and records process events.
 The workload scope excludes Agency's collector/control process. Pause/resume

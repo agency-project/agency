@@ -22,10 +22,11 @@ import termios
 import time
 import tty
 import urllib.request
+import uuid
 
 args = sys.argv[1:]
 settings = json.loads(open(args[args.index("--settings") + 1]).read())
-session_id = args[args.index("--session-id") + 1]
+session_id = args[args.index("--session-id") + 1] if "--session-id" in args else str(uuid.uuid4())
 hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]
 token = os.environ[hook["allowedEnvVars"][0]]
 

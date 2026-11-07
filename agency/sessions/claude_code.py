@@ -13,6 +13,11 @@ Claude Code specifics:
 
 from __future__ import annotations
 
+import copy
+import json
+import os
+from pathlib import Path
+
 from .session import (
     HOOK_TIMEOUT_S,
     TOKEN_VARIABLE,
@@ -47,6 +52,41 @@ _USER_OTEL_LOG_VARIABLES = (
 )
 
 
+def _additional_settings(cli_args, cwd):
+    """Compose only Claude's singular --settings option; leave other args alone."""
+    remaining, source = [], None
+    index = 0
+    while index < len(cli_args):
+        argument = cli_args[index]
+        if argument == "--":
+            remaining.extend(cli_args[index:])
+            break
+        if argument == "--settings":
+            index += 1
+            if index == len(cli_args):
+                raise ValueError("Claude Code --settings requires a file path or JSON object")
+            source = cli_args[index]
+        elif argument.startswith("--settings="):
+            source = argument.split("=", 1)[1]
+        else:
+            remaining.append(argument)
+        index += 1
+    if source is None:
+        return {}, remaining
+
+    def invalid_constant(_value):
+        raise ValueError("non-finite values are not JSON")
+
+    try:
+        text = source if source.lstrip().startswith("{") else (Path(cwd) / source).read_text()
+        settings = json.loads(text, parse_constant=invalid_constant)
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+    except (OSError, ValueError):
+        raise ValueError("Cannot load Claude Code --settings as a JSON object") from None
+    return settings, remaining
+
+
 class ClaudeCodeSession(CliSession):
     agent_name = "claude"
     harness = "claude_code"
@@ -62,6 +102,30 @@ class ClaudeCodeSession(CliSession):
         ),
     }
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._claude_settings, self._claude_cli_args = _additional_settings(self.cli_args, self.cwd)
+        arguments = self._claude_cli_args
+        if "--" in arguments:
+            arguments = arguments[: arguments.index("--")]
+        hooks_disabled = (
+            any(flag in arguments for flag in ("--bare", "--safe-mode"))
+            or any(
+                os.environ.get(name, "").lower() in {"1", "true"}
+                for name in ("CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE")
+            )
+            or self._claude_settings.get("disableAllHooks") is True
+        )
+        self.engine_coverage = dict(type(self).engine_coverage)
+        if hooks_disabled:
+            if self.policy.tool_hooks or self.policy.default_to_deny:
+                raise ValueError("Claude Code tool policy requires native hooks to be enabled")
+            self.engine_coverage.update(
+                tools="unavailable",
+                turns="unavailable",
+                reason="Native Claude Code hooks are explicitly disabled; hook-based tool and turn observation is unavailable.",
+            )
+
     def _prepare(self) -> None:
         hook = {
             "type": "http",
@@ -72,11 +136,11 @@ class ClaudeCodeSession(CliSession):
             "headers": {"Authorization": f"Bearer ${TOKEN_VARIABLE}"},
             "allowedEnvVars": [TOKEN_VARIABLE],
         }
-        settings = {"hooks": {event: [{"hooks": [hook]}] for event in HOOK_EVENTS}}
+        agency_hooks = {event: [{"hooks": [hook]}] for event in HOOK_EVENTS}
         if self.policy.tool_hooks or self.policy.default_to_deny:
             # Command hooks can fail closed on relay outages (exit 2).
             # HTTP hook errors alone do not guarantee a native denial.
-            settings["hooks"]["PreToolUse"] = [
+            agency_hooks["PreToolUse"] = [
                 {
                     "hooks": [
                         {
@@ -87,16 +151,23 @@ class ClaudeCodeSession(CliSession):
                     ]
                 }
             ]
+        settings = copy.deepcopy(self._claude_settings)
+        hooks = settings.setdefault("hooks", {})
+        if not isinstance(hooks, dict):
+            raise ValueError("Claude Code --settings hooks must be an object")
+        for event, entries in agency_hooks.items():
+            existing = hooks.get(event, [])
+            if not isinstance(existing, list):
+                raise ValueError(f"Claude Code --settings hooks.{event} must be a list")
+            hooks[event] = [*existing, *entries]
         self._write_private_json(SETTINGS_FILE, settings)
 
     def _cli_argv(self) -> "list[str]":
         return [
             self.binary,
-            "--session-id",
-            self.session_id,
             "--settings",
             str(self.run_dir / SETTINGS_FILE),
-            *self.cli_args,
+            *self._claude_cli_args,
         ]
 
     def _cli_environment(self, env: dict) -> None:

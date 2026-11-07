@@ -7,6 +7,9 @@ the live trajectory reader the web UI uses, not through private state.
 
 import json
 import os
+import shlex
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,6 +17,7 @@ from pathlib import Path
 import pyte
 import pytest
 
+from agency.agpolicy import agpolicy
 from agency.configs.agconfig import agconfig, dataloggerconfig
 from agency.observability.agdatalogger import agDataLogger
 from agency.sessions import claude_code
@@ -217,6 +221,238 @@ def test_settings_file_subscribes_http_hooks_without_exposing_the_token(make_ses
     assert session.host_token not in path.read_text()
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert oct((session.run_dir / session_module.SESSION_FILE).stat().st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.parametrize(
+    "cli_args",
+    [
+        [],
+        ["--continue"],
+        ["--resume", "native-session"],
+        ["--resume", "native-session", "--fork-session"],
+        ["--session-id", "8a62efba-931b-47c0-9a83-cce9d04b4afb"],
+    ],
+)
+def test_native_conversation_selection_remains_owned_by_claude(make_session, cli_args):
+    session = make_session(cli_args=cli_args)
+    argv = session._cli_argv()
+    assert argv == [
+        session.binary,
+        "--settings",
+        str(session.run_dir / claude_code.SETTINGS_FILE),
+        *cli_args,
+    ]
+    assert session.session_id not in argv
+
+
+@pytest.mark.parametrize("form", ["file", "json", "equals", "last"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_explicit_settings_compose_user_fields_and_hooks(make_session, tmp_path, form, enforce):
+    user_hook = {"hooks": [{"type": "command", "command": "printf user-hook"}]}
+    source = {
+        "permissions": {"defaultMode": "plan", "deny": ["Bash(rm *)"]},
+        "future": {"opaque": [1, {"retained": True}]},
+        "hooks": {"SessionStart": [user_hook, user_hook], "PreToolUse": [user_hook]},
+    }
+    path = tmp_path / "user-settings.json"
+    original = json.dumps(source)
+    path.write_text(original)
+    arguments = {
+        "file": ["--settings", path.name],
+        "json": ["--settings", original],
+        "equals": [f"--settings={original}"],
+        "last": ["--settings", "ignored-missing.json", f"--settings={path.name}"],
+    }[form]
+    policy = agpolicy(tool_hooks={"Bash": lambda event: True}) if enforce else None
+    session = make_session(cli_args=[*arguments, "--permission-mode", "manual"], policy=policy)
+    merged = json.loads((session.run_dir / claude_code.SETTINGS_FILE).read_text())
+    assert merged["permissions"] == source["permissions"]
+    assert merged["future"] == source["future"]
+    assert merged["hooks"]["SessionStart"][:2] == [user_hook, user_hook]
+    assert merged["hooks"]["PreToolUse"][0] == user_hook
+    agency_pre_tool = merged["hooks"]["PreToolUse"][1]["hooks"][0]
+    assert agency_pre_tool["type"] == ("command" if enforce else "http")
+    assert session._cli_argv() == [
+        session.binary,
+        "--settings",
+        str(session.run_dir / claude_code.SETTINGS_FILE),
+        "--permission-mode",
+        "manual",
+    ]
+    assert path.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--settings"],
+        ["--settings", "missing.json"],
+        ["--settings", "[]"],
+        ["--settings", "{"],
+        ["--settings", '{"future":NaN}'],
+    ],
+)
+def test_malformed_explicit_settings_fail_before_launch(tmp_path, arguments):
+    with pytest.raises(ValueError, match="--settings"):
+        claude_code._additional_settings(arguments, tmp_path)
+
+
+@pytest.mark.parametrize("source", ["123", "~/settings.json"])
+def test_explicit_settings_file_names_are_not_parsed_as_json(tmp_path, source):
+    path = tmp_path / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    settings = {"permissions": {"defaultMode": "plan"}, "future": {"retained": True}}
+    path.write_text(json.dumps(settings))
+    assert claude_code._additional_settings(["--settings", source], tmp_path) == (settings, [])
+
+
+def test_settings_option_after_cli_terminator_is_a_native_prompt(tmp_path):
+    arguments = ["--", "--settings", "prompt text"]
+    assert claude_code._additional_settings(arguments, tmp_path) == ({}, arguments)
+
+
+def test_real_claude_keeps_user_startup_hook_and_agency_http_collection(
+    make_session, monkeypatch, tmp_path
+):
+    binary = os.environ.get("AGENCY_CAPTURE_TEST_CLAUDE")
+    if not binary:
+        pytest.skip("set AGENCY_CAPTURE_TEST_CLAUDE for real local settings integration")
+    marker = tmp_path / "user-hook.marker"
+    command = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('user hook')",
+            str(marker),
+        ]
+    )
+    source = {
+        "permissions": {"defaultMode": "plan"},
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]},
+    }
+    path = tmp_path / "custom.json"
+    original = json.dumps(source)
+    path.write_text(original)
+    state = tmp_path / "claude-config"
+    state.mkdir()
+    (state / ".claude.json").write_text(
+        json.dumps({"hasCompletedOnboarding": True, "theme": "dark"})
+    )
+    monkeypatch.setenv("HOME", str(state))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(state))
+    session = make_session(
+        binary=Path(binary),
+        cli_args=[
+            f"--settings={path}",
+            "--setting-sources",
+            "user",
+            "--model",
+            "gpt-6-luna",
+            "-p",
+            "fixture",
+        ],
+        policy=agpolicy(tool_hooks={"Bash": lambda event: True}),
+    )
+    events = []
+    handle = session.handle_hook
+
+    def record(payload):
+        events.append(payload.get("hook_event_name"))
+        return handle(payload)
+
+    monkeypatch.setattr(session, "handle_hook", record)
+    env = session._environment()
+    env.update(
+        ANTHROPIC_BASE_URL="http://127.0.0.1:1",
+        ANTHROPIC_API_KEY="fixture-no-model",
+        ANTHROPIC_AUTH_TOKEN="fixture-no-model",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+        CLAUDE_CODE_USE_BEDROCK="0",
+        CLAUDE_CODE_USE_VERTEX="0",
+        CLAUDE_CODE_USE_FOUNDRY="0",
+    )
+    for key in ("LITE_LLM_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        env.pop(key, None)
+    process = subprocess.Popen(
+        session._cli_argv(),
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        eventually(lambda: require(marker.exists() and "UserPromptSubmit" in events), timeout=10)
+        assert path.read_text() == original
+        settings = json.loads((session.run_dir / claude_code.SETTINGS_FILE).read_text())
+        assert settings["hooks"]["PreToolUse"][-1]["hooks"][0]["type"] == "command"
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "optout",
+    [
+        ("--bare", None),
+        ("--safe-mode", None),
+        ("CLAUDE_CODE_SIMPLE", "1"),
+        ("CLAUDE_CODE_SIMPLE", "true"),
+        ("CLAUDE_CODE_SAFE_MODE", "1"),
+        ("CLAUDE_CODE_SAFE_MODE", "TRUE"),
+        ("settings", None),
+    ],
+)
+@pytest.mark.parametrize("enforce", [False, True])
+def test_explicit_hook_optouts_preserve_native_behavior_and_reject_tool_policy(
+    tmp_path, monkeypatch, optout, enforce
+):
+    name, value = optout
+    arguments = []
+    if name.startswith("--"):
+        arguments = [name]
+    elif name == "settings":
+        arguments = ["--settings", '{"disableAllHooks":true}']
+    else:
+        monkeypatch.setenv(name, value)
+    kwargs = dict(
+        cwd=tmp_path,
+        binary="claude",
+        cli_args=arguments,
+        run_dir=tmp_path,
+        ui_port=0,
+        use_scope=False,
+        policy=agpolicy(tool_hooks={"Bash": lambda event: True}) if enforce else None,
+    )
+    if enforce:
+        with pytest.raises(ValueError, match="tool policy requires native hooks"):
+            claude_code.ClaudeCodeSession(**kwargs)
+    else:
+        session = claude_code.ClaudeCodeSession(**kwargs)
+        assert session.engine_coverage["tools"] == "unavailable"
+        assert session.engine_coverage["turns"] == "unavailable"
+        assert session.engine_coverage["llm"] == "claude_code_reported"
+        if name == "settings":
+            assert session._claude_settings["disableAllHooks"] is True
+        else:
+            assert session._claude_cli_args == arguments
+    assert claude_code.ClaudeCodeSession.engine_coverage["tools"] == "hook_boundaries"
+
+
+def test_hook_optout_keeps_independent_syscall_policy_available(tmp_path):
+    session = claude_code.ClaudeCodeSession(
+        cwd=tmp_path,
+        binary="claude",
+        cli_args=["--bare"],
+        run_dir=tmp_path,
+        ui_port=0,
+        use_scope=False,
+        policy=agpolicy(syscall_hooks={"execve": lambda event: True}),
+    )
+    assert session.trace and "execve" in session.runtime_config.ptrace.syscalls
+    assert session.engine_coverage["tools"] == "unavailable"
 
 
 def test_claude_environment_keeps_user_settings_and_drops_parent_session_markers(
