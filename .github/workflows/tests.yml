@@ -71,7 +71,9 @@ jobs:
             exit 1
           fi
           curl -fsSL https://opencode.ai/install | bash -s -- --version "$opencode_version"
-          curl -fsSL https://x.ai/cli/install.sh | bash
+          # Keep the terminal protocol on the version covered by the Grok
+          # lifecycle test; upstream UI changes can break prompt detection.
+          curl -fsSL https://x.ai/cli/install.sh | bash -s -- 1.0.67
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"

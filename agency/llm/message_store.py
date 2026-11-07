@@ -69,6 +69,7 @@ def block_of(payload: dict) -> dict:
 # was made by the operator, through ``agent.patch_history``.
 OPERATOR_ORIGIN = "operator"
 MODEL_ORIGIN = "model"
+MESSAGE_STORE_VERSION = 2
 
 
 def with_tool_schema(
@@ -247,6 +248,68 @@ class MessageStore:
         self._lock.release()
 
     @_exclusive
+    def migrate_hashes(self, digests: "Iterable[str]") -> "tuple[MessageStore, list[str]]":
+        """Rebuild an unversioned checkpoint with position-independent hashes.
+
+        Read the originals, without applying patches, so edits remain reversible.
+        Refuse ambiguous merges instead of silently changing a patch's scope.
+        The source store is left untouched, including when migration fails.
+        """
+        migrated = MessageStore()
+        block_hashes = {
+            old: migrated.add_block(MessageBlock.from_payload(payload))
+            for old, payload in self.message_block_lookup.items()
+        }
+        missing = set(self.message_patch_lookup) - block_hashes.keys()
+        if missing:
+            raise ValueError(
+                "cannot migrate checkpoint patches whose original blocks are missing: "
+                + ", ".join(sorted(missing))
+            )
+
+        # Blocks differing only in index collapse into one. Their effective
+        # edits (including an unpatched occurrence) must agree, as must origin.
+        originals = {
+            h for record in self.message_structure_lookup.values() for h in record.get("blocks", [])
+        } | self.message_patch_lookup.keys()
+        edits = {}
+        for old in originals:
+            new = block_hashes[old]
+            replacement = self.message_patch_lookup.get(old)
+            edit = (
+                None
+                if replacement is None
+                else (tuple(block_hashes[h] for h in replacement), self.patch_origin(old))
+            )
+            if new in edits and edits[new] != edit:
+                raise ValueError(
+                    "cannot migrate checkpoint: blocks differing only in index "
+                    f"have conflicting patches ({new}); resolve them with the old version"
+                )
+            edits[new] = edit
+        for digest, edit in edits.items():
+            if edit is not None:
+                replacement, origin = edit
+                migrated.add_patch(digest, list(replacement), origin=origin)
+
+        message_hashes = {}
+        for old, record in self.message_structure_lookup.items():
+            record = copy.deepcopy(record)
+            if "opaque" not in record:
+                original_blocks = record["blocks"]
+                if "indexes" not in record:
+                    indexes = [
+                        block_of(self.message_block_lookup[h]).get("index") for h in original_blocks
+                    ]
+                    if any(index is not None for index in indexes):
+                        record["indexes"] = indexes
+                record["blocks"] = [block_hashes[h] for h in original_blocks]
+            new = content_hash(record)
+            migrated.message_structure_lookup[new] = record
+            message_hashes[old] = new
+        return migrated, [message_hashes[h] for h in digests]
+
+    @_exclusive
     def __len__(self) -> int:
         return len(self.message_structure_lookup)
 
@@ -366,7 +429,7 @@ class MessageStore:
         for position, block_hash in enumerate(record["blocks"]):
             replacement = self.message_patch_lookup.get(block_hash)
             if replacement is None:
-                block = block_of(self.message_block_lookup[block_hash])
+                block = copy.deepcopy(block_of(self.message_block_lookup[block_hash]))
                 if indexes is not None and indexes[position] is not None:
                     block["index"] = indexes[position]
                 blocks.append(block)
@@ -374,7 +437,9 @@ class MessageStore:
                 patched = True
                 if applied is not None:
                     applied.add(block_hash)
-                blocks.extend(block_of(self.message_block_lookup[h]) for h in replacement)
+                blocks.extend(
+                    copy.deepcopy(block_of(self.message_block_lookup[h])) for h in replacement
+                )
         if patched:
             if not blocks and record["blocks"]:
                 return None

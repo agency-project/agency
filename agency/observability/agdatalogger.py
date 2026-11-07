@@ -825,8 +825,10 @@ def reconstruct_llm_patches(connection: "sqlite3.Connection", call_label: str) -
         ).fetchone()
         return block_of(json.loads(payload))
 
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(message_patch_lookup)")}
+    origin_column = "origin" if "origin" in columns else "'operator'"
     rows = connection.execute(
-        "SELECT original_hash, replacement_hash, origin FROM message_patch_lookup "
+        f"SELECT original_hash, replacement_hash, {origin_column} FROM message_patch_lookup "
         "WHERE call_label = ? ORDER BY rowid",
         (call_label,),
     ).fetchall()

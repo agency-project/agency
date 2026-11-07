@@ -2,7 +2,7 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING
 
-from .llm.message_store import MessageStore
+from .llm.message_store import MESSAGE_STORE_VERSION, MessageStore
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -107,6 +107,7 @@ class agcontext:
         store = self.message_store
         with store:
             return {
+                "message_store_version": MESSAGE_STORE_VERSION,
                 "message_hash_list": list(self.message_hash_list),
                 "message_block_lookup": dict(store.message_block_lookup),
                 "message_structure_lookup": dict(store.message_structure_lookup),
@@ -119,14 +120,21 @@ class agcontext:
         """Constructor keywords for a ``message_state`` -- or for a checkpoint
         from before the lookups, which kept a plain message list as "history"."""
         if "message_hash_list" in state:
+            version = state.get("message_store_version")
+            if version not in (None, MESSAGE_STORE_VERSION):
+                raise ValueError(f"unsupported checkpoint message_store_version: {version!r}")
+            store = MessageStore(
+                dict(state.get("message_block_lookup") or {}),
+                dict(state.get("message_structure_lookup") or {}),
+                {k: list(v) for k, v in (state.get("message_patch_lookup") or {}).items()},
+                dict(state.get("message_patch_origin") or {}),
+            )
+            hashes = list(state["message_hash_list"])
+            if version is None:
+                store, hashes = store.migrate_hashes(hashes)
             return {
-                "message_hash_list": list(state["message_hash_list"]),
-                "message_store": MessageStore(
-                    dict(state.get("message_block_lookup") or {}),
-                    dict(state.get("message_structure_lookup") or {}),
-                    {k: list(v) for k, v in (state.get("message_patch_lookup") or {}).items()},
-                    dict(state.get("message_patch_origin") or {}),
-                ),
+                "message_hash_list": hashes,
+                "message_store": store,
             }
         store = MessageStore()
         return {

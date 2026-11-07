@@ -529,3 +529,28 @@ def test_a_model_edit_through_the_real_host_server_reaches_the_backend_and_the_r
     # After the run: the agent's history shows the edit only if it persists.
     texts = [m["blocks"][0]["text"] for m in context.get_resolved_transcript()]
     assert texts[1] == ("Alice has a red car." if persist else FACTS)
+
+
+def test_deleting_all_blocks_sequentially_leaves_a_marker(run):
+    history = [_text("user", "first", "second")]
+    run.server.dispatch({"messages": history})
+    entries = run.view.entries()
+    for entry in entries:
+        run.tools.edit_context(id=entry.id, delete=True)
+    run.server.dispatch({"messages": history})
+    assert _sent(run.backend) == [[REMOVED_TEXT]]
+
+
+@pytest.mark.parametrize("same_message", [False, True])
+def test_deleting_identical_blocks_never_removes_the_whole_message(run, same_message):
+    history = (
+        [_text("user", "same", "same")]
+        if same_message
+        else [_text("user", "same"), _text("user", "same")]
+    )
+    run.server.dispatch({"messages": history})
+    run.tools.edit_context(id=run.view.entries()[0].id, delete=True)
+    run.server.dispatch({"messages": history})
+    assert _sent(run.backend) == (
+        [[REMOVED_TEXT, REMOVED_TEXT]] if same_message else [[REMOVED_TEXT], [REMOVED_TEXT]]
+    )

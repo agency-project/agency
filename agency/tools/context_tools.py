@@ -120,11 +120,18 @@ class ContextView:
         store = self._server.message_store
         with store:
             rows: "list[tuple[str, str, str, dict]]" = []  # (message hash, role, hash, block)
+            sole = set()
             for message_hash in latest["harness_message_hashes"]:
                 record = store.message_structure_lookup[message_hash]
                 role = record.get("role")
                 if "opaque" in record or role == TOOL_SCHEMA_ROLE:
                     continue
+                # Count surviving block identities per message occurrence. A
+                # deletion replaces every copy of its target, and earlier edits
+                # may already have removed the other blocks of this message.
+                surviving = {h for h in record["blocks"] if store.message_patch_lookup.get(h, [h])}
+                if len(surviving) == 1:
+                    sole.update(surviving)
                 for block_hash, payload in store.payloads(message_hash):
                     rows.append((message_hash, role, block_hash, block_of(payload)))
             patch_keys = store.patch_keys_for(row[2] for row in rows)
@@ -134,12 +141,6 @@ class ContextView:
                 if block.get("type") == "tool_use"
                 and _base_tool_name(str(block.get("name") or "")) in CONTEXT_TOOL_NAMES
             }
-            message_sizes: "dict[str, int]" = {}
-            for message_hash, *_ in rows:
-                message_sizes[message_hash] = message_sizes.get(message_hash, 0) + 1
-            # One edit changes every copy of a block, so a block is "only" if it is
-            # the only block of any message it appears in.
-            sole = {h for m, _r, h, _b in rows if message_sizes[m] == 1}
             entries = []
             for message_hash, role, block_hash, block in rows:
                 key = patch_keys.get(block_hash)
@@ -240,22 +241,21 @@ class ContextView:
     ) -> "_Entry":
         """Replace a block's text with *text*, or remove the block if *text* is
         ``None``. Returns the entry edited."""
-        entry = self.find(block_id, allow_self_edit=allow_self_edit)
-        if entry.protected is not None:
-            raise PermissionError(f"block {entry.id} is {entry.protected} and cannot be edited")
-        replacement = self._replacement(entry, text)
         store = self._server.message_store
-        with self._lock:
+        with self._lock, store:
+            entry = self.find(block_id, allow_self_edit=allow_self_edit)
+            if entry.protected is not None:
+                raise PermissionError(f"block {entry.id} is {entry.protected} and cannot be edited")
+            replacement = self._replacement(entry, text)
             self._count_call(max_edits)
             latest = self._server.latest_request()
             key = entry.patch_key if entry.patch_key is not None else entry.block_hash
-            with store:
-                store.add_block(MessageBlock(entry.role, entry.original))
-                store.add_patch(
-                    key,
-                    [store.add_block(MessageBlock(entry.role, b)) for b in replacement],
-                    origin=MODEL_ORIGIN,
-                )
+            store.add_block(MessageBlock(entry.role, entry.original))
+            store.add_patch(
+                key,
+                [store.add_block(MessageBlock(entry.role, b)) for b in replacement],
+                origin=MODEL_ORIGIN,
+            )
             self._edits[key] = {"seq": latest["seq"] if latest else 0, "persist": persist}
         return entry
 

@@ -568,3 +568,24 @@ def test_a_patch_records_its_origin_and_removing_or_clearing_forgets_it():
     _add_patch(store, "user", {"type": "text", "index": 0, "text": "m"}, [], origin="model")
     store.clear_patches()
     assert store.message_patch_origin == {}
+
+
+def test_reconstructing_indexes_does_not_mutate_nested_stored_blocks():
+    store = MessageStore()
+    messages = [
+        {
+            "role": "user",
+            "blocks": [
+                {"type": "text", "role": "inner", "text": "same", "index": 0},
+                {"type": "text", "role": "inner", "text": "same", "index": 1},
+            ],
+        }
+    ]
+    hashes = store.add_messages(messages)
+    before = copy.deepcopy(store.message_block_lookup)
+    assert store.materialize(hashes) == messages
+    assert store.message_block_lookup == before
+    (key,) = store.message_block_lookup
+    store.add_patch(key, [key])
+    assert store.materialize(hashes) == messages
+    assert store.message_block_lookup == before

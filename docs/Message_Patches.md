@@ -247,3 +247,18 @@ pytest tests/harness/test_agproxy_ptrace.py -k "pause or ack"   # ptrace tests n
 `tests/test_agent_live_patch.py` includes a test that sends a request through a real
 `HostServerManager` over the host UDS, and tests that patch an agent while its skill run
 is active.
+
+### Checkpoint compatibility
+
+Checkpoint message stores now record `message_store_version: 2`. Loading an
+unversioned checkpoint translates its block hashes, message hashes, and patch
+references to the position-independent format. Original indexes and unedited
+blocks are retained, so patches still apply when a harness resends its history
+and can still be reverted. Unversioned checkpoints already using the new hashes
+are supported too.
+
+Migration reports an error when original blocks needed to translate a patch are
+missing, or when blocks differing only in index would merge incompatible edits
+(including an edited occurrence and an unedited one). Resolve those patches with
+the version that created the checkpoint before saving it again. Migration does
+not rewrite the source checkpoint file.

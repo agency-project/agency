@@ -797,3 +797,34 @@ def test_second_connection_can_read_while_writer_stays_open(tmp_path):
     finally:
         reader.close()
     dc.stop()
+
+
+def test_reconstruct_patches_reads_a_legacy_database_without_migrating_it():
+    from agency.llm.message_store import content_hash
+    from agency.observability.agdatalogger import reconstruct_llm_patches
+
+    original = {"role": "user", "type": "text", "index": 0, "text": "original"}
+    replacement = {**original, "text": "replacement"}
+    key, value = content_hash(original), content_hash(replacement)
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE message_block_lookup (hash TEXT, payload TEXT)")
+        conn.execute(
+            "CREATE TABLE message_patch_lookup (call_label TEXT, original_hash TEXT, seq INTEGER, replacement_hash TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO message_block_lookup VALUES (?, ?)",
+            [(key, json.dumps(original)), (value, json.dumps(replacement))],
+        )
+        conn.execute("INSERT INTO message_patch_lookup VALUES ('call', ?, 0, ?)", (key, value))
+        conn.execute("PRAGMA query_only = ON")
+        assert reconstruct_llm_patches(conn, "call") == [
+            {
+                "original_hash": key,
+                "original": {k: v for k, v in original.items() if k != "role"},
+                "replacement": [{k: v for k, v in replacement.items() if k != "role"}],
+                "origin": "operator",
+            }
+        ]
+        assert "origin" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(message_patch_lookup)")
+        }
